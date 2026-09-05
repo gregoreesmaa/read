@@ -765,37 +765,23 @@ pub fn layoutViewport(
         // ----------------------------------------------------
         if (line_info.block_type == .quote) {
             var text_slice = line_bytes;
+            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
             var quote_depth: usize = 0;
             while (text_slice.len > 0 and text_slice[0] == '>') {
                 quote_depth += 1;
                 text_slice = text_slice[1..];
-                if (text_slice.len > 0 and text_slice[0] == ' ') text_slice = text_slice[1..];
+                while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
             }
 
             const quote_margin = @as(f32, @floatFromInt(quote_depth)) * 16.0;
-            const block_height = config.line_height * 1.1;
-
-            if (cur_y + block_height >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len) {
-                // Accent left bar
-                commands_out[cmd_count] = .{
-                    .kind = .fill_rect,
-                    .rect = .{
-                        .x = content_x + quote_margin - 12.0,
-                        .y = cur_y,
-                        .w = 3.0,
-                        .h = block_height,
-                    },
-                    .color = theme.quote_bar,
-                };
-                cmd_count += 1;
-            }
+            const start_y = cur_y;
 
             const spans_n = parser.parseInlines(text_slice, &span_buf);
             cur_y = layoutWrappedSpans(
                 span_buf[0..spans_n],
                 content_x + quote_margin,
                 content_width - quote_margin,
-                cur_y,
+                start_y,
                 config.base_font_size,
                 config.line_height,
                 theme.muted,
@@ -804,6 +790,26 @@ pub fn layoutViewport(
                 commands_out,
                 &cmd_count,
             );
+
+            const block_height = cur_y - start_y;
+
+            if (start_y + block_height >= 0 and start_y <= vp_bottom) {
+                var d: usize = 1;
+                while (d <= quote_depth and cmd_count < commands_out.len) : (d += 1) {
+                    const bar_margin = @as(f32, @floatFromInt(d)) * 16.0;
+                    commands_out[cmd_count] = .{
+                        .kind = .fill_rect,
+                        .rect = .{
+                            .x = content_x + bar_margin - 12.0,
+                            .y = start_y,
+                            .w = 3.0,
+                            .h = block_height,
+                        },
+                        .color = theme.quote_bar,
+                    };
+                    cmd_count += 1;
+                }
+            }
             continue;
         }
 

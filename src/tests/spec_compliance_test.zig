@@ -111,15 +111,40 @@ test "spec compliance: blockquotes and nested quotes" {
     const doc =
         \\> Single level quote
         \\>> Nested level quote
+        \\> > Space separated nested quote
     ;
 
     var lines: [8]simd.Line = undefined;
     var fence = false;
     const n = simd.scanLines(doc, &lines, &fence);
 
-    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(simd.BlockType.quote, lines[0].block_type);
     try std.testing.expectEqual(simd.BlockType.quote, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.quote, lines[2].block_type);
+
+    var cmds: [64]layout.DrawCommand = undefined;
+    const vp_cfg = layout.ViewportConfig{
+        .window_width = 800,
+        .window_height = 600,
+        .scroll_y = 0,
+        .content_max_width = 600,
+    };
+    const cmd_count = layout.layoutViewport(doc, lines[0..n], vp_cfg, &cmds);
+    try std.testing.expect(cmd_count > 0);
+
+    // Count fill_rect commands (the quote bars)
+    var bar_count: usize = 0;
+    for (cmds[0..cmd_count]) |cmd| {
+        if (cmd.kind == .fill_rect and cmd.rect.w == 3.0) {
+            bar_count += 1;
+        }
+    }
+    // Line 0 (depth 1): 1 bar
+    // Line 1 (depth 2): 2 bars
+    // Line 2 (depth 2): 2 bars
+    // Total = 5 bars
+    try std.testing.expectEqual(@as(usize, 5), bar_count);
 }
 
 test "spec compliance: unordered lists (*, -, +) and ordered lists (1., 1))" {
