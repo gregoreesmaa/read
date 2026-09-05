@@ -40,7 +40,18 @@ static int g_code_block_count = 0;
 static int g_copied_block_idx = -1;
 static double g_copied_timestamp = 0;
 
+typedef struct {
+    int id;
+    float x, y, w, h;
+    float max_scroll_x;
+} ScrollableBlockRecord;
+
+#define MAX_SCROLLABLE_BLOCKS 128
+static ScrollableBlockRecord g_scrollable_blocks[MAX_SCROLLABLE_BLOCKS];
+static int g_scrollable_block_count = 0;
+
 static BOOL g_has_selection = NO;
+static int g_selection_mode = 0; // 0 = none, 1 = range, 2 = word, 3 = line, 4 = all
 static NSPoint g_select_start = {0, 0}; // Stored in document coordinates
 static NSPoint g_select_end = {0, 0};   // Stored in document coordinates
 static BOOL g_select_all = NO;
@@ -188,6 +199,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 
     g_text_record_count = 0;
     g_code_block_count = 0;
+    g_scrollable_block_count = 0;
     g_current_cg_context = ctx;
 
     if (g_callbacks.on_draw) {
@@ -385,6 +397,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 
     // Double click: word selection
     if ([event clickCount] == 2) {
+        g_selection_mode = 2;
         for (int q = 0; q < g_text_record_count; q++) {
             QuadTextRecord* rec = &g_text_records[q];
             if (g_select_start.x >= rec->x && g_select_start.x <= rec->x + rec->w &&
@@ -398,6 +411,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     }
     // Triple click: line selection
     else if ([event clickCount] >= 3) {
+        g_selection_mode = 3;
         float click_doc_y = g_select_start.y;
         float line_min_x = 9999.0f;
         float line_max_x = -9999.0f;
@@ -412,18 +426,28 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
             g_select_start = NSMakePoint(line_min_x, click_doc_y);
             g_select_end = NSMakePoint(line_max_x, click_doc_y);
         }
+    } else {
+        g_selection_mode = 1;
     }
 
     [self setNeedsDisplay:YES];
 }
 
 - (void)mouseDragged:(NSEvent *)event {
-    NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
-    g_select_end = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
-    [self setNeedsDisplay:YES];
+    if (g_selection_mode <= 1) {
+        NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
+        g_select_end = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
+        [self setNeedsDisplay:YES];
+    }
 }
 
 - (void)mouseUp:(NSEvent *)event {
+    if (g_selection_mode >= 2) {
+        // Prohibit mouseUp from moving g_select_end on double or triple click
+        [self setNeedsDisplay:YES];
+        return;
+    }
+
     NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
     NSPoint end_doc = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
 
@@ -431,6 +455,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     if (fabs(end_doc.y - g_select_start.y) < 4.0f && fabs(end_doc.x - g_select_start.x) < 4.0f) {
         if ([event clickCount] < 2) {
             g_has_selection = NO;
+            g_selection_mode = 0;
 
             // Check if link was clicked
             for (int i = 0; i < g_text_record_count; i++) {
@@ -518,6 +543,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 - (void)selectAllDocument {
     g_select_all = YES;
     g_has_selection = YES;
+    g_selection_mode = 4;
     [self setNeedsDisplay:YES];
 }
 
@@ -623,7 +649,18 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
             dx *= 20.0;
             dy *= 20.0;
         }
-        g_callbacks.on_scroll((float)dx, (float)dy);
+        NSPoint win_pt = [event locationInWindow];
+        NSPoint view_pt = [self convertPoint:win_pt fromView:nil];
+        int hovered_block_id = -1;
+        for (int i = 0; i < g_scrollable_block_count; i++) {
+            ScrollableBlockRecord* b = &g_scrollable_blocks[i];
+            if (view_pt.x >= b->x && view_pt.x <= b->x + b->w &&
+                view_pt.y >= b->y && view_pt.y <= b->y + b->h) {
+                hovered_block_id = b->id;
+                break;
+            }
+        }
+        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id);
     }
     [self setNeedsDisplay:YES];
 }
@@ -646,7 +683,16 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     if ([chars length] > 0) {
         unichar c = [chars characterAtIndex:0];
         if (g_callbacks.on_key) {
-            g_callbacks.on_key((int)c);
+            int hovered_block_id = -1;
+            for (int i = 0; i < g_scrollable_block_count; i++) {
+                ScrollableBlockRecord* b = &g_scrollable_blocks[i];
+                if (g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
+                    g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
+                    hovered_block_id = b->id;
+                    break;
+                }
+            }
+            g_callbacks.on_key((int)c, hovered_block_id);
         }
         [self setNeedsDisplay:YES];
     }
@@ -754,6 +800,29 @@ void platform_register_code_block(float x, float y, float w, float h, const char
         b->text[0] = '\0';
         b->len = 0;
     }
+}
+
+void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x) {
+    if (g_scrollable_block_count >= MAX_SCROLLABLE_BLOCKS) return;
+    g_scrollable_blocks[g_scrollable_block_count++] = (ScrollableBlockRecord){
+        .id = block_id,
+        .x = x,
+        .y = y,
+        .w = w,
+        .h = h,
+        .max_scroll_x = max_scroll_x,
+    };
+}
+
+void platform_begin_clip(float x, float y, float w, float h) {
+    if (!g_current_cg_context) return;
+    CGContextSaveGState(g_current_cg_context);
+    CGContextClipToRect(g_current_cg_context, CGRectMake(x, y, w, h));
+}
+
+void platform_end_clip(void) {
+    if (!g_current_cg_context) return;
+    CGContextRestoreGState(g_current_cg_context);
 }
 
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
@@ -875,6 +944,7 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     g_text_record_count = 0;
     g_code_block_count = 0;
+    g_scrollable_block_count = 0;
     g_current_cg_context = ctx;
 
     render_fn(width, height);

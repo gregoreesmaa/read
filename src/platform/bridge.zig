@@ -1,9 +1,9 @@
 const std = @import("std");
 
 pub const PlatformCallbacks = extern struct {
-    on_scroll: ?*const fn (delta_x: f32, delta_y: f32) callconv(.c) void,
+    on_scroll: ?*const fn (delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void,
     on_resize: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
-    on_key: ?*const fn (key_code: c_int) callconv(.c) void,
+    on_key: ?*const fn (key_code: c_int, hovered_block_id: c_int) callconv(.c) void,
     on_draw: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
 };
 
@@ -55,6 +55,24 @@ pub extern "c" fn platform_register_code_block(
     code_text: [*]const u8,
     code_len: c_int,
 ) void;
+
+pub extern "c" fn platform_register_scrollable_block(
+    block_id: c_int,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    max_scroll_x: f32,
+) void;
+
+pub extern "c" fn platform_begin_clip(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) void;
+
+pub extern "c" fn platform_end_clip() void;
 
 pub extern "c" fn platform_measure_text(
     text: [*]const u8,

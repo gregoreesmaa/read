@@ -45,6 +45,8 @@ const DEFAULT_DOC =
 const MAX_LINES = 200_000;
 const MAX_COMMANDS = 2048;
 
+pub const MAX_SCROLLABLE_BLOCKS = layout.MAX_SCROLLABLE_BLOCKS;
+
 pub const AppState = struct {
     bytes: []const u8 = "",
     mapped_file: ?mmap.MappedFile = null,
@@ -54,7 +56,8 @@ pub const AppState = struct {
     window_height: f32 = 750.0,
     scroll_y: f32 = 0.0,
     max_scroll_y: f32 = 0.0,
-    table_scroll_x: f32 = 0.0,
+    block_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
+    block_max_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
     is_dark_theme: bool = true,
 };
 
@@ -62,10 +65,15 @@ var g_app: AppState = .{};
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 
-fn onScroll(delta_x: f32, delta_y: f32) callconv(.c) void {
+fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void {
     g_app.scroll_y = std.math.clamp(g_app.scroll_y - delta_y, 0.0, g_app.max_scroll_y);
-    if (delta_x != 0.0) {
-        g_app.table_scroll_x = @max(0.0, g_app.table_scroll_x - delta_x);
+    if (delta_x != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
+        const id: usize = @intCast(hovered_block_id);
+        g_app.block_scroll_x[id] = std.math.clamp(
+            g_app.block_scroll_x[id] - delta_x,
+            0.0,
+            g_app.block_max_scroll_x[id],
+        );
     }
 }
 
@@ -74,7 +82,7 @@ fn onResize(w: c_int, h: c_int) callconv(.c) void {
     g_app.window_height = @floatFromInt(h);
 }
 
-fn onKey(key_code: c_int) callconv(.c) void {
+fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
     switch (key_code) {
         'j' => {
             g_app.scroll_y = std.math.clamp(g_app.scroll_y + 40.0, 0.0, g_app.max_scroll_y);
@@ -83,10 +91,24 @@ fn onKey(key_code: c_int) callconv(.c) void {
             g_app.scroll_y = std.math.clamp(g_app.scroll_y - 40.0, 0.0, g_app.max_scroll_y);
         },
         'h' => {
-            g_app.table_scroll_x = @max(0.0, g_app.table_scroll_x - 30.0);
+            if (hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
+                const id: usize = @intCast(hovered_block_id);
+                g_app.block_scroll_x[id] = std.math.clamp(
+                    g_app.block_scroll_x[id] - 30.0,
+                    0.0,
+                    g_app.block_max_scroll_x[id],
+                );
+            }
         },
         'l' => {
-            g_app.table_scroll_x += 30.0;
+            if (hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
+                const id: usize = @intCast(hovered_block_id);
+                g_app.block_scroll_x[id] = std.math.clamp(
+                    g_app.block_scroll_x[id] + 30.0,
+                    0.0,
+                    g_app.block_max_scroll_x[id],
+                );
+            }
         },
         ' ' => {
             g_app.scroll_y = std.math.clamp(g_app.scroll_y + g_app.window_height * 0.8, 0.0, g_app.max_scroll_y);
@@ -111,7 +133,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = g_app.scroll_y,
-        .table_scroll_x = g_app.table_scroll_x,
+        .block_scroll_x = g_app.block_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
     };
 
@@ -155,6 +177,31 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.text.ptr,
                     @intCast(cmd.text.len),
                 );
+            },
+            .register_scrollable_block => {
+                bridge.platform_register_scrollable_block(
+                    cmd.scrollable_id,
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.rect.w,
+                    cmd.rect.h,
+                    cmd.max_scroll_x,
+                );
+                if (cmd.scrollable_id >= 0 and cmd.scrollable_id < MAX_SCROLLABLE_BLOCKS) {
+                    const id: usize = @intCast(cmd.scrollable_id);
+                    g_app.block_max_scroll_x[id] = cmd.max_scroll_x;
+                }
+            },
+            .begin_clip => {
+                bridge.platform_begin_clip(
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.rect.w,
+                    cmd.rect.h,
+                );
+            },
+            .end_clip => {
+                bridge.platform_end_clip();
             },
             .line => {
                 bridge.platform_draw_rect(

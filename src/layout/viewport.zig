@@ -128,6 +128,9 @@ pub const DrawCommandKind = enum {
     text_run,
     line,
     code_block_bg,
+    register_scrollable_block,
+    begin_clip,
+    end_clip,
 };
 
 pub const Color = struct {
@@ -172,12 +175,14 @@ pub const Rect = struct {
 
 pub const DrawCommand = struct {
     kind: DrawCommandKind,
-    rect: Rect,
-    color: Color,
+    rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    color: Color = Color.transparent,
     text: []const u8 = "",
     font_size: f32 = 16.0,
     style: parser.SpanStyle = .{},
     link_target: ?[]const u8 = null,
+    scrollable_id: c_int = -1,
+    max_scroll_x: f32 = 0.0,
 };
 
 pub const Theme = struct {
@@ -216,11 +221,13 @@ pub const Theme = struct {
     };
 };
 
+pub const MAX_SCROLLABLE_BLOCKS = 128;
+
 pub const ViewportConfig = struct {
     window_width: f32,
     window_height: f32,
     scroll_y: f32,
-    table_scroll_x: f32 = 0.0,
+    block_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
     content_max_width: f32 = 600.0,
     base_font_size: f32 = 17.0,
     line_height: f32 = 29.75,
@@ -339,6 +346,7 @@ pub fn layoutViewport(
 
     var span_buf: [32]parser.InlineSpan = undefined;
     var i: usize = 0;
+    var next_block_id: usize = 0;
 
     while (i < lines.len) : (i += 1) {
         if (cmd_count >= commands_out.len - 16) break;
@@ -363,8 +371,26 @@ pub fn layoutViewport(
             const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0;
             const block_top = cur_y;
             const block_bottom = cur_y + code_block_h;
+            const block_id = next_block_id;
+            next_block_id += 1;
 
             if (block_bottom >= 0 and block_top <= vp_bottom) {
+                // Find longest line to determine max_scroll_x
+                var max_code_line_w: f32 = 0;
+                var measure_i = i + 1;
+                while (measure_i < scan_i and measure_i < lines.len) : (measure_i += 1) {
+                    const c_len = lines[measure_i].len;
+                    const line_w = @as(f32, @floatFromInt(c_len)) * (config.base_font_size * 0.88 * 0.60);
+                    if (line_w > max_code_line_w) max_code_line_w = line_w;
+                }
+
+                // Maximum horizontal scroll: right side aligned with right end of text line
+                const max_scroll_x = @max(0.0, max_code_line_w - content_width + 16.0);
+                const cur_scroll_x = if (block_id < MAX_SCROLLABLE_BLOCKS)
+                    std.math.clamp(config.block_scroll_x[block_id], 0.0, max_scroll_x)
+                else
+                    0.0;
+
                 // Extract entire code block slice for the Copy button
                 const code_slice = if (scan_i > i + 1)
                     bytes[lines[i + 1].offset .. lines[scan_i - 1].offset + lines[scan_i - 1].len]
@@ -385,6 +411,36 @@ pub fn layoutViewport(
                 };
                 cmd_count += 1;
 
+                // Register scrollable block
+                if (cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .register_scrollable_block,
+                        .rect = .{
+                            .x = content_x - 12.0,
+                            .y = cur_y,
+                            .w = content_width + 24.0,
+                            .h = code_block_h,
+                        },
+                        .scrollable_id = @intCast(block_id),
+                        .max_scroll_x = max_scroll_x,
+                    };
+                    cmd_count += 1;
+                }
+
+                // Begin clip
+                if (cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .begin_clip,
+                        .rect = .{
+                            .x = content_x - 12.0,
+                            .y = cur_y,
+                            .w = content_width + 24.0,
+                            .h = code_block_h,
+                        },
+                    };
+                    cmd_count += 1;
+                }
+
                 var code_y = cur_y + 12.0;
                 var draw_i = i + 1;
                 while (draw_i < scan_i and draw_i < lines.len) : (draw_i += 1) {
@@ -396,7 +452,7 @@ pub fn layoutViewport(
                         commands_out[cmd_count] = .{
                             .kind = .text_run,
                             .rect = .{
-                                .x = content_x,
+                                .x = content_x - cur_scroll_x,
                                 .y = code_y,
                                 .w = content_width,
                                 .h = config.line_height * 0.88,
@@ -409,6 +465,15 @@ pub fn layoutViewport(
                         cmd_count += 1;
                     }
                     code_y += config.line_height * 0.88;
+                }
+
+                // End clip
+                if (cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .end_clip,
+                        .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+                    };
+                    cmd_count += 1;
                 }
             }
 
@@ -433,6 +498,8 @@ pub fn layoutViewport(
 
             const row_h = config.line_height * 1.3;
             const table_h = @as(f32, @floatFromInt(table_rows_count)) * row_h;
+            const block_id = next_block_id;
+            next_block_id += 1;
 
             if (cur_y + table_h >= 0 and cur_y <= vp_bottom) {
                 // Pass 1: measure column count and column widths
@@ -475,6 +542,43 @@ pub fn layoutViewport(
                 if (total_measured_w < content_width) {
                     const extra_per_col = (content_width - total_measured_w) / @as(f32, @floatFromInt(col_count));
                     for (0..col_count) |ci| col_widths[ci] += extra_per_col;
+                    total_measured_w = content_width;
+                }
+
+                const max_scroll_x = @max(0.0, total_measured_w - content_width);
+                const cur_scroll_x = if (block_id < MAX_SCROLLABLE_BLOCKS)
+                    std.math.clamp(config.block_scroll_x[block_id], 0.0, max_scroll_x)
+                else
+                    0.0;
+
+                // Register scrollable block
+                if (cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .register_scrollable_block,
+                        .rect = .{
+                            .x = content_x - 4.0,
+                            .y = cur_y,
+                            .w = content_width + 8.0,
+                            .h = table_h,
+                        },
+                        .scrollable_id = @intCast(block_id),
+                        .max_scroll_x = max_scroll_x,
+                    };
+                    cmd_count += 1;
+                }
+
+                // Begin clip
+                if (cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .begin_clip,
+                        .rect = .{
+                            .x = content_x - 4.0,
+                            .y = cur_y - 2.0,
+                            .w = content_width + 8.0,
+                            .h = table_h + 4.0,
+                        },
+                    };
+                    cmd_count += 1;
                 }
 
                 var row_y = cur_y;
@@ -497,7 +601,7 @@ pub fn layoutViewport(
                     if (is_sep) {
                         commands_out[cmd_count] = .{
                             .kind = .line,
-                            .rect = .{ .x = content_x, .y = row_y + 2.0, .w = @max(content_width, total_measured_w), .h = 1.0 },
+                            .rect = .{ .x = content_x - cur_scroll_x, .y = row_y + 2.0, .w = @max(content_width, total_measured_w), .h = 1.0 },
                             .color = theme.table_border,
                         };
                         cmd_count += 1;
@@ -509,7 +613,7 @@ pub fn layoutViewport(
                     // Render row cells with inline parsing
                     var cell_start: usize = 0;
                     var c_idx: usize = 0;
-                    var cur_col_x = content_x - if (total_measured_w > content_width) config.table_scroll_x else 0.0;
+                    var cur_col_x = content_x - cur_scroll_x;
 
                     for (r_bytes, 0..) |c, char_idx| {
                         if (c == '|') {
@@ -559,12 +663,21 @@ pub fn layoutViewport(
                     // Row divider line
                     commands_out[cmd_count] = .{
                         .kind = .line,
-                        .rect = .{ .x = content_x, .y = row_y + row_h - 2.0, .w = content_width, .h = 1.0 },
+                        .rect = .{ .x = content_x - cur_scroll_x, .y = row_y + row_h - 2.0, .w = @max(content_width, total_measured_w), .h = 1.0 },
                         .color = theme.table_border,
                     };
                     cmd_count += 1;
 
                     row_y += row_h;
+                }
+
+                // End clip
+                if (cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .end_clip,
+                        .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+                    };
+                    cmd_count += 1;
                 }
             }
 
@@ -812,8 +925,72 @@ pub fn layoutViewport(
         }
 
         // ----------------------------------------------------
-        // Paragraph with Word-Wrapping and Accurate Inline Spans
+        // Paragraph with Word-Wrapping, Setext Headings, and Inline Spans
         // ----------------------------------------------------
+        var is_setext_h1 = false;
+        var is_setext_h2 = false;
+        if (i + 1 < lines.len) {
+            const next_info = lines[i + 1];
+            const next_bytes = bytes[next_info.offset..][0..next_info.len];
+            var next_trimmed = next_bytes;
+            while (next_trimmed.len > 0 and (next_trimmed[0] == ' ' or next_trimmed[0] == '\t')) : (next_trimmed = next_trimmed[1..]) {}
+            if (next_trimmed.len >= 2) {
+                if (next_trimmed[0] == '=') {
+                    var all_eq = true;
+                    for (next_trimmed) |ch| {
+                        if (ch != '=' and ch != ' ') {
+                            all_eq = false;
+                            break;
+                        }
+                    }
+                    if (all_eq) is_setext_h1 = true;
+                } else if (next_trimmed[0] == '-') {
+                    var all_dash = true;
+                    for (next_trimmed) |ch| {
+                        if (ch != '-' and ch != ' ') {
+                            all_dash = false;
+                            break;
+                        }
+                    }
+                    if (all_dash) is_setext_h2 = true;
+                }
+            }
+        }
+
+        if (is_setext_h1 or is_setext_h2) {
+            const heading_level: usize = if (is_setext_h1) 1 else 2;
+            const font_size = config.base_font_size * (if (heading_level == 1) @as(f32, 2.2) else @as(f32, 1.7));
+            const heading_line_h = config.line_height * (if (heading_level == 1) @as(f32, 1.5) else @as(f32, 1.35));
+            const margin_top = font_size * 1.5;
+            const margin_bottom = font_size * 0.5;
+
+            cur_y += margin_top;
+
+            const span_count = parser.parseInlines(line_bytes, &span_buf);
+            for (span_buf[0..span_count]) |*s| {
+                s.style.heading = true;
+                s.style.bold = true;
+            }
+
+            const end_y = layoutWrappedSpans(
+                span_buf[0..span_count],
+                content_x,
+                content_width,
+                cur_y,
+                font_size,
+                heading_line_h,
+                theme.text,
+                theme.accent,
+                vp_bottom,
+                commands_out,
+                &cmd_count,
+            );
+
+            cur_y = end_y + margin_bottom;
+            i += 1; // Consume the underline line
+            continue;
+        }
+
         const span_count = parser.parseInlines(line_bytes, &span_buf);
         if (span_count == 0) {
             cur_y += config.line_height * 0.5;

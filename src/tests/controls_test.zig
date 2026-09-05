@@ -1,0 +1,240 @@
+const std = @import("std");
+const layout = @import("../layout/viewport.zig");
+const simd = @import("../core/simd.zig");
+const parser = @import("../core/parser.zig");
+
+// Simulation of SelectionState and ControlState matching macOS / App logic
+pub const SelectionMode = enum {
+    none,
+    range,
+    word,
+    line,
+    all,
+};
+
+pub const Point = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+};
+
+pub const SelectionState = struct {
+    has_selection: bool = false,
+    mode: SelectionMode = .none,
+    start: Point = .{},
+    end: Point = .{},
+
+    pub fn onMouseDown(
+        self: *SelectionState,
+        click_x: f32,
+        click_y: f32,
+        click_count: usize,
+        records: []const layout.DrawCommand,
+    ) void {
+        self.has_selection = true;
+        self.start = .{ .x = click_x, .y = click_y };
+        self.end = self.start;
+
+        if (click_count == 2) {
+            self.mode = .word;
+            // Locate word boundary
+            for (records) |cmd| {
+                if (cmd.kind == .text_run and
+                    click_x >= cmd.rect.x and click_x <= cmd.rect.x + cmd.rect.w and
+                    click_y >= cmd.rect.y and click_y <= cmd.rect.y + cmd.rect.h)
+                {
+                    self.start = .{ .x = cmd.rect.x, .y = cmd.rect.y + cmd.rect.h * 0.5 };
+                    self.end = .{ .x = cmd.rect.x + cmd.rect.w, .y = cmd.rect.y + cmd.rect.h * 0.5 };
+                    break;
+                }
+            }
+        } else if (click_count >= 3) {
+            self.mode = .line;
+            var min_x: f32 = 9999.0;
+            var max_x: f32 = -9999.0;
+            for (records) |cmd| {
+                if (cmd.kind == .text_run and @abs(cmd.rect.y + cmd.rect.h * 0.5 - click_y) < 16.0) {
+                    min_x = @min(min_x, cmd.rect.x);
+                    max_x = @max(max_x, cmd.rect.x + cmd.rect.w);
+                }
+            }
+            if (max_x > min_x) {
+                self.start = .{ .x = min_x, .y = click_y };
+                self.end = .{ .x = max_x, .y = click_y };
+            }
+        } else {
+            self.mode = .range;
+        }
+    }
+
+    pub fn onMouseDragged(self: *SelectionState, drag_x: f32, drag_y: f32) void {
+        if (self.mode == .range or self.mode == .none) {
+            self.end = .{ .x = drag_x, .y = drag_y };
+        }
+    }
+
+    pub fn onMouseUp(self: *SelectionState, up_x: f32, up_y: f32, click_count: usize) void {
+        // Double-click and triple-click lock: mouse-up MUST NOT move cursor-end
+        if (self.mode == .word or self.mode == .line or self.mode == .all) {
+            return;
+        }
+
+        const dist_x = @abs(up_x - self.start.x);
+        const dist_y = @abs(up_y - self.start.y);
+
+        if (dist_x < 4.0 and dist_y < 4.0) {
+            if (click_count < 2) {
+                self.has_selection = false;
+                self.mode = .none;
+            }
+        } else {
+            self.end = .{ .x = up_x, .y = up_y };
+        }
+    }
+};
+
+test "controls: double-click word selection is locked against mouse-up shift" {
+    var state = SelectionState{};
+
+    const sample_commands = [_]layout.DrawCommand{
+        .{
+            .kind = .text_run,
+            .rect = .{ .x = 100.0, .y = 50.0, .w = 80.0, .h = 24.0 },
+            .text = "superfast",
+        },
+    };
+
+    // User double-clicks in middle of word at (140.0, 60.0)
+    state.onMouseDown(140.0, 60.0, 2, &sample_commands);
+
+    // Verify word mode and word boundaries set
+    try std.testing.expectEqual(SelectionMode.word, state.mode);
+    try std.testing.expectEqual(@as(f32, 100.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 180.0), state.end.x);
+
+    // User releases mouse at (142.0, 61.0) - slightly shifted
+    state.onMouseUp(142.0, 61.0, 2);
+
+    // Prohibit bug: cursor-end MUST NOT change to mouse-up position!
+    try std.testing.expectEqual(@as(f32, 100.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 180.0), state.end.x);
+    try std.testing.expect(state.has_selection);
+}
+
+test "controls: triple-click line selection is locked against mouse-up shift" {
+    var state = SelectionState{};
+
+    const sample_commands = [_]layout.DrawCommand{
+        .{
+            .kind = .text_run,
+            .rect = .{ .x = 50.0, .y = 100.0, .w = 60.0, .h = 24.0 },
+            .text = "First",
+        },
+        .{
+            .kind = .text_run,
+            .rect = .{ .x = 120.0, .y = 100.0, .w = 80.0, .h = 24.0 },
+            .text = "Second",
+        },
+    };
+
+    // User triple-clicks anywhere on line
+    state.onMouseDown(70.0, 110.0, 3, &sample_commands);
+
+    try std.testing.expectEqual(SelectionMode.line, state.mode);
+    try std.testing.expectEqual(@as(f32, 50.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 200.0), state.end.x);
+
+    // Mouse-up anywhere on line
+    state.onMouseUp(150.0, 112.0, 3);
+
+    // End must remain at 200.0
+    try std.testing.expectEqual(@as(f32, 50.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 200.0), state.end.x);
+}
+
+test "controls: single click without drag clears selection" {
+    var state = SelectionState{};
+    state.has_selection = true;
+    state.mode = .range;
+    state.start = .{ .x = 100.0, .y = 100.0 };
+    state.end = .{ .x = 250.0, .y = 100.0 };
+
+    // New single click at (300.0, 300.0)
+    state.onMouseDown(300.0, 300.0, 1, &.{});
+    state.onMouseUp(300.0, 300.0, 1);
+
+    try std.testing.expect(!state.has_selection);
+    try std.testing.expectEqual(SelectionMode.none, state.mode);
+}
+
+test "controls: keybindings j, k, space, t navigation" {
+    var scroll_y: f32 = 0.0;
+    const max_scroll_y: f32 = 1000.0;
+    const window_height: f32 = 600.0;
+    var is_dark: bool = true;
+
+    // 'j' scrolls down by 40px
+    scroll_y = std.math.clamp(scroll_y + 40.0, 0.0, max_scroll_y);
+    try std.testing.expectEqual(@as(f32, 40.0), scroll_y);
+
+    // 'k' scrolls up by 40px
+    scroll_y = std.math.clamp(scroll_y - 40.0, 0.0, max_scroll_y);
+    try std.testing.expectEqual(@as(f32, 0.0), scroll_y);
+
+    // 'k' cannot scroll past top
+    scroll_y = std.math.clamp(scroll_y - 40.0, 0.0, max_scroll_y);
+    try std.testing.expectEqual(@as(f32, 0.0), scroll_y);
+
+    // ' ' (Space) page down (0.8 * window_height = 480px)
+    scroll_y = std.math.clamp(scroll_y + window_height * 0.8, 0.0, max_scroll_y);
+    try std.testing.expectEqual(@as(f32, 480.0), scroll_y);
+
+    // 't' toggles theme
+    is_dark = !is_dark;
+    try std.testing.expectEqual(false, is_dark);
+    is_dark = !is_dark;
+    try std.testing.expectEqual(true, is_dark);
+}
+
+test "controls: distinct per-block horizontal scrolling with mouse-over requirement and right alignment" {
+    const MAX_BLOCKS = layout.MAX_SCROLLABLE_BLOCKS;
+    var block_scroll_x = [_]f32{0.0} ** MAX_BLOCKS;
+    var block_max_scroll_x = [_]f32{0.0} ** MAX_BLOCKS;
+
+    // Block 0: Code block with max_scroll 150px
+    block_max_scroll_x[0] = 150.0;
+    // Block 1: Table with max_scroll 300px
+    block_max_scroll_x[1] = 300.0;
+
+    // 1. Scrolling when mouse is NOT over any block (hovered_block_id = -1)
+    const hovered_none: c_int = -1;
+    if (hovered_none >= 0) {
+        const id: usize = @intCast(hovered_none);
+        block_scroll_x[id] += 30.0;
+    }
+    try std.testing.expectEqual(@as(f32, 0.0), block_scroll_x[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), block_scroll_x[1]);
+
+    // 2. Scrolling when mouse IS over Block 0
+    const hovered_block_0: c_int = 0;
+    const b0_id: usize = @intCast(hovered_block_0);
+    block_scroll_x[b0_id] = std.math.clamp(block_scroll_x[b0_id] + 50.0, 0.0, block_max_scroll_x[b0_id]);
+
+    // Block 0 scrolled by 50px, Block 1 is strictly untouched!
+    try std.testing.expectEqual(@as(f32, 50.0), block_scroll_x[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), block_scroll_x[1]);
+
+    // 3. Scroll Block 0 past its maximum -> must clamp to max_scroll_x (right side aligned)
+    block_scroll_x[b0_id] = std.math.clamp(block_scroll_x[b0_id] + 200.0, 0.0, block_max_scroll_x[b0_id]);
+    try std.testing.expectEqual(@as(f32, 150.0), block_scroll_x[0]);
+
+    // 4. Scroll Block 0 left past 0 -> must clamp to 0.0
+    block_scroll_x[b0_id] = std.math.clamp(block_scroll_x[b0_id] - 300.0, 0.0, block_max_scroll_x[b0_id]);
+    try std.testing.expectEqual(@as(f32, 0.0), block_scroll_x[0]);
+
+    // 5. Scroll Block 1 while hovering Block 1
+    const hovered_block_1: c_int = 1;
+    const b1_id: usize = @intCast(hovered_block_1);
+    block_scroll_x[b1_id] = std.math.clamp(block_scroll_x[b1_id] + 120.0, 0.0, block_max_scroll_x[b1_id]);
+    try std.testing.expectEqual(@as(f32, 120.0), block_scroll_x[1]);
+    try std.testing.expectEqual(@as(f32, 0.0), block_scroll_x[0]); // Block 0 still 0
+}

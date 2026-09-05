@@ -5,9 +5,13 @@ pub const simd = @import("core/simd.zig");
 pub const parser = @import("core/parser.zig");
 pub const layout = @import("layout/viewport.zig");
 pub const strict_benchmarks = @import("core/strict_benchmarks.zig");
+pub const controls_test = @import("tests/controls_test.zig");
+pub const spec_compliance_test = @import("tests/spec_compliance_test.zig");
 
 test {
     _ = strict_benchmarks;
+    _ = controls_test;
+    _ = spec_compliance_test;
 }
 
 test "simd line scanner and block classification" {

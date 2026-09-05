@@ -17,6 +17,14 @@ pub const InlineSpan = struct {
     link_target: ?[]const u8 = null,
 };
 
+fn isAsciiPunct(ch: u8) bool {
+    return switch (ch) {
+        '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+        ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~' => true,
+        else => false,
+    };
+}
+
 /// High-speed inline parser for viewport lines.
 /// Zero heap allocations: tokens are stored directly into caller's slice.
 pub fn parseInlines(
@@ -33,6 +41,29 @@ pub fn parseInlines(
 
     while (i < line.len and span_count < spans_out.len) {
         const c = line[i];
+
+        // Backslash escape for Markdown punctuation: \* \_ \[ \] \` etc.
+        if (c == '\\' and i + 1 < line.len) {
+            const next_c = line[i + 1];
+            if (isAsciiPunct(next_c)) {
+                if (i > span_start) {
+                    spans_out[span_count] = .{
+                        .text = line[span_start..i],
+                        .style = cur_style,
+                    };
+                    span_count += 1;
+                    if (span_count >= spans_out.len) break;
+                }
+                spans_out[span_count] = .{
+                    .text = line[i + 1 .. i + 2],
+                    .style = cur_style,
+                };
+                span_count += 1;
+                i += 2;
+                span_start = i;
+                continue;
+            }
+        }
 
         // Inline code `...`
         if (c == '`') {
@@ -65,10 +96,11 @@ pub fn parseInlines(
             }
         }
 
-        // Bold ** or Italic *
+        // Bold ***, **, or Italic *
         if (c == '*' or c == '_') {
-            const is_double = (i + 1 < line.len and line[i + 1] == c);
-            const delim_len: usize = if (is_double) 2 else 1;
+            const is_triple = (i + 2 < line.len and line[i + 1] == c and line[i + 2] == c);
+            const is_double = !is_triple and (i + 1 < line.len and line[i + 1] == c);
+            const delim_len: usize = if (is_triple) 3 else if (is_double) 2 else 1;
 
             if (i > span_start) {
                 spans_out[span_count] = .{
@@ -79,7 +111,10 @@ pub fn parseInlines(
                 if (span_count >= spans_out.len) break;
             }
 
-            if (is_double) {
+            if (is_triple) {
+                cur_style.bold = !cur_style.bold;
+                cur_style.italic = !cur_style.italic;
+            } else if (is_double) {
                 cur_style.bold = !cur_style.bold;
             } else {
                 cur_style.italic = !cur_style.italic;
@@ -105,6 +140,45 @@ pub fn parseInlines(
             i += 2;
             span_start = i;
             continue;
+        }
+
+        // Image ![alt](url)
+        if (c == '!' and i + 1 < line.len and line[i + 1] == '[') {
+            var close_bracket = i + 2;
+            while (close_bracket < line.len and line[close_bracket] != ']') : (close_bracket += 1) {}
+
+            if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
+                var close_paren = close_bracket + 2;
+                while (close_paren < line.len and line[close_paren] != ')') : (close_paren += 1) {}
+
+                if (close_paren < line.len) {
+                    if (i > span_start) {
+                        spans_out[span_count] = .{
+                            .text = line[span_start..i],
+                            .style = cur_style,
+                        };
+                        span_count += 1;
+                        if (span_count >= spans_out.len) break;
+                    }
+
+                    const alt_text = line[i + 2 .. close_bracket];
+                    const img_url = line[close_bracket + 2 .. close_paren];
+
+                    var img_style = cur_style;
+                    img_style.link = true;
+
+                    spans_out[span_count] = .{
+                        .text = if (alt_text.len > 0) alt_text else "🖼 Image",
+                        .style = img_style,
+                        .link_target = img_url,
+                    };
+                    span_count += 1;
+
+                    i = close_paren + 1;
+                    span_start = i;
+                    continue;
+                }
+            }
         }
 
         // Link [text](url)
@@ -141,6 +215,45 @@ pub fn parseInlines(
                     span_count += 1;
 
                     i = close_paren + 1;
+                    span_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // Autolink <http://...>, <https://...>, <user@domain.com>
+        if (c == '<') {
+            var close_angle = i + 1;
+            while (close_angle < line.len and line[close_angle] != '>') : (close_angle += 1) {}
+
+            if (close_angle < line.len) {
+                const inner = line[i + 1 .. close_angle];
+                const is_url = std.mem.startsWith(u8, inner, "http://") or
+                    std.mem.startsWith(u8, inner, "https://") or
+                    std.mem.startsWith(u8, inner, "mailto:") or
+                    (std.mem.indexOfScalar(u8, inner, '@') != null and std.mem.indexOfScalar(u8, inner, ' ') == null);
+
+                if (is_url) {
+                    if (i > span_start) {
+                        spans_out[span_count] = .{
+                            .text = line[span_start..i],
+                            .style = cur_style,
+                        };
+                        span_count += 1;
+                        if (span_count >= spans_out.len) break;
+                    }
+
+                    var link_style = cur_style;
+                    link_style.link = true;
+
+                    spans_out[span_count] = .{
+                        .text = inner,
+                        .style = link_style,
+                        .link_target = inner,
+                    };
+                    span_count += 1;
+
+                    i = close_angle + 1;
                     span_start = i;
                     continue;
                 }

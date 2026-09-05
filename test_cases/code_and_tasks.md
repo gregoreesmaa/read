@@ -5,7 +5,7 @@ const std = @import("std");
 
 pub fn main() void {
     const stdout = std.io.getStdOut().writer();
-    stdout.print("Zero dependencies. Microsecond speed.\n", .{}) catch {};
+    stdout.print("Zero dependencies. Microsecond speed. Distinct per-block horizontal scrolling with right-alignment clamping.\n", .{}) catch {};
 }
 ```
 
