@@ -621,7 +621,7 @@ pub fn layoutViewport(
             const quote_margin = @as(f32, @floatFromInt(quote_depth)) * 16.0;
             const block_height = config.line_height * 1.1;
 
-            if (cur_y + block_height >= 0 and cur_y <= vp_bottom) {
+            if (cur_y + block_height >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len) {
                 // Accent left bar
                 commands_out[cmd_count] = .{
                     .kind = .fill_rect,
@@ -634,24 +634,22 @@ pub fn layoutViewport(
                     .color = theme.quote_bar,
                 };
                 cmd_count += 1;
-
-                const spans_n = parser.parseInlines(text_slice, &span_buf);
-                cur_y = layoutWrappedSpans(
-                    span_buf[0..spans_n],
-                    content_x + quote_margin,
-                    content_width - quote_margin,
-                    cur_y,
-                    config.base_font_size,
-                    config.line_height,
-                    theme.muted,
-                    theme.accent,
-                    vp_bottom,
-                    commands_out,
-                    &cmd_count,
-                );
-            } else {
-                cur_y += block_height;
             }
+
+            const spans_n = parser.parseInlines(text_slice, &span_buf);
+            cur_y = layoutWrappedSpans(
+                span_buf[0..spans_n],
+                content_x + quote_margin,
+                content_width - quote_margin,
+                cur_y,
+                config.base_font_size,
+                config.line_height,
+                theme.muted,
+                theme.accent,
+                vp_bottom,
+                commands_out,
+                &cmd_count,
+            );
             continue;
         }
 
@@ -670,7 +668,7 @@ pub fn layoutViewport(
 
             const block_height = config.line_height;
 
-            if (cur_y + block_height >= 0 and cur_y <= vp_bottom) {
+            if (cur_y + block_height >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len - 2) {
                 // Checkbox box
                 commands_out[cmd_count] = .{
                     .kind = .fill_rect,
@@ -689,25 +687,23 @@ pub fn layoutViewport(
                     .style = .{ .bold = true },
                 };
                 cmd_count += 1;
-
-                const spans_n = parser.parseInlines(item_text, &span_buf);
-                const txt_color = if (is_checked) theme.muted else theme.text;
-                cur_y = layoutWrappedSpans(
-                    span_buf[0..spans_n],
-                    content_x + 28.0,
-                    content_width - 28.0,
-                    cur_y,
-                    config.base_font_size,
-                    config.line_height,
-                    txt_color,
-                    theme.accent,
-                    vp_bottom,
-                    commands_out,
-                    &cmd_count,
-                );
-            } else {
-                cur_y += block_height;
             }
+
+            const spans_n = parser.parseInlines(item_text, &span_buf);
+            const txt_color = if (is_checked) theme.muted else theme.text;
+            cur_y = layoutWrappedSpans(
+                span_buf[0..spans_n],
+                content_x + 28.0,
+                content_width - 28.0,
+                cur_y,
+                config.base_font_size,
+                config.line_height,
+                txt_color,
+                theme.accent,
+                vp_bottom,
+                commands_out,
+                &cmd_count,
+            );
             continue;
         }
 
@@ -734,7 +730,7 @@ pub fn layoutViewport(
             const text_x = bullet_x + 18.0;
             const block_height = config.line_height;
 
-            if (cur_y + block_height >= 0 and cur_y <= vp_bottom) {
+            if (cur_y + block_height >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len) {
                 if (line_info.block_type == .bullet_list) {
                     commands_out[cmd_count] = .{
                         .kind = .text_run,
@@ -755,24 +751,22 @@ pub fn layoutViewport(
                     };
                     cmd_count += 1;
                 }
-
-                const spans_n = parser.parseInlines(item_text, &span_buf);
-                cur_y = layoutWrappedSpans(
-                    span_buf[0..spans_n],
-                    text_x,
-                    content_width - (text_x - content_x),
-                    cur_y,
-                    config.base_font_size,
-                    config.line_height,
-                    theme.text,
-                    theme.accent,
-                    vp_bottom,
-                    commands_out,
-                    &cmd_count,
-                );
-            } else {
-                cur_y += block_height;
             }
+
+            const spans_n = parser.parseInlines(item_text, &span_buf);
+            cur_y = layoutWrappedSpans(
+                span_buf[0..spans_n],
+                text_x,
+                content_width - (text_x - content_x),
+                cur_y,
+                config.base_font_size,
+                config.line_height,
+                theme.text,
+                theme.accent,
+                vp_bottom,
+                commands_out,
+                &cmd_count,
+            );
             continue;
         }
 
@@ -801,4 +795,106 @@ pub fn layoutViewport(
     }
 
     return cmd_count;
+}
+
+test "strict scroll smoothness across enumerations, lists, headings, and mixed blocks" {
+    const test_doc =
+        \\# Main Heading 1
+        \\## Secondary Heading 2
+        \\### Section 3
+        \\
+        \\A normal paragraph with enough words to verify multi-line wrapping and baseline alignment across lines.
+        \\
+        \\> A blockquote that spans across multiple sentences and tests whether quoting margins and bars scroll with zero jitter.
+        \\> Second line of blockquote.
+        \\
+        \\* Enumeration item_alpha with short text
+        \\* Enumeration item_beta with a significantly longer description that wraps across multiple lines in the viewport to test multi-line list scroll stability
+        \\* Enumeration item_gamma with `inline code` and **bold formatting** to verify inline styles during scroll
+        \\
+        \\1. Ordered step_one: initialize memory map
+        \\2. Ordered step_two: scan SIMD vector chunk line boundaries with microsecond throughput
+        \\3. Ordered step_three: calculate visible viewport draw commands strictly without layout jitter or jumps
+        \\4. Ordered step_four: render frame to native macOS Cocoa CoreText buffer
+        \\
+        \\- [x] Completed task_one with checkmark
+        \\- [ ] Incomplete task_two that requires user action and spans across several words
+        \\- [x] Another completed task_three testing multi-item task list smoothness
+        \\
+        \\| Col A | Col B | Col C |
+        \\| :--- | :--- | :--- |
+        \\| Data 1 | Data 2 | Data 3 |
+        \\| Data 4 | Data 5 | Data 6 |
+        \\
+        \\```zig
+        \\pub fn main() void {
+        \\    std.debug.print("Hello smooth scroll!\n", .{});
+        \\}
+        \\```
+        \\
+        \\Final trailing paragraph at the bottom of the document.
+    ;
+
+    var lines_buf: [256]simd.Line = undefined;
+    var fence = false;
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+    const lines = lines_buf[0..line_count];
+
+    var cmds_a: [512]DrawCommand = undefined;
+    var cmds_b: [512]DrawCommand = undefined;
+
+    const step_sizes = [_]f32{ 1.0, 3.0, 7.0, 14.0, 28.0 };
+
+    for (step_sizes) |delta_s| {
+        var s: f32 = 0.0;
+        while (s < 1200.0) : (s += delta_s) {
+            const config_a = ViewportConfig{
+                .window_width = 800.0,
+                .window_height = 600.0,
+                .scroll_y = s,
+            };
+            const count_a = layoutViewport(test_doc, lines, config_a, &cmds_a);
+
+            const config_b = ViewportConfig{
+                .window_width = 800.0,
+                .window_height = 600.0,
+                .scroll_y = s + delta_s,
+            };
+            const count_b = layoutViewport(test_doc, lines, config_b, &cmds_b);
+
+            // Verify that all distinct anchor words across lists, enumerations, headings, and quotes
+            // scroll with mathematical smoothness (diff == delta_s exactly within 0.01 px)
+            const anchor_words = [_][]const u8{
+                "Main", "Secondary", "Section", "paragraph", "blockquote",
+                "item_alpha", "item_beta", "item_gamma",
+                "step_one:", "step_two:", "step_three:", "step_four:",
+                "task_one", "task_two", "task_three",
+                "Data 1", "Data 4", "trailing",
+            };
+
+            for (anchor_words) |word| {
+                var ya: ?f32 = null;
+                var yb: ?f32 = null;
+
+                for (cmds_a[0..count_a]) |ca| {
+                    if (ca.kind == .text_run and std.mem.eql(u8, ca.text, word)) {
+                        ya = ca.rect.y;
+                        break;
+                    }
+                }
+                for (cmds_b[0..count_b]) |cb| {
+                    if (cb.kind == .text_run and std.mem.eql(u8, cb.text, word)) {
+                        yb = cb.rect.y;
+                        break;
+                    }
+                }
+
+                if (ya != null and yb != null) {
+                    const actual_diff = ya.? - yb.?;
+                    const jitter = @abs(actual_diff - delta_s);
+                    try std.testing.expect(jitter < 0.01);
+                }
+            }
+        }
+    }
 }
