@@ -64,6 +64,10 @@ pub const AppState = struct {
 };
 
 var g_app: AppState = .{};
+// Caller-owned scratch for corrected ordered-list markers, reset per frame.
+var g_markers: layout.OrderedMarkerStore = .{};
+// Headless command-stream probe flag (set by --dump-commands under TEST_HOOKS).
+var g_dump_commands: bool = false;
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
@@ -72,11 +76,56 @@ const MAX_CHECKPOINTS = 2048;
 var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
 var g_checkpoint_count: usize = 0;
 
+// Tiny hand-rolled atof: ship builds must not link std.fmt.parseFloat,
+// whose float tables cost kilobytes of __TEXT. Handles optional sign,
+// integer digits, and an optional fraction; anything else parses as prefix.
+fn parseF32(s: []const u8) f32 {
+    var i: usize = 0;
+    var neg = false;
+    if (i < s.len and (s[i] == '+' or s[i] == '-')) {
+        neg = s[i] == '-';
+        i += 1;
+    }
+    var val: f32 = 0.0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        val = val * 10.0 + @as(f32, @floatFromInt(s[i] - '0'));
+    }
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        var place: f32 = 0.1;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            val += @as(f32, @floatFromInt(s[i] - '0')) * place;
+            place *= 0.1;
+        }
+    }
+    return if (neg) -val else val;
+}
+
 fn getTimestampMs() i64 {
     var ts: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
+
+fn nowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+// Headless scroll-sweep profiler state (needs -Dtest-hooks): renders a
+// range of scroll offsets in one process — caches stay warm exactly like
+// live scrolling — and prints per-offset phase timings. Compiled out of
+// ship builds.
+var g_sweep_active: bool = false;
+var g_sweep_from: f32 = 0.0;
+var g_sweep_to: f32 = 0.0;
+var g_sweep_step: f32 = 0.0;
+
+// Two-phase drag-back residue test state (needs -Dtest-hooks): selection A
+// then shrink to B, painted incrementally on one bitmap. See --select-drag.
+var g_drag_active: bool = false;
+var g_drag_vals: [8]f32 = [_]f32{0.0} ** 8;
 
 fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void {
     const now_ms = getTimestampMs();
@@ -117,6 +166,29 @@ fn onResize(w: c_int, h: c_int) callconv(.c) void {
     g_app.window_height = @floatFromInt(h);
     updateDocumentMetrics();
     g_app.scroll_y = std.math.clamp(g_app.scroll_y, 0.0, g_app.max_scroll_y);
+}
+
+fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
+    if (url_len <= 0) return;
+    const url = url_ptr[0..@as(usize, @intCast(url_len))];
+    // External links stay in the platform layer; only `#fragment`
+    // section links scroll in-document.
+    if (url.len == 0 or url[0] != '#') return;
+    const frag = url[1..];
+    const vp_config = layout.ViewportConfig{
+        .window_width = g_app.window_width,
+        .window_height = g_app.window_height,
+        .scroll_y = 0.0,
+        .image_size_fn = bridge.platform_get_image_size,
+    };
+    const target = layout.anchorScrollY(
+        g_app.bytes,
+        g_app.lines[0..g_app.line_count],
+        vp_config,
+        frag,
+    ) orelse return;
+    g_app.scroll_y = std.math.clamp(target, 0.0, g_app.max_scroll_y);
+    bridge.platform_request_redraw();
 }
 
 fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
@@ -160,6 +232,18 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
     }
 }
 
+// Open a damage clip for partial passes; full passes paint unclipped.
+// Out-of-line (not inlined into onDraw) so the branch and call setup live
+// here, not in the hot function body: __TEXT sits near a page boundary.
+// Nest-safe: block clips save/restore inside this one; register-only paths
+// are unaffected since a clip gates pixels, never state. Returns whether
+// the caller must close the clip.
+fn clipPassToDamage(dmg: damage.Damage) bool {
+    if (dmg.full) return false;
+    bridge.platform_begin_clip(dmg.rect.x, dmg.rect.y, dmg.rect.w, dmg.rect.h);
+    return true;
+}
+
 fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     const fw: f32 = @floatFromInt(w);
     const fh: f32 = @floatFromInt(h);
@@ -182,6 +266,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     const has_pending = bridge.platform_get_pending_damage(&pdx, &pdy, &pdw, &pdh) != 0;
     const dmg = damage.Damage.fromPending(has_pending, pdx, pdy, pdw, pdh, g_app.window_width, g_app.window_height);
 
+    g_markers.reset();
     const vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
@@ -190,15 +275,52 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .is_dark_theme = g_app.is_dark_theme,
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
         .image_size_fn = bridge.platform_get_image_size,
+        .ordered_markers = &g_markers,
     };
 
+    var t_layout_ns: u64 = 0;
+    if (build_options.test_hooks and g_sweep_active) t_layout_ns = nowNs();
     const cmd_count = layout.layoutViewport(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
         vp_config,
         &g_commands_buffer,
     );
+    var t_paint_ns: u64 = 0;
+    if (build_options.test_hooks and g_sweep_active) t_paint_ns = nowNs();
 
+    // Headless layout probe (needs -Dtest-hooks): dump the emitted command
+    // stream so partial-damage renders can be diffed against the full
+    // stream. Compiled out of ship builds.
+    if (build_options.test_hooks and g_dump_commands) {
+        std.debug.print("Commands: {d}\n", .{cmd_count});
+        for (g_commands_buffer[0..cmd_count]) |cmd| {
+            const kept: u8 = if (dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) 1 else 0;
+            const tlen: usize = @min(cmd.text.len, 48);
+            const showlen: usize = if (cmd.text.len > 100000) 0 else tlen;
+            std.debug.print("CMD {s} {d:.1} {d:.1} {d:.1} {d:.1} kept={d} rgb={d},{d},{d} len={d} fs={d:.1} txt='{s}'\n", .{
+                @tagName(cmd.kind),
+                cmd.rect.x,
+                cmd.rect.y,
+                cmd.rect.w,
+                cmd.rect.h,
+                kept,
+                cmd.color.r,
+                cmd.color.g,
+                cmd.color.b,
+                cmd.text.len,
+                cmd.font_size,
+                cmd.text[0..showlen],
+            });
+        }
+    }
+
+    // Partial-damage passes hard-clip to the damage rect (see clipPassToDamage:
+    // translucent pixels are not idempotent under src-over, so unclipped
+    // repaints of boundary-crossing records accumulated an extra coat on
+    // every partial draw — flicker during GIF ticks/selection drags, residue
+    // on drag-back, proven by --select-drag differing from a fresh render).
+    const clipped_pass = @call(.never_inline, clipPassToDamage, .{dmg});
     for (g_commands_buffer[0..cmd_count]) |cmd| {
         switch (cmd.kind) {
             .fill_rect => {
@@ -366,6 +488,29 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
             bar_color.a,
         );
     }
+    if (clipped_pass) {
+        bridge.platform_end_clip();
+    }
+
+    // Scroll-sweep profiler row (needs -Dtest-hooks): per-offset phase
+    // timings plus workload counters. Compiled out of ship builds.
+    if (build_options.test_hooks and g_sweep_active) {
+        const t_end_ns = nowNs();
+        var shape_hits: u64 = 0;
+        var shape_misses: u64 = 0;
+        var atlas_flushes: u64 = 0;
+        bridge.platform_glyph_cache_stats(&shape_hits, &shape_misses, &atlas_flushes);
+        std.debug.print("SWEEP off={d:.0} layout_us={d} paint_us={d} cmds={d} img={d} hits={d} miss={d} flush={d}\n", .{
+            g_app.scroll_y,
+            (t_paint_ns - t_layout_ns) / 1000,
+            (t_end_ns - t_paint_ns) / 1000,
+            cmd_count,
+            bridge.platform_test_image_draws(),
+            shape_hits,
+            shape_misses,
+            atlas_flushes,
+        });
+    }
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -377,6 +522,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = args_it.next(); // skip exe name
     var screenshot_path: ?[*:0]const u8 = null;
     var dump_records = false;
+    var settle_images_ms: i64 = 0;
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--screenshot")) {
@@ -385,51 +531,103 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         } else if (std.mem.eql(u8, arg, "--scroll")) {
             if (args_it.next()) |sc_str| {
-                g_app.scroll_y = std.fmt.parseFloat(f32, sc_str) catch 0.0;
-            }
-        } else if (std.mem.eql(u8, arg, "--damage")) {
-            // Headless parity-test hook (needs -Dtest-hooks): inject
-            // synthetic pending damage. Compiled out of ship builds.
-            if (build_options.test_hooks) {
-                if (args_it.next()) |dmg_str| {
-                    var it = std.mem.splitScalar(u8, dmg_str, ',');
-                    const dx = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    const dy = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    const dw = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    const dh = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    bridge.platform_set_test_damage(dx, dy, dw, dh, 1);
-                }
-            } else {
-                file_path = arg;
-            }
-        } else if (std.mem.eql(u8, arg, "--dump-records")) {
-            if (build_options.test_hooks) {
-                dump_records = true;
-            } else {
-                file_path = arg;
-            }
-        } else if (std.mem.eql(u8, arg, "--select")) {
-            // Headless selection screenshot: doc-space endpoints x1,y1,x2,y2.
-            if (build_options.test_hooks) {
-                if (args_it.next()) |sel_str| {
-                    var it = std.mem.splitScalar(u8, sel_str, ',');
-                    const x1 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    const y1 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    const x2 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    const y2 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
-                    bridge.platform_set_test_selection(x1, y1, x2, y2, 1);
-                }
-            } else {
-                file_path = arg;
+                g_app.scroll_y = parseF32(sc_str);
             }
         } else {
-            file_path = arg;
+            // Document paths land in file_path from any position; hook
+            // flags (and their consumed values, taken above) never do, so
+            // a missing document still falls back to the default doc.
+            if (!std.mem.startsWith(u8, arg, "--")) file_path = arg;
+            // Headless test-hooks matching (needs -Dtest-hooks): ONE
+            // comptime gate for the whole tail, so ship builds emit zero
+            // bytes here — no per-flag scaffolding, no flag literals, no
+            // page-boundary cascade (__TEXT budget; see size_gate.sh).
+            // New hooks flags belong in this chain, in the same shape:
+            // parse values only, never touch file_path.
+            if (build_options.test_hooks) {
+                if (std.mem.eql(u8, arg, "--scroll-sweep")) {
+                    // Scroll profiler: render offsets from,to,step in one
+                    // process (+ --screenshot as scratch output).
+                    if (args_it.next()) |sw_str| {
+                        var it = std.mem.splitScalar(u8, sw_str, ',');
+                        var vals: [3]f32 = [_]f32{0.0} ** 3;
+                        var i: usize = 0;
+                        while (it.next()) |num| {
+                            if (i >= vals.len) break;
+                            vals[i] = std.fmt.parseFloat(f32, num) catch 0.0;
+                            i += 1;
+                        }
+                        g_sweep_from = vals[0];
+                        g_sweep_to = vals[1];
+                        g_sweep_step = vals[2];
+                        g_sweep_active = true;
+                    }
+                } else if (std.mem.eql(u8, arg, "--damage")) {
+                    // Parity-test hook: inject synthetic pending damage.
+                    if (args_it.next()) |dmg_str| {
+                        var it = std.mem.splitScalar(u8, dmg_str, ',');
+                        const dx = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const dy = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const dw = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const dh = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        bridge.platform_set_test_damage(dx, dy, dw, dh, 1);
+                    }
+                } else if (std.mem.eql(u8, arg, "--dump-records")) {
+                    dump_records = true;
+                } else if (std.mem.eql(u8, arg, "--dump-commands")) {
+                    g_dump_commands = true;
+                } else if (std.mem.eql(u8, arg, "--settle-images")) {
+                    settle_images_ms = 3000;
+                } else if (std.mem.startsWith(u8, arg, "--probe-px=")) {
+                    var it = std.mem.splitScalar(u8, arg["--probe-px=".len..], ',');
+                    const qx = std.fmt.parseInt(c_int, it.next() orelse "0", 10) catch 0;
+                    const qy = std.fmt.parseInt(c_int, it.next() orelse "0", 10) catch 0;
+                    bridge.platform_probe_px_add(qx, qy);
+                } else if (std.mem.eql(u8, arg, "--select")) {
+                    // Selection screenshot: doc-space endpoints x1,y1,x2,y2.
+                    if (args_it.next()) |sel_str| {
+                        var it = std.mem.splitScalar(u8, sel_str, ',');
+                        const x1 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const y1 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const x2 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const y2 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        bridge.platform_set_test_selection(x1, y1, x2, y2, 1);
+                    }
+                } else if (std.mem.eql(u8, arg, "--force-scale")) {
+                    // Force the headless output scale (e.g. 2 for the live
+                    // Retina atlas path) to diff per-frame pixels.
+                    if (args_it.next()) |sc_str| {
+                        bridge.platform_set_test_scale(std.fmt.parseFloat(f32, sc_str) catch 0.0);
+                    }
+                } else if (std.mem.eql(u8, arg, "--select-drag")) {
+                    // Drag-back residue test: caret baseline, extend to A,
+                    // shrink to B — every phase after the first incremental
+                    // with live drag damage on one bitmap, each dumped to
+                    // /tmp/drag_phase_N.png. Doc-space x1,y1,x2,y2,x3,y3,x4,y4.
+                    if (args_it.next()) |sel_str| {
+                        var it = std.mem.splitScalar(u8, sel_str, ',');
+                        var i: usize = 0;
+                        while (it.next()) |num| {
+                            if (i >= g_drag_vals.len) break;
+                            g_drag_vals[i] = std.fmt.parseFloat(f32, num) catch 0.0;
+                            i += 1;
+                        }
+                        g_drag_active = true;
+                    }
+                }
+            }
         }
     }
 
     if (file_path) |path| {
-        const mapped = mmap.MappedFile.open(path) catch |err| {
-            std.debug.print("Failed to open file '{s}': {any}\n", .{ path, err });
+        const mapped = mmap.MappedFile.open(path) catch {
+            // Ship-safe error path: raw writes only, so no std.fmt
+            // error-formatting machinery is linked into ship builds.
+            const pre = "Failed to open file: ";
+            _ = std.c.write(std.posix.STDERR_FILENO, pre, pre.len);
+            _ = std.c.write(std.posix.STDERR_FILENO, path.ptr, path.len);
+            const nl = "\n";
+            _ = std.c.write(std.posix.STDERR_FILENO, nl, nl.len);
             return;
         };
         g_app.mapped_file = mapped;
@@ -450,11 +648,69 @@ pub fn main(init: std.process.Init.Minimal) !void {
         g_app.window_width = 1200.0;
         g_app.window_height = 900.0;
         updateDocumentMetrics();
+        // Let async image decodes finish, then relayout with real sizes.
+        // TEST_HOOKS only; ship screenshots render immediately.
+        if (build_options.test_hooks and settle_images_ms > 0) {
+            const t0 = getTimestampMs();
+            const req = std.posix.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
+            while (bridge.platform_images_pending() > 0 and
+                getTimestampMs() - t0 < settle_images_ms)
+            {
+                _ = std.c.nanosleep(&req, null);
+            }
+            if (build_options.test_hooks) {
+                std.debug.print("SETTLE pending={d} elapsed_ms={d}\n", .{
+                    bridge.platform_images_pending(),
+                    getTimestampMs() - t0,
+                });
+            }
+            updateDocumentMetrics();
+        }
+        // Drag-back residue test (needs -Dtest-hooks): incremental repaint
+        // of A-then-B on one bitmap, compared by the caller against a fresh
+        // full render of B. Any byte difference is leftover highlight.
+        if (build_options.test_hooks and g_drag_active) {
+            const v = g_drag_vals;
+            const r = bridge.platform_render_select_drag_png(sc_path, 1200, 900, onDraw,
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            if (r == 0) {
+                std.debug.print("Drag capture generated: {s}\n", .{sc_path});
+                std.c.exit(0);
+            } else {
+                std.debug.print("Drag capture failed (code {d})\n", .{r});
+                std.c.exit(1);
+            }
+        }
+        // Scroll-sweep profiler (needs -Dtest-hooks): one render per offset,
+        // caches warm across offsets exactly like live scrolling. Each
+        // render prints a SWEEP timing row from onDraw.
+        if (build_options.test_hooks and g_sweep_active) {
+            if (g_sweep_step > 0.0 and g_sweep_to >= g_sweep_from) {
+                var off = g_sweep_from;
+                while (off <= g_sweep_to) : (off += g_sweep_step) {
+                    g_app.scroll_y = off;
+                    const r = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
+                    if (r != 0) {
+                        std.debug.print("Sweep render failed at offset {d:.0} (code {d})\n", .{ off, r });
+                        std.c.exit(1);
+                    }
+                }
+            } else {
+                g_app.scroll_y = g_sweep_from;
+                const r = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
+                if (r != 0) std.c.exit(1);
+            }
+            std.c.exit(0);
+        }
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});
             if (build_options.test_hooks and dump_records) {
                 std.debug.print("Text records rebuilt: {d}\n", .{bridge.platform_text_record_count()});
+                var total: c_ulong = 0;
+                var primed: c_ulong = 0;
+                bridge.platform_test_image_primed(&total, &primed);
+                std.debug.print("Image frames primed: {d}/{d}\n", .{ primed, total });
             }
             std.c.exit(0);
         } else {
@@ -468,6 +724,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_resize = onResize,
         .on_key = onKey,
         .on_draw = onDraw,
+        .on_link = onLink,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);

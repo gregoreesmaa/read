@@ -14,7 +14,7 @@ Every agent working on this repository MUST strictly follow these principles.
   - Virtualized viewport: Only tokens visibly intersecting the screen are parsed and rendered.
   - Memory-mapped files: Zero-copy virtual address space mapping.
 - **Zero Dependencies**: No Electron, no WebKit, no heavy UI toolkits, no external package manager dependencies.
-- **Binary Footprint**: Executable size must remain strictly under 500 KB.
+- **Binary Footprint**: Executable size must remain strictly under 350 KiB.
 
 ---
 

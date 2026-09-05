@@ -18,7 +18,9 @@ static BOOL g_last_code_btn_hover = NO;
 // a frame tick whose stamp is stale means the image left the viewport, so
 // the animation chain parks instead of waking the loop.
 static unsigned long g_draw_seq = 0;
+#ifdef READ_ANIMATED_GIF
 static BOOL gif_window_visible(void); // defined with the image cache below
+#endif
 
 typedef struct {
     float x;
@@ -95,6 +97,49 @@ static NSRect union_rect(NSRect a, NSRect b) {
     return NSUnionRect(a, b);
 }
 
+#ifdef TEST_HOOKS
+// Live flicker/damage instrumentation. Enabled by the presence of the file
+// /tmp/read-draw-on (a file flag, so it survives `open` launches where
+// environment variables do not propagate). Appends one k=v line per draw
+// and per draw-scheduling event to /tmp/read-draw.log, fflush'd per line.
+// `touch /tmp/read-draw-on`, scroll, `rm` it to stop. Ship builds compile
+// every DBGLOG below to an empty statement: zero bytes, zero cost.
+#include <time.h>
+static FILE* dbg_log_file(void) {
+    static FILE* f = NULL;
+    static int checked = 0;
+    if (!checked) {
+        checked = 1;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:@"/tmp/read-draw-on"])
+            f = fopen("/tmp/read-draw.log", "a");
+    }
+    return f;
+}
+static uint64_t dbg_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+// Wall-clock ms since first call: lets offline analysis separate draw cost
+// (DRAW us=) from queueing stalls (gaps between consecutive t=). A blackout
+// with healthy us= values shows up as a t= gap, not a slow draw.
+static unsigned long long dbg_t_ms(void) {
+    static uint64_t t0 = 0;
+    uint64_t now = dbg_now_ns();
+    if (!t0) t0 = now;
+    return (unsigned long long)((now - t0) / 1000000ull);
+}
+static const char* dbg_base(const char* url) {
+    if (!url) return "-";
+    const char* s = strrchr(url, '/');
+    return s ? s + 1 : url;
+}
+#define DBGLOG(fmt, ...) do { FILE* _f = dbg_log_file(); if (_f) { fprintf(_f, fmt "\n", ##__VA_ARGS__); fflush(_f); } } while (0)
+static unsigned long g_test_image_draws; // defined with the test hooks below
+#else
+#define DBGLOG(fmt, ...) do {} while (0)
+#endif
+
 // Current selection bounds in VIEW coordinates, expanded by pad.
 // This is the exact damage box for cursor/selection changes.
 static NSRect selection_bounds_expanded(float pad) {
@@ -108,15 +153,26 @@ static NSRect selection_bounds_expanded(float pad) {
     float x2 = fmaxf(g_select_start.x, g_select_end.x);
     float y1 = fminf(g_select_start.y, g_select_end.y) - g_scroll_y;
     float y2 = fmaxf(g_select_start.y, g_select_end.y) - g_scroll_y;
-    if (y2 - y1 > 32.0f) {
-        // Multi-line: intermediate rows highlight edge-to-edge, far outside
-        // the endpoint x-range. Invalidate the full view width.
-        // Regression (2026-09): endpoint bbox left those rows stale.
+    // Vertical pad covers a full max-height record (46px, measured) past an
+    // endpoint inside the highlight's +-4px line-inclusion band.
+    float ypad = pad + 32.0f;
+    // Integral pixels: a fractional clip edge repaints glyph AA pixels at
+    // partial coverage over identical pixels (src-over is not idempotent),
+    // leaving 1px seams (2026-09 drag shimmer). Round out once here so every
+    // consumer (invalidate, Zig cull, headless parity) agrees.
+    if ((x2 - x1) > 2.0f || (y2 - y1) > 2.0f) {
+        // Any extended selection paints intermediate rows edge-to-edge, far
+        // outside the endpoint x-range (a y-span test cannot tell same-line
+        // from adjacent-line drags). Only a collapsed caret keeps a tight
+        // box. Regression (2026-09): stale highlight fringe / residue.
         NSView* v = damage_target_view();
         float vw = v ? (float)[v bounds].size.width : 1200.0f;
-        return NSMakeRect(-pad, y1 - pad, vw + 2.0f * pad, (y2 - y1) + 2.0f * pad);
+        float qx = floorf(-pad), qy = floorf(y1 - ypad);
+        return NSMakeRect(qx, qy, ceilf(vw + pad) - qx, ceilf(y2 + ypad) - qy);
     }
-    return NSMakeRect(x1 - pad, y1 - pad, (x2 - x1) + 2.0f * pad, (y2 - y1) + 2.0f * pad);
+    float tx = x1 - pad, ty = y1 - ypad;
+    float qx = floorf(tx), qy = floorf(ty);
+    return NSMakeRect(qx, qy, ceilf(x2 + pad) - qx, ceilf(y2 + ypad) - qy);
 }
 
 static NSRect copy_button_rect_for_block(CodeBlockRecord* b) {
@@ -207,8 +263,15 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
 // static storage / one malloc-at-startup pixel buffer.
 // ---------------------------------------------------------------------------
 
-#define SHAPE_CACHE_CAP 1024
-#define ATLAS_PX 2048
+// 4096 direct-mapped slots (BSS: no binary cost). 1024 collided constantly
+// once ~500 runs were resident, evicting shaped lines mid-scroll and forcing
+// re-shape + re-raster churn on every frame (2026-09 scroll-storm hunt).
+#define SHAPE_CACHE_CAP 4096
+// 4096px = 16 MiB coverage cache, malloc-once on the cold path (BSS/file
+// size unaffected). A 2048px atlas thrashed on ordinary files at 2x
+// (flush + full re-raster storm every ~60 scroll frames, 2026-09 blackout
+// hunt); the live working set fits comfortably here.
+#define ATLAS_PX 4096
 #define RASTER_SCALE 2
 
 typedef struct {
@@ -224,7 +287,7 @@ typedef struct {
 } ShapedEntry;
 
 static ShapedEntry g_shape_cache[SHAPE_CACHE_CAP]; // BSS: no binary cost
-static unsigned char* g_atlas_px = NULL;  // one 4 MiB buffer, malloc-once
+static unsigned char* g_atlas_px = NULL;  // one 16 MiB buffer, malloc-once
 static CGContextRef g_atlas_ctx = NULL;
 // Single persistent atlas image: provider-backed LIVE view of g_atlas_px,
 // created once — never copied, never rebuilt (verified live via probe:
@@ -294,6 +357,9 @@ static void atlas_flush(void) {
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
     for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
     g_atlas_flushes++;
+#ifdef TEST_HOOKS
+    DBGLOG("EV atlas_flush t=%llu n=%llu", dbg_t_ms(), (unsigned long long)g_atlas_flushes);
+#endif
 }
 
 static void atlas_ensure(void) {
@@ -572,6 +638,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             float view_y = rec->doc_y - g_scroll_y;
 
             if (r_bot < min_y - 4.0f || r_top > max_y + 4.0f) {
+#ifdef TEST_HOOKS
+                if (g_text_record_count < 400)
+                    DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+#endif
                 continue;
             }
 
@@ -584,17 +654,35 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (is_first_line && is_last_line) {
                 float left_x = fminf(top_pt.x, bot_pt.x);
                 float right_x = fmaxf(top_pt.x, bot_pt.x);
-                if (rec->x + rec->w < left_x || rec->x > right_x) continue;
+                if (rec->x + rec->w < left_x || rec->x > right_x) {
+#ifdef TEST_HOOKS
+                    if (g_text_record_count < 400)
+                        DBGLOG("EV hlskip xrow q=%d x=%.1f w=%.1f l=%.1f r=%.1f txt=%.12s", q, rec->x, rec->w, left_x, right_x, rec->text);
+#endif
+                    continue;
+                }
                 c_start = get_char_index_at_x(rec, left_x - rec->x);
                 c_end = get_char_index_at_x(rec, right_x - rec->x);
             } else if (is_first_line) {
                 float start_x = top_pt.x;
-                if (rec->x + rec->w < start_x) continue;
+                if (rec->x + rec->w < start_x) {
+#ifdef TEST_HOOKS
+                    if (g_text_record_count < 400)
+                        DBGLOG("EV hlskip xfirst q=%d x=%.1f w=%.1f s=%.1f txt=%.12s", q, rec->x, rec->w, start_x, rec->text);
+#endif
+                    continue;
+                }
                 c_start = get_char_index_at_x(rec, start_x - rec->x);
                 c_end = rec->len;
             } else if (is_last_line) {
                 float end_x = bot_pt.x;
-                if (rec->x > end_x) continue;
+                if (rec->x > end_x) {
+#ifdef TEST_HOOKS
+                    if (g_text_record_count < 400)
+                        DBGLOG("EV hlskip xlast q=%d x=%.1f w=%.1f e=%.1f txt=%.12s", q, rec->x, rec->w, end_x, rec->text);
+#endif
+                    continue;
+                }
                 c_start = 0;
                 c_end = get_char_index_at_x(rec, end_x - rec->x);
             } else {
@@ -602,6 +690,12 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 c_end = rec->len;
             }
 
+            if (c_end <= c_start) {
+#ifdef TEST_HOOKS
+                if (g_text_record_count < 400)
+                    DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d txt=%.12s", q, c_start, c_end, rec->len, rec->text);
+#endif
+            }
             if (c_end > c_start) {
                 float x1 = rec->x + get_x_for_char_index(rec, c_start);
                 float x2 = rec->x + get_x_for_char_index(rec, c_end);
@@ -633,6 +727,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
     if (!ctx) return;
     g_draw_seq++;
+#ifdef TEST_HOOKS
+    uint64_t draw_t0 = dbg_now_ns();
+    uint64_t shape_hits0 = g_shape_hits, shape_miss0 = g_shape_misses;
+    unsigned long flush0 = (unsigned long)g_atlas_flushes;
+#endif
 
     g_text_record_count = 0;
     g_code_block_count = 0;
@@ -647,6 +746,16 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
 
     paint_selection_highlight(ctx);
+#ifdef TEST_HOOKS
+    DBGLOG("DRAW seq=%lu t=%llu dirty=%.0f,%.0f,%.0fx%.0f scroll=%.1f scale=%.1f us=%llu txt=%d code=%d sblk=%d imgdraw=%lu dhit=+%llu dmiss=+%llu dflush=+%lu sel=%d,%d,%.0f,%.0f,%.0f,%.0f",
+        g_draw_seq, dbg_t_ms(), dirtyRect.origin.x, dirtyRect.origin.y, dirtyRect.size.width, dirtyRect.size.height,
+        g_scroll_y, g_output_scale, (unsigned long long)(dbg_now_ns() - draw_t0),
+        g_text_record_count, g_code_block_count, g_scrollable_block_count, g_test_image_draws,
+        (unsigned long long)(g_shape_hits - shape_hits0), (unsigned long long)(g_shape_misses - shape_miss0),
+        (unsigned long)g_atlas_flushes - flush0,
+        g_has_selection ? 1 : 0, g_selection_mode,
+        g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
+#endif
 
     // Draw visible-on-hover Copy Button for Code Blocks
     double now = [NSDate timeIntervalSinceReferenceDate];
@@ -744,6 +853,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     // rect-precise below.
     if (g_text_record_count > 0 && over_link != g_last_link_hover) {
         g_last_link_hover = over_link;
+#ifdef TEST_HOOKS
+        DBGLOG("EV hover_flip link=%d", over_link ? 1 : 0);
+#endif
         [self setNeedsDisplay:YES];
     }
     g_last_code_btn_hover = over_code_btn;
@@ -770,6 +882,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         g_last_link_hover = NO;
         g_last_code_btn_hover = NO;
         [[NSCursor IBeamCursor] set];
+#ifdef TEST_HOOKS
+        DBGLOG("EV mouseexit_full");
+#endif
         [self setNeedsDisplay:YES];
     }
 }
@@ -840,6 +955,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
     // Damage: old selection bounds + new caret/word/line box only.
     invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+#ifdef TEST_HOOKS
+    DBGLOG("EV mousedown clicks=%d mode=%d pt=%.0f,%.0f", (int)[event clickCount], g_selection_mode,
+        g_select_start.x, g_select_start.y);
+#endif
 }
 
 - (void)mouseDragged:(NSEvent *)event {
@@ -850,15 +969,34 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         // Contract pinned by dragSelectionDamage tests in damage.zig.
         NSRect old_sel = selection_bounds_expanded(24.0f);
         NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
+#ifdef TEST_HOOKS
+        NSPoint prev_end = g_select_end;
+#endif
         g_select_end = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
         invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+#ifdef TEST_HOOKS
+        DBGLOG("EV mousedrag mode=%d end=%.0f,%.0f->%.0f,%.0f dmg=%.0f,%.0f,%.0fx%.0f",
+            g_selection_mode, prev_end.x, prev_end.y, g_select_end.x, g_select_end.y,
+            union_rect(old_sel, selection_bounds_expanded(24.0f)).origin.x,
+            union_rect(old_sel, selection_bounds_expanded(24.0f)).origin.y,
+            union_rect(old_sel, selection_bounds_expanded(24.0f)).size.width,
+            union_rect(old_sel, selection_bounds_expanded(24.0f)).size.height);
+#endif
     }
+#ifdef TEST_HOOKS
+    else {
+        DBGLOG("EV mousedrag mode=%d ignored (word/line lock)", g_selection_mode);
+    }
+#endif
 }
 
 - (void)mouseUp:(NSEvent *)event {
     if (g_selection_mode >= 2) {
         // Prohibit mouseUp from moving g_select_end on double or triple click.
         // Damage: selection did not change, so no repaint is needed.
+#ifdef TEST_HOOKS
+        DBGLOG("EV mouseup mode=%d action=locked", g_selection_mode);
+#endif
         return;
     }
 
@@ -880,16 +1018,25 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->link_url[0] != '\0' &&
                     end_doc.x >= rec->x && end_doc.x <= rec->x + rec->w &&
                     end_doc.y >= rec->doc_y && end_doc.y <= rec->doc_y + rec->h) {
-                    NSString* urlStr = [NSString stringWithUTF8String:rec->link_url];
-                    NSURL* url = [NSURL URLWithString:urlStr];
-                    if (url) {
-                        [[NSWorkspace sharedWorkspace] openURL:url];
+                    // Section links scroll in-document via the Zig layout
+                    // layer; everything else opens in the browser.
+                    if (rec->link_url[0] == '#' && g_callbacks.on_link) {
+                        g_callbacks.on_link(rec->link_url, (int)strlen(rec->link_url));
+                    } else {
+                        NSString* urlStr = [NSString stringWithUTF8String:rec->link_url];
+                        NSURL* url = [NSURL URLWithString:urlStr];
+                        if (url) {
+                            [[NSWorkspace sharedWorkspace] openURL:url];
+                        }
                     }
                     break;
                 }
             }
             // Damage: cleared selection repaints its old bounds only.
             invalidate_rect(old_sel);
+#ifdef TEST_HOOKS
+            DBGLOG("EV mouseup mode=%d action=clear", g_selection_mode);
+#endif
             return;
         }
     } else {
@@ -897,6 +1044,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
 
     invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+#ifdef TEST_HOOKS
+    DBGLOG("EV mouseup mode=%d action=extend end=%.0f,%.0f", g_selection_mode,
+        g_select_end.x, g_select_end.y);
+#endif
 }
 
 - (NSMenu *)menuForEvent:(NSEvent *)event {
@@ -964,6 +1115,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     g_select_all = YES;
     g_has_selection = YES;
     g_selection_mode = 4;
+#ifdef TEST_HOOKS
+    DBGLOG("EV selectall_full");
+#endif
     [self setNeedsDisplay:YES];
 }
 
@@ -1073,6 +1227,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             momentum == NSEventPhaseEnded || momentum == NSEventPhaseCancelled) {
             g_callbacks.on_scroll(0.0f, 0.0f, -1);
             // Damage: scroll-lock reset changes no pixels, so no repaint.
+#ifdef TEST_HOOKS
+            DBGLOG("EV scroll_end");
+#endif
             return;
         }
 
@@ -1094,6 +1251,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
         }
         g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id);
+#ifdef TEST_HOOKS
+        DBGLOG("EV scroll t=%llu dx=%.1f dy=%.1f hover=%d phase=%lu mom=%lu", dbg_t_ms(), dx, dy, hovered_block_id,
+            (unsigned long)phase, (unsigned long)momentum);
+#endif
     }
     [self setNeedsDisplay:YES];
 }
@@ -1127,6 +1288,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         if (g_callbacks.on_key) {
             g_callbacks.on_key((int)c, hovered_block_id);
         }
+#ifdef TEST_HOOKS
+        DBGLOG("EV key c=%c scroll=%.0f", (char)c, g_scroll_y);
+#endif
         // Damage: h/l nudge one hovered block -> its exact box only.
         // j/k/Space scroll and t theme-toggle repaint every pixel -> full.
         if ((c == 'h' || c == 'l') && hovered_block_id >= 0) {
@@ -1150,6 +1314,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     if (g_callbacks.on_resize) {
         g_callbacks.on_resize((int)newSize.width, (int)newSize.height);
     }
+#ifdef TEST_HOOKS
+    DBGLOG("EV resize_full %.0fx%.0f", newSize.width, newSize.height);
+#endif
     [self setNeedsDisplay:YES];
 }
 
@@ -1175,12 +1342,27 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 // parked chains schedule nothing, so idle stays at zero wakeups.
 - (void)windowDidDeminiaturize:(NSNotification *)notification {
     (void)notification;
+#ifdef TEST_HOOKS
+    DBGLOG("EV deminiaturize_full");
+#endif
     [g_main_view setNeedsDisplay:YES];
 }
 
 - (void)windowDidChangeOcclusionState:(NSNotification *)notification {
     (void)notification;
+#ifdef READ_ANIMATED_GIF
+#ifdef TEST_HOOKS
+    if (gif_window_visible()) DBGLOG("EV occlusion_full");
+#endif
     if (gif_window_visible()) [g_main_view setNeedsDisplay:YES];
+#else
+    // Static-image ship build: no animation chains to re-arm, but a
+    // visibility restore still gets one redraw via the same occlusion test
+    // the animated driver used (AppKit may not redisplay on its own).
+    BOOL vis = g_window && ![g_window isMiniaturized] && [g_window isVisible] &&
+        (([g_window occlusionState] & NSWindowOcclusionStateVisible) != 0);
+    if (vis) [g_main_view setNeedsDisplay:YES];
+#endif
 }
 
 @end
@@ -1253,6 +1435,15 @@ void platform_set_test_damage(float x, float y, float w, float h, int valid) {
     g_test_damage_valid = valid ? YES : NO;
 }
 int platform_text_record_count(void) { return g_text_record_count; }
+// Image draws this pass, for the scroll-sweep profiler. Shape hits/misses
+// and atlas flushes come from platform_glyph_cache_stats.
+static unsigned long g_test_image_draws = 0;
+unsigned long platform_test_image_draws(void) { return g_test_image_draws; }
+// Forced output scale for headless renders (0 = auto 1x). Lets hooks route
+// platform_draw_text through the live Retina atlas path (shape + rasterize
+// + coverage-mask blits) so per-frame pixel behavior can be diffed.
+static float g_test_scale = 0.0f;
+void platform_set_test_scale(float s) { g_test_scale = s; }
 void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
     g_select_start = NSMakePoint(x1, y1);
     g_select_end = NSMakePoint(x2, y2);
@@ -1337,7 +1528,7 @@ void platform_end_clip(void) {
 
 // Record quad for mouse text selection & copying (anchored to document Y).
 // noinline: called from 4 sites (register/draw/legacy); one shared copy keeps
-// __TEXT off the next page boundary (binary budget < 500 KiB).
+// __TEXT off the next page boundary (binary budget < 350 KiB).
 static __attribute__((noinline)) void record_text_quad(const char* text, int len, float x, float y, float w, float h,
                              float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
                              const char* link_url, int link_url_len) {
@@ -1466,7 +1657,8 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
 }
 
 // ---------------------------------------------------------------------------
-// Image Cache: async load + animated GIF frame cycling
+// Image Cache: async load (+ animated GIF frame cycling under
+// READ_ANIMATED_GIF; ship builds decode frame 0 as a still)
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -1475,6 +1667,7 @@ typedef struct {
     CGImageRef* frames;         // malloc'd array of CGImageRef
     double*     frame_delays;   // malloc'd array of per-frame delay in seconds
     int         frame_count;
+    int         primed_frames;  // frames force-decoded off-main at load
     int         cur_frame;      // current display frame index
     float       natural_w;      // logical pixel size at 72 dpi
     float       natural_h;
@@ -1494,10 +1687,14 @@ typedef struct {
 static CachedImageRecord g_image_cache[MAX_IMAGE_CACHE];
 static int  g_image_cache_count = 0;
 
-// Forward declarations
+// Forward declarations (animated path only; static ship builds decode frame 0
+// and never schedule — see -Danimated-gif in build.zig to opt back in).
+#ifdef READ_ANIMATED_GIF
 static void gif_schedule_next_frame(CachedImageRecord* rec);
 static BOOL gif_window_visible(void);
+#endif
 
+#ifdef READ_ANIMATED_GIF
 // The window is a valid animation sink only while it is actually on screen.
 // Hidden, miniaturized, or fully occluded windows never advance or schedule:
 // the chain parks and consumes zero wakeups until the next genuine draw.
@@ -1521,9 +1718,18 @@ static void gif_advance_frame(CachedImageRecord* rec) {
     if (!rec || rec->frame_count <= 1) return;
     if (!gif_window_visible() || rec->last_draw_seq != g_draw_seq) {
         rec->parked = YES;
+#ifdef TEST_HOOKS
+        DBGLOG("EV gif_park url=%s reason=%s", dbg_base(rec->url),
+            !gif_window_visible() ? "hidden" : "stale-seq");
+#endif
         return;
     }
     rec->cur_frame = (rec->cur_frame + 1) % rec->frame_count;
+#ifdef TEST_HOOKS
+    DBGLOG("EV gif_adv url=%s frame=%d/%d rect=%.0f,%.0f,%.0fx%.0f", dbg_base(rec->url),
+        rec->cur_frame, rec->frame_count, rec->last_doc_x, rec->last_doc_y - g_scroll_y,
+        rec->last_w, rec->last_h);
+#endif
     if (rec->has_rect) {
         // Document -> view coordinates at current scroll offset.
         invalidate_rect(NSMakeRect(
@@ -1546,6 +1752,9 @@ static void gif_schedule_next_frame(CachedImageRecord* rec) {
     rec->parked = NO;
     double delay = rec->frame_delays[rec->cur_frame];
     if (delay < 0.02) delay = 0.1; // clamp degenerate GIFs
+#ifdef TEST_HOOKS
+    DBGLOG("EV gif_sched url=%s delay=%.3f frame=%d", dbg_base(rec->url), delay, rec->cur_frame);
+#endif
     // One-shot wakeup on the main run-loop only; never a repeating driver.
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
@@ -1553,6 +1762,7 @@ static void gif_schedule_next_frame(CachedImageRecord* rec) {
         ^{ gif_advance_frame(rec); }
     );
 }
+#endif // READ_ANIMATED_GIF
 
 // Resolve relative path to absolute
 static NSString* resolve_image_path(NSString* pathStr) {
@@ -1563,6 +1773,13 @@ static NSString* resolve_image_path(NSString* pathStr) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:full]) return full;
     return nil;
 }
+
+// Forward: vector fallback defined alongside load_image_sync below.
+static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageRecord* rec);
+
+// Forward: decode primer lives at end-of-file (see note there) so its
+// __text bytes don't shift the hot mid-file layout.
+static int prime_frame_decode(CGImageRef img);
 
 // Decode all frames from a CGImageSource into the cache record
 static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecord* rec) {
@@ -1575,13 +1792,17 @@ static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecor
     rec->natural_w = (float)CGImageGetWidth(first);
     rec->natural_h = (float)CGImageGetHeight(first);
 
+#ifdef READ_ANIMATED_GIF
     rec->frames       = (CGImageRef*)malloc(sizeof(CGImageRef) * count);
     rec->frame_delays = (double*)malloc(sizeof(double) * count);
     rec->frame_count  = (int)count;
+    rec->primed_frames = 0;
     rec->frames[0]    = first; // already retained by Create
+    rec->primed_frames += prime_frame_decode(first);
 
     for (size_t i = 1; i < count; i++) {
         rec->frames[i] = CGImageSourceCreateImageAtIndex(src, i, NULL);
+        rec->primed_frames += prime_frame_decode(rec->frames[i]);
     }
 
     // Extract per-frame delays (GIF {GIFDelayTime} property)
@@ -1598,6 +1819,17 @@ static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecor
         }
         rec->frame_delays[i] = delay;
     }
+#else
+    // Static ship build: first frame only. Animated GIFs render as stills:
+    // no extra frame decodes, no per-frame delay property parsing.
+    rec->frames = (CGImageRef*)malloc(sizeof(CGImageRef));
+    rec->frame_delays = NULL;
+    if (!rec->frames) { CGImageRelease(first); rec->failed = YES; return; }
+    rec->frame_count = 1;
+    rec->primed_frames = 0;
+    rec->frames[0] = first; // already retained by Create
+    rec->primed_frames += prime_frame_decode(first);
+#endif
 }
 
 // Synchronously populate a cache slot from a URL/path string
@@ -1617,10 +1849,55 @@ static void load_image_sync(CachedImageRecord* rec, NSString* pathStr) {
     if (src) {
         load_image_source_into_record(src, rec);
         CFRelease(src);
-    } else {
-        rec->failed = YES;
+    }
+    // Vector fallback (SVG/PDF): ImageIO cannot rasterize these
+    // (CreateImageAtIndex returns NULL), but AppKit can. Rasterize once at
+    // 2x (capped) and cache a single still frame; draw, sizing, and
+    // single-frame stillness work unchanged.
+    if (rec->frame_count == 0) {
+        // The ImageIO attempt above marks failed=YES when it yields zero
+        // frames (always, for SVG/PDF). The vector fallback below is
+        // decisive: clear the stale flag so a successful rasterize sticks.
+        rec->failed = NO;
+        rasterize_vector_into_record(pathStr, rec);
+        if (rec->frame_count == 0) rec->failed = YES;
     }
     rec->loading = NO;
+}
+
+// Rasterize a vector image (SVG/PDF) via AppKit into a single cached frame.
+// Natural size stays in points (layout fits it like any raster); the cached
+// frame is 2x for Retina-crisp downscale draws.
+static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageRecord* rec) {
+    NSImage* ni = [[NSImage alloc] initWithContentsOfFile:resolvedPath];
+    if (!ni || ![ni isValid]) return;
+    NSSize pts = [ni size];
+    if (pts.width < 1 || pts.height < 1) return;
+    // Clamp giant vectors (points), then rasterize at 2x.
+    const CGFloat kMaxDimPts = 1024.0;
+    CGFloat s = 1.0;
+    if (pts.width > kMaxDimPts || pts.height > kMaxDimPts)
+        s = kMaxDimPts / (pts.width > pts.height ? pts.width : pts.height);
+    NSSize rs = NSMakeSize(round(pts.width * s * 2.0), round(pts.height * s * 2.0));
+    if (rs.width < 1 || rs.height < 1) return;
+    NSRect proposed = NSMakeRect(0, 0, rs.width, rs.height);
+    CGImageRef cg = [ni CGImageForProposedRect:&proposed context:nil hints:nil];
+    if (!cg || CGImageGetWidth(cg) < 1 || CGImageGetHeight(cg) < 1) return;
+    rec->frames = malloc(sizeof(CGImageRef));
+    rec->frame_delays = malloc(sizeof(double));
+    if (!rec->frames || !rec->frame_delays) {
+        free(rec->frames); free(rec->frame_delays);
+        rec->frames = NULL; rec->frame_delays = NULL;
+        return;
+    }
+    rec->frames[0] = CGImageRetain(cg);
+    rec->frame_delays[0] = 0.0;
+    rec->frame_count = 1;
+    // CGImageForProposedRect rasterizes eagerly: pixels are already warm.
+    rec->primed_frames = 1;
+    rec->cur_frame = 0;
+    rec->natural_w = (float)pts.width;
+    rec->natural_h = (float)pts.height;
 }
 
 // Returns existing or initiates async load; returns NULL if not yet ready
@@ -1654,10 +1931,17 @@ static CachedImageRecord* get_or_load_image_record(const char* url, int url_len)
         load_image_sync(rec, resolvedCopy);
         dispatch_async(dispatch_get_main_queue(), ^{
             [g_main_view setNeedsDisplay:YES];
+#ifdef TEST_HOOKS
+            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
+                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
+                rec->natural_w, rec->natural_h);
+#endif
+#ifdef READ_ANIMATED_GIF
             // Kick off GIF animation if multi-frame
             if (!rec->failed && rec->frame_count > 1) {
                 gif_schedule_next_frame(rec);
             }
+#endif
         });
     });
 
@@ -1673,11 +1957,56 @@ void platform_get_image_size(const char* url, int url_len, float* out_w, float* 
     *out_h = rec->natural_h;
 }
 
+#ifdef TEST_HOOKS
+static int g_probe_count = 0;
+static int g_probe_xy[16] = {0};
+void platform_probe_px_add(int x, int y) {
+    if (g_probe_count < 8) {
+        g_probe_xy[2 * g_probe_count] = x;
+        g_probe_xy[2 * g_probe_count + 1] = y;
+        g_probe_count++;
+    }
+}
+#endif
+
+#ifdef TEST_HOOKS
+// Total frames vs force-decoded frames across the image cache, for the
+// decode-priming regression test: every loaded frame must be primed.
+void platform_test_image_primed(unsigned long* total_frames, unsigned long* primed_frames) {
+    unsigned long t = 0, p = 0;
+    for (int i = 0; i < g_image_cache_count; i++) {
+        if (g_image_cache[i].failed) continue;
+        t += (unsigned long)g_image_cache[i].frame_count;
+        p += (unsigned long)g_image_cache[i].primed_frames;
+    }
+    if (total_frames) *total_frames = t;
+    if (primed_frames) *primed_frames = p;
+}
+#endif
+
+// Number of image records still decoding (for headless settle waits).
+int platform_images_pending(void) {
+    int n = 0;
+    for (int i = 0; i < g_image_cache_count; i++)
+        if (g_image_cache[i].loading) n++;
+    return n;
+}
+
 void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h) {
     if (!g_current_cg_context || w <= 0 || h <= 0) return;
     CGContextRef ctx = g_current_cg_context;
+#ifdef TEST_HOOKS
+    g_test_image_draws++;
+#endif
 
     CachedImageRecord* rec = get_or_load_image_record(url, url_len);
+#ifdef TEST_HOOKS
+    DBGLOG("EV img_draw url=%s frame=%d/%d loading=%d failed=%d rect=%.0f,%.0f,%.0fx%.0f",
+        rec ? dbg_base(rec->url) : "-",
+        rec ? rec->cur_frame : -1, rec ? rec->frame_count : -1,
+        rec ? (rec->loading ? 1 : 0) : -1, rec ? (rec->failed ? 1 : 0) : -1,
+        x, y, w, h);
+#endif
 
     // Record the frame rect in document coordinates so GIF ticks can
     // invalidate exactly this box (scroll-compensated at tick time).
@@ -1714,9 +2043,11 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
     // Stamp this pass: proves the image is inside the painted viewport, and
     // re-arms a parked animation chain from this genuine event-driven draw.
     rec->last_draw_seq = g_draw_seq;
+#ifdef READ_ANIMATED_GIF
     if (rec->parked && rec->frame_count > 1) {
         gif_schedule_next_frame(rec);
     }
+#endif
     CGImageRef frame = rec->frames[rec->cur_frame];
     if (!frame) return;
 
@@ -1764,6 +2095,35 @@ float platform_measure_text(const char* text, int len, float font_size, int is_b
 }
 
 // Headless screenshot engine: renders directly to a PNG image file
+// Prime one frame's pixel decode off the main thread. ImageIO defers full
+// decompression until first draw, which hitched scrolling 3-11ms per newly
+// visible image on showcase.md (profiled via --scroll-sweep). Drawing once
+// into a transient bitmap forces the complete decode now, on the background
+// load queue, so scroll-time draws find warm pixels. (A 1x1 probe is not
+// enough: ImageIO may satisfy tiny draws from an embedded thumbnail without
+// decoding the full image.) Pure CoreGraphics: safe off the main thread.
+// Returns 1 when the frame decoded.
+//
+// SIZE NOTE: this definition lives at end-of-file deliberately. __TEXT sits
+// ~12 bytes under a 16 KiB page boundary of the 350 KiB budget; a mid-file
+// function here shifts every function after it (branch ranges, literal pools
+// and alignment NOPs cascade ~3x the function's own bytes). At EOF nothing
+// follows it, so its bytes cost only themselves. Keep it tiny; check
+// scripts/size_gate.sh after touching it.
+static int prime_frame_decode(CGImageRef img) {
+    if (!img) return 0;
+    // Fixed small probe context: big enough that ImageIO fully decodes
+    // instead of thumbnailing, tiny enough to stay cheap for 44-frame GIFs.
+    // Degenerate images fail the context creation below and count unprimed.
+    CGContextRef c = CGBitmapContextCreate(NULL, 512, 512, 8, 0,
+        CGImageGetColorSpace(img),
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    if (!c) return 0;
+    CGContextDrawImage(c, CGRectMake(0, 0, 512, 512), img);
+    CGContextRelease(c);
+    return 1;
+}
+
 int platform_render_to_png(const char* output_path, int width, int height, void (*render_fn)(int width, int height)) {
     if (!output_path || width <= 0 || height <= 0 || !render_fn) return -1;
 
@@ -1789,13 +2149,45 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     g_code_block_count = 0;
     g_scrollable_block_count = 0;
     g_current_cg_context = ctx;
+#ifdef TEST_HOOKS
+    g_test_image_draws = 0;
+#endif
     // Headless render has no AppKit dirty rect: full redraw.
     g_pending_dirty_valid = NO;
     // Headless bitmap contexts are 1x: cached lines draw directly so
     // screenshots match the pre-atlas renderer pixel-for-pixel.
     g_output_scale = 1.0f;
+#ifdef TEST_HOOKS
+    // Forced scale (platform_set_test_scale): exercise the live Retina atlas
+    // path headlessly for per-frame pixel diffs.
+    if (g_test_scale > 0.0f) g_output_scale = g_test_scale;
+#endif
 
     render_fn(width, height);
+
+#ifdef TEST_HOOKS
+    // Headless pixel probe: print bitmap values at requested image coords
+    // (top-down) so scripts can assert content without external tools.
+    if (g_probe_count > 0) {
+        unsigned char* bytes = CGBitmapContextGetData(ctx);
+        size_t bpr = CGBitmapContextGetBytesPerRow(ctx);
+        for (int i = 0; i < g_probe_count; i++) {
+            int qx = g_probe_xy[2 * i], qy = g_probe_xy[2 * i + 1];
+            if (qx < 0 || qy < 0 || qx >= width || qy >= height || !bytes) {
+                fprintf(stderr, "PROBE %d,%d=OOB\n", qx, qy);
+                continue;
+            }
+            // Bitmap memory is top-down here: the flipped CTM maps
+            // y-down view coords back onto memory row == y. (The old
+            // height-1-qy mapping read mirrored rows; the PNG was always
+            // correct — verified visually against probe ground truth.)
+            size_t brow = (size_t)qy;
+            size_t o = brow * bpr + (size_t)qx * 4;
+            fprintf(stderr, "PROBE %d,%d=%d,%d,%d,%d\n", qx, qy,
+                    bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]);
+        }
+    }
+#endif
 
     // Headless selection captures paint the same highlight as live draws.
     if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
@@ -1818,3 +2210,149 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     return success ? 0 : -5;
 }
+
+#ifdef TEST_HOOKS
+// Two-phase incremental repaint simulation for the drag-back residue test.
+// Phase 1 paints selection A full (the frame before the drag step).
+// Phase 2 paints selection B with the pending-damage rect forced to the
+// exact union mouseDragged would invalidate, over the SAME bitmap without
+// clearing — AppKit backing-store semantics. The Zig culling path and the
+// highlight painter then behave exactly like a live incremental redraw, so
+// any byte difference vs a fresh full render of B is genuine residue.
+// Headless contexts are 1x: this covers damage/culling/highlight logic, not
+// the Retina atlas-blit path (stateless by construction: coverage mask plus
+// per-frame fill color, nothing highlight-baked is cached).
+// The PNG tail below duplicates render_to_png on purpose: sharing it would
+// re-cut ship __TEXT, which sits 12 bytes under a 16 KiB page boundary.
+static int headless_dump_png(CGContextRef ctx, const char* output_path) {
+    CGImageRef image = CGBitmapContextCreateImage(ctx);
+    if (!image) return -3;
+    NSBitmapImageRep* rep = [[NSBitmapImageRep alloc] initWithCGImage:image];
+    CGImageRelease(image);
+    NSData* pngData = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    if (!pngData) return -4;
+    NSString* pathStr = [NSString stringWithUTF8String:output_path];
+    BOOL success = [pngData writeToFile:pathStr atomically:YES];
+    return success ? 0 : -5;
+}
+
+int platform_render_select_drag_png(const char* output_path, int width, int height,
+    void (*render_fn)(int width, int height),
+    float ax1, float ay1, float ax2, float ay2,
+    float bx1, float by1, float bx2, float by2)
+{
+    if (!output_path || width <= 0 || height <= 0 || !render_fn) return -1;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(
+        NULL,
+        width,
+        height,
+        8,
+        width * 4,
+        colorSpace,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
+    );
+    CGColorSpaceRelease(colorSpace);
+
+    if (!ctx) return -2;
+
+    // Flip context coordinate space to match flipped view
+    CGContextTranslateCTM(ctx, 0, height);
+    CGContextScaleCTM(ctx, 1.0f, -1.0f);
+    // Headless bitmap contexts are 1x: cached lines draw directly.
+    g_output_scale = 1.0f;
+#ifdef TEST_HOOKS
+    // Forced scale (platform_set_test_scale): same live-atlas exercise as
+    // render_to_png, for every drag phase below.
+    if (g_test_scale > 0.0f) g_output_scale = g_test_scale;
+#endif
+
+    g_has_selection = YES;
+    g_select_all = NO;
+    g_selection_mode = 1;
+    g_current_cg_context = ctx;
+
+    // Phase 0: caret baseline at A-start, FULL (the settled frame before the
+    // drag begins). No highlight: collapsed selection paints nothing.
+    g_select_start = NSMakePoint(ax1, ay1);
+    g_select_end = NSMakePoint(ax1, ay1);
+    g_draw_seq++;
+    g_text_record_count = 0;
+    g_code_block_count = 0;
+    g_scrollable_block_count = 0;
+    g_pending_dirty_valid = NO;
+    render_fn(width, height);
+    paint_selection_highlight(ctx);
+    NSRect box_prev = selection_bounds_expanded(24.0f);
+    int rc = headless_dump_png(ctx, "/tmp/drag_phase_0.png");
+    if (rc != 0) { CGContextRelease(ctx); return rc; }
+
+    // Phase 1: extend to A, incremental with exactly the damage a live
+    // mouseDragged frame would invalidate (union of previous and new box).
+    // AppKit pre-clips every drawRect to its dirty rect, so the highlight
+    // is clipped to the damage here too: fringe highlight outside the box
+    // never paints, exactly like live (2026-09 flicker: unclipped headless
+    // highlight hid missing-fringe frames).
+    g_select_start = NSMakePoint(ax1, ay1);
+    g_select_end = NSMakePoint(ax2, ay2);
+    NSRect box_a = selection_bounds_expanded(24.0f);
+    g_draw_seq++;
+    g_text_record_count = 0;
+    g_code_block_count = 0;
+    g_scrollable_block_count = 0;
+    g_pending_dirty = union_rect(box_prev, box_a);
+    g_pending_dirty_valid = YES;
+    CGContextSaveGState(ctx);
+    CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
+        g_pending_dirty.size.width, g_pending_dirty.size.height));
+    render_fn(width, height);
+    paint_selection_highlight(ctx);
+    CGContextRestoreGState(ctx);
+    rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
+    if (rc != 0) { CGContextRelease(ctx); return rc; }
+
+    // Phase 2: shrink to B (the drag-back), incremental the same way.
+    // A B of all zeros means release-to-clear (mouseUp within 4px of the
+    // anchor): selection off, damage is the old box only — exactly the
+    // mouseUp-clear path, the gesture end this test exists for.
+    int clearing = (bx1 == 0.0f && by1 == 0.0f && bx2 == 0.0f && by2 == 0.0f);
+    NSRect box_b = box_a;
+    if (!clearing) {
+        g_select_start = NSMakePoint(bx1, by1);
+        g_select_end = NSMakePoint(bx2, by2);
+        box_b = selection_bounds_expanded(24.0f);
+    } else {
+        g_has_selection = NO;
+    }
+    g_draw_seq++;
+    g_text_record_count = 0;
+    g_code_block_count = 0;
+    g_scrollable_block_count = 0;
+    g_pending_dirty = clearing ? box_a : union_rect(box_a, box_b);
+    g_pending_dirty_valid = YES;
+    CGContextSaveGState(ctx);
+    CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
+        g_pending_dirty.size.width, g_pending_dirty.size.height));
+    render_fn(width, height);
+    paint_selection_highlight(ctx);
+    CGContextRestoreGState(ctx);
+    rc = headless_dump_png(ctx, "/tmp/drag_phase_2.png");
+    if (rc != 0) { CGContextRelease(ctx); return rc; }
+
+    g_current_cg_context = NULL;
+    g_pending_dirty_valid = NO;
+
+    CGContextRelease(ctx);
+    // Final accumulation already dumped as phase 2; copy it to the output
+    // (re-encoding from a released context is impossible, so dump first).
+    if (strcmp(output_path, "/tmp/drag_phase_2.png") == 0) return 0;
+    NSFileManager* fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:[NSString stringWithUTF8String:output_path] error:NULL];
+    BOOL success = [fm copyItemAtPath:@"/tmp/drag_phase_2.png"
+                               toPath:[NSString stringWithUTF8String:output_path]
+                                error:NULL];
+
+    return success ? 0 : -5;
+}
+#endif

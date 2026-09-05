@@ -492,3 +492,61 @@ test "damage: drag reversal still covers released lines" {
     const start_line: DirtyRect = .{ .x = 600.0, .y = 100.0, .w = 90.0, .h = 24.0 };
     try std.testing.expect(DirtyRect.contains(dmg, start_line));
 }
+
+test "damage: randomized keeps/clip agree with rect algebra" {
+    // Seeded interaction fuzz at the algebra level: keeps() must match
+    // intersects(), clip() must equal intersection(), united() must cover
+    // both inputs, and fromPending() must collapse full/empty/missing rects.
+    // Any disagreement here becomes a stale/residue pixel downstream.
+    var prng = std.Random.DefaultPrng.init(0xda4a6e20260905);
+    const rnd = prng.random();
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const dr: DirtyRect = .{
+            .x = rnd.float(f32) * 3000.0 - 750.0,
+            .y = rnd.float(f32) * 3000.0 - 750.0,
+            .w = rnd.float(f32) * 1300.0 - 50.0,
+            .h = rnd.float(f32) * 1300.0 - 50.0,
+        };
+        const cr: DirtyRect = .{
+            .x = rnd.float(f32) * 3000.0 - 750.0,
+            .y = rnd.float(f32) * 3000.0 - 750.0,
+            .w = rnd.float(f32) * 1300.0 - 50.0,
+            .h = rnd.float(f32) * 1300.0 - 50.0,
+        };
+        const dmg = Damage.partial(dr, .unknown);
+        try std.testing.expectEqual(DirtyRect.intersects(dr, cr), dmg.keeps(cr.x, cr.y, cr.w, cr.h));
+        const clipped = dmg.clip(cr.x, cr.y, cr.w, cr.h);
+        const inter = DirtyRect.intersection(dr, cr);
+        try std.testing.expectEqual(inter.x, clipped.x);
+        try std.testing.expectEqual(inter.y, clipped.y);
+        try std.testing.expectEqual(inter.w, clipped.w);
+        try std.testing.expectEqual(inter.h, clipped.h);
+        try std.testing.expectEqual(clipped.isEmpty(), !dmg.keeps(cr.x, cr.y, cr.w, cr.h));
+        // united()/contains() agree exactly on whole-number rects (the
+        // production damage domain: boxes are pixel-quantized, so w = x1-x0
+        // is exact; fractional inputs can differ by 1 ulp on recompute).
+        const ir: DirtyRect = .{
+            .x = @floor(rnd.float(f32) * 3000.0 - 750.0),
+            .y = @floor(rnd.float(f32) * 3000.0 - 750.0),
+            .w = @floor(rnd.float(f32) * 1300.0 - 50.0),
+            .h = @floor(rnd.float(f32) * 1300.0 - 50.0),
+        };
+        const jr: DirtyRect = .{
+            .x = @floor(rnd.float(f32) * 3000.0 - 750.0),
+            .y = @floor(rnd.float(f32) * 3000.0 - 750.0),
+            .w = @floor(rnd.float(f32) * 1300.0 - 50.0),
+            .h = @floor(rnd.float(f32) * 1300.0 - 50.0),
+        };
+        const u = ir.united(jr);
+        try std.testing.expect(u.contains(ir));
+        try std.testing.expect(u.contains(jr));
+        // Full-view and degenerate pending rects collapse to full redraws.
+        const fv = Damage.fromPending(true, 0.0, 0.0, 1200.0, 900.0, 1200.0, 900.0);
+        try std.testing.expect(fv.full);
+        const ze = Damage.fromPending(true, 10.0, 10.0, 0.0, 50.0, 1200.0, 900.0);
+        try std.testing.expect(ze.full);
+        const no = Damage.fromPending(false, 10.0, 10.0, 50.0, 50.0, 1200.0, 900.0);
+        try std.testing.expect(no.full);
+    }
+}

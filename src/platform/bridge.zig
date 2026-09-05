@@ -5,6 +5,9 @@ pub const PlatformCallbacks = extern struct {
     on_resize: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
     on_key: ?*const fn (key_code: c_int, hovered_block_id: c_int) callconv(.c) void,
     on_draw: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
+    /// Section-link clicks (`#fragment` URLs). Appended last so existing
+    /// field offsets never shift across the FFI boundary.
+    on_link: ?*const fn (url: [*]const u8, url_len: c_int) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_init(
@@ -70,6 +73,8 @@ pub extern "c" fn platform_get_image_size(
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;
+pub extern "c" fn platform_images_pending() c_int;
+pub extern "c" fn platform_probe_px_add(x: c_int, y: c_int) void;
 
 pub extern "c" fn platform_register_text_run(
     text: [*]const u8,
@@ -127,6 +132,24 @@ pub extern "c" fn platform_glyph_cache_stats(
     misses: *u64,
     flushes: *u64,
 ) void;
+
+pub extern "c" fn platform_test_image_draws() c_ulong;
+pub extern "c" fn platform_test_image_primed(total_frames: *c_ulong, primed_frames: *c_ulong) void;
+pub extern "c" fn platform_set_test_scale(s: f32) void;
+pub extern "c" fn platform_render_select_drag_png(
+    output_path: [*:0]const u8,
+    width: c_int,
+    height: c_int,
+    render_fn: *const fn (width: c_int, height: c_int) callconv(.c) void,
+    ax1: f32,
+    ay1: f32,
+    ax2: f32,
+    ay2: f32,
+    bx1: f32,
+    by1: f32,
+    bx2: f32,
+    by2: f32,
+) c_int;
 
 pub extern "c" fn platform_render_to_png(
     output_path: [*:0]const u8,

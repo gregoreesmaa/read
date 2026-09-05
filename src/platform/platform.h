@@ -10,6 +10,7 @@ typedef struct {
     void (*on_resize)(int width, int height);
     void (*on_key)(int key_code, int hovered_block_id);
     void (*on_draw)(int width, int height);
+    void (*on_link)(const char* url, int url_len);
 } PlatformCallbacks;
 
 int platform_init(const char* title, int width, int height, PlatformCallbacks callbacks);

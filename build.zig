@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
         "test-hooks",
         "Include headless test hooks (--damage/--select/--dump-records) for damage parity tests (adds bytes; ship builds leave it off)",
     ) orelse false;
+    // Animated GIF frame cycling is required reader behavior: always on in
+    // every build (ship included). No build option disables it.
     const build_options = b.addOptions();
     build_options.addOption(bool, "test_hooks", test_hooks);
 
@@ -98,12 +100,20 @@ pub fn build(b: *std.Build) void {
         // -Os for the platform glue TU only: its cost is dominated by
         // CoreText/CG/UIColor calls, while the microsecond hot paths (scan,
         // layout, viewport) live in the Zig TU pinned by strict benchmarks.
-        // Keeps the ship binary under the 500 KiB budget (page-alignment
+        // Keeps the ship binary under the 350 KiB budget (page-alignment
         // padding makes even small __TEXT growth disproportionate).
         const cflags: []const []const u8 = if (test_hooks)
-            &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1"}
+            &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1", "-DREAD_ANIMATED_GIF=1"}
         else
-            &.{"-fobjc-arc", "-Os"};
+            &.{"-fobjc-arc", "-Os", "-DREAD_ANIMATED_GIF=1"};
+        // Binary diet (AGENTS.md §1: < 350 KiB): behavior-neutral linker
+        // trims only — no codegen, API, or optimization-level change.
+        // --gc-sections dead-strips unreachable sections, -dead_strip_dylibs
+        // drops unused dylib edges, -fstrip drops the symbol table (kept for
+        // Debug and test-hooks builds, which need their symbols).
+        exe.link_gc_sections = true;
+        exe.dead_strip_dylibs = true;
+        if (!test_hooks and optimize != .Debug) exe.root_module.strip = true;
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
             .flags = cflags,

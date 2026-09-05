@@ -295,10 +295,12 @@ test "controls: accurate document height computation ensures tables and end of d
         .scroll_y = 0.0,
     };
 
-    const accurate_height = layout.computeDocumentHeight(
+    const accurate_height = layout.computeDocumentHeightEx(
         showcase_doc,
         lines_buf[0..line_count],
         vp_config,
+        null,
+        null,
     );
 
     // Previously, naive (line_count * 28.0) produced ~3080px which trapped scrolling before the table.
