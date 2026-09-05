@@ -24,6 +24,116 @@ fn isAsciiPunct(ch: u8) bool {
     };
 }
 
+/// Parsed `(destination "optional title")` tail of an inline link or image.
+/// `dest_start..dest_end` bounds the URL (angle brackets excluded); `close`
+/// is the index of the final `)`. Titles are validated but dropped: the
+/// reader has no tooltip surface. Returns null when the tail is malformed,
+/// in which case the caller must leave the source as literal text.
+const LinkTail = struct {
+    dest_start: usize,
+    dest_end: usize,
+    close: usize,
+};
+
+fn parseLinkTail(line: []const u8, paren_open: usize) ?LinkTail {
+    if (paren_open >= line.len or line[paren_open] != '(') return null;
+    var pos = paren_open + 1;
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+    if (pos >= line.len) return null;
+
+    var dest_start: usize = pos;
+    var dest_end: usize = pos;
+    if (line[pos] == '<') {
+        const gt = std.mem.indexOfScalarPos(u8, line, pos + 1, '>');
+        const end = gt orelse return null;
+        dest_start = pos + 1;
+        dest_end = end;
+        pos = end + 1;
+    } else {
+        var depth: usize = 0;
+        var end = pos;
+        var ok = false;
+        while (end < line.len) {
+            const c = line[end];
+            if (c == '(') {
+                depth += 1;
+            } else if (c == ')') {
+                if (depth == 0) {
+                    ok = true;
+                    break;
+                }
+                depth -= 1;
+            } else if (c == ' ' or c == '\t' or c < 0x20) {
+                break;
+            }
+            end += 1;
+        }
+        // An empty destination `[t]()` is valid; anything else must have
+        // consumed at least one character to be well-formed here.
+        if (!ok and end != pos) {
+            // Ran into whitespace/control: destination ends here, a title
+            // or ')' must follow.
+        } else if (!ok) {
+            return null;
+        }
+        dest_start = pos;
+        dest_end = end;
+        pos = end;
+    }
+
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+    if (pos >= line.len) return null;
+    if (line[pos] == ')') return .{ .dest_start = dest_start, .dest_end = dest_end, .close = pos };
+
+    // Optional title: "...", '...', or (...). A raw inner quote of the
+    // same kind ends the title, so `("a "b" c")` fails and stays literal.
+    const q = line[pos];
+    if (q == '"' or q == '\'') {
+        var j = pos + 1;
+        var closed = false;
+        while (j < line.len) {
+            if (line[j] == '\\' and j + 1 < line.len) {
+                j += 2;
+                continue;
+            }
+            if (line[j] == q) {
+                closed = true;
+                break;
+            }
+            j += 1;
+        }
+        if (!closed) return null;
+        pos = j + 1;
+    } else if (q == '(') {
+        var depth: usize = 1;
+        var j = pos + 1;
+        var closed = false;
+        while (j < line.len) {
+            if (line[j] == '\\' and j + 1 < line.len) {
+                j += 2;
+                continue;
+            } else if (line[j] == '(') {
+                depth += 1;
+            } else if (line[j] == ')') {
+                depth -= 1;
+                if (depth == 0) {
+                    closed = true;
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if (!closed) return null;
+        pos = j + 1;
+    } else {
+        return null;
+    }
+
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+    if (pos >= line.len or line[pos] != ')') return null;
+    return .{ .dest_start = dest_start, .dest_end = dest_end, .close = pos };
+}
+
 /// High-speed inline parser for viewport lines.
 /// Zero heap allocations: tokens are stored directly into caller's slice.
 pub fn parseInlines(
@@ -141,16 +251,13 @@ pub fn parseInlines(
             continue;
         }
 
-        // Image ![alt](url)
+        // Image ![alt](url "optional title")
         if (c == '!' and i + 1 < line.len and line[i + 1] == '[') {
             var close_bracket = i + 2;
             while (close_bracket < line.len and line[close_bracket] != ']') : (close_bracket += 1) {}
 
             if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
-                var close_paren = close_bracket + 2;
-                while (close_paren < line.len and line[close_paren] != ')') : (close_paren += 1) {}
-
-                if (close_paren < line.len) {
+                if (parseLinkTail(line, close_bracket + 1)) |tail| {
                     if (i > span_start) {
                         spans_out[span_count] = .{
                             .text = line[span_start..i],
@@ -161,7 +268,7 @@ pub fn parseInlines(
                     }
 
                     const alt_text = line[i + 2 .. close_bracket];
-                    const img_url = line[close_bracket + 2 .. close_paren];
+                    const img_url = line[tail.dest_start..tail.dest_end];
 
                     var img_style = cur_style;
                     img_style.link = true;
@@ -173,23 +280,20 @@ pub fn parseInlines(
                     };
                     span_count += 1;
 
-                    i = close_paren + 1;
+                    i = tail.close + 1;
                     span_start = i;
                     continue;
                 }
             }
         }
 
-        // Link [text](url)
+        // Link [text](url "optional title")
         if (c == '[') {
             var close_bracket = i + 1;
             while (close_bracket < line.len and line[close_bracket] != ']') : (close_bracket += 1) {}
 
             if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
-                var close_paren = close_bracket + 2;
-                while (close_paren < line.len and line[close_paren] != ')') : (close_paren += 1) {}
-
-                if (close_paren < line.len) {
+                if (parseLinkTail(line, close_bracket + 1)) |tail| {
                     // Flush preceding plain text
                     if (i > span_start) {
                         spans_out[span_count] = .{
@@ -201,7 +305,7 @@ pub fn parseInlines(
                     }
 
                     const link_text = line[i + 1 .. close_bracket];
-                    const link_url = line[close_bracket + 2 .. close_paren];
+                    const link_url = line[tail.dest_start..tail.dest_end];
 
                     var link_style = cur_style;
                     link_style.link = true;
@@ -213,7 +317,7 @@ pub fn parseInlines(
                     };
                     span_count += 1;
 
-                    i = close_paren + 1;
+                    i = tail.close + 1;
                     span_start = i;
                     continue;
                 }
@@ -466,44 +570,38 @@ pub fn parseInlinesStream(
             continue;
         }
 
-        // Image ![alt](url)
+        // Image ![alt](url "optional title")
         if (c == '!' and i + 1 < line.len and line[i + 1] == '[') {
             var close_bracket = i + 2;
             while (close_bracket < line.len and line[close_bracket] != ']') : (close_bracket += 1) {}
 
             if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
-                var close_paren = close_bracket + 2;
-                while (close_paren < line.len and line[close_paren] != ')') : (close_paren += 1) {}
-
-                if (close_paren < line.len) {
+                if (parseLinkTail(line, close_bracket + 1)) |tail| {
                     em.flushText(span_start, i);
                     // Empty alt text yields an image token with len 0; the
                     // renderer substitutes the fallback label (parseInlines
                     // uses "🖼 Image") without any string copy here.
                     em.emitSlice(.image, i + 2, close_bracket);
-                    em.emitSlice(.image_src, close_bracket + 2, close_paren);
-                    i = close_paren + 1;
+                    em.emitSlice(.image_src, tail.dest_start, tail.dest_end);
+                    i = tail.close + 1;
                     span_start = i;
                     continue;
                 }
             }
         }
 
-        // Link [text](url)
+        // Link [text](url "optional title")
         if (c == '[') {
             var close_bracket = i + 1;
             while (close_bracket < line.len and line[close_bracket] != ']') : (close_bracket += 1) {}
 
             if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
-                var close_paren = close_bracket + 2;
-                while (close_paren < line.len and line[close_paren] != ')') : (close_paren += 1) {}
-
-                if (close_paren < line.len) {
+                if (parseLinkTail(line, close_bracket + 1)) |tail| {
                     em.flushText(span_start, i);
-                    em.emitSlice(.start_link, close_bracket + 2, close_paren);
+                    em.emitSlice(.start_link, tail.dest_start, tail.dest_end);
                     em.emitText(i + 1, close_bracket);
                     em.emitEvent(.end_link);
-                    i = close_paren + 1;
+                    i = tail.close + 1;
                     span_start = i;
                     continue;
                 }
@@ -641,4 +739,400 @@ test "pass2: parseLineStream slices one mmap line with zero copies" {
     try std.testing.expect(saw_bold_text);
     // Out-of-range tokens can never trap tokenSlice.
     try std.testing.expectEqual(@as(usize, 0), tokenSlice(doc, .{ .kind = .text, .start = 5000, .len = 10 }).len);
+}
+
+/// Decodes one HTML entity starting right after the `&` (`rest[0]` is the
+/// first entity character; the trailing `;` must be inside `rest`).
+/// Writes UTF-8 into `out`, returns bytes written, or 0 when not an entity
+/// (caller keeps the literal text). Deliberate subset, not the full HTML5
+/// table: `amp lt gt quot apos nbsp` plus decimal/hex numeric references
+/// (which can address every scalar, e.g. `&#39;` `&#x2F;`).
+pub fn decodeEntityAfterAmp(rest: []const u8, out: []u8) usize {
+    const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return 0;
+    if (semi == 0 or semi > 10) return 0;
+    const body = rest[0..semi];
+    const named: ?[]const u8 = if (std.mem.eql(u8, body, "amp"))
+        "&"
+    else if (std.mem.eql(u8, body, "lt"))
+        "<"
+    else if (std.mem.eql(u8, body, "gt"))
+        ">"
+    else if (std.mem.eql(u8, body, "quot"))
+        "\""
+    else if (std.mem.eql(u8, body, "apos"))
+        "'"
+    else if (std.mem.eql(u8, body, "nbsp"))
+        " "
+    else
+        null;
+    if (named) |s| {
+        if (out.len < s.len) return 0;
+        @memcpy(out[0..s.len], s);
+        return s.len;
+    }
+    // Numeric reference: &#123; or &#x1A; (case-insensitive x).
+    if (body.len < 2 or body[0] != '#') return 0;
+    var digits = body[1..];
+    var base: u32 = 10;
+    if (digits.len > 1 and (digits[0] == 'x' or digits[0] == 'X')) {
+        base = 16;
+        digits = digits[1..];
+    }
+    if (digits.len == 0 or digits.len > 6) return 0;
+    var value: u32 = 0;
+    for (digits) |d| {
+        const v: u32 = if (d >= '0' and d <= '9')
+            @as(u32, d - '0')
+        else if (base == 16 and d >= 'a' and d <= 'f')
+            @as(u32, d - 'a' + 10)
+        else if (base == 16 and d >= 'A' and d <= 'F')
+            @as(u32, d - 'A' + 10)
+        else
+            return 0;
+        value = value * base + v;
+        if (value > 0x10FFFF) return 0;
+    }
+    // NUL becomes U+FFFD; lone surrogates are rejected (literal text).
+    const scalar: u21 = if (value == 0)
+        0xFFFD
+    else if (value >= 0xD800 and value <= 0xDFFF)
+        return 0
+    else
+        @intCast(value);
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(scalar, &buf) catch return 0;
+    if (out.len < n) return 0;
+    @memcpy(out[0..n], buf[0..n]);
+    return n;
+}
+
+/// Consumed length of the entity starting at `line[i]` (`line[i] == '&'`),
+/// or 0 when there is no valid `&...;` entity here. The decoded bytes are
+/// available via `decodeEntityAfterAmp`; this helper answers the cheaper
+/// "is there an entity" question for measurement pre-scans.
+pub fn entityLengthAt(line: []const u8, i: usize) usize {
+    if (i >= line.len or line[i] != '&') return 0;
+    const semi = std.mem.indexOfScalarPos(u8, line, i + 1, ';') orelse return 0;
+    if (semi - (i + 1) == 0 or semi - (i + 1) > 10) return 0;
+    var tmp: [4]u8 = undefined;
+    const n = decodeEntityAfterAmp(line[i + 1 ..], tmp[0..]);
+    if (n == 0) return 0;
+    return semi - i + 1;
+}
+
+/// One link reference definition (`[label]: /url "title"`). Slices borrow
+/// the document buffer (zero-copy); titles validate the definition but are
+/// dropped (no tooltip surface). Only single-line definitions are collected;
+/// a title continued on the next line stays literal text.
+pub const RefDef = struct {
+    label: []const u8,
+    url: []const u8,
+    line_idx: u32,
+};
+
+/// Cold-path upper bound for definitions per document.
+pub const MAX_REF_DEFS: usize = 128;
+
+/// Parses a single-line reference definition. Up to 3 leading spaces (a tab
+/// or 4th space makes it indented code, never a definition). Returns the
+/// label and URL slices, or null when the line is not a valid definition
+/// (including a malformed trailing title, which invalidates the whole def).
+pub fn parseRefDefLine(line: []const u8) ?struct { label: []const u8, url: []const u8 } {
+    var pos: usize = 0;
+    var indent: usize = 0;
+    while (pos < line.len and line[pos] == ' ') : (pos += 1) {
+        indent += 1;
+    }
+    if (indent >= 4) return null;
+    if (pos < line.len and line[pos] == '\t') return null;
+    if (pos >= line.len or line[pos] != '[') return null;
+
+    // Label: first raw `]` ends it; raw `[` inside invalidates.
+    var j = pos + 1;
+    var label_end: ?usize = null;
+    while (j < line.len) {
+        if (line[j] == '\\' and j + 1 < line.len) {
+            j += 2;
+            continue;
+        }
+        if (line[j] == ']') {
+            label_end = j;
+            break;
+        }
+        if (line[j] == '[') return null;
+        j += 1;
+    }
+    const le = label_end orelse return null;
+    var label = line[pos + 1 .. le];
+    while (label.len > 0 and (label[0] == ' ' or label[0] == '\t')) : (label = label[1..]) {}
+    while (label.len > 0 and (label[label.len - 1] == ' ' or label[label.len - 1] == '\t')) : (label = label[0 .. label.len - 1]) {}
+    if (label.len == 0 or label.len > 999) return null;
+
+    pos = le + 1;
+    if (pos >= line.len or line[pos] != ':') return null;
+    pos += 1;
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+    if (pos >= line.len) return null;
+
+    var url_start: usize = pos;
+    var url_end: usize = pos;
+    if (line[pos] == '<') {
+        const gt = std.mem.indexOfScalarPos(u8, line, pos + 1, '>') orelse return null;
+        url_start = pos + 1;
+        url_end = gt;
+        pos = gt + 1;
+    } else {
+        var end = pos;
+        var depth: usize = 0;
+        while (end < line.len) {
+            const c = line[end];
+            if (c == '(') {
+                depth += 1;
+            } else if (c == ')') {
+                if (depth == 0) break;
+                depth -= 1;
+            } else if (c == ' ' or c == '\t' or c < 0x20) {
+                break;
+            }
+            end += 1;
+        }
+        if (end == pos) return null;
+        url_end = end;
+        pos = end;
+    }
+
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+    if (pos >= line.len) return .{ .label = label, .url = line[url_start..url_end] };
+
+    // Optional same-line title; anything else invalidates the definition.
+    const q = line[pos];
+    if (q == '"' or q == '\'') {
+        var k = pos + 1;
+        var closed = false;
+        while (k < line.len) {
+            if (line[k] == '\\' and k + 1 < line.len) {
+                k += 2;
+                continue;
+            }
+            if (line[k] == q) {
+                closed = true;
+                break;
+            }
+            k += 1;
+        }
+        if (!closed) return null;
+        pos = k + 1;
+    } else if (q == '(') {
+        var depth: usize = 1;
+        var k = pos + 1;
+        var closed = false;
+        while (k < line.len) {
+            if (line[k] == '\\' and k + 1 < line.len) {
+                k += 2;
+                continue;
+            } else if (line[k] == '(') {
+                depth += 1;
+            } else if (line[k] == ')') {
+                depth -= 1;
+                if (depth == 0) {
+                    closed = true;
+                    break;
+                }
+            }
+            k += 1;
+        }
+        if (!closed) return null;
+        pos = k + 1;
+    } else {
+        return null;
+    }
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
+    if (pos != line.len) return null;
+    return .{ .label = label, .url = line[url_start..url_end] };
+}
+
+/// Cold-path scan of all single-line reference definitions in a document.
+/// Zero heap allocations; writes at most `out.len` entries, returns the
+/// stored count. First definition wins on duplicate labels (CommonMark).
+pub fn scanRefDefs(bytes: []const u8, lines: []const simd.Line, out: []RefDef) usize {
+    var count: usize = 0;
+    for (lines, 0..) |ln, idx| {
+        if (ln.block_type != .paragraph) continue;
+        const text = bytes[ln.offset..][0..ln.len];
+        if (parseRefDefLine(text)) |d| {
+            if (count >= out.len) break;
+            out[count] = .{ .label = d.label, .url = d.url, .line_idx = @intCast(idx) };
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// ASCII case-insensitive label match with inner whitespace collapsed
+/// (CommonMark reference matching, line-local edition).
+fn matchLabel(a: []const u8, b: []const u8) bool {
+    var x = a;
+    var y = b;
+    while (x.len > 0 and (x[0] == ' ' or x[0] == '\t')) : (x = x[1..]) {}
+    while (x.len > 0 and (x[x.len - 1] == ' ' or x[x.len - 1] == '\t')) : (x = x[0 .. x.len - 1]) {}
+    while (y.len > 0 and (y[0] == ' ' or y[0] == '\t')) : (y = y[1..]) {}
+    while (y.len > 0 and (y[y.len - 1] == ' ' or y[y.len - 1] == '\t')) : (y = y[0 .. y.len - 1]) {}
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < x.len and j < y.len) {
+        const sx = x[i] == ' ' or x[i] == '\t';
+        const sy = y[j] == ' ' or y[j] == '\t';
+        if (sx or sy) {
+            if (!(sx and sy)) return false;
+            while (i < x.len and (x[i] == ' ' or x[i] == '\t')) : (i += 1) {}
+            while (j < y.len and (y[j] == ' ' or y[j] == '\t')) : (j += 1) {}
+            continue;
+        }
+        var cx = x[i];
+        var cy = y[j];
+        if (cx >= 'A' and cx <= 'Z') cx += 32;
+        if (cy >= 'A' and cy <= 'Z') cy += 32;
+        if (cx != cy) return false;
+        i += 1;
+        j += 1;
+    }
+    return i >= x.len and j >= y.len;
+}
+
+/// First definition whose label matches (case-insensitive, collapsed).
+pub fn findRefDef(defs: []const RefDef, label: []const u8) ?RefDef {
+    for (defs) |d| {
+        if (matchLabel(d.label, label)) return d;
+    }
+    return null;
+}
+
+fn linkTargetOf(line: []const u8) ?[]const u8 {
+    var spans: [8]InlineSpan = undefined;
+    const n = parseInlines(line, &spans);
+    for (spans[0..n]) |s| {
+        if (s.style.link) return s.link_target;
+    }
+    return null;
+}
+
+test "inline links: titles validate, destinations exclude brackets" {
+    // Plain destination with double-quoted title.
+    const t1 = linkTargetOf("[URL and title](/url/ \"title\")");
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("/url/", t1.?);
+
+    // Title may be separated by two spaces or a tab.
+    try std.testing.expectEqualStrings("/url/", linkTargetOf("[t](/url/  \"spaced\")").?);
+    try std.testing.expectEqualStrings("/url/", linkTargetOf("[t](/url/\t\"tabbed\")").?);
+
+    // Empty destination is a link with an empty target.
+    const t_empty = linkTargetOf("[Empty]()");
+    try std.testing.expect(t_empty != null);
+    try std.testing.expectEqualStrings("", t_empty.?);
+
+    // Angle destination keeps raw characters (unbalanced query "&").
+    try std.testing.expectEqualStrings(
+        "/script?foo=1&bar=2",
+        linkTargetOf("Here's an inline [link](</script?foo=1&bar=2>).").?,
+    );
+
+    // Balanced parens inside a bare destination are kept.
+    try std.testing.expectEqualStrings("u(v)w", linkTargetOf("[a](u(v)w)").?);
+
+    // Literal quotes inside a double-quoted title invalidate the link:
+    // the source must stay literal text (no link spans at all).
+    try std.testing.expect(linkTargetOf("Foo [bar](/url/ \"Title with \"quotes\" inside\").") == null);
+
+    // Unterminated title also stays literal.
+    try std.testing.expect(linkTargetOf("[a](/u \"no end") == null);
+
+    // Image destinations follow the same rule (title dropped).
+    var spans: [8]InlineSpan = undefined;
+    const n = parseInlines("![alt](/img.png \"Title\")", &spans);
+    var found_img = false;
+    for (spans[0..n]) |s| {
+        if (s.style.link and s.link_target != null and std.mem.eql(u8, s.link_target.?, "/img.png")) {
+            found_img = true;
+        }
+    }
+    try std.testing.expect(found_img);
+}
+
+test "entities: named and numeric references decode" {
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), decodeEntityAfterAmp("amp;T", out[0..]));
+    try std.testing.expectEqualStrings("&", out[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), decodeEntityAfterAmp("lt;", out[0..]));
+    try std.testing.expectEqualStrings("<", out[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), decodeEntityAfterAmp("gt;", out[0..]));
+    try std.testing.expectEqual(@as(usize, 2), decodeEntityAfterAmp("nbsp;", out[0..]));
+    try std.testing.expectEqual(@as(usize, 1), decodeEntityAfterAmp("#39;", out[0..]));
+    try std.testing.expectEqualStrings("'", out[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), decodeEntityAfterAmp("#x2F;", out[0..]));
+    try std.testing.expectEqualStrings("/", out[0..1]);
+    try std.testing.expectEqual(@as(usize, 3), decodeEntityAfterAmp("#0;", out[0..]));
+    // Unknown names, missing semicolons, and bare ampersands stay literal.
+    try std.testing.expectEqual(@as(usize, 0), decodeEntityAfterAmp("bogus;", out[0..]));
+    try std.testing.expectEqual(@as(usize, 0), decodeEntityAfterAmp("amp", out[0..]));
+    try std.testing.expectEqual(@as(usize, 0), decodeEntityAfterAmp(";", out[0..]));
+    try std.testing.expectEqual(@as(usize, 5), entityLengthAt("AT&amp;T", 2));
+    try std.testing.expectEqual(@as(usize, 0), entityLengthAt("AT&T", 2));
+    try std.testing.expectEqual(@as(usize, 0), entityLengthAt("fish & chips", 5));
+}
+
+test "refdefs: single-line definitions scan, indent and titles gate" {
+    // Valid definitions with titles, extra spaces, and 1-3 space indent.
+    const d1 = parseRefDefLine("[1]: http://example.com/?foo=1&bar=2");
+    try std.testing.expect(d1 != null);
+    try std.testing.expectEqualStrings("1", d1.?.label);
+    try std.testing.expectEqualStrings("http://example.com/?foo=1&bar=2", d1.?.url);
+
+    const d2 = parseRefDefLine("[2]: http://att.com/  \"AT&T\"");
+    try std.testing.expect(d2 != null);
+    try std.testing.expectEqualStrings("http://att.com/", d2.?.url);
+
+    try std.testing.expect(parseRefDefLine(" [once]: /url") != null);
+    try std.testing.expect(parseRefDefLine("  [twice]: /url") != null);
+    try std.testing.expect(parseRefDefLine("   [thrice]: /url") != null);
+
+    // Four spaces or a tab: indented code, never a definition.
+    try std.testing.expect(parseRefDefLine("    [four]: /url") == null);
+    try std.testing.expect(parseRefDefLine("\t[tab]: /url") == null);
+
+    // Malformed trailing titles invalidate the whole definition.
+    try std.testing.expect(parseRefDefLine("[bar]: /url/ \"Title with \"quotes\" inside\"") == null);
+    try std.testing.expect(parseRefDefLine("[a]: /url garbage") == null);
+
+    // Use sites are not definitions.
+    try std.testing.expect(parseRefDefLine("Here's a [link] [1] with text.") == null);
+    try std.testing.expect(parseRefDefLine("[1].") == null);
+    try std.testing.expect(parseRefDefLine("[foo] bar") == null);
+
+    // Matching is case-insensitive with collapsed whitespace.
+    const defs = [_]RefDef{
+        .{ .label = "Once", .url = "/url", .line_idx = 3 },
+        .{ .label = "a  b", .url = "/u2", .line_idx = 5 },
+    };
+    try std.testing.expectEqualStrings("/url", findRefDef(&defs, "once").?.url);
+    try std.testing.expectEqualStrings("/url", findRefDef(&defs, "ONCE").?.url);
+    try std.testing.expectEqualStrings("/u2", findRefDef(&defs, "a b").?.url);
+    try std.testing.expect(findRefDef(&defs, "missing") == null);
+}
+
+test "refdefs: amps document yields two definitions" {
+    const doc =
+        "Here's a [link] [1] with an ampersand in the URL.\n" ++
+        "\n" ++
+        "[1]: http://example.com/?foo=1&bar=2\n" ++
+        "[2]: http://att.com/  \"AT&T\"\n";
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var defs: [8]RefDef = undefined;
+    const m = scanRefDefs(doc, lines[0..n], &defs);
+    try std.testing.expectEqual(@as(usize, 2), m);
+    try std.testing.expectEqualStrings("1", defs[0].label);
+    try std.testing.expectEqualStrings("http://example.com/?foo=1&bar=2", defs[0].url);
+    try std.testing.expectEqualStrings("2", defs[1].label);
 }

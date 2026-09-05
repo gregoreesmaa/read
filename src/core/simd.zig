@@ -168,6 +168,21 @@ pub fn scanLines(
     return line_count;
 }
 
+/// True for a thematic break of `marker` (`-`, `*`, `_`): at least three
+/// markers with only spaces between/around (`---`, `- - -`, `***`, ...).
+/// Contiguous runs fold through the same check, so one helper covers both.
+fn isSpacedHr(trimmed: []const u8, marker: u8) bool {
+    var count: usize = 0;
+    for (trimmed) |c| {
+        if (c == marker) {
+            count += 1;
+        } else if (c != ' ') {
+            return false;
+        }
+    }
+    return count >= 3;
+}
+
 /// Fast single-dispatch classifier for a single line of markdown.
 /// Inlined into the scan loop; the switch on the first content byte compiles
 /// to a jump table, so the common paragraph case costs one indirect jump.
@@ -264,9 +279,10 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool) 
         },
         // Task list, hr, or bullet: original precedence task -> hr -> bullet.
         '-', '*', '+' => {
-            // Task list: - [ ] or - [x] or * [ ] or * [x]
+            // Task list: - [ ] or - [x] (tab counts as the space after the
+            // marker, matching `-`, `*`, `+` bullet handling below).
             if (trimmed.len >= 5 and
-                trimmed[1] == ' ' and trimmed[2] == '[' and
+                (trimmed[1] == ' ' or trimmed[1] == '\t') and trimmed[2] == '[' and
                 (trimmed[3] == ' ' or trimmed[3] == 'x' or trimmed[3] == 'X') and
                 trimmed[4] == ']')
             {
@@ -277,28 +293,18 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool) 
                     .indent = indent,
                 };
             }
-            // Horizontal rule: ---, *** (and ___ is handled under '_')
-            if ((first == '-' or first == '*') and trimmed.len >= 3 and
-                trimmed[1] == first and trimmed[2] == first)
-            {
-                var is_hr = true;
-                for (trimmed) |c| {
-                    if (c != first and c != ' ') {
-                        is_hr = false;
-                        break;
-                    }
-                }
-                if (is_hr) {
-                    return Line{
-                        .offset = offset,
-                        .len = raw_len,
-                        .block_type = .hr,
-                        .indent = indent,
-                    };
-                }
+            // Horizontal rule: ---, ***, and spaced forms (- - -, * * *).
+            // (___ and _ _ _ are handled under '_'.)
+            if ((first == '-' or first == '*') and isSpacedHr(trimmed, first)) {
+                return Line{
+                    .offset = offset,
+                    .len = raw_len,
+                    .block_type = .hr,
+                    .indent = indent,
+                };
             }
-            // Bullet list: - , * , +
-            if (trimmed.len >= 2 and trimmed[1] == ' ') {
+            // Bullet list: - , * , + (tab counts as the following space)
+            if (trimmed.len >= 2 and (trimmed[1] == ' ' or trimmed[1] == '\t')) {
                 return Line{
                     .offset = offset,
                     .len = raw_len,
@@ -313,24 +319,15 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool) 
                 .indent = indent,
             };
         },
-        // '_': only ___ hr, else paragraph.
+        // '_': ___, _ _ _, and spaced variants are hr, else paragraph.
         '_' => {
-            if (trimmed.len >= 3 and trimmed[1] == '_' and trimmed[2] == '_') {
-                var is_hr = true;
-                for (trimmed) |c| {
-                    if (c != '_' and c != ' ') {
-                        is_hr = false;
-                        break;
-                    }
-                }
-                if (is_hr) {
-                    return Line{
-                        .offset = offset,
-                        .len = raw_len,
-                        .block_type = .hr,
-                        .indent = indent,
-                    };
-                }
+            if (isSpacedHr(trimmed, '_')) {
+                return Line{
+                    .offset = offset,
+                    .len = raw_len,
+                    .block_type = .hr,
+                    .indent = indent,
+                };
             }
             return Line{
                 .offset = offset,
@@ -788,6 +785,34 @@ test "pass1: findBlockForOffset binary search" {
     try std.testing.expectEqual(@as(usize, 2), findBlockForOffset(&map, 25));
     try std.testing.expectEqual(@as(usize, 3), findBlockForOffset(&map, 1000));
     try std.testing.expectEqual(@as(usize, 0), findBlockForOffset(&.{}, 50));
+}
+
+fn classifyOne(line: []const u8) BlockType {
+    var lines: [1]Line = undefined;
+    var fence = false;
+    const n = scanLines(line, &lines, &fence);
+    std.debug.assert(n == 1);
+    return lines[0].block_type;
+}
+
+test "classify: tab after bullet/task markers, spaced thematic breaks" {
+    // Tab counts as the space after -, *, + bullets and task markers.
+    try std.testing.expectEqual(BlockType.bullet_list, classifyOne("*\tasterisk 1"));
+    try std.testing.expectEqual(BlockType.bullet_list, classifyOne("+\tPlus 1"));
+    try std.testing.expectEqual(BlockType.bullet_list, classifyOne("-\tMinus 1"));
+    try std.testing.expectEqual(BlockType.task_list, classifyOne("-\t[ ] spaced task"));
+    try std.testing.expectEqual(BlockType.bullet_list, classifyOne("* space bullet"));
+    // Spaced thematic breaks for -, *, _ (up to 3 leading spaces).
+    try std.testing.expectEqual(BlockType.hr, classifyOne("- - -"));
+    try std.testing.expectEqual(BlockType.hr, classifyOne(" * * *"));
+    try std.testing.expectEqual(BlockType.hr, classifyOne("  - - -"));
+    try std.testing.expectEqual(BlockType.hr, classifyOne("_ _ _"));
+    try std.testing.expectEqual(BlockType.hr, classifyOne("___"));
+    try std.testing.expectEqual(BlockType.hr, classifyOne("---"));
+    // Near-misses stay lists and paragraphs.
+    try std.testing.expectEqual(BlockType.bullet_list, classifyOne("- - foo"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("*foo"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("--"));
 }
 
 fn recordBlockRun(bytes_inner: []const u8, nl_pos: usize, out: []u32, n: *usize) void {
