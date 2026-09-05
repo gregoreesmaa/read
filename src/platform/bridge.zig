@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const PlatformCallbacks = extern struct {
-    on_scroll: ?*const fn (delta_y: f32) callconv(.c) void,
+    on_scroll: ?*const fn (delta_x: f32, delta_y: f32) callconv(.c) void,
     on_resize: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
     on_key: ?*const fn (key_code: c_int) callconv(.c) void,
     on_draw: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
@@ -16,6 +16,7 @@ pub extern "c" fn platform_init(
 
 pub extern "c" fn platform_run_loop() void;
 pub extern "c" fn platform_request_redraw() void;
+pub extern "c" fn platform_sync_scroll(scroll_y: f32) void;
 
 pub extern "c" fn platform_draw_rect(
     x: f32,
@@ -41,6 +42,17 @@ pub extern "c" fn platform_draw_text(
     g: u8,
     b: u8,
     a: u8,
+    link_url: ?[*]const u8,
+    link_url_len: c_int,
+) void;
+
+pub extern "c" fn platform_register_code_block(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    code_text: [*]const u8,
+    code_len: c_int,
 ) void;
 
 pub extern "c" fn platform_measure_text(

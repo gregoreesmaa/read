@@ -58,13 +58,17 @@ Enforced by strict regression benchmarks (`src/core/strict_benchmarks.zig`) test
 
 | Input | Action |
 | :--- | :--- |
-| `Mouse Drag` | Normal text selection |
+| `Mouse Drag` | Character-accurate substring selection (copies partial words and spaces) |
 | `Double Click` | Select word |
 | `Triple Click` | Select full line |
+| `Right Click` | Context menu (Copy, Select All, Open Link in Browser, Copy Link) |
+| `Click Link` | Open link directly in default web browser |
+| `Hover Code Block` | Visible-on-hover "Copy" button with visual feedback |
 | `Cmd+C` | Copy selected text to system clipboard |
 | `Cmd+A` | Select entire document |
 | `j` / `Down` | Scroll down |
 | `k` / `Up` | Scroll up |
+| `h` / `l` / `Swipe` | Scroll wide tables horizontally |
 | `Space` | Page down |
 | `t` | Toggle Zen Dark / Light theme |
 | `q` | Quit |

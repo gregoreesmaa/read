@@ -54,6 +54,7 @@ pub const AppState = struct {
     window_height: f32 = 750.0,
     scroll_y: f32 = 0.0,
     max_scroll_y: f32 = 0.0,
+    table_scroll_x: f32 = 0.0,
     is_dark_theme: bool = true,
 };
 
@@ -61,8 +62,11 @@ var g_app: AppState = .{};
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 
-fn onScroll(delta_y: f32) callconv(.c) void {
+fn onScroll(delta_x: f32, delta_y: f32) callconv(.c) void {
     g_app.scroll_y = std.math.clamp(g_app.scroll_y - delta_y, 0.0, g_app.max_scroll_y);
+    if (delta_x != 0.0) {
+        g_app.table_scroll_x = @max(0.0, g_app.table_scroll_x - delta_x);
+    }
 }
 
 fn onResize(w: c_int, h: c_int) callconv(.c) void {
@@ -77,6 +81,12 @@ fn onKey(key_code: c_int) callconv(.c) void {
         },
         'k' => {
             g_app.scroll_y = std.math.clamp(g_app.scroll_y - 40.0, 0.0, g_app.max_scroll_y);
+        },
+        'h' => {
+            g_app.table_scroll_x = @max(0.0, g_app.table_scroll_x - 30.0);
+        },
+        'l' => {
+            g_app.table_scroll_x += 30.0;
         },
         ' ' => {
             g_app.scroll_y = std.math.clamp(g_app.scroll_y + g_app.window_height * 0.8, 0.0, g_app.max_scroll_y);
@@ -95,10 +105,13 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     g_app.window_width = @floatFromInt(w);
     g_app.window_height = @floatFromInt(h);
 
+    bridge.platform_sync_scroll(g_app.scroll_y);
+
     const vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = g_app.scroll_y,
+        .table_scroll_x = g_app.table_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
     };
 
@@ -123,6 +136,26 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.color.a,
                 );
             },
+            .code_block_bg => {
+                bridge.platform_draw_rect(
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.rect.w,
+                    cmd.rect.h,
+                    cmd.color.r,
+                    cmd.color.g,
+                    cmd.color.b,
+                    cmd.color.a,
+                );
+                bridge.platform_register_code_block(
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.rect.w,
+                    cmd.rect.h,
+                    cmd.text.ptr,
+                    @intCast(cmd.text.len),
+                );
+            },
             .line => {
                 bridge.platform_draw_rect(
                     cmd.rect.x,
@@ -140,6 +173,9 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 const is_italic: c_int = if (cmd.style.italic) 1 else 0;
                 const is_mono: c_int = if (cmd.style.code) 1 else 0;
 
+                const url_ptr = if (cmd.link_target) |t| t.ptr else null;
+                const url_len: c_int = if (cmd.link_target) |t| @intCast(t.len) else 0;
+
                 bridge.platform_draw_text(
                     cmd.text.ptr,
                     @intCast(cmd.text.len),
@@ -153,6 +189,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.color.g,
                     cmd.color.b,
                     cmd.color.a,
+                    url_ptr,
+                    url_len,
                 );
             },
         }

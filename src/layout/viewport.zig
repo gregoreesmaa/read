@@ -13,7 +13,7 @@ pub const SYSTEM_FONT_WIDTHS = [128]u16{
     // 24-31
     0, 0, 0, 0, 0, 0, 0, 0,
     // 32-39: space ! " # $ % & '
-    512, 286, 453, 605, 605, 900, 687, 272,
+    256, 286, 453, 605, 605, 900, 687, 272,
     // 40-47: ( ) * + , - . /
     357, 357, 447, 605, 272, 447, 272, 280,
     // 48-55: 0 1 2 3 4 5 6 7
@@ -48,7 +48,7 @@ pub const SYSTEM_FONT_BOLD_WIDTHS = [128]u16{
     // 24-31
     0, 0, 0, 0, 0, 0, 0, 0,
     // 32-39: space ! " # $ % & '
-    465, 331, 544, 646, 646, 1011, 719, 323,
+    256, 331, 544, 646, 646, 1011, 719, 323,
     // 40-47: ( ) * + , - . /
     404, 404, 459, 646, 323, 459, 323, 310,
     // 48-55: 0 1 2 3 4 5 6 7
@@ -95,6 +95,7 @@ pub const DrawCommandKind = enum {
     fill_rect,
     text_run,
     line,
+    code_block_bg,
 };
 
 pub const Color = struct {
@@ -187,6 +188,7 @@ pub const ViewportConfig = struct {
     window_width: f32,
     window_height: f32,
     scroll_y: f32,
+    table_scroll_x: f32 = 0.0,
     content_max_width: f32 = 760.0,
     base_font_size: f32 = 17.0,
     line_height: f32 = 28.0,
@@ -313,12 +315,6 @@ pub fn layoutViewport(
         // Early exit if past bottom of viewport
         if (cur_y > vp_bottom) break;
 
-        // Fast skip for lines completely above viewport
-        if (cur_y + 80.0 < 0 and line_info.block_type != .code_fence_start and line_info.block_type != .table_row) {
-            cur_y += config.line_height;
-            continue;
-        }
-
         const line_bytes = bytes[line_info.offset..][0..line_info.len];
 
         // ----------------------------------------------------
@@ -336,9 +332,15 @@ pub fn layoutViewport(
             const block_bottom = cur_y + code_block_h;
 
             if (block_bottom >= 0 and block_top <= vp_bottom) {
+                // Extract entire code block slice for the Copy button
+                const code_slice = if (scan_i > i + 1)
+                    bytes[lines[i + 1].offset .. lines[scan_i - 1].offset + lines[scan_i - 1].len]
+                else
+                    "";
+
                 // Code block background card
                 commands_out[cmd_count] = .{
-                    .kind = .fill_rect,
+                    .kind = .code_block_bg,
                     .rect = .{
                         .x = content_x - 12.0,
                         .y = cur_y,
@@ -346,6 +348,7 @@ pub fn layoutViewport(
                         .h = code_block_h,
                     },
                     .color = theme.code_bg,
+                    .text = code_slice,
                 };
                 cmd_count += 1;
 
@@ -461,7 +464,7 @@ pub fn layoutViewport(
                     if (is_sep) {
                         commands_out[cmd_count] = .{
                             .kind = .line,
-                            .rect = .{ .x = content_x, .y = row_y + 2.0, .w = content_width, .h = 1.0 },
+                            .rect = .{ .x = content_x, .y = row_y + 2.0, .w = @max(content_width, total_measured_w), .h = 1.0 },
                             .color = theme.table_border,
                         };
                         cmd_count += 1;
@@ -473,7 +476,7 @@ pub fn layoutViewport(
                     // Render row cells with inline parsing
                     var cell_start: usize = 0;
                     var c_idx: usize = 0;
-                    var cur_col_x = content_x;
+                    var cur_col_x = content_x - if (total_measured_w > content_width) config.table_scroll_x else 0.0;
 
                     for (r_bytes, 0..) |c, char_idx| {
                         if (c == '|') {
