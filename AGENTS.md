@@ -21,7 +21,7 @@ Every agent working on this repository MUST strictly follow these principles.
 ## 2. Immutable Targets & Benchmark Invariance
 
 - **Strict Benchmarks are Immutable**:
-  - The metrics codified in `src/core/strict_benchmarks.zig` (e.g., > 2.5 GB/s scanner throughput, < 1.0 ms for 50,000 lines, < 50 µs viewport layout latency, 0 hot path allocations) are **non-negotiable**.
+  - The metrics codified in `src/core/strict_benchmarks.zig` (e.g., > 5.0 GB/s scanner throughput, < 450 µs for 50,000 lines, < 12 µs viewport layout latency, < 12 µs deep-scroll latency, 8-byte packed Line struct, 0 hot path allocations) are **non-negotiable**.
   - **Rule**: If an implementation change fails a strict performance target, **NEVER loosen or change the benchmark target**. Always optimize the implementation until it meets the target.
 
 ---
