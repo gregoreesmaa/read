@@ -62,31 +62,58 @@ pub const HEADING_FONT_WIDTHS = [128]u16{
     592, 616, 518, 466, 258, 466, 620, 910,
 };
 
+// Calibrated ASCII advance widths for IBM Plex Serif Italic (in 1/1000 em)
+pub const SERIF_FONT_ITALIC_WIDTHS = [128]u16{
+    0, 424, 424, 424, 424, 424, 424, 424,
+    424, 212, 212, 424, 424, 212, 424, 424,
+    424, 424, 424, 424, 424, 424, 424, 424,
+    424, 424, 424, 424, 424, 424, 424, 424,
+    212, 254, 387, 641, 539, 836, 655, 216,
+    298, 298, 420, 550, 244, 360, 244, 350,
+    550, 550, 550, 550, 550, 550, 550, 550,
+    550, 550, 258, 258, 550, 550, 550, 444,
+    836, 638, 617, 591, 664, 591, 567, 679,
+    723, 314, 436, 661, 547, 800, 711, 674,
+    583, 674, 622, 549, 599, 674, 605, 889,
+    605, 583, 576, 281, 351, 281, 550, 523,
+    600, 544, 516, 428, 543, 445, 301, 472,
+    551, 300, 270, 530, 281, 843, 568, 496,
+    533, 518, 437, 370, 355, 567, 453, 697,
+    570, 453, 453, 299, 312, 299, 550, 424,
+};
+
 pub fn measureChar(c: u8, font_size: f32, is_bold: bool, is_mono: bool) f32 {
-    return measureCharEx(c, font_size, is_bold, is_mono, false);
+    return measureCharEx(c, font_size, is_bold, false, is_mono, false);
 }
 
-pub fn measureCharEx(c: u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool) f32 {
+pub fn measureCharEx(c: u8, font_size: f32, is_bold: bool, is_italic: bool, is_mono: bool, is_heading: bool) f32 {
     if (is_mono) return font_size * 0.60;
     const idx = if (c < 128) c else 32;
     if (is_heading) {
         return @as(f32, @floatFromInt(HEADING_FONT_WIDTHS[idx])) * font_size / 1000.0;
     }
-    const width_table = if (is_bold) SERIF_FONT_BOLD_WIDTHS else SERIF_FONT_WIDTHS;
+    const width_table = if (is_bold)
+        &SERIF_FONT_BOLD_WIDTHS
+    else if (is_italic)
+        &SERIF_FONT_ITALIC_WIDTHS
+    else
+        &SERIF_FONT_WIDTHS;
     return @as(f32, @floatFromInt(width_table[idx])) * font_size / 1000.0;
 }
 
 pub fn measureText(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool) f32 {
-    return measureTextEx(text, font_size, is_bold, is_mono, false);
+    return measureTextEx(text, font_size, is_bold, false, is_mono, false);
 }
 
-pub fn measureTextEx(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool) f32 {
+pub fn measureTextEx(text: []const u8, font_size: f32, is_bold: bool, is_italic: bool, is_mono: bool, is_heading: bool) f32 {
     if (is_mono) return @as(f32, @floatFromInt(text.len)) * font_size * 0.60;
     var total: f32 = 0;
     const width_table = if (is_heading)
         &HEADING_FONT_WIDTHS
     else if (is_bold)
         &SERIF_FONT_BOLD_WIDTHS
+    else if (is_italic)
+        &SERIF_FONT_ITALIC_WIDTHS
     else
         &SERIF_FONT_WIDTHS;
     for (text) |c| {
@@ -222,10 +249,11 @@ pub fn layoutWrappedSpans(
 
         const is_mono = span.style.code;
         const is_bold = span.style.bold;
+        const is_italic = span.style.italic;
         const is_heading = span.style.heading;
         const span_color = if (span.style.link) accent_color else default_color;
         const span_text = span.text;
-        const space_w = measureCharEx(' ', font_size, false, false, is_heading);
+        const space_w = measureCharEx(' ', font_size, false, false, false, is_heading);
 
         var i: usize = 0;
         while (i < span_text.len) {
@@ -240,7 +268,7 @@ pub fn layoutWrappedSpans(
             const w_start = i;
             while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
             const word = span_text[w_start..i];
-            const word_w = measureTextEx(word, font_size, is_bold, is_mono, is_heading);
+            const word_w = measureTextEx(word, font_size, is_bold, is_italic, is_mono, is_heading);
 
             // Wrap to next visual line if exceeding max width
             if (cur_x + word_w > start_x + max_w and cur_x > start_x) {
@@ -912,21 +940,21 @@ test "strict scroll smoothness across enumerations, lists, headings, and mixed b
     }
 }
 
-pub fn getCharIndexAtX(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool, x_offset: f32) usize {
+pub fn getCharIndexAtX(text: []const u8, font_size: f32, is_bold: bool, is_italic: bool, is_mono: bool, is_heading: bool, x_offset: f32) usize {
     if (x_offset <= 0) return 0;
     var acc: f32 = 0;
     for (text, 0..) |c, i| {
-        const w = measureCharEx(c, font_size, is_bold, is_mono, is_heading);
+        const w = measureCharEx(c, font_size, is_bold, is_italic, is_mono, is_heading);
         if (acc + w * 0.5 > x_offset) return i;
         acc += w;
     }
     return text.len;
 }
 
-pub fn getXForCharIndex(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool, char_idx: usize) f32 {
+pub fn getXForCharIndex(text: []const u8, font_size: f32, is_bold: bool, is_italic: bool, is_mono: bool, is_heading: bool, char_idx: usize) f32 {
     if (char_idx == 0) return 0.0;
     const clamped = @min(char_idx, text.len);
-    return measureTextEx(text[0..clamped], font_size, is_bold, is_mono, is_heading);
+    return measureTextEx(text[0..clamped], font_size, is_bold, is_italic, is_mono, is_heading);
 }
 
 pub const Point = struct {
@@ -970,18 +998,18 @@ pub fn extractSelectionText(
             const left_x = @min(top_pt.x, bot_pt.x);
             const right_x = @max(top_pt.x, bot_pt.x);
             if (cmd.rect.x + cmd.rect.w < left_x or cmd.rect.x > right_x) continue;
-            c_start = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, left_x - cmd.rect.x);
-            c_end = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, right_x - cmd.rect.x);
+            c_start = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.italic, cmd.style.code, cmd.style.heading, left_x - cmd.rect.x);
+            c_end = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.italic, cmd.style.code, cmd.style.heading, right_x - cmd.rect.x);
         } else if (is_first_line) {
             const start_x = top_pt.x;
             if (cmd.rect.x + cmd.rect.w < start_x) continue;
-            c_start = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, start_x - cmd.rect.x);
+            c_start = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.italic, cmd.style.code, cmd.style.heading, start_x - cmd.rect.x);
             c_end = cmd.text.len;
         } else if (is_last_line) {
             const end_x = bot_pt.x;
             if (cmd.rect.x > end_x) continue;
             c_start = 0;
-            c_end = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, end_x - cmd.rect.x);
+            c_end = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.italic, cmd.style.code, cmd.style.heading, end_x - cmd.rect.x);
         } else {
             c_start = 0;
             c_end = cmd.text.len;
