@@ -126,8 +126,18 @@ Read supports all major image and vector formats through zero-dependency native 
 ### Modern WebP
 ![WebP Compressed Graphic](assets/images/sample_webp.webp)
 
-### Graphics Interchange Format (GIF)
+
+### Graphics Interchange Format (GIF) — Static Palette
+
 ![GIF Palette Image](assets/images/sample_gif.gif)
+
+### Animated GIF — Rotating Earth (44 frames, public domain)
+
+Animated GIFs are loaded via native ImageIO; the first frame is displayed in static
+reading mode. Source: Wikimedia Commons.
+
+![Rotating Earth — Animated GIF (first frame shown)](assets/images/sample_animated.gif)
+
 
 ### High Efficiency Image Container (HEIC)
 ![Modern HEIC Format](assets/images/sample_heic.heic)
