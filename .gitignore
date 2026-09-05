@@ -5,3 +5,4 @@ artifacts/
 *.o
 *.png
 !screenshots/*.png
+!assets/images/*.png
