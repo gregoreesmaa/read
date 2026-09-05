@@ -31,11 +31,11 @@ All metrics are codified in `src/core/strict_benchmarks.zig` and verified on App
 | Metric | Typical Markdown App (Electron / WebTech) | Standard Native Reader | **Read** (Zig 0.16) | Target Guaranteed |
 | :--- | :--- | :--- | :--- | :--- |
 | **Binary Size** | ~180 MB | ~15 – 35 MB | **< 500 KB** (`ReleaseFast`) | **< 500 KB** |
-| **Document Open Time** | 350 – 1,200 ms | 20 – 60 ms | **≤ 20 µs** (Zero-copy `mmap`) | **≤ 20 µs** |
-| **SIMD Line Scanning** | ~100 ms | 15 – 25 ms | **≤ 450 µs for 50,000 lines** (**≥ 5.0 GB/s**) | **≥ 5.0 GB/s, ≤ 450 µs** |
-| **Viewport Layout Latency** | 8 – 16 ms | 1 – 3 ms | **≤ 12 µs** | **≤ 12 µs** |
-| **Substring Search (50k lines)** | ~50 ms | 5 – 10 ms | **≤ 85 µs** | **≤ 85 µs** |
-| **Deep-Scroll Layout (line 45k+)** | 8 – 16 ms | 1 – 3 ms | **≤ 12 µs** (checkpointed) | **≤ 12 µs** |
+| **Document Open Time** | 350 – 1,200 ms | 20 – 60 ms | **≤ 18 µs** (Zero-copy `mmap`) | **≤ 18 µs** |
+| **SIMD Line Scanning** | ~100 ms | 15 – 25 ms | **≤ 400 µs for 50,000 lines** (**≥ 5.5 GB/s**) | **≥ 5.5 GB/s, ≤ 400 µs** |
+| **Viewport Layout Latency** | 8 – 16 ms | 1 – 3 ms | **≤ 8 µs** | **≤ 8 µs** |
+| **Substring Search (50k lines)** | ~50 ms | 5 – 10 ms | **≤ 50 µs** | **≤ 50 µs** |
+| **Deep-Scroll Layout (line 45k+)** | 8 – 16 ms | 1 – 3 ms | **≤ 11 µs** (checkpointed) | **≤ 11 µs** |
 | **Line Index Footprint** | — | — | **8-byte packed `Line` struct** | **8 bytes** |
 | **Hot Path Heap Allocations** | Millions | Thousands | **0** (Zero heap allocations) | **0** |
 | **Active Memory (MaxRSS)** | 150 – 400 MB | 30 – 80 MB | **< 6 MB** | Minimal OS page footprint |

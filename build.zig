@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) void {
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
+    const test_hooks = b.option(
+        bool,
+        "test-hooks",
+        "Include headless test hooks (--damage/--select/--dump-records) for damage parity tests (adds bytes; ship builds leave it off)",
+    ) orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "test_hooks", test_hooks);
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -80,14 +87,26 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "read", .module = mod },
+                .{ .name = "build_options", .module = build_options.createModule() },
             },
         }),
     });
 
     if (target.result.os.tag.isDarwin()) {
+        // Headless test hooks (__damage/--select/--dump-records backing) only
+        // exist in -Dtest-hooks=true builds; ship builds skip them for size.
+        // -Os for the platform glue TU only: its cost is dominated by
+        // CoreText/CG/UIColor calls, while the microsecond hot paths (scan,
+        // layout, viewport) live in the Zig TU pinned by strict benchmarks.
+        // Keeps the ship binary under the 500 KiB budget (page-alignment
+        // padding makes even small __TEXT growth disproportionate).
+        const cflags: []const []const u8 = if (test_hooks)
+            &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1"}
+        else
+            &.{"-fobjc-arc", "-Os"};
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = &.{"-fobjc-arc"},
+            .flags = cflags,
         });
         exe.root_module.linkFramework("Cocoa", .{});
         exe.root_module.linkFramework("CoreText", .{});

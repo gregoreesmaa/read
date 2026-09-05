@@ -108,6 +108,14 @@ static NSRect selection_bounds_expanded(float pad) {
     float x2 = fmaxf(g_select_start.x, g_select_end.x);
     float y1 = fminf(g_select_start.y, g_select_end.y) - g_scroll_y;
     float y2 = fmaxf(g_select_start.y, g_select_end.y) - g_scroll_y;
+    if (y2 - y1 > 32.0f) {
+        // Multi-line: intermediate rows highlight edge-to-edge, far outside
+        // the endpoint x-range. Invalidate the full view width.
+        // Regression (2026-09): endpoint bbox left those rows stale.
+        NSView* v = damage_target_view();
+        float vw = v ? (float)[v bounds].size.width : 1200.0f;
+        return NSMakeRect(-pad, y1 - pad, vw + 2.0f * pad, (y2 - y1) + 2.0f * pad);
+    }
     return NSMakeRect(x1 - pad, y1 - pad, (x2 - x1) + 2.0f * pad, (y2 - y1) + 2.0f * pad);
 }
 
@@ -223,6 +231,13 @@ static CGContextRef g_atlas_ctx = NULL;
 // mutations of the pixel buffer are visible through the same image object).
 static CGImageRef g_atlas_img = NULL;
 static int g_atlas_x = 0, g_atlas_y = 0, g_atlas_shelf_h = 0;
+// Destination backing scale for the current draw (2 on Retina, 1 headless or
+// 1x displays). The atlas is rasterized at 2x, so slice blits are only
+// pixel-exact when the destination scale matches; on 1x the cached CTLine
+// draws directly (shaping still cached — the dominant win is kept).
+// Regression (2026-09): unconditional blits downscaled 2x art into 1x
+// destinations, softening edges vs the previous direct renderer.
+static float g_output_scale = 2.0f;
 static uint64_t g_shape_hits = 0, g_shape_misses = 0, g_atlas_flushes = 0;
 
 static uint64_t shape_key(const char* text, int len, float font_size,
@@ -306,6 +321,22 @@ static void atlas_ensure(void) {
 
 static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str);
 
+// One shared attributed-line constructor for the three CTLine creation sites
+// (shape miss, atlas rasterize, legacy draw): a single noinline copy keeps
+// __TEXT small, and every line shares identical attribute construction.
+static __attribute__((noinline)) CTLineRef ctline_with_font(NSString* str, NSFont* nsFont, CGColorRef fg) {
+    if (!str || !nsFont) return NULL;
+    NSDictionary* attrs = fg ? @{
+        (id)kCTFontAttributeName: nsFont,
+        (id)kCTForegroundColorAttributeName: (__bridge id)fg,
+    } : @{
+        (id)kCTFontAttributeName: nsFont,
+    };
+    NSAttributedString* as = [[NSAttributedString alloc] initWithString:str attributes:attrs];
+    if (!as) return NULL;
+    return CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+}
+
 // Shape (or hit) a run. On hit returns the entry with zero shaping work.
 // On miss shapes exactly once, retains the CTLine, and rasterizes into the
 // atlas when `rasterize` is set (measure-only callers pass 0 and the rect
@@ -334,9 +365,7 @@ static ShapedEntry* shape_run(const char* text, int len, float font_size,
     NSString* str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
     if (!str) return NULL;
     NSFont* nsFont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
-    NSDictionary* attrs = @{(id)kCTFontAttributeName: nsFont};
-    NSAttributedString* as = [[NSAttributedString alloc] initWithString:str attributes:attrs];
-    CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+    CTLineRef line = ctline_with_font(str, nsFont, NULL);
     if (!line) return NULL;
 
     CGFloat ascent, descent, leading;
@@ -379,12 +408,7 @@ static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str)
     }
 
     // White coverage mask, 2x supersampled for Retina-crisp blits.
-    NSDictionary* white = @{
-        (id)kCTFontAttributeName: nsFont,
-        (id)kCTForegroundColorAttributeName: (__bridge id)[NSColor whiteColor].CGColor,
-    };
-    NSAttributedString* was = [[NSAttributedString alloc] initWithString:str attributes:white];
-    CTLineRef wline = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)was);
+    CTLineRef wline = ctline_with_font(str, nsFont, [NSColor whiteColor].CGColor);
     if (!wline) return;
 
     // NOTE: stored vertically mirrored: the per-frame ClipToMask blit in the
@@ -514,6 +538,93 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     [self addTrackingArea:area];
 }
 
+// Flowing per-line selection highlight over the rebuilt text records.
+// Shared by live drawRect and headless screenshots so --select captures
+// exercise the real painter (regression: highlight used to render as a
+// bare start-end rectangle when records went stale).
+static __attribute__((noinline)) void paint_selection_highlight(CGContextRef ctx) {
+// Draw flowing standard text selection highlight
+if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
+    CGContextSetRGBFillColor(ctx, 0.22f, 0.58f, 0.98f, 0.32f);
+
+    if (g_select_all) {
+        for (int q = 0; q < g_text_record_count; q++) {
+            QuadTextRecord* rec = &g_text_records[q];
+            float view_y = rec->doc_y - g_scroll_y;
+            CGContextFillRect(ctx, CGRectMake(rec->x, view_y, rec->w, rec->h));
+        }
+    } else {
+        NSPoint pt1 = g_select_start;
+        NSPoint pt2 = g_select_end;
+        BOOL is_downward = (pt1.y < pt2.y || (pt1.y == pt2.y && pt1.x <= pt2.x));
+        NSPoint top_pt = is_downward ? pt1 : pt2;
+        NSPoint bot_pt = is_downward ? pt2 : pt1;
+
+        float min_y = top_pt.y;
+        float max_y = bot_pt.y;
+
+        int last_selected_idx = -1;
+
+        for (int q = 0; q < g_text_record_count; q++) {
+            QuadTextRecord* rec = &g_text_records[q];
+            float r_top = rec->doc_y;
+            float r_bot = rec->doc_y + rec->h;
+            float view_y = rec->doc_y - g_scroll_y;
+
+            if (r_bot < min_y - 4.0f || r_top > max_y + 4.0f) {
+                continue;
+            }
+
+            int c_start = 0;
+            int c_end = rec->len;
+
+            BOOL is_first_line = (min_y >= r_top && min_y <= r_bot);
+            BOOL is_last_line = (max_y >= r_top && max_y <= r_bot);
+
+            if (is_first_line && is_last_line) {
+                float left_x = fminf(top_pt.x, bot_pt.x);
+                float right_x = fmaxf(top_pt.x, bot_pt.x);
+                if (rec->x + rec->w < left_x || rec->x > right_x) continue;
+                c_start = get_char_index_at_x(rec, left_x - rec->x);
+                c_end = get_char_index_at_x(rec, right_x - rec->x);
+            } else if (is_first_line) {
+                float start_x = top_pt.x;
+                if (rec->x + rec->w < start_x) continue;
+                c_start = get_char_index_at_x(rec, start_x - rec->x);
+                c_end = rec->len;
+            } else if (is_last_line) {
+                float end_x = bot_pt.x;
+                if (rec->x > end_x) continue;
+                c_start = 0;
+                c_end = get_char_index_at_x(rec, end_x - rec->x);
+            } else {
+                c_start = 0;
+                c_end = rec->len;
+            }
+
+            if (c_end > c_start) {
+                float x1 = rec->x + get_x_for_char_index(rec, c_start);
+                float x2 = rec->x + get_x_for_char_index(rec, c_end);
+                CGContextFillRect(ctx, CGRectMake(x1, view_y, x2 - x1, rec->h));
+
+                // Highlight space between adjacent selected words on the same line
+                if (last_selected_idx >= 0 && last_selected_idx == q - 1) {
+                    QuadTextRecord* prev = &g_text_records[last_selected_idx];
+                    if (fabs(prev->doc_y - rec->doc_y) < 6.0f) {
+                        float gap_x = prev->x + prev->w;
+                        float gap_w = rec->x - gap_x;
+                        if (gap_w > 0) {
+                            CGContextFillRect(ctx, CGRectMake(gap_x, view_y, gap_w, rec->h));
+                        }
+                    }
+                }
+                last_selected_idx = q;
+            }
+        }
+    }
+}
+}
+
 - (void)drawRect:(NSRect)dirtyRect {
     // Record the compositor's dirty rect so the Zig draw callback can cull
     // off-region commands. Never ignored: partial damage skips pixels.
@@ -527,92 +638,15 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     g_code_block_count = 0;
     g_scrollable_block_count = 0;
     g_current_cg_context = ctx;
+    NSScreen* draw_screen = [self.window screen];
+    g_output_scale = draw_screen ? (float)[draw_screen backingScaleFactor] : 1.0f;
+    if (g_output_scale < 1.0f) g_output_scale = 1.0f;
 
     if (g_callbacks.on_draw) {
         g_callbacks.on_draw((int)self.bounds.size.width, (int)self.bounds.size.height);
     }
 
-    // Draw flowing standard text selection highlight
-    if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
-        CGContextSetRGBFillColor(ctx, 0.22f, 0.58f, 0.98f, 0.32f);
-
-        if (g_select_all) {
-            for (int q = 0; q < g_text_record_count; q++) {
-                QuadTextRecord* rec = &g_text_records[q];
-                float view_y = rec->doc_y - g_scroll_y;
-                CGContextFillRect(ctx, CGRectMake(rec->x, view_y, rec->w, rec->h));
-            }
-        } else {
-            NSPoint pt1 = g_select_start;
-            NSPoint pt2 = g_select_end;
-            BOOL is_downward = (pt1.y < pt2.y || (pt1.y == pt2.y && pt1.x <= pt2.x));
-            NSPoint top_pt = is_downward ? pt1 : pt2;
-            NSPoint bot_pt = is_downward ? pt2 : pt1;
-
-            float min_y = top_pt.y;
-            float max_y = bot_pt.y;
-            BOOL is_single_line = (fabs(max_y - min_y) < 18.0f);
-
-            int last_selected_idx = -1;
-
-            for (int q = 0; q < g_text_record_count; q++) {
-                QuadTextRecord* rec = &g_text_records[q];
-                float r_top = rec->doc_y;
-                float r_bot = rec->doc_y + rec->h;
-                float view_y = rec->doc_y - g_scroll_y;
-
-                if (r_bot < min_y - 4.0f || r_top > max_y + 4.0f) {
-                    continue;
-                }
-
-                int c_start = 0;
-                int c_end = rec->len;
-
-                BOOL is_first_line = (min_y >= r_top && min_y <= r_bot);
-                BOOL is_last_line = (max_y >= r_top && max_y <= r_bot);
-
-                if (is_first_line && is_last_line) {
-                    float left_x = fminf(top_pt.x, bot_pt.x);
-                    float right_x = fmaxf(top_pt.x, bot_pt.x);
-                    if (rec->x + rec->w < left_x || rec->x > right_x) continue;
-                    c_start = get_char_index_at_x(rec, left_x - rec->x);
-                    c_end = get_char_index_at_x(rec, right_x - rec->x);
-                } else if (is_first_line) {
-                    float start_x = top_pt.x;
-                    if (rec->x + rec->w < start_x) continue;
-                    c_start = get_char_index_at_x(rec, start_x - rec->x);
-                    c_end = rec->len;
-                } else if (is_last_line) {
-                    float end_x = bot_pt.x;
-                    if (rec->x > end_x) continue;
-                    c_start = 0;
-                    c_end = get_char_index_at_x(rec, end_x - rec->x);
-                } else {
-                    c_start = 0;
-                    c_end = rec->len;
-                }
-
-                if (c_end > c_start) {
-                    float x1 = rec->x + get_x_for_char_index(rec, c_start);
-                    float x2 = rec->x + get_x_for_char_index(rec, c_end);
-                    CGContextFillRect(ctx, CGRectMake(x1, view_y, x2 - x1, rec->h));
-
-                    // Highlight space between adjacent selected words on the same line
-                    if (last_selected_idx >= 0 && last_selected_idx == q - 1) {
-                        QuadTextRecord* prev = &g_text_records[last_selected_idx];
-                        if (fabs(prev->doc_y - rec->doc_y) < 6.0f) {
-                            float gap_x = prev->x + prev->w;
-                            float gap_w = rec->x - gap_x;
-                            if (gap_w > 0) {
-                                CGContextFillRect(ctx, CGRectMake(gap_x, view_y, gap_w, rec->h));
-                            }
-                        }
-                    }
-                    last_selected_idx = q;
-                }
-            }
-        }
-    }
+    paint_selection_highlight(ctx);
 
     // Draw visible-on-hover Copy Button for Code Blocks
     double now = [NSDate timeIntervalSinceReferenceDate];
@@ -810,15 +844,14 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 
 - (void)mouseDragged:(NSEvent *)event {
     if (g_selection_mode <= 1) {
+        // Damage: the selection spans start->end across full line widths, not
+        // just the cursor path, so invalidate old + new full bounds.
+        // Regression: a cursor strip left newly selected lines stale.
+        // Contract pinned by dragSelectionDamage tests in damage.zig.
+        NSRect old_sel = selection_bounds_expanded(24.0f);
         NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
-        NSPoint prev_end = g_select_end;
         g_select_end = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
-        // Damage: only the strip between previous and new cursor-end changed.
-        float y1 = fminf(prev_end.y, g_select_end.y) - g_scroll_y;
-        float y2 = fmaxf(prev_end.y, g_select_end.y) - g_scroll_y;
-        float x1 = fminf(prev_end.x, g_select_end.x);
-        float x2 = fmaxf(prev_end.x, g_select_end.x);
-        invalidate_rect(NSMakeRect(x1 - 24.0f, y1 - 24.0f, (x2 - x1) + 48.0f, (y2 - y1) + 48.0f));
+        invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
     }
 }
 
@@ -1210,9 +1243,37 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
     invalidate_rect(NSMakeRect(x, y, w, h));
 }
 
+#ifdef TEST_HOOKS
+// Headless test hooks (damage/selection parity tests): inject a synthetic
+// pending-damage rect and read back the rebuilt text-record count.
+static BOOL g_test_damage_valid = NO;
+static NSRect g_test_damage; // zero-initialized == NSZeroRect
+void platform_set_test_damage(float x, float y, float w, float h, int valid) {
+    g_test_damage = NSMakeRect(x, y, w, h);
+    g_test_damage_valid = valid ? YES : NO;
+}
+int platform_text_record_count(void) { return g_text_record_count; }
+void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
+    g_select_start = NSMakePoint(x1, y1);
+    g_select_end = NSMakePoint(x2, y2);
+    g_has_selection = enable ? YES : NO;
+    g_selection_mode = enable ? 1 : 0;
+    g_select_all = NO;
+}
+#endif
+
 // Returns the dirty rect AppKit reported for the in-progress draw, for
 // compositor culling in the Zig draw callback. 0 = no pending damage.
 int platform_get_pending_damage(float* x, float* y, float* w, float* h) {
+#ifdef TEST_HOOKS
+    if (g_test_damage_valid) {
+        if (x) *x = g_test_damage.origin.x;
+        if (y) *y = g_test_damage.origin.y;
+        if (w) *w = g_test_damage.size.width;
+        if (h) *h = g_test_damage.size.height;
+        return 1;
+    }
+#endif
     if (!g_pending_dirty_valid) return 0;
     if (x) *x = g_pending_dirty.origin.x;
     if (y) *y = g_pending_dirty.origin.y;
@@ -1275,7 +1336,9 @@ void platform_end_clip(void) {
 }
 
 // Record quad for mouse text selection & copying (anchored to document Y).
-static void record_text_quad(const char* text, int len, float x, float y, float w, float h,
+// noinline: called from 4 sites (register/draw/legacy); one shared copy keeps
+// __TEXT off the next page boundary (binary budget < 500 KiB).
+static __attribute__((noinline)) void record_text_quad(const char* text, int len, float x, float y, float w, float h,
                              float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
                              const char* link_url, int link_url_len) {
     if (g_text_record_count >= MAX_QUAD_RECORDS) return;
@@ -1303,20 +1366,78 @@ static void record_text_quad(const char* text, int len, float x, float y, float 
     }
 }
 
+// Record-only registration for culled text runs: the selection/hover/link
+// model (g_text_records) must be rebuilt on EVERY draw, including partial
+// damage draws that skip pixels. Uses the same shaping cache as the draw
+// path (measure-only, no rasterize) so records match drawn runs exactly.
+// Regression guard: src/layout/damage.zig documents the invariant.
+void platform_register_text_run(const char* text, int len, float x, float y, float w, float h, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, const char* link_url, int link_url_len) {
+    if (!text || len <= 0) return;
+    // Measure-only: a miss shapes exactly once (cached thereafter), so the
+    // recorded width matches the draw path's shaped width in all cases.
+    ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading, 0);
+    if (e && e->line) {
+        record_text_quad(text, len, x, y, e->w, e->h, font_size,
+                         is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+    } else {
+        record_text_quad(text, len, x, y, w, h, font_size,
+                         is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+    }
+}
+
+// Legacy direct text draw with a fresh explicit-color line (pixel-identical
+// to the pre-atlas renderer). Records the run only when do_record is set, so
+// callers that already recorded with shaped dims never double-record.
+static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, int do_record, const char* link_url, int link_url_len) {
+    NSString* str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
+    if (!str) return;
+    NSFont* nsFont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGFloat components[4] = { r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f };
+    CGColorRef fontColor = CGColorCreate(colorSpace, components);
+    CTLineRef ctLine = ctline_with_font(str, nsFont, fontColor);
+    if (ctLine && do_record) {
+        // Uncacheable run: measure for the record. The shaped call site
+        // already recorded exact dims, so it passes do_record=0 and skips
+        // these two CoreText queries on every 1x frame.
+        CGFloat ascent, descent, leading;
+        double measuredWidth = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading);
+        double trailing = CTLineGetTrailingWhitespaceWidth(ctLine);
+        record_text_quad(text, len, x, y, (float)(measuredWidth + trailing), (float)(ascent + descent),
+                         font_size, is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+    }
+    if (ctLine) {
+        CGContextSaveGState(ctx);
+        CGContextTranslateCTM(ctx, x, y + font_size * 0.85f);
+        CGContextScaleCTM(ctx, 1.0f, -1.0f);
+        CGContextSetTextPosition(ctx, 0, 0);
+        CTLineDraw(ctLine, ctx);
+        CGContextRestoreGState(ctx);
+        CFRelease(ctLine);
+    }
+    CGColorRelease(fontColor);
+    CGColorSpaceRelease(colorSpace);
+}
+
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
     if (!g_current_cg_context || len <= 0 || !text) return;
     CGContextRef ctx = g_current_cg_context;
 
-    // Shaping economy: one shape + one rasterize per unique run; every later
-    // frame is a textured quad (atlas mask blit, GPU-composited).
-    ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading, 1);
-    if (e && e->aw != 0) {
+    // Shaping economy: shape once per unique run (cached thereafter). Only
+    // rasterize when this destination will actually blit (2x); on 1x the
+    // legacy path draws directly, so rasterizing would just churn the atlas
+    // toward a pointless flush every frame (observed live: ~96% of draws).
+    ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading,
+                               (g_output_scale > 1.5f) ? 1 : 0);
+    if (e && e->line) {
+        // Record EXACTLY ONCE per call with shaped dims; every branch below
+        // is pixels-only (regression: an earlier fall-through recorded twice).
         record_text_quad(text, len, x, y, e->w, e->h, font_size,
                          is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
-
         // Per-frame render is ONE retained slice blit: no shaping, no copy,
-        // no allocation, no CPU compositing.
-        if (e->slice) {
+        // no allocation, no CPU compositing. Only when the destination scale
+        // matches the 2x raster, otherwise the downsample softens edges.
+        if (e->aw != 0 && e->slice && g_output_scale > 1.5f) {
             // Destination: same geometry as the old CTLineDraw baseline
             // (y + size*0.85, ascent above) so layout is pixel-identical.
             float dest_y = y + font_size * 0.85f - e->ascent;
@@ -1328,57 +1449,20 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             CGContextRestoreGState(ctx);
             return; // textured quad done: no shaping, no CPU compositing
         }
-        // Atlas image unavailable: fall through to direct cached-line draw.
-        if (e->line) {
-            CGContextSaveGState(ctx);
-            CGContextTranslateCTM(ctx, x, y + font_size * 0.85f);
-            CGContextScaleCTM(ctx, 1.0f, -1.0f);
-            CGContextSetTextPosition(ctx, 0, 0);
-            CTLineDraw(e->line, ctx);
-            CGContextRestoreGState(ctx);
-            return;
-        }
+        // 1x destination (or missing slice): legacy pixels, no re-record.
+        // NOTE: drawing the cached font-only line via the context fill color
+        // was measured rendering every glyph dim (0 bright pixels over a full
+        // document vs ~27k on the explicit-color path), so that shortcut
+        // stays removed until the cause is understood. The shaping cache
+        // still serves measure/hit-test paths with zero re-shape cost.
+        draw_text_legacy(ctx, text, len, x, y, font_size, is_bold, is_italic, is_mono, is_heading,
+                         r, g, b, a, 0, link_url, link_url_len);
+        return;
     }
 
-    // Uncacheable run (>510 bytes): legacy direct path, unchanged geometry.
-    NSString* str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
-    if (!str) return;
-
-    NSFont* nsFont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
-    CTFontRef font = (__bridge CTFontRef)nsFont;
-
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGFloat components[4] = { r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f };
-    CGColorRef fontColor = CGColorCreate(colorSpace, components);
-
-    NSDictionary* attributes = @{
-        (id)kCTFontAttributeName: (__bridge id)font,
-        (id)kCTForegroundColorAttributeName: (__bridge id)fontColor,
-    };
-
-    NSAttributedString* attrStr = [[NSAttributedString alloc] initWithString:str attributes:attributes];
-    CTLineRef ctLine = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)attrStr);
-
-    CGFloat ascent, descent, leading;
-    double measuredWidth = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading);
-    double trailing = CTLineGetTrailingWhitespaceWidth(ctLine);
-
-    record_text_quad(text, len, x, y, (float)(measuredWidth + trailing), (float)(ascent + descent),
-                     font_size, is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
-
-    CGContextSaveGState(ctx);
-
-    CGContextTranslateCTM(ctx, x, y + font_size * 0.85f);
-    CGContextScaleCTM(ctx, 1.0f, -1.0f);
-
-    CGContextSetTextPosition(ctx, 0, 0);
-    CTLineDraw(ctLine, ctx);
-
-    CGContextRestoreGState(ctx);
-
-    CFRelease(ctLine);
-    CGColorRelease(fontColor);
-    CGColorSpaceRelease(colorSpace);
+    // Uncacheable run (>510 bytes): legacy pixels + record.
+    draw_text_legacy(ctx, text, len, x, y, font_size, is_bold, is_italic, is_mono, is_heading,
+                     r, g, b, a, 1, link_url, link_url_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,8 +1791,14 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     g_current_cg_context = ctx;
     // Headless render has no AppKit dirty rect: full redraw.
     g_pending_dirty_valid = NO;
+    // Headless bitmap contexts are 1x: cached lines draw directly so
+    // screenshots match the pre-atlas renderer pixel-for-pixel.
+    g_output_scale = 1.0f;
 
     render_fn(width, height);
+
+    // Headless selection captures paint the same highlight as live draws.
+    if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
 
     g_current_cg_context = NULL;
 

@@ -195,6 +195,43 @@ pub const DamageTracker = struct {
     }
 };
 
+/// Selection bounds in VIEW coordinates, expanded by pad.
+/// Mirrors `selection_bounds_expanded` in macos.m: endpoints are stored in
+/// document space, so y is shifted by scroll_y. The platform
+/// drag/down/up handlers must invalidate this FULL box — never a
+/// cursor-path strip: the flowing highlight spans full line widths between
+/// the endpoints, far outside any strip around the cursor.
+///
+/// Multi-line selections (y-span over one row) expand to the full view
+/// width: intermediate rows highlight edge-to-edge, outside the endpoint
+/// x-range entirely. Single-line selections keep a tight box.
+///
+/// Companion invariant (enforced in main.zig, not here): the text-record
+/// model backing selection/hover/link painting is rebuilt on EVERY draw,
+/// including partial-damage draws that skip pixels (via
+/// `platform_register_text_run`). Culling pixels must never starve state.
+pub fn selectionBoundsBox(sx: f32, sy_doc: f32, ex: f32, ey_doc: f32, scroll_y: f32, pad: f32, full_w: f32) DirtyRect {
+    const y1 = @min(sy_doc, ey_doc) - scroll_y - pad;
+    const y2 = @max(sy_doc, ey_doc) - scroll_y + pad;
+    if (@max(sy_doc, ey_doc) - @min(sy_doc, ey_doc) > 32.0) {
+        return .{ .x = 0.0 - pad, .y = y1, .w = full_w + 2.0 * pad, .h = y2 - y1 };
+    }
+    const x1 = @min(sx, ex) - pad;
+    const x2 = @max(sx, ex) + pad;
+    return .{ .x = x1, .y = y1, .w = x2 - x1, .h = y2 - y1 };
+}
+
+/// Damage for one drag step: union of the full selection bounds before and
+/// after the cursor-end moves. Mirrors `mouseDragged` in macos.m.
+/// Regression (2026-09): invalidating only the prev-end→new-end cursor strip
+/// left newly selected lines showing stale pixels, because the highlight
+/// covers full line widths the strip never touches.
+pub fn dragSelectionDamage(sx: f32, sy_doc: f32, old_ex: f32, old_ey_doc: f32, new_ex: f32, new_ey_doc: f32, scroll_y: f32, pad: f32, full_w: f32) DirtyRect {
+    const old = selectionBoundsBox(sx, sy_doc, old_ex, old_ey_doc, scroll_y, pad, full_w);
+    const new = selectionBoundsBox(sx, sy_doc, new_ex, new_ey_doc, scroll_y, pad, full_w);
+    return old.united(new);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -389,4 +426,69 @@ test "damage: redraw-region verification against real layout output" {
             else => {},
         }
     }
+}
+
+test "damage: keeps() retains partially overlapped commands (no containment narrowing)" {
+    // Regression (2026-09): narrowing keeps() to full containment dropped
+    // highlight and text pixels on every partial redraw. Intersection of
+    // command rect with damage is the contract — partial overlap MUST draw.
+    const dmg = Damage.partial(.{ .x = 680.0, .y = 100.0, .w = 80.0, .h = 60.0 }, .selection);
+    // Line body mostly outside the damage, touching it at the right edge.
+    try std.testing.expect(dmg.keeps(200.0, 110.0, 500.0, 24.0));
+    // Command fully inside the damage is kept.
+    try std.testing.expect(dmg.keeps(690.0, 110.0, 50.0, 20.0));
+    // Fully disjoint command is still culled (performance preserved).
+    try std.testing.expect(!dmg.keeps(0.0, 500.0, 600.0, 24.0));
+    // Touching at exactly one edge (zero-area overlap) draws nothing.
+    try std.testing.expect(!dmg.keeps(760.0, 100.0, 40.0, 60.0));
+}
+
+test "damage: selection bounds mirror the platform formula" {
+    // selectionBoundsBox must match macos.m selection_bounds_expanded:
+    // doc-space endpoints, y shifted by scroll, expanded by pad.
+    // Single-line selection keeps a tight box.
+    const b = selectionBoundsBox(700.0, 500.0, 100.0, 520.0, 400.0, 24.0, 1200.0);
+    try std.testing.expectEqual(@as(f32, 76.0), b.x);
+    try std.testing.expectEqual(@as(f32, 76.0), b.y);
+    try std.testing.expectEqual(@as(f32, 648.0), b.w);
+    try std.testing.expectEqual(@as(f32, 68.0), b.h);
+    // Multi-line selection expands to the full view width: intermediate
+    // rows highlight edge-to-edge, outside the endpoint x-range.
+    const m = selectionBoundsBox(700.0, 500.0, 100.0, 620.0, 400.0, 24.0, 1200.0);
+    try std.testing.expectEqual(@as(f32, -24.0), m.x);
+    try std.testing.expectEqual(@as(f32, 76.0), m.y);
+    try std.testing.expectEqual(@as(f32, 1248.0), m.w);
+    try std.testing.expectEqual(@as(f32, 168.0), m.h);
+}
+
+test "damage: drag invalidation covers full selection, not the cursor strip" {
+    // Regression (2026-09): mouseDragged invalidated only the
+    // prev-end→new-end cursor strip, leaving newly selected full-width
+    // lines stale. Drag from (650,100) to (120,260): intermediate lines
+    // span x=200..700, far outside any strip around the cursor path.
+    const pad: f32 = 24.0;
+    const scroll_y: f32 = 0.0;
+    const full_w: f32 = 1200.0;
+    const dmg = dragSelectionDamage(650.0, 100.0, 650.0, 130.0, 120.0, 260.0, scroll_y, pad, full_w);
+    // Intermediate full-width line must lie inside the damage.
+    const midline: DirtyRect = .{ .x = 200.0, .y = 160.0, .w = 500.0, .h = 24.0 };
+    try std.testing.expect(DirtyRect.contains(dmg, midline));
+    // Damage is exactly the union of the old and new full selection bounds.
+    const old = selectionBoundsBox(650.0, 100.0, 650.0, 130.0, scroll_y, pad, full_w);
+    const new = selectionBoundsBox(650.0, 100.0, 120.0, 260.0, scroll_y, pad, full_w);
+    const u = old.united(new);
+    try std.testing.expectEqual(u.x, dmg.x);
+    try std.testing.expectEqual(u.y, dmg.y);
+    try std.testing.expectEqual(u.w, dmg.w);
+    try std.testing.expectEqual(u.h, dmg.h);
+}
+
+test "damage: drag reversal still covers released lines" {
+    // Dragging back up must keep the abandoned lines inside the damage so
+    // their highlight is cleared, not left stale.
+    const dmg = dragSelectionDamage(650.0, 100.0, 120.0, 260.0, 650.0, 130.0, 0.0, 24.0, 1200.0);
+    const released: DirtyRect = .{ .x = 200.0, .y = 230.0, .w = 500.0, .h = 24.0 };
+    try std.testing.expect(DirtyRect.contains(dmg, released));
+    const start_line: DirtyRect = .{ .x = 600.0, .y = 100.0, .w = 90.0, .h = 24.0 };
+    try std.testing.expect(DirtyRect.contains(dmg, start_line));
 }

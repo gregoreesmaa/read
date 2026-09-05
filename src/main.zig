@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const mmap = @import("core/mmap.zig");
 const simd = @import("core/simd.zig");
 const parser = @import("core/parser.zig");
@@ -280,7 +281,6 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 );
             },
             .text_run => {
-                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
                 const is_bold: c_int = if (cmd.style.bold) 1 else 0;
                 const is_italic: c_int = if (cmd.style.italic) 1 else 0;
                 const is_mono: c_int = if (cmd.style.code) 1 else 0;
@@ -288,6 +288,28 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
                 const url_ptr = if (cmd.link_target) |t| t.ptr else null;
                 const url_len: c_int = if (cmd.link_target) |t| @intCast(t.len) else 0;
+
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) {
+                    // Pixels culled, but the selection/hover/link record model
+                    // must still be rebuilt (regression: partial draws starved
+                    // it, breaking highlight painting — see damage.zig).
+                    bridge.platform_register_text_run(
+                        cmd.text.ptr,
+                        @intCast(cmd.text.len),
+                        cmd.rect.x,
+                        cmd.rect.y,
+                        cmd.rect.w,
+                        cmd.rect.h,
+                        cmd.font_size,
+                        is_bold,
+                        is_italic,
+                        is_mono,
+                        is_heading,
+                        url_ptr,
+                        url_len,
+                    );
+                    continue;
+                }
 
                 bridge.platform_draw_text(
                     cmd.text.ptr,
@@ -354,6 +376,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var args_it = std.process.Args.Iterator.init(init.args);
     _ = args_it.next(); // skip exe name
     var screenshot_path: ?[*:0]const u8 = null;
+    var dump_records = false;
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--screenshot")) {
@@ -363,6 +386,41 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else if (std.mem.eql(u8, arg, "--scroll")) {
             if (args_it.next()) |sc_str| {
                 g_app.scroll_y = std.fmt.parseFloat(f32, sc_str) catch 0.0;
+            }
+        } else if (std.mem.eql(u8, arg, "--damage")) {
+            // Headless parity-test hook (needs -Dtest-hooks): inject
+            // synthetic pending damage. Compiled out of ship builds.
+            if (build_options.test_hooks) {
+                if (args_it.next()) |dmg_str| {
+                    var it = std.mem.splitScalar(u8, dmg_str, ',');
+                    const dx = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const dy = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const dw = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const dh = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    bridge.platform_set_test_damage(dx, dy, dw, dh, 1);
+                }
+            } else {
+                file_path = arg;
+            }
+        } else if (std.mem.eql(u8, arg, "--dump-records")) {
+            if (build_options.test_hooks) {
+                dump_records = true;
+            } else {
+                file_path = arg;
+            }
+        } else if (std.mem.eql(u8, arg, "--select")) {
+            // Headless selection screenshot: doc-space endpoints x1,y1,x2,y2.
+            if (build_options.test_hooks) {
+                if (args_it.next()) |sel_str| {
+                    var it = std.mem.splitScalar(u8, sel_str, ',');
+                    const x1 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const y1 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const x2 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const y2 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    bridge.platform_set_test_selection(x1, y1, x2, y2, 1);
+                }
+            } else {
+                file_path = arg;
             }
         } else {
             file_path = arg;
@@ -395,6 +453,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});
+            if (build_options.test_hooks and dump_records) {
+                std.debug.print("Text records rebuilt: {d}\n", .{bridge.platform_text_record_count()});
+            }
             std.c.exit(0);
         } else {
             std.debug.print("Failed to generate screenshot (code {d})\n", .{rc});

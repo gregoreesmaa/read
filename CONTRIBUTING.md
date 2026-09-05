@@ -11,11 +11,16 @@ non-negotiables:
    zig build test -Doptimize=ReleaseFast --summary all
    ```
    100% of tests and strict performance benchmarks must pass. The targets in
-   `src/core/strict_benchmarks.zig` (5.0 GB/s scan, 450 µs/50k lines, 20 µs mmap open,
-   12 µs viewport, 12 µs deep-scroll, 0 hot-path allocations, 8-byte `Line`, < 500 KB
+   `src/core/strict_benchmarks.zig` (5.5 GB/s scan, 400 µs/50k lines, 18 µs mmap open,
+   8 µs viewport, 11 µs deep-scroll, 0 hot-path allocations, 8-byte `Line`, < 500 KB
    binary) are **immutable** — if your change misses one, optimize the implementation,
    never loosen the target.
-2. **Regenerate screenshots:**
+2. **Run the damage parity check** (selection/hover record model must be
+   identical under full and partial redraws):
+   ```bash
+   sh scripts/damage_parity.sh
+   ```
+3. **Regenerate screenshots:**
    ```bash
    ./scripts/screenshot_suite.sh screenshots
    ```

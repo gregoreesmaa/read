@@ -20,6 +20,10 @@ int platform_get_pending_damage(float* x, float* y, float* w, float* h);
 void platform_sync_scroll(float scroll_y);
 
 void platform_draw_rect(float x, float y, float w, float h, unsigned char r, unsigned char g, unsigned char b, unsigned char a);
+void platform_register_text_run(const char* text, int len, float x, float y, float w, float h, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, const char* link_url, int link_url_len);
+void platform_set_test_damage(float x, float y, float w, float h, int valid);
+int platform_text_record_count(void);
+void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable);
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len);
 void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h);
 void platform_get_image_size(const char* url, int url_len, float* out_w, float* out_h);
