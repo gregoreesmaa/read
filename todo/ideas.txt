@@ -1,0 +1,28 @@
+Ditch the AST for a SAX-Style Streaming Parser: Do not build a full Abstract Syntax Tree in memory. Instead, make src/core/parser.zig a state machine that emits tokens (e.g., StartBold, Text("hello"), EndBold) directly to the renderer as it reads the mmap buffer. This reduces parsing RAM usage to near zero, as you only store the current token state rather than a document-sized tree structure.  ;
+
+Volatile Memory Release: While mmap.zig maps the file, the OS will keep those pages in the page cache. As the user scrolls past sections of a massive Markdown file, periodically call madvise with MADV_DONTNEED on the bytes far outside the current reading view. This explicitly tells the kernel it can reclaim that RAM immediately, keeping your Resident Set Size (RSS) tiny.  ;
+
+Event-Driven Idling (Zero-Polling): The rendering loop must never spin or redraw if nothing has changed. Rely strictly on OS-level blocking events (e.g., epoll or macOS's kqueue). If the user isn't scrolling, typing, or resizing the window, the application should consume exactly 0.0% CPU.
+
+Avoid Heavy Vectorization (AVX-512): Wide SIMD instructions in src/core/simd.zig (like AVX-512) can trigger severe voltage spikes and force the CPU to draw significantly more wattage, sometimes even halting the core briefly to change power states. Stick to lightweight 128-bit instructions (SSE/NEON) or even simple 64-bit scalar SWAR techniques, which keep the CPU in a lower power state while still offering decent branchless parsing.
+
+Time-Sliced (Amortized) Layout: Instead of blocking the UI thread to calculate layout when the user scrolls into an unparsed area, break the layout engine into a resumable state machine. Allocate a strict time budget (e.g., 2 milliseconds per 16ms frame). The engine processes as many markdown blocks as it can within that budget, yields control back to the UI to render the frame, and resumes on the next tick. This guarantees the UI never drops a frame, even if text rendering is momentarily delayed.
+
+The "Goldilocks" Buffer (Spatial Hysteresis): Pure viewport-only rendering stutters because scrolling immediately hits unparsed territory. Instead, maintain a sliding window: parse and layout the current viewport, plus exactly one screen-height above and below. As the user scrolls down, incrementally parse the new bottom buffer and aggressively free or MADV_DONTNEED the layout data that falls out of the top buffer. This bounds RAM to roughly three screens of data at any time while absorbing sudden scroll spikes.
+
+Heuristic Scrollbar Estimation: To keep the scrollbar smooth without calculating the true layout of a 50,000-word document, decouple the scrollbar from pixel-perfect rendering.
+
+Do a blazing-fast, low-power SIMD scan of the mmap file just to count newline characters (\n).
+
+Multiply the line count by your default font's line-height to get an estimated total document height.
+
+Use this fake height for the scrollbar. As the user scrolls and the time-sliced engine calculates actual pixel heights for viewed blocks, silently update the total height estimate and adjust the scroll thumb.
+
+
+Scroll Anchoring: When lazy-calculating layouts above the current viewport (e.g., the user is scrolling upward), the newly calculated pixel heights will differ from your heuristic estimates. This normally causes the document to jump, breaking smoothness. Implement scroll anchoring: lock the exact pixel position of the top-most visible element in the viewport, and absorb any height deltas by silently shifting the invisible scroll offset above it.
+
+Indexed Block Map for O(1) Random Access: A pure streaming parser struggles if a user drags the scrollbar instantly to the bottom of the document, as it has to read everything in between. During your initial fast newline scan, store an array of u32 file offsets pointing to double-newlines (\n\n). This requires only a few kilobytes of RAM even for a massive book. When the user jumps to 75% of the scrollbar, you instantly binary-search this array to find the nearest block offset and begin your time-sliced parsing exactly from that byte.
+
+Damage Tracking (Dirty Rectangles): Never issue a full-screen redraw unless the window is resized. If a cursor blinks, an animated GIF ticks to the next frame, or a single line of text is typed, calculate the exact bounding box of the change. Submit only that tiny rectangle to the OS compositor to update. This allows the GPU and CPU to remain in their lowest power states for 99% of the screen area.  
+
+
