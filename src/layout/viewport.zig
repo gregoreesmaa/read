@@ -234,6 +234,78 @@ pub const ViewportConfig = struct {
     is_dark_theme: bool = true,
 };
 
+pub const ScrollAxisLock = enum {
+    none,
+    vertical,
+    horizontal,
+};
+
+/// Natural directional scroll lock engine.
+/// Prevents incidental horizontal drift when scrolling vertically,
+/// and prevents vertical jumps when panning horizontally.
+pub const ScrollLockState = struct {
+    axis: ScrollAxisLock = .none,
+    last_timestamp_ms: i64 = 0,
+
+    pub fn reset(self: *ScrollLockState) void {
+        self.axis = .none;
+    }
+
+    pub fn processScroll(
+        self: *ScrollLockState,
+        delta_x: f32,
+        delta_y: f32,
+        hovered_block_id: c_int,
+        now_ms: i64,
+    ) struct { dx: f32, dy: f32 } {
+        if (delta_x == 0.0 and delta_y == 0.0) {
+            self.axis = .none;
+            return .{ .dx = 0.0, .dy = 0.0 };
+        }
+
+        if (now_ms - self.last_timestamp_ms > 150) {
+            self.axis = .none;
+        }
+        self.last_timestamp_ms = now_ms;
+
+        var eff_dx = delta_x;
+        var eff_dy = delta_y;
+
+        const abs_x = @abs(delta_x);
+        const abs_y = @abs(delta_y);
+
+        if (hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
+            // Intentional strong redirection between axes
+            if (self.axis == .vertical and abs_x > 2.5 * abs_y and abs_x > 8.0) {
+                self.axis = .horizontal;
+            } else if (self.axis == .horizontal and abs_y > 2.5 * abs_x and abs_y > 8.0) {
+                self.axis = .vertical;
+            }
+
+            // Lock acquisition on gesture start
+            if (self.axis == .none) {
+                if (abs_y >= abs_x and abs_y > 0.5) {
+                    self.axis = .vertical;
+                } else if (abs_x > abs_y and abs_x > 0.5) {
+                    self.axis = .horizontal;
+                }
+            }
+
+            // Apply active axis lock: cancel the orthogonal direction
+            if (self.axis == .vertical) {
+                eff_dx = 0.0;
+            } else if (self.axis == .horizontal) {
+                eff_dy = 0.0;
+            }
+        } else {
+            eff_dx = 0.0;
+            self.axis = .vertical;
+        }
+
+        return .{ .dx = eff_dx, .dy = eff_dy };
+    }
+};
+
 /// Renders a series of inline spans with automatic word wrapping and exact typography.
 pub fn layoutWrappedSpans(
     spans: []const parser.InlineSpan,
@@ -252,7 +324,7 @@ pub fn layoutWrappedSpans(
     var cur_y = base_y;
 
     for (spans) |span| {
-        if (cmd_count.* >= commands_out.len - 4) break;
+        if (commands_out.len >= 4 and cmd_count.* >= commands_out.len - 4) break;
 
         const is_mono = span.style.code;
         const is_bold = span.style.bold;
@@ -1019,6 +1091,308 @@ pub fn layoutViewport(
     }
 
     return cmd_count;
+}
+
+/// Computes the accurate total vertical height of the document based on font metrics,
+/// margins, code blocks, tables, and word-wrapped content lines.
+/// Zero heap allocations: works purely with stack buffers and font metrics tables.
+pub fn computeDocumentHeight(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    config: ViewportConfig,
+) f32 {
+    if (lines.len == 0) return 0.0;
+
+    const content_width = if (config.window_width > config.content_max_width)
+        config.content_max_width
+    else
+        @max(config.window_width - 64.0, 100.0);
+
+    const content_x = if (config.window_width > config.content_max_width)
+        (config.window_width - config.content_max_width) * 0.5
+    else
+        32.0;
+
+    var cur_y: f32 = 50.0;
+    var span_buf: [32]parser.InlineSpan = undefined;
+    var i: usize = 0;
+    var dummy_cmd_count: usize = 0;
+
+    while (i < lines.len) : (i += 1) {
+        const line_info = lines[i];
+        const line_bytes = bytes[line_info.offset..][0..line_info.len];
+
+        // 1. Code blocks
+        if (line_info.block_type == .code_fence_start) {
+            var code_line_count: usize = 0;
+            var scan_i = i + 1;
+            while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
+                code_line_count += 1;
+            }
+            const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0;
+            cur_y += code_block_h + 16.0;
+            i = scan_i;
+            continue;
+        }
+
+        if (line_info.block_type == .code_fence_end) {
+            continue;
+        }
+
+        // 2. Tables
+        if (line_info.block_type == .table_row) {
+            var table_rows_count: usize = 0;
+            var scan_i = i;
+            while (scan_i < lines.len and lines[scan_i].block_type == .table_row) : (scan_i += 1) {
+                table_rows_count += 1;
+            }
+            const row_h = config.line_height * 1.3;
+            const table_h = @as(f32, @floatFromInt(table_rows_count)) * row_h;
+            cur_y += table_h + 16.0;
+            i = scan_i - 1;
+            continue;
+        }
+
+        // 3. Headings (H1 - H6)
+        if (@intFromEnum(line_info.block_type) >= @intFromEnum(simd.BlockType.heading1) and
+            @intFromEnum(line_info.block_type) <= @intFromEnum(simd.BlockType.heading6))
+        {
+            const level = @intFromEnum(line_info.block_type);
+            const scale: f32 = switch (level) {
+                1 => 2.1,
+                2 => 1.6,
+                3 => 1.3,
+                4 => 1.15,
+                else => 1.05,
+            };
+            const font_size = config.base_font_size * scale;
+            const heading_line_h = font_size * 1.3;
+            const margin_top = font_size * 2.5;
+            const margin_bottom = font_size * 0.5;
+
+            var h_offset: usize = 0;
+            while (h_offset < line_bytes.len and line_bytes[h_offset] == '#') : (h_offset += 1) {}
+            while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
+
+            cur_y += margin_top;
+
+            const h_text = line_bytes[h_offset..];
+            const span_count = parser.parseInlines(h_text, &span_buf);
+            for (span_buf[0..span_count]) |*s| {
+                s.style.bold = true;
+                s.style.heading = true;
+            }
+
+            const end_y = layoutWrappedSpans(
+                span_buf[0..span_count],
+                content_x,
+                content_width,
+                cur_y,
+                font_size,
+                heading_line_h,
+                Color.transparent,
+                Color.transparent,
+                std.math.inf(f32),
+                &.{},
+                &dummy_cmd_count,
+            );
+
+            cur_y = end_y + margin_bottom;
+            continue;
+        }
+
+        // 4. Horizontal Rule
+        if (line_info.block_type == .hr) {
+            cur_y += 24.0;
+            continue;
+        }
+
+        // 5. Blank Line
+        if (line_info.block_type == .blank) {
+            cur_y += config.line_height * 0.75;
+            continue;
+        }
+
+        // 6. Blockquote
+        if (line_info.block_type == .quote) {
+            var text_slice = line_bytes;
+            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
+            var quote_depth: usize = 0;
+            while (text_slice.len > 0 and text_slice[0] == '>') {
+                quote_depth += 1;
+                text_slice = text_slice[1..];
+                while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
+            }
+
+            const quote_margin = @as(f32, @floatFromInt(quote_depth)) * 16.0;
+            const spans_n = parser.parseInlines(text_slice, &span_buf);
+            cur_y = layoutWrappedSpans(
+                span_buf[0..spans_n],
+                content_x + quote_margin,
+                content_width - quote_margin,
+                cur_y,
+                config.base_font_size,
+                config.line_height,
+                Color.transparent,
+                Color.transparent,
+                std.math.inf(f32),
+                &.{},
+                &dummy_cmd_count,
+            );
+            continue;
+        }
+
+        // 7. Task List
+        if (line_info.block_type == .task_list) {
+            var text_slice = line_bytes;
+            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
+            const text_start = if (text_slice.len >= 5) 5 else text_slice.len;
+            const item_text = if (text_start < text_slice.len and text_slice[text_start] == ' ')
+                text_slice[text_start + 1 ..]
+            else
+                text_slice[text_start..];
+
+            const spans_n = parser.parseInlines(item_text, &span_buf);
+            cur_y = layoutWrappedSpans(
+                span_buf[0..spans_n],
+                content_x + 28.0,
+                content_width - 28.0,
+                cur_y,
+                config.base_font_size,
+                config.line_height,
+                Color.transparent,
+                Color.transparent,
+                std.math.inf(f32),
+                &.{},
+                &dummy_cmd_count,
+            );
+            continue;
+        }
+
+        // 8. Lists (Bullet & Ordered)
+        if (line_info.block_type == .bullet_list or line_info.block_type == .ordered_list) {
+            var text_slice = line_bytes;
+            var indent_level: f32 = @floatFromInt(line_info.indent);
+            if (indent_level > 32) indent_level = 32;
+
+            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
+
+            var prefix_len: usize = 0;
+            if (line_info.block_type == .bullet_list and text_slice.len >= 2) {
+                prefix_len = 2;
+            } else if (line_info.block_type == .ordered_list) {
+                while (prefix_len < text_slice.len and text_slice[prefix_len] != ' ') : (prefix_len += 1) {}
+                if (prefix_len < text_slice.len) prefix_len += 1;
+            }
+
+            const item_text = text_slice[prefix_len..];
+            const bullet_x = content_x + indent_level * 10.0;
+            const text_x = bullet_x + 18.0;
+
+            const spans_n = parser.parseInlines(item_text, &span_buf);
+            cur_y = layoutWrappedSpans(
+                span_buf[0..spans_n],
+                text_x,
+                content_width - (text_x - content_x),
+                cur_y,
+                config.base_font_size,
+                config.line_height,
+                Color.transparent,
+                Color.transparent,
+                std.math.inf(f32),
+                &.{},
+                &dummy_cmd_count,
+            );
+            continue;
+        }
+
+        // 9. Paragraph / Setext
+        var is_setext_h1 = false;
+        var is_setext_h2 = false;
+        if (i + 1 < lines.len) {
+            const next_info = lines[i + 1];
+            const next_bytes = bytes[next_info.offset..][0..next_info.len];
+            var next_trimmed = next_bytes;
+            while (next_trimmed.len > 0 and (next_trimmed[0] == ' ' or next_trimmed[0] == '\t')) : (next_trimmed = next_trimmed[1..]) {}
+            if (next_trimmed.len >= 2) {
+                if (next_trimmed[0] == '=') {
+                    var all_eq = true;
+                    for (next_trimmed) |ch| {
+                        if (ch != '=' and ch != ' ') {
+                            all_eq = false;
+                            break;
+                        }
+                    }
+                    if (all_eq) is_setext_h1 = true;
+                } else if (next_trimmed[0] == '-') {
+                    var all_dash = true;
+                    for (next_trimmed) |ch| {
+                        if (ch != '-' and ch != ' ') {
+                            all_dash = false;
+                            break;
+                        }
+                    }
+                    if (all_dash) is_setext_h2 = true;
+                }
+            }
+        }
+
+        if (is_setext_h1 or is_setext_h2) {
+            const heading_level: usize = if (is_setext_h1) 1 else 2;
+            const font_size = config.base_font_size * (if (heading_level == 1) @as(f32, 2.2) else @as(f32, 1.7));
+            const heading_line_h = config.line_height * (if (heading_level == 1) @as(f32, 1.5) else @as(f32, 1.35));
+            const margin_top = font_size * 1.5;
+            const margin_bottom = font_size * 0.5;
+
+            cur_y += margin_top;
+
+            const span_count = parser.parseInlines(line_bytes, &span_buf);
+            for (span_buf[0..span_count]) |*s| {
+                s.style.heading = true;
+                s.style.bold = true;
+            }
+
+            const end_y = layoutWrappedSpans(
+                span_buf[0..span_count],
+                content_x,
+                content_width,
+                cur_y,
+                font_size,
+                heading_line_h,
+                Color.transparent,
+                Color.transparent,
+                std.math.inf(f32),
+                &.{},
+                &dummy_cmd_count,
+            );
+
+            cur_y = end_y + margin_bottom;
+            i += 1;
+            continue;
+        }
+
+        const span_count = parser.parseInlines(line_bytes, &span_buf);
+        if (span_count == 0) {
+            cur_y += config.line_height * 0.5;
+            continue;
+        }
+
+        cur_y = layoutWrappedSpans(
+            span_buf[0..span_count],
+            content_x,
+            content_width,
+            cur_y,
+            config.base_font_size,
+            config.line_height,
+            Color.transparent,
+            Color.transparent,
+            std.math.inf(f32),
+            &.{},
+            &dummy_cmd_count,
+        ) + 4.0;
+    }
+
+    return cur_y + 50.0;
 }
 
 test "strict scroll smoothness across enumerations, lists, headings, and mixed blocks" {

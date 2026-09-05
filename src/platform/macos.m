@@ -643,6 +643,13 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 
 - (void)scrollWheel:(NSEvent *)event {
     if (g_callbacks.on_scroll) {
+        NSEventPhase phase = [event phase];
+        if (phase == NSEventPhaseEnded || phase == NSEventPhaseCancelled) {
+            g_callbacks.on_scroll(0.0f, 0.0f, -1);
+            [self setNeedsDisplay:YES];
+            return;
+        }
+
         CGFloat dx = [event scrollingDeltaX];
         CGFloat dy = [event scrollingDeltaY];
         if (![event hasPreciseScrollingDeltas]) {

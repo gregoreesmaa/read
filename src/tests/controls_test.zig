@@ -2,6 +2,7 @@ const std = @import("std");
 const layout = @import("../layout/viewport.zig");
 const simd = @import("../core/simd.zig");
 const parser = @import("../core/parser.zig");
+const mmap = @import("../core/mmap.zig");
 
 // Simulation of SelectionState and ControlState matching macOS / App logic
 pub const SelectionMode = enum {
@@ -238,3 +239,109 @@ test "controls: distinct per-block horizontal scrolling with mouse-over requirem
     try std.testing.expectEqual(@as(f32, 120.0), block_scroll_x[1]);
     try std.testing.expectEqual(@as(f32, 0.0), block_scroll_x[0]); // Block 0 still 0
 }
+
+test "controls: directional scroll locking prevents accidental diagonal scrolling" {
+    var lock = layout.ScrollLockState{};
+
+    // 1. Initial vertical scroll with slight horizontal drift over a scrollable block
+    const res1 = lock.processScroll(2.0, 15.0, 0, 1000);
+    try std.testing.expectEqual(layout.ScrollAxisLock.vertical, lock.axis);
+    try std.testing.expectEqual(@as(f32, 0.0), res1.dx); // horizontal drift cancelled
+    try std.testing.expectEqual(@as(f32, 15.0), res1.dy);
+
+    // 2. Continuing vertical gesture: horizontal drift remains completely locked out
+    const res2 = lock.processScroll(6.0, 12.0, 0, 1020);
+    try std.testing.expectEqual(layout.ScrollAxisLock.vertical, lock.axis);
+    try std.testing.expectEqual(@as(f32, 0.0), res2.dx);
+    try std.testing.expectEqual(@as(f32, 12.0), res2.dy);
+
+    // 3. Gesture ends (fingers lifted -> 0 deltas) -> lock resets to none
+    const res_end = lock.processScroll(0.0, 0.0, -1, 1040);
+    try std.testing.expectEqual(layout.ScrollAxisLock.none, lock.axis);
+    try std.testing.expectEqual(@as(f32, 0.0), res_end.dx);
+    try std.testing.expectEqual(@as(f32, 0.0), res_end.dy);
+
+    // 4. New gesture: user intentionally scrolls horizontally over the code block / table
+    const res3 = lock.processScroll(16.0, 3.0, 0, 1060);
+    try std.testing.expectEqual(layout.ScrollAxisLock.horizontal, lock.axis);
+    try std.testing.expectEqual(@as(f32, 16.0), res3.dx);
+    try std.testing.expectEqual(@as(f32, 0.0), res3.dy); // vertical jump cancelled
+
+    // 5. Time gap > 150ms between events resets the lock naturally without lifting fingers
+    const res4 = lock.processScroll(2.0, 18.0, 0, 1250);
+    try std.testing.expectEqual(layout.ScrollAxisLock.vertical, lock.axis);
+    try std.testing.expectEqual(@as(f32, 0.0), res4.dx);
+    try std.testing.expectEqual(@as(f32, 18.0), res4.dy);
+
+    // 6. Strong intentional redirection mid-gesture switches active axis
+    const res5 = lock.processScroll(32.0, 4.0, 0, 1270);
+    try std.testing.expectEqual(layout.ScrollAxisLock.horizontal, lock.axis);
+    try std.testing.expectEqual(@as(f32, 32.0), res5.dx);
+    try std.testing.expectEqual(@as(f32, 0.0), res5.dy);
+}
+
+test "controls: accurate document height computation ensures tables and end of document are reachable" {
+    var file = try mmap.MappedFile.open("showcase.md");
+    defer file.close();
+    const showcase_doc = file.bytes;
+
+    var lines_buf: [256]simd.Line = undefined;
+    var in_fence = false;
+    const line_count = simd.scanLines(showcase_doc, &lines_buf, &in_fence);
+
+    const vp_config = layout.ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+    };
+
+    const accurate_height = layout.computeDocumentHeight(
+        showcase_doc,
+        lines_buf[0..line_count],
+        vp_config,
+    );
+
+    // Previously, naive (line_count * 28.0) produced ~3080px which trapped scrolling before the table.
+    // Accurate height accounts for heading margins, wrapping, tables, and spacing (~4500px).
+    try std.testing.expect(accurate_height > 4000.0);
+
+    const max_scroll_y = @max(0.0, accurate_height - vp_config.window_height + 400.0);
+    try std.testing.expect(max_scroll_y > 3500.0);
+
+    // Verify that at max scroll (or scrolled to the table region), table rows and trailing content are visible
+    var commands_buf: [1024]layout.DrawCommand = undefined;
+    var table_scroll_config = vp_config;
+    table_scroll_config.scroll_y = 3500.0;
+
+    const cmd_count = layout.layoutViewport(
+        showcase_doc,
+        lines_buf[0..line_count],
+        table_scroll_config,
+        &commands_buf,
+    );
+
+    try std.testing.expect(cmd_count > 0);
+
+    // Confirm that table content text runs are generated
+    var found_table_header = false;
+    var found_table_content = false;
+    for (commands_buf[0..cmd_count]) |cmd| {
+        if (cmd.kind == .text_run) {
+            if (std.mem.indexOf(u8, cmd.text, "Standard Reader") != null or
+                std.mem.indexOf(u8, cmd.text, "Browser / Electron") != null)
+            {
+                found_table_header = true;
+            }
+            if (std.mem.indexOf(u8, cmd.text, "Startup Time") != null or
+                std.mem.indexOf(u8, cmd.text, "Active RAM") != null or
+                std.mem.indexOf(u8, cmd.text, "< 2 ms") != null)
+            {
+                found_table_content = true;
+            }
+        }
+    }
+
+    try std.testing.expect(found_table_header);
+    try std.testing.expect(found_table_content);
+}
+

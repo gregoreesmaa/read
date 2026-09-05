@@ -64,22 +64,50 @@ pub const AppState = struct {
 var g_app: AppState = .{};
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
+var g_scroll_lock: layout.ScrollLockState = .{};
+
+fn getTimestampMs() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
 
 fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void {
-    g_app.scroll_y = std.math.clamp(g_app.scroll_y - delta_y, 0.0, g_app.max_scroll_y);
-    if (delta_x != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
+    const now_ms = getTimestampMs();
+    const locked = g_scroll_lock.processScroll(delta_x, delta_y, hovered_block_id, now_ms);
+
+    if (locked.dy != 0.0) {
+        g_app.scroll_y = std.math.clamp(g_app.scroll_y - locked.dy, 0.0, g_app.max_scroll_y);
+    }
+    if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);
         g_app.block_scroll_x[id] = std.math.clamp(
-            g_app.block_scroll_x[id] - delta_x,
+            g_app.block_scroll_x[id] - locked.dx,
             0.0,
             g_app.block_max_scroll_x[id],
         );
     }
 }
 
+fn updateDocumentMetrics() void {
+    const vp_config = layout.ViewportConfig{
+        .window_width = g_app.window_width,
+        .window_height = g_app.window_height,
+        .scroll_y = 0.0,
+    };
+    const total_height = layout.computeDocumentHeight(
+        g_app.bytes,
+        g_app.lines[0..g_app.line_count],
+        vp_config,
+    );
+    g_app.max_scroll_y = @max(0.0, total_height - g_app.window_height + 400.0);
+}
+
 fn onResize(w: c_int, h: c_int) callconv(.c) void {
     g_app.window_width = @floatFromInt(w);
     g_app.window_height = @floatFromInt(h);
+    updateDocumentMetrics();
+    g_app.scroll_y = std.math.clamp(g_app.scroll_y, 0.0, g_app.max_scroll_y);
 }
 
 fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
@@ -124,8 +152,13 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
 }
 
 fn onDraw(w: c_int, h: c_int) callconv(.c) void {
-    g_app.window_width = @floatFromInt(w);
-    g_app.window_height = @floatFromInt(h);
+    const fw: f32 = @floatFromInt(w);
+    const fh: f32 = @floatFromInt(h);
+    if (fw != g_app.window_width or fh != g_app.window_height) {
+        g_app.window_width = fw;
+        g_app.window_height = fh;
+        updateDocumentMetrics();
+    }
 
     bridge.platform_sync_scroll(g_app.scroll_y);
 
@@ -306,14 +339,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
     g_app.lines = g_lines_buffer[0..g_app.line_count];
 
-    // Compute estimated total document height
-    const total_height = @as(f32, @floatFromInt(g_app.line_count)) * 28.0;
-    g_app.max_scroll_y = @max(0.0, total_height - g_app.window_height + 400.0);
+    // Compute accurate total document height and max scroll limit
+    updateDocumentMetrics();
 
     // Headless screenshot mode
     if (screenshot_path) |sc_path| {
         g_app.window_width = 1200.0;
         g_app.window_height = 900.0;
+        updateDocumentMetrics();
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});
