@@ -243,3 +243,340 @@ test "spec compliance: triple emphasis (***bold and italic*** and ___bold and it
     try std.testing.expect(found_triple1);
     try std.testing.expect(found_triple2);
 }
+
+test "spec compliance: standalone image block parsing and viewport command generation" {
+    const md =
+        \\# Visual Gallery
+        \\
+        \\![PNG Example](assets/images/sample_png.png)
+        \\![SVG Vector Graphic](assets/images/sample_svg.svg)
+        \\![WebP Graphic](assets/images/sample_webp.webp)
+        \\![GIF Animation](assets/images/sample_gif.gif)
+        \\![JPEG Photographic](assets/images/sample_jpeg.jpg)
+        \\![TIFF Archival](assets/images/sample_tiff.tiff)
+        \\![BMP Bitmap](assets/images/sample_bmp.bmp)
+        \\![HEIC Mobile](assets/images/sample_heic.heic)
+    ;
+
+    var lines: [16]simd.Line = undefined;
+    var fence = false;
+    const line_count = simd.scanLines(md, &lines, &fence);
+
+    try std.testing.expectEqual(@as(usize, 10), line_count);
+    try std.testing.expectEqual(simd.BlockType.heading1, lines[0].block_type);
+    try std.testing.expectEqual(simd.BlockType.blank, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[2].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[3].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[4].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[5].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[6].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[7].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[8].block_type);
+    try std.testing.expectEqual(simd.BlockType.image, lines[9].block_type);
+
+    const vp_config = layout.ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 800.0,
+        .scroll_y = 0.0,
+    };
+
+    var commands: [64]layout.DrawCommand = undefined;
+    const cmd_count = layout.layoutViewport(md, lines[0..line_count], vp_config, &commands);
+    try std.testing.expect(cmd_count > 0);
+
+    var img_cmd_count: usize = 0;
+    for (commands[0..cmd_count]) |cmd| {
+        if (cmd.kind == .image) {
+            img_cmd_count += 1;
+            try std.testing.expect(cmd.rect.w > 0.0);
+            try std.testing.expect(cmd.rect.h > 0.0);
+            try std.testing.expect(cmd.link_target != null);
+        }
+    }
+    try std.testing.expect(img_cmd_count >= 1);
+}
+
+test "situation: mixed CRLF, LF, and trailing bare line endings" {
+    const doc = "Line 1 CRLF\r\nLine 2 LF\nLine 3 CRLF\r\nLine 4 EOF no newline";
+    var lines: [8]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(doc, &lines, &in_fence);
+
+    try std.testing.expectEqual(@as(usize, 4), n);
+
+    const l1 = doc[lines[0].offset..][0..lines[0].len];
+    const l2 = doc[lines[1].offset..][0..lines[1].len];
+    const l3 = doc[lines[2].offset..][0..lines[2].len];
+    const l4 = doc[lines[3].offset..][0..lines[3].len];
+
+    try std.testing.expectEqualStrings("Line 1 CRLF", l1);
+    try std.testing.expectEqualStrings("Line 2 LF", l2);
+    try std.testing.expectEqualStrings("Line 3 CRLF", l3);
+    try std.testing.expectEqualStrings("Line 4 EOF no newline", l4);
+}
+
+test "situation: extreme and pathological line lengths" {
+    const allocator = std.testing.allocator;
+    var long_line: std.ArrayList(u8) = .empty;
+    defer long_line.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        try long_line.appendSlice(allocator, "word_segment_");
+    }
+    try long_line.append(allocator, '\n');
+
+    var lines: [4]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(long_line.items, &lines, &in_fence);
+
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u20, @intCast(long_line.items.len - 1)), lines[0].len);
+
+    var cmds: [256]layout.DrawCommand = undefined;
+    const cfg = layout.ViewportConfig{
+        .window_width = 600.0,
+        .window_height = 800.0,
+        .scroll_y = 0.0,
+    };
+    const cmd_count = layout.layoutViewport(long_line.items, lines[0..n], cfg, &cmds);
+    try std.testing.expect(cmd_count > 0);
+}
+
+test "situation: deeply nested blockquotes (up to 8 levels)" {
+    const doc =
+        \\> Level 1
+        \\>> Level 2
+        \\>>> Level 3
+        \\>>>> Level 4
+        \\>>>>> Level 5
+        \\>>>>>> Level 6
+        \\>>>>>>> Level 7
+        \\>>>>>>>> Level 8
+    ;
+
+    var lines: [16]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(doc, &lines, &in_fence);
+
+    try std.testing.expectEqual(@as(usize, 8), n);
+    for (lines[0..n]) |l| {
+        try std.testing.expectEqual(simd.BlockType.quote, l.block_type);
+    }
+
+    var cmds: [128]layout.DrawCommand = undefined;
+    const cfg = layout.ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+    };
+    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    try std.testing.expect(count > 0);
+
+    // Verify quote bars: 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 = 36 bars total
+    var bar_count: usize = 0;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .fill_rect and c.rect.w == 3.0) {
+            bar_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 36), bar_count);
+}
+
+test "situation: unclosed code fence and malformed block elements" {
+    const doc =
+        \\```zig
+        \\pub fn unclosed() void {
+        \\    // This fence never closes before EOF
+        \\
+    ;
+
+    var lines: [8]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(doc, &lines, &in_fence);
+
+    try std.testing.expect(n >= 3);
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[0].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_line, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_line, lines[2].block_type);
+    try std.testing.expect(in_fence);
+
+    var cmds: [64]layout.DrawCommand = undefined;
+    const cfg = layout.ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    try std.testing.expect(count > 0);
+}
+
+test "situation: Unicode UTF-8 multi-byte robustness across headings and inlines" {
+    const doc =
+        \\# Überschrift mit Umlauten und Emojis 🚀
+        \\
+        \\Text with **fettgedruckten Äpfeln**, *kursiven Büchern*, and [Webseite](https://example.de/ökologie).
+        \\
+        \\- Item with Cyrillic: Привет, мир!
+        \\- Item with CJK: こんにちは世界
+    ;
+
+    var lines: [16]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(doc, &lines, &in_fence);
+
+    try std.testing.expectEqual(@as(usize, 6), n);
+    try std.testing.expectEqual(simd.BlockType.heading1, lines[0].block_type);
+    try std.testing.expectEqual(simd.BlockType.blank, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.paragraph, lines[2].block_type);
+    try std.testing.expectEqual(simd.BlockType.blank, lines[3].block_type);
+    try std.testing.expectEqual(simd.BlockType.bullet_list, lines[4].block_type);
+    try std.testing.expectEqual(simd.BlockType.bullet_list, lines[5].block_type);
+
+    var cmds: [128]layout.DrawCommand = undefined;
+    const cfg = layout.ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 800.0,
+        .scroll_y = 0.0,
+    };
+    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    try std.testing.expect(count > 0);
+}
+
+test "situation: extreme viewport dimensions and overscroll boundaries" {
+    const doc =
+        \\# Boundary Test
+        \\Testing extreme layout dimensions.
+        \\- Bullet one
+        \\- Bullet two
+    ;
+
+    var lines: [8]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(doc, &lines, &in_fence);
+
+    var cmds: [64]layout.DrawCommand = undefined;
+
+    // 1. Tiny viewport (50x50)
+    const cfg_tiny = layout.ViewportConfig{
+        .window_width = 50.0,
+        .window_height = 50.0,
+        .scroll_y = 0.0,
+    };
+    const count_tiny = layout.layoutViewport(doc, lines[0..n], cfg_tiny, &cmds);
+    try std.testing.expect(count_tiny > 0);
+
+    // 2. 4K Ultra-wide viewport (3840x2160)
+    const cfg_4k = layout.ViewportConfig{
+        .window_width = 3840.0,
+        .window_height = 2160.0,
+        .scroll_y = 0.0,
+    };
+    const count_4k = layout.layoutViewport(doc, lines[0..n], cfg_4k, &cmds);
+    try std.testing.expect(count_4k > 0);
+
+    // 3. Negative scroll (overscroll bounce)
+    const cfg_neg = layout.ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = -300.0,
+    };
+    const count_neg = layout.layoutViewport(doc, lines[0..n], cfg_neg, &cmds);
+    try std.testing.expect(count_neg > 0);
+
+    // 4. Past EOF scroll
+    const cfg_eof = layout.ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 100_000.0,
+    };
+    const count_eof = layout.layoutViewport(doc, lines[0..n], cfg_eof, &cmds);
+    // Background fill command only
+    try std.testing.expectEqual(@as(usize, 1), count_eof);
+}
+
+test "situation: arbitrary scroll position checkpoint invariance across rich document" {
+    const allocator = std.testing.allocator;
+    const chunk =
+        \\# Section Heading
+        \\Paragraph with some **bold** and *italic* styling.
+        \\| Col A | Col B |
+        \\| --- | --- |
+        \\| Val 1 | Val 2 |
+        \\```zig
+        \\const x = 42;
+        \\```
+        \\> Quote text
+        \\- [x] Task complete
+        \\
+    ;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        try buf.appendSlice(allocator, chunk);
+    }
+
+    const mem = buf.items;
+    const lines = try allocator.alloc(simd.Line, 3000);
+    defer allocator.free(lines);
+
+    var in_fence = false;
+    const line_count = simd.scanLines(mem, lines, &in_fence);
+
+    var checkpoints: [128]layout.Checkpoint = undefined;
+    var cp_count: usize = 0;
+
+    const base_cfg = layout.ViewportConfig{
+        .window_width = 900.0,
+        .window_height = 700.0,
+        .scroll_y = 0.0,
+    };
+
+    const doc_h = layout.computeDocumentHeightEx(
+        mem,
+        lines[0..line_count],
+        base_cfg,
+        &checkpoints,
+        &cp_count,
+    );
+
+    try std.testing.expect(cp_count > 0);
+
+    // Test a sweep of diverse scroll positions
+    const scroll_positions = [_]f32{ 0.0, 500.0, 1500.0, 3200.0, 6400.0, doc_h * 0.5, doc_h * 0.85 };
+
+    for (scroll_positions) |s_y| {
+        const cfg_no_cp = layout.ViewportConfig{
+            .window_width = 900.0,
+            .window_height = 700.0,
+            .scroll_y = s_y,
+        };
+        const cfg_cp = layout.ViewportConfig{
+            .window_width = 900.0,
+            .window_height = 700.0,
+            .scroll_y = s_y,
+            .checkpoints = checkpoints[0..cp_count],
+        };
+
+        var cmds_a: [512]layout.DrawCommand = undefined;
+        var cmds_b: [512]layout.DrawCommand = undefined;
+
+        const count_a = layout.layoutViewport(mem, lines[0..line_count], cfg_no_cp, &cmds_a);
+        const count_b = layout.layoutViewport(mem, lines[0..line_count], cfg_cp, &cmds_b);
+
+        try std.testing.expectEqual(count_a, count_b);
+        for (cmds_a[0..count_a], 0..) |ca, idx| {
+            const cb = cmds_b[idx];
+            try std.testing.expectEqual(ca.kind, cb.kind);
+            try std.testing.expectApproxEqAbs(ca.rect.x, cb.rect.x, 0.01);
+            try std.testing.expectApproxEqAbs(ca.rect.y, cb.rect.y, 0.1);
+            try std.testing.expectApproxEqAbs(ca.rect.w, cb.rect.w, 0.01);
+            try std.testing.expectApproxEqAbs(ca.rect.h, cb.rect.h, 0.01);
+        }
+    }
+}
+
+

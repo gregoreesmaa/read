@@ -131,6 +131,7 @@ pub const DrawCommandKind = enum {
     register_scrollable_block,
     begin_clip,
     end_clip,
+    image,
 };
 
 pub const Color = struct {
@@ -223,6 +224,12 @@ pub const Theme = struct {
 
 pub const MAX_SCROLLABLE_BLOCKS = 128;
 
+pub const Checkpoint = struct {
+    line_idx: u32,
+    y: f32,
+    next_block_id: u16,
+};
+
 pub const ViewportConfig = struct {
     window_width: f32,
     window_height: f32,
@@ -232,6 +239,7 @@ pub const ViewportConfig = struct {
     base_font_size: f32 = 17.0,
     line_height: f32 = 29.75,
     is_dark_theme: bool = true,
+    checkpoints: []const Checkpoint = &.{},
 };
 
 pub const ScrollAxisLock = enum {
@@ -419,6 +427,30 @@ pub fn layoutViewport(
     var span_buf: [32]parser.InlineSpan = undefined;
     var i: usize = 0;
     var next_block_id: usize = 0;
+
+    // Fast O(1) / O(log N) viewport seeking via sparse checkpoints
+    if (config.checkpoints.len > 0 and config.scroll_y > 800.0) {
+        const target_y = config.scroll_y - 600.0;
+        var left: usize = 0;
+        var right: usize = config.checkpoints.len;
+        var best_cp: ?Checkpoint = null;
+
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            if (config.checkpoints[mid].y <= target_y) {
+                best_cp = config.checkpoints[mid];
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        if (best_cp) |cp| {
+            i = cp.line_idx;
+            cur_y = cp.y - config.scroll_y;
+            next_block_id = cp.next_block_id;
+        }
+    }
 
     while (i < lines.len) : (i += 1) {
         if (cmd_count >= commands_out.len - 16) break;
@@ -833,6 +865,76 @@ pub fn layoutViewport(
         }
 
         // ----------------------------------------------------
+        // Standalone Images: ![alt](url)
+        // ----------------------------------------------------
+        if (line_info.block_type == .image) {
+            var text_slice = line_bytes;
+            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
+            var alt_text: []const u8 = "";
+            var img_url: []const u8 = "";
+            if (text_slice.len >= 5 and text_slice[0] == '!' and text_slice[1] == '[') {
+                var cb: usize = 2;
+                while (cb < text_slice.len and text_slice[cb] != ']') : (cb += 1) {}
+                if (cb + 1 < text_slice.len and text_slice[cb + 1] == '(') {
+                    var cp: usize = cb + 2;
+                    while (cp < text_slice.len and text_slice[cp] != ')') : (cp += 1) {}
+                    if (cp <= text_slice.len) {
+                        alt_text = text_slice[2..cb];
+                        img_url = text_slice[cb + 2 .. cp];
+                    }
+                }
+            }
+
+            const img_h: f32 = 240.0;
+            const margin_top: f32 = 18.0;
+            const margin_bottom: f32 = 18.0;
+            const has_caption = alt_text.len > 0;
+            const caption_h: f32 = if (has_caption) (config.line_height * 0.85 + 8.0) else 0.0;
+
+            cur_y += margin_top;
+
+            if (cur_y + img_h >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len) {
+                commands_out[cmd_count] = .{
+                    .kind = .image,
+                    .rect = .{
+                        .x = content_x,
+                        .y = cur_y,
+                        .w = content_width,
+                        .h = img_h,
+                    },
+                    .text = alt_text,
+                    .link_target = img_url,
+                };
+                cmd_count += 1;
+            }
+
+            if (has_caption) {
+                const caption_y = cur_y + img_h + 6.0;
+                if (caption_y + config.line_height >= 0 and caption_y <= vp_bottom and cmd_count < commands_out.len) {
+                    const caption_w = measureTextEx(alt_text, config.base_font_size * 0.85, false, true, false, false);
+                    const caption_x = content_x + (content_width - @min(content_width, caption_w)) * 0.5;
+                    commands_out[cmd_count] = .{
+                        .kind = .text_run,
+                        .rect = .{
+                            .x = caption_x,
+                            .y = caption_y,
+                            .w = caption_w,
+                            .h = config.line_height * 0.85,
+                        },
+                        .color = theme.muted,
+                        .text = alt_text,
+                        .font_size = config.base_font_size * 0.85,
+                        .style = .{ .italic = true },
+                    };
+                    cmd_count += 1;
+                }
+            }
+
+            cur_y += img_h + caption_h + margin_bottom;
+            continue;
+        }
+
+        // ----------------------------------------------------
         // Blockquote (Supports nested quotes)
         // ----------------------------------------------------
         if (line_info.block_type == .quote) {
@@ -1101,7 +1203,23 @@ pub fn computeDocumentHeight(
     lines: []const simd.Line,
     config: ViewportConfig,
 ) f32 {
-    if (lines.len == 0) return 0.0;
+    return computeDocumentHeightEx(bytes, lines, config, null, null);
+}
+
+/// Computes accurate document height and optionally records sparse checkpoints
+/// for O(1) viewport seeking during scrolling.
+/// Zero heap allocations: works purely with stack buffers and font metrics tables.
+pub fn computeDocumentHeightEx(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    config: ViewportConfig,
+    checkpoints_out: ?[]Checkpoint,
+    checkpoint_count_out: ?*usize,
+) f32 {
+    if (lines.len == 0) {
+        if (checkpoint_count_out) |out| out.* = 0;
+        return 0.0;
+    }
 
     const content_width = if (config.window_width > config.content_max_width)
         config.content_max_width
@@ -1117,8 +1235,23 @@ pub fn computeDocumentHeight(
     var span_buf: [32]parser.InlineSpan = undefined;
     var i: usize = 0;
     var dummy_cmd_count: usize = 0;
+    var cp_count: usize = 0;
+    var last_cp_line: usize = 0;
+    var next_block_id: usize = 0;
 
     while (i < lines.len) : (i += 1) {
+        // Record sparse checkpoint at clean block boundary
+        if (checkpoints_out) |cps| {
+            if ((i == 0 or i >= last_cp_line + 128) and cp_count < cps.len) {
+                cps[cp_count] = .{
+                    .line_idx = @intCast(i),
+                    .y = cur_y,
+                    .next_block_id = @intCast(@min(next_block_id, 65535)),
+                };
+                cp_count += 1;
+                last_cp_line = i;
+            }
+        }
         const line_info = lines[i];
         const line_bytes = bytes[line_info.offset..][0..line_info.len];
 
@@ -1131,6 +1264,7 @@ pub fn computeDocumentHeight(
             }
             const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0;
             cur_y += code_block_h + 16.0;
+            next_block_id += 1;
             i = scan_i;
             continue;
         }
@@ -1149,6 +1283,7 @@ pub fn computeDocumentHeight(
             const row_h = config.line_height * 1.3;
             const table_h = @as(f32, @floatFromInt(table_rows_count)) * row_h;
             cur_y += table_h + 16.0;
+            next_block_id += 1;
             i = scan_i - 1;
             continue;
         }
@@ -1210,6 +1345,24 @@ pub fn computeDocumentHeight(
         // 5. Blank Line
         if (line_info.block_type == .blank) {
             cur_y += config.line_height * 0.75;
+            continue;
+        }
+
+        // Image
+        if (line_info.block_type == .image) {
+            var text_slice = line_bytes;
+            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
+            var alt_len: usize = 0;
+            if (text_slice.len >= 5 and text_slice[0] == '!' and text_slice[1] == '[') {
+                var cb: usize = 2;
+                while (cb < text_slice.len and text_slice[cb] != ']') : (cb += 1) {}
+                alt_len = cb - 2;
+            }
+            const img_h: f32 = 240.0;
+            const margin_top: f32 = 18.0;
+            const margin_bottom: f32 = 18.0;
+            const caption_h: f32 = if (alt_len > 0) (config.line_height * 0.85 + 8.0) else 0.0;
+            cur_y += margin_top + img_h + caption_h + margin_bottom;
             continue;
         }
 
@@ -1390,6 +1543,10 @@ pub fn computeDocumentHeight(
             &.{},
             &dummy_cmd_count,
         ) + 4.0;
+    }
+
+    if (checkpoint_count_out) |out| {
+        out.* = cp_count;
     }
 
     return cur_y + 50.0;
@@ -1687,3 +1844,81 @@ test "strict cross-element copying across headings, paragraphs, lists, tables, a
     );
     try std.testing.expect(std.mem.indexOf(u8, sel3, "Ultra high throughput\n• Precise") != null);
 }
+
+test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
+    // 1. Invariance: Line must be exactly 8 bytes (64 bits) for cache-line alignment and -33% memory footprint
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(simd.Line));
+
+    const allocator = std.testing.allocator;
+    const doc_chunk =
+        \\# Chapter Heading
+        \\Paragraph line one of text with some **bold** content.
+        \\Paragraph line two continuing the narrative.
+        \\- Bullet list item
+        \\
+    ;
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        try buffer.appendSlice(allocator, doc_chunk);
+    }
+
+    const mem = buffer.items;
+    var lines_buf: [3000]simd.Line = undefined;
+    var in_fence = false;
+    const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
+
+    var checkpoints: [64]Checkpoint = undefined;
+    var cp_count: usize = 0;
+
+    const vp_config_base = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+
+    _ = computeDocumentHeightEx(
+        mem,
+        lines_buf[0..line_count],
+        vp_config_base,
+        &checkpoints,
+        &cp_count,
+    );
+
+    try std.testing.expect(cp_count > 0);
+
+    // Test deep scroll: with checkpoints vs without checkpoints
+    const scroll_target = 5000.0;
+    const config_no_cp = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = scroll_target,
+    };
+    const config_with_cp = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = scroll_target,
+        .checkpoints = checkpoints[0..cp_count],
+    };
+
+    var cmds_no_cp: [512]DrawCommand = undefined;
+    var cmds_with_cp: [512]DrawCommand = undefined;
+
+    const count_no_cp = layoutViewport(mem, lines_buf[0..line_count], config_no_cp, &cmds_no_cp);
+    const count_with_cp = layoutViewport(mem, lines_buf[0..line_count], config_with_cp, &cmds_with_cp);
+
+    // Must generate the exact same visible draw commands
+    try std.testing.expectEqual(count_no_cp, count_with_cp);
+    for (cmds_no_cp[0..count_no_cp], 0..) |cmd_a, idx| {
+        const cmd_b = cmds_with_cp[idx];
+        try std.testing.expectEqual(cmd_a.kind, cmd_b.kind);
+        try std.testing.expectApproxEqAbs(cmd_a.rect.x, cmd_b.rect.x, 0.01);
+        try std.testing.expectApproxEqAbs(cmd_a.rect.y, cmd_b.rect.y, 0.01);
+        try std.testing.expectApproxEqAbs(cmd_a.rect.w, cmd_b.rect.w, 0.01);
+        try std.testing.expectApproxEqAbs(cmd_a.rect.h, cmd_b.rect.h, 0.01);
+    }
+}
+

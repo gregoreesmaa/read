@@ -66,6 +66,10 @@ var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
 
+const MAX_CHECKPOINTS = 2048;
+var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
+var g_checkpoint_count: usize = 0;
+
 fn getTimestampMs() i64 {
     var ts: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
@@ -95,10 +99,12 @@ fn updateDocumentMetrics() void {
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
     };
-    const total_height = layout.computeDocumentHeight(
+    const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
         vp_config,
+        &g_checkpoints,
+        &g_checkpoint_count,
     );
     g_app.max_scroll_y = @max(0.0, total_height - g_app.window_height + 400.0);
 }
@@ -168,6 +174,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .scroll_y = g_app.scroll_y,
         .block_scroll_x = g_app.block_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
+        .checkpoints = g_checkpoints[0..g_checkpoint_count],
     };
 
     const cmd_count = layout.layoutViewport(
@@ -273,6 +280,18 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.color.a,
                     url_ptr,
                     url_len,
+                );
+            },
+            .image => {
+                const url_ptr = if (cmd.link_target) |t| t.ptr else null;
+                const url_len: c_int = if (cmd.link_target) |t| @intCast(t.len) else 0;
+                bridge.platform_draw_image(
+                    url_ptr,
+                    url_len,
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.rect.w,
+                    cmd.rect.h,
                 );
             },
         }

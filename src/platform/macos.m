@@ -899,6 +899,104 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     CGColorSpaceRelease(colorSpace);
 }
 
+typedef struct {
+    char url[512];
+    NSImage* image;
+    BOOL failed;
+} CachedImageRecord;
+
+#define MAX_IMAGE_CACHE 64
+static CachedImageRecord g_image_cache[MAX_IMAGE_CACHE];
+static int g_image_cache_count = 0;
+
+static NSImage* get_or_load_image(const char* url, int url_len) {
+    if (!url || url_len <= 0 || url_len >= 512) return nil;
+
+    for (int i = 0; i < g_image_cache_count; i++) {
+        if (strncmp(g_image_cache[i].url, url, url_len) == 0 && g_image_cache[i].url[url_len] == '\0') {
+            return g_image_cache[i].failed ? nil : g_image_cache[i].image;
+        }
+    }
+
+    if (g_image_cache_count >= MAX_IMAGE_CACHE) return nil;
+
+    NSString* pathStr = [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding];
+    if (!pathStr) return nil;
+
+    NSImage* img = nil;
+    if ([pathStr hasPrefix:@"http://"] || [pathStr hasPrefix:@"https://"]) {
+        NSURL* u = [NSURL URLWithString:pathStr];
+        if (u) img = [[NSImage alloc] initWithContentsOfURL:u];
+    } else {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:pathStr]) {
+            img = [[NSImage alloc] initWithContentsOfFile:pathStr];
+        } else {
+            NSString* cwd = [[NSFileManager defaultManager] currentDirectoryPath];
+            NSString* fullPath = [cwd stringByAppendingPathComponent:pathStr];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:fullPath]) {
+                img = [[NSImage alloc] initWithContentsOfFile:fullPath];
+            }
+        }
+    }
+
+    CachedImageRecord* rec = &g_image_cache[g_image_cache_count++];
+    memcpy(rec->url, url, url_len);
+    rec->url[url_len] = '\0';
+    rec->image = img;
+    rec->failed = (img == nil);
+    return img;
+}
+
+void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h) {
+    if (!g_current_cg_context || w <= 0 || h <= 0) return;
+    CGContextRef ctx = g_current_cg_context;
+
+    NSImage* img = get_or_load_image(url, url_len);
+    if (img) {
+        NSSize imgSize = [img size];
+        if (imgSize.width > 0 && imgSize.height > 0) {
+            float scale_w = w / (float)imgSize.width;
+            float scale_h = h / (float)imgSize.height;
+            float scale = (scale_w < scale_h) ? scale_w : scale_h;
+            if (scale > 1.5f && (float)imgSize.width < w && (float)imgSize.height < h) {
+                scale = 1.0f;
+            }
+            float draw_w = (float)imgSize.width * scale;
+            float draw_h = (float)imgSize.height * scale;
+            float draw_x = x + (w - draw_w) * 0.5f;
+            float draw_y = y + (h - draw_h) * 0.5f;
+
+            CGContextSaveGState(ctx);
+            CGContextSetRGBFillColor(ctx, 22.0f / 255.0f, 22.0f / 255.0f, 24.0f / 255.0f, 0.6f);
+            NSRect cardRect = NSMakeRect(draw_x - 4.0f, draw_y - 4.0f, draw_w + 8.0f, draw_h + 8.0f);
+            CGContextFillRect(ctx, cardRect);
+
+            NSRect destRect = NSMakeRect(draw_x, draw_y, draw_w, draw_h);
+            CGImageRef cgImg = [img CGImageForProposedRect:&destRect context:nil hints:nil];
+            if (cgImg) {
+                CGContextTranslateCTM(ctx, draw_x, draw_y + draw_h);
+                CGContextScaleCTM(ctx, 1.0f, -1.0f);
+                CGContextDrawImage(ctx, CGRectMake(0, 0, draw_w, draw_h), cgImg);
+            } else {
+                NSGraphicsContext* nsCtx = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+                [NSGraphicsContext saveGraphicsState];
+                [NSGraphicsContext setCurrentContext:nsCtx];
+                [img drawInRect:destRect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0 respectFlipped:YES hints:nil];
+                [NSGraphicsContext restoreGraphicsState];
+            }
+            CGContextRestoreGState(ctx);
+            return;
+        }
+    }
+
+    CGContextSaveGState(ctx);
+    CGContextSetRGBFillColor(ctx, 28.0f / 255.0f, 28.0f / 255.0f, 32.0f / 255.0f, 1.0f);
+    CGContextFillRect(ctx, CGRectMake(x, y, w, h));
+    CGContextSetRGBStrokeColor(ctx, 60.0f / 255.0f, 60.0f / 255.0f, 70.0f / 255.0f, 1.0f);
+    CGContextStrokeRect(ctx, CGRectMake(x, y, w, h));
+    CGContextRestoreGState(ctx);
+}
+
 float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono) {
     if (!text || len <= 0) return 0.0f;
 

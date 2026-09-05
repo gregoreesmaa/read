@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const BlockType = enum(u8) {
+pub const BlockType = enum(u5) {
     paragraph = 0,
     heading1 = 1,
     heading2 = 2,
@@ -18,13 +18,14 @@ pub const BlockType = enum(u8) {
     table_row = 14,
     blank = 15,
     task_list = 16,
+    image = 17,
 };
 
-pub const Line = struct {
+pub const Line = packed struct(u64) {
     offset: u32,
-    len: u32,
+    len: u20,
     block_type: BlockType,
-    indent: u8,
+    indent: u7,
 };
 
 pub const VecSize = 32;
@@ -45,6 +46,70 @@ pub fn scanLines(
 
     const nl_vec: ByteVec = @splat('\n');
 
+    // Fast 64-byte dual-vector loop to minimize branch mispredictions and maximize ILP
+    while (i + 2 * VecSize <= len) {
+        const chunk0: ByteVec = bytes[i..][0..VecSize].*;
+        const chunk1: ByteVec = bytes[i + VecSize ..][0..VecSize].*;
+        const matches0: @Vector(VecSize, bool) = (chunk0 == nl_vec);
+        const matches1: @Vector(VecSize, bool) = (chunk1 == nl_vec);
+        const bitmask0: MaskType = @as(MaskType, @bitCast(matches0));
+        const bitmask1: MaskType = @as(MaskType, @bitCast(matches1));
+
+        if ((bitmask0 | bitmask1) != 0) {
+            if (bitmask0 != 0) {
+                var mask = bitmask0;
+                while (mask != 0) {
+                    const tz = @ctz(mask);
+                    const nl_pos = i + tz;
+
+                    if (line_count < lines_out.len) {
+                        var end_pos = nl_pos;
+                        if (end_pos > line_start and bytes[end_pos - 1] == '\r') {
+                            end_pos -= 1;
+                        }
+                        const line_bytes = bytes[line_start..end_pos];
+                        lines_out[line_count] = classifyLine(
+                            line_bytes,
+                            @as(u32, @intCast(line_start)),
+                            in_code_fence_state,
+                        );
+                        line_count += 1;
+                    }
+
+                    line_start = nl_pos + 1;
+                    mask &= mask - 1;
+                }
+            }
+
+            if (bitmask1 != 0) {
+                var mask = bitmask1;
+                while (mask != 0) {
+                    const tz = @ctz(mask);
+                    const nl_pos = i + VecSize + tz;
+
+                    if (line_count < lines_out.len) {
+                        var end_pos = nl_pos;
+                        if (end_pos > line_start and bytes[end_pos - 1] == '\r') {
+                            end_pos -= 1;
+                        }
+                        const line_bytes = bytes[line_start..end_pos];
+                        lines_out[line_count] = classifyLine(
+                            line_bytes,
+                            @as(u32, @intCast(line_start)),
+                            in_code_fence_state,
+                        );
+                        line_count += 1;
+                    }
+
+                    line_start = nl_pos + 1;
+                    mask &= mask - 1;
+                }
+            }
+        }
+        i += 2 * VecSize;
+    }
+
+    // 32-byte single-vector remainder
     while (i + VecSize <= len) {
         const chunk: ByteVec = bytes[i..][0..VecSize].*;
         const matches: @Vector(VecSize, bool) = (chunk == nl_vec);
@@ -71,7 +136,6 @@ pub fn scanLines(
                 }
 
                 line_start = nl_pos + 1;
-                // Clear the lowest set bit
                 mask &= mask - 1;
             }
         }
@@ -114,13 +178,13 @@ pub fn scanLines(
 
 /// Fast branchless/minimal-branch classifier for a single line of markdown
 pub fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool) Line {
-    const raw_len: u32 = @intCast(line.len);
+    const raw_len: u20 = @intCast(@min(line.len, (1 << 20) - 1));
 
     // Fast check for blank lines
     var idx: usize = 0;
     while (idx < line.len and (line[idx] == ' ' or line[idx] == '\t')) : (idx += 1) {}
 
-    const indent: u8 = @intCast(@min(idx, 255));
+    const indent: u7 = @intCast(@min(idx, 127));
 
     if (idx >= line.len) {
         return Line{
@@ -180,6 +244,24 @@ pub fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool) Line {
             .block_type = .task_list,
             .indent = indent,
         };
+    }
+
+    // Standalone image: ![alt](url)
+    if (trimmed.len >= 5 and trimmed[0] == '!' and trimmed[1] == '[') {
+        var cb: usize = 2;
+        while (cb < trimmed.len and trimmed[cb] != ']') : (cb += 1) {}
+        if (cb + 1 < trimmed.len and trimmed[cb + 1] == '(') {
+            var cp: usize = cb + 2;
+            while (cp < trimmed.len and trimmed[cp] != ')') : (cp += 1) {}
+            if (cp < trimmed.len and cp + 1 == trimmed.len) {
+                return Line{
+                    .offset = offset,
+                    .len = raw_len,
+                    .block_type = .image,
+                    .indent = indent,
+                };
+            }
+        }
     }
 
     const first = trimmed[0];

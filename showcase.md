@@ -107,3 +107,33 @@ Three or more hyphens, asterisks, or underscores produce horizontal divider line
 ***
 
 Enjoy pure, distraction-free reading.
+
+---
+
+## 8. Images & Media Formats
+
+Read supports all major image and vector formats through zero-dependency native OS graphics pipeline:
+
+### Scalable Vector Graphics (SVG)
+![Scalable Vector Graphics Demonstration](assets/images/sample_svg.svg)
+
+### Portable Network Graphics (PNG)
+![High Definition PNG](assets/images/sample_png.png)
+
+### Photographic JPEG
+![Photographic JPEG Image](assets/images/sample_jpeg.jpg)
+
+### Modern WebP
+![WebP Compressed Graphic](assets/images/sample_webp.webp)
+
+### Graphics Interchange Format (GIF)
+![GIF Palette Image](assets/images/sample_gif.gif)
+
+### High Efficiency Image Container (HEIC)
+![Modern HEIC Format](assets/images/sample_heic.heic)
+
+### Tagged Image File Format (TIFF)
+![Deep Color Archival TIFF](assets/images/sample_tiff.tiff)
+
+### Windows Bitmap (BMP)
+![Uncompressed Raster BMP](assets/images/sample_bmp.bmp)

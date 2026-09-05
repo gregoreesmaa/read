@@ -134,7 +134,7 @@ test "microsecond benchmark on 50,000 lines" {
 }
 
 test "mmap mapped file read and parse" {
-    const test_filename = "test_sample.md";
+    const test_filename = "test_sample_mmap.md";
     const test_content =
         \\# Read Engine Test
         \\This file was mapped directly into virtual memory.

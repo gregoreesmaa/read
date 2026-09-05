@@ -47,6 +47,15 @@ pub extern "c" fn platform_draw_text(
     link_url_len: c_int,
 ) void;
 
+pub extern "c" fn platform_draw_image(
+    url: ?[*]const u8,
+    url_len: c_int,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) void;
+
 pub extern "c" fn platform_register_code_block(
     x: f32,
     y: f32,
