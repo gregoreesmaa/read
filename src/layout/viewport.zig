@@ -2,88 +2,93 @@ const std = @import("std");
 const simd = @import("../core/simd.zig");
 const parser = @import("../core/parser.zig");
 
-// Calibrated ASCII advance widths for Apple SF Pro system font (in 1/1000 em)
-pub const SYSTEM_FONT_WIDTHS = [128]u16{
-    // 0-7
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 8-15
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 16-23
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 24-31
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 32-39: space ! " # $ % & '
-    256, 286, 453, 605, 605, 900, 687, 272,
-    // 40-47: ( ) * + , - . /
-    357, 357, 447, 605, 272, 447, 272, 280,
-    // 48-55: 0 1 2 3 4 5 6 7
-    605, 439, 579, 602, 619, 593, 612, 544,
-    // 56-63: 8 9 : ; < = > ?
-    614, 612, 272, 272, 605, 605, 605, 488,
-    // 64-71: @ A B C D E F G
-    893, 649, 632, 691, 702, 571, 547, 722,
-    // 72-79: H I J K L M N O
-    717, 243, 513, 634, 543, 849, 717, 747,
-    // 80-87: P Q R S T U V W
-    610, 747, 628, 612, 609, 712, 649, 943,
-    // 88-95: X Y Z [ \ ] ^ _
-    654, 630, 637, 357, 280, 357, 605, 559,
-    // 96-103: ` a b c d e f g
-    475, 527, 589, 535, 589, 546, 337, 584,
-    // 104-111: h i j k l m n o
-    563, 222, 222, 518, 228, 845, 559, 566,
-    // 112-119: p q r s t u v w
-    585, 584, 356, 499, 338, 559, 517, 750,
-    // 120-127: x y z { | } ~ DEL
-    500, 518, 514, 357, 234, 357, 605, 0,
+// Calibrated ASCII advance widths for IBM Plex Serif Regular (in 1/1000 em)
+pub const SERIF_FONT_WIDTHS = [128]u16{
+    0, 464, 464, 464, 464, 464, 464, 464,
+    464, 232, 232, 464, 464, 232, 464, 464,
+    464, 464, 464, 464, 464, 464, 464, 464,
+    464, 464, 464, 464, 464, 464, 464, 464,
+    232, 280, 415, 695, 592, 913, 710, 241,
+    329, 329, 442, 600, 268, 393, 268, 366,
+    600, 600, 600, 600, 600, 600, 600, 600,
+    600, 600, 288, 288, 600, 600, 600, 487,
+    923, 686, 670, 649, 706, 641, 626, 721,
+    787, 346, 457, 707, 594, 872, 778, 716,
+    625, 716, 672, 588, 652, 735, 664, 968,
+    669, 634, 637, 284, 365, 284, 600, 564,
+    600, 546, 598, 516, 608, 536, 342, 544,
+    624, 315, 303, 584, 300, 953, 639, 564,
+    613, 598, 443, 488, 353, 619, 534, 777,
+    561, 534, 508, 327, 298, 327, 600, 464,
 };
 
-pub const SYSTEM_FONT_BOLD_WIDTHS = [128]u16{
-    // 0-7
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 8-15
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 16-23
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 24-31
-    0, 0, 0, 0, 0, 0, 0, 0,
-    // 32-39: space ! " # $ % & '
-    256, 331, 544, 646, 646, 1011, 719, 323,
-    // 40-47: ( ) * + , - . /
-    404, 404, 459, 646, 323, 459, 323, 310,
-    // 48-55: 0 1 2 3 4 5 6 7
-    660, 487, 618, 644, 662, 638, 659, 580,
-    // 56-63: 8 9 : ; < = > ?
-    669, 659, 323, 323, 646, 646, 646, 532,
-    // 64-71: @ A B C D E F G
-    902, 708, 668, 716, 722, 597, 573, 735,
-    // 72-79: H I J K L M N O
-    758, 293, 576, 684, 570, 882, 743, 761,
-    // 80-87: P Q R S T U V W
-    649, 761, 669, 650, 635, 735, 696, 984,
-    // 88-95: X Y Z [ \ ] ^ _
-    705, 683, 651, 404, 310, 404, 646, 602,
-    // 96-103: ` a b c d e f g
-    475, 565, 626, 563, 626, 576, 383, 620,
-    // 104-111: h i j k l m n o
-    607, 262, 262, 576, 270, 907, 602, 595,
-    // 112-119: p q r s t u v w
-    622, 623, 410, 542, 388, 602, 558, 822,
-    // 120-127: x y z { | } ~ DEL
-    556, 572, 542, 404, 274, 404, 646, 0,
+// Calibrated ASCII advance widths for IBM Plex Serif Bold (in 1/1000 em)
+pub const SERIF_FONT_BOLD_WIDTHS = [128]u16{
+    0, 464, 464, 464, 464, 464, 464, 464,
+    464, 232, 232, 464, 464, 232, 464, 464,
+    464, 464, 464, 464, 464, 464, 464, 464,
+    464, 464, 464, 464, 464, 464, 464, 464,
+    232, 312, 480, 639, 595, 924, 747, 266,
+    355, 355, 590, 600, 283, 398, 282, 428,
+    600, 600, 600, 600, 600, 600, 600, 600,
+    600, 600, 303, 304, 600, 600, 600, 519,
+    904, 699, 704, 665, 755, 658, 639, 775,
+    812, 384, 514, 767, 620, 896, 791, 760,
+    681, 760, 735, 629, 710, 769, 694, 1027,
+    727, 688, 653, 355, 428, 355, 600, 560,
+    600, 571, 626, 535, 632, 566, 385, 580,
+    651, 335, 322, 622, 326, 971, 662, 582,
+    633, 626, 493, 508, 373, 647, 564, 868,
+    588, 571, 514, 385, 374, 385, 600, 464,
+};
+
+// Calibrated ASCII advance widths for Space Grotesk Bold headings (in 1/1000 em)
+pub const HEADING_FONT_WIDTHS = [128]u16{
+    910, 910, 910, 910, 910, 910, 910, 910,
+    910, 254, 254, 910, 910, 600, 910, 910,
+    910, 910, 910, 910, 910, 910, 910, 910,
+    910, 910, 910, 910, 910, 910, 910, 910,
+    254, 298, 514, 636, 606, 758, 591, 294,
+    398, 390, 540, 620, 294, 432, 298, 388,
+    648, 452, 594, 608, 636, 600, 618, 554,
+    600, 618, 298, 298, 620, 620, 620, 578,
+    1014, 634, 664, 644, 666, 554, 534, 662,
+    656, 264, 610, 626, 542, 882, 670, 676,
+    604, 676, 632, 606, 588, 672, 618, 898,
+    644, 624, 576, 358, 388, 358, 620, 620,
+    296, 578, 638, 586, 638, 577, 436, 638,
+    616, 266, 268, 564, 266, 854, 616, 612,
+    638, 638, 396, 524, 456, 616, 548, 784,
+    592, 616, 518, 466, 258, 466, 620, 910,
 };
 
 pub fn measureChar(c: u8, font_size: f32, is_bold: bool, is_mono: bool) f32 {
+    return measureCharEx(c, font_size, is_bold, is_mono, false);
+}
+
+pub fn measureCharEx(c: u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool) f32 {
     if (is_mono) return font_size * 0.60;
     const idx = if (c < 128) c else 32;
-    const width_table = if (is_bold) SYSTEM_FONT_BOLD_WIDTHS else SYSTEM_FONT_WIDTHS;
+    if (is_heading) {
+        return @as(f32, @floatFromInt(HEADING_FONT_WIDTHS[idx])) * font_size / 1000.0;
+    }
+    const width_table = if (is_bold) SERIF_FONT_BOLD_WIDTHS else SERIF_FONT_WIDTHS;
     return @as(f32, @floatFromInt(width_table[idx])) * font_size / 1000.0;
 }
 
 pub fn measureText(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool) f32 {
+    return measureTextEx(text, font_size, is_bold, is_mono, false);
+}
+
+pub fn measureTextEx(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool) f32 {
     if (is_mono) return @as(f32, @floatFromInt(text.len)) * font_size * 0.60;
     var total: f32 = 0;
-    const width_table = if (is_bold) SYSTEM_FONT_BOLD_WIDTHS else SYSTEM_FONT_WIDTHS;
+    const width_table = if (is_heading)
+        &HEADING_FONT_WIDTHS
+    else if (is_bold)
+        &SERIF_FONT_BOLD_WIDTHS
+    else
+        &SERIF_FONT_WIDTHS;
     for (text) |c| {
         const idx = if (c < 128) c else 32;
         total += @as(f32, @floatFromInt(width_table[idx])) * font_size / 1000.0;
@@ -108,27 +113,27 @@ pub const Color = struct {
     pub const black = Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
     pub const transparent = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
 
-    // Zen Dark theme palette
-    pub const bg_dark = Color{ .r = 20, .g = 20, .b = 22, .a = 255 };
-    pub const text_dark = Color{ .r = 232, .g = 232, .b = 236, .a = 255 };
-    pub const text_muted_dark = Color{ .r = 145, .g = 145, .b = 155, .a = 255 };
+    // Dark theme palette (#121212 bg, #E0E0E0 text)
+    pub const bg_dark = Color{ .r = 18, .g = 18, .b = 18, .a = 255 };
+    pub const text_dark = Color{ .r = 224, .g = 224, .b = 224, .a = 255 };
+    pub const text_muted_dark = Color{ .r = 140, .g = 140, .b = 145, .a = 255 };
     pub const accent_dark = Color{ .r = 96, .g = 165, .b = 250, .a = 255 };
-    pub const code_bg_dark = Color{ .r = 28, .g = 28, .b = 32, .a = 255 };
-    pub const quote_bar_dark = Color{ .r = 80, .g = 80, .b = 95, .a = 255 };
-    pub const hr_dark = Color{ .r = 45, .g = 45, .b = 52, .a = 255 };
-    pub const table_border_dark = Color{ .r = 50, .g = 50, .b = 60, .a = 255 };
-    pub const table_header_bg_dark = Color{ .r = 30, .g = 30, .b = 36, .a = 255 };
+    pub const code_bg_dark = Color{ .r = 26, .g = 26, .b = 28, .a = 255 };
+    pub const quote_bar_dark = Color{ .r = 70, .g = 70, .b = 80, .a = 255 };
+    pub const hr_dark = Color{ .r = 40, .g = 40, .b = 45, .a = 255 };
+    pub const table_border_dark = Color{ .r = 45, .g = 45, .b = 52, .a = 255 };
+    pub const table_header_bg_dark = Color{ .r = 28, .g = 28, .b = 32, .a = 255 };
 
-    // Zen Light theme palette
-    pub const bg_light = Color{ .r = 252, .g = 252, .b = 252, .a = 255 };
-    pub const text_light = Color{ .r = 28, .g = 28, .b = 32, .a = 255 };
-    pub const text_muted_light = Color{ .r = 115, .g = 115, .b = 125, .a = 255 };
+    // Light theme palette (#FAFAFA bg, #1E2022 text)
+    pub const bg_light = Color{ .r = 250, .g = 250, .b = 250, .a = 255 };
+    pub const text_light = Color{ .r = 30, .g = 32, .b = 34, .a = 255 };
+    pub const text_muted_light = Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
     pub const accent_light = Color{ .r = 37, .g = 99, .b = 235, .a = 255 };
-    pub const code_bg_light = Color{ .r = 243, .g = 244, .b = 246, .a = 255 };
+    pub const code_bg_light = Color{ .r = 240, .g = 241, .b = 243, .a = 255 };
     pub const quote_bar_light = Color{ .r = 203, .g = 213, .b = 225, .a = 255 };
     pub const hr_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
     pub const table_border_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
-    pub const table_header_bg_light = Color{ .r = 248, .g = 250, .b = 252, .a = 255 };
+    pub const table_header_bg_light = Color{ .r = 244, .g = 245, .b = 247, .a = 255 };
 };
 
 pub const Rect = struct {
@@ -189,9 +194,9 @@ pub const ViewportConfig = struct {
     window_height: f32,
     scroll_y: f32,
     table_scroll_x: f32 = 0.0,
-    content_max_width: f32 = 760.0,
+    content_max_width: f32 = 600.0,
     base_font_size: f32 = 17.0,
-    line_height: f32 = 28.0,
+    line_height: f32 = 29.75,
     is_dark_theme: bool = true,
 };
 
@@ -212,15 +217,15 @@ pub fn layoutWrappedSpans(
     var cur_x = start_x;
     var cur_y = base_y;
 
-    const space_w = measureChar(' ', font_size, false, false);
-
     for (spans) |span| {
         if (cmd_count.* >= commands_out.len - 4) break;
 
         const is_mono = span.style.code;
         const is_bold = span.style.bold;
+        const is_heading = span.style.heading;
         const span_color = if (span.style.link) accent_color else default_color;
         const span_text = span.text;
+        const space_w = measureCharEx(' ', font_size, false, false, is_heading);
 
         var i: usize = 0;
         while (i < span_text.len) {
@@ -235,7 +240,7 @@ pub fn layoutWrappedSpans(
             const w_start = i;
             while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
             const word = span_text[w_start..i];
-            const word_w = measureText(word, font_size, is_bold, is_mono);
+            const word_w = measureTextEx(word, font_size, is_bold, is_mono, is_heading);
 
             // Wrap to next visual line if exceeding max width
             if (cur_x + word_w > start_x + max_w and cur_x > start_x) {
@@ -555,30 +560,38 @@ pub fn layoutViewport(
                 else => 1.05,
             };
             const font_size = config.base_font_size * scale;
-            const block_height = config.line_height * scale * 1.15;
+            const heading_line_h = font_size * 1.3;
+            const margin_top = font_size * 2.5;
+            const margin_bottom = font_size * 0.5;
 
             var h_offset: usize = 0;
             while (h_offset < line_bytes.len and line_bytes[h_offset] == '#') : (h_offset += 1) {}
-            if (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') h_offset += 1;
+            while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
 
-            if (cur_y + block_height >= 0 and cur_y <= vp_bottom) {
-                commands_out[cmd_count] = .{
-                    .kind = .text_run,
-                    .rect = .{
-                        .x = content_x,
-                        .y = cur_y + 8.0,
-                        .w = content_width,
-                        .h = block_height,
-                    },
-                    .color = theme.text,
-                    .text = line_bytes[h_offset..],
-                    .font_size = font_size,
-                    .style = .{ .bold = true },
-                };
-                cmd_count += 1;
+            cur_y += margin_top;
+
+            const h_text = line_bytes[h_offset..];
+            const span_count = parser.parseInlines(h_text, &span_buf);
+            for (span_buf[0..span_count]) |*s| {
+                s.style.bold = true;
+                s.style.heading = true;
             }
 
-            cur_y += block_height + 12.0;
+            const end_y = layoutWrappedSpans(
+                span_buf[0..span_count],
+                content_x,
+                content_width,
+                cur_y,
+                font_size,
+                heading_line_h,
+                theme.text,
+                theme.accent,
+                vp_bottom,
+                commands_out,
+                &cmd_count,
+            );
+
+            cur_y = end_y + margin_bottom;
             continue;
         }
 
@@ -897,4 +910,195 @@ test "strict scroll smoothness across enumerations, lists, headings, and mixed b
             }
         }
     }
+}
+
+pub fn getCharIndexAtX(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool, x_offset: f32) usize {
+    if (x_offset <= 0) return 0;
+    var acc: f32 = 0;
+    for (text, 0..) |c, i| {
+        const w = measureCharEx(c, font_size, is_bold, is_mono, is_heading);
+        if (acc + w * 0.5 > x_offset) return i;
+        acc += w;
+    }
+    return text.len;
+}
+
+pub fn getXForCharIndex(text: []const u8, font_size: f32, is_bold: bool, is_mono: bool, is_heading: bool, char_idx: usize) f32 {
+    if (char_idx == 0) return 0.0;
+    const clamped = @min(char_idx, text.len);
+    return measureTextEx(text[0..clamped], font_size, is_bold, is_mono, is_heading);
+}
+
+pub const Point = struct {
+    x: f32,
+    y: f32,
+};
+
+/// Extracts plaintext string corresponding to selected text range across draw commands.
+/// Accurately formats spaces, line wraps, and paragraph/element breaks.
+pub fn extractSelectionText(
+    commands: []const DrawCommand,
+    p1: Point,
+    p2: Point,
+    out_buf: []u8,
+) []const u8 {
+    const is_downward = (p1.y < p2.y or (p1.y == p2.y and p1.x <= p2.x));
+    const top_pt = if (is_downward) p1 else p2;
+    const bot_pt = if (is_downward) p2 else p1;
+
+    const min_y = top_pt.y;
+    const max_y = bot_pt.y;
+
+    var out_pos: usize = 0;
+    var last_doc_y: f32 = -9999.0;
+
+    for (commands) |cmd| {
+        if (cmd.kind != .text_run or cmd.text.len == 0) continue;
+
+        const r_top = cmd.rect.y;
+        const r_bot = cmd.rect.y + cmd.rect.h;
+
+        if (r_bot < min_y - 4.0 or r_top > max_y + 4.0) continue;
+
+        const is_first_line = (min_y >= r_top and min_y <= r_bot);
+        const is_last_line = (max_y >= r_top and max_y <= r_bot);
+
+        var c_start: usize = 0;
+        var c_end: usize = cmd.text.len;
+
+        if (is_first_line and is_last_line) {
+            const left_x = @min(top_pt.x, bot_pt.x);
+            const right_x = @max(top_pt.x, bot_pt.x);
+            if (cmd.rect.x + cmd.rect.w < left_x or cmd.rect.x > right_x) continue;
+            c_start = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, left_x - cmd.rect.x);
+            c_end = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, right_x - cmd.rect.x);
+        } else if (is_first_line) {
+            const start_x = top_pt.x;
+            if (cmd.rect.x + cmd.rect.w < start_x) continue;
+            c_start = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, start_x - cmd.rect.x);
+            c_end = cmd.text.len;
+        } else if (is_last_line) {
+            const end_x = bot_pt.x;
+            if (cmd.rect.x > end_x) continue;
+            c_start = 0;
+            c_end = getCharIndexAtX(cmd.text, cmd.font_size, cmd.style.bold, cmd.style.code, cmd.style.heading, end_x - cmd.rect.x);
+        } else {
+            c_start = 0;
+            c_end = cmd.text.len;
+        }
+
+        if (c_end > c_start and c_end <= cmd.text.len) {
+            const slice = cmd.text[c_start..c_end];
+            if (last_doc_y > -9000.0 and @abs(cmd.rect.y - last_doc_y) > 10.0) {
+                if (@abs(cmd.rect.y - last_doc_y) > 35.0) {
+                    if (out_pos + 2 <= out_buf.len) {
+                        out_buf[out_pos] = '\n';
+                        out_buf[out_pos + 1] = '\n';
+                        out_pos += 2;
+                    }
+                } else {
+                    if (out_pos + 1 <= out_buf.len) {
+                        out_buf[out_pos] = '\n';
+                        out_pos += 1;
+                    }
+                }
+            } else if (last_doc_y > -9000.0) {
+                if (out_pos + 1 <= out_buf.len) {
+                    out_buf[out_pos] = ' ';
+                    out_pos += 1;
+                }
+            }
+
+            const copy_len = @min(slice.len, out_buf.len - out_pos);
+            @memcpy(out_buf[out_pos..][0..copy_len], slice[0..copy_len]);
+            out_pos += copy_len;
+            last_doc_y = cmd.rect.y;
+        }
+    }
+
+    return out_buf[0..out_pos];
+}
+
+test "strict cross-element copying across headings, paragraphs, lists, tables, and code blocks" {
+    const test_doc =
+        \\# Fast Markdown Architecture
+        \\
+        \\Read is built strictly with zero runtime allocations.
+        \\
+        \\* Ultra high throughput
+        \\* Precise typography
+        \\
+        \\```zig
+        \\pub fn main() void {}
+        \\```
+    ;
+
+    var lines_buf: [64]simd.Line = undefined;
+    var fence = false;
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    var text_buf: [1024]u8 = undefined;
+
+    // 1. Selection spanning from Heading across Paragraph
+    var h_cmd: ?DrawCommand = null;
+    var p_cmd: ?DrawCommand = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Architecture")) h_cmd = c;
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "strictly")) p_cmd = c;
+    }
+
+    try std.testing.expect(h_cmd != null);
+    try std.testing.expect(p_cmd != null);
+
+    const sel1 = extractSelectionText(
+        cmds[0..count],
+        .{ .x = h_cmd.?.rect.x + 2.0, .y = h_cmd.?.rect.y + 5.0 },
+        .{ .x = p_cmd.?.rect.x + p_cmd.?.rect.w - 1.0, .y = p_cmd.?.rect.y + 5.0 },
+        &text_buf,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, sel1, "Architecture\n\nRead is built strictly") != null);
+
+    // 2. Selection spanning Paragraph across List item
+    var p2_cmd: ?DrawCommand = null;
+    var list_cmd: ?DrawCommand = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "allocations.")) p2_cmd = c;
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "throughput")) list_cmd = c;
+    }
+    try std.testing.expect(p2_cmd != null);
+    try std.testing.expect(list_cmd != null);
+
+    const sel2 = extractSelectionText(
+        cmds[0..count],
+        .{ .x = p2_cmd.?.rect.x + 2.0, .y = p2_cmd.?.rect.y + 5.0 },
+        .{ .x = list_cmd.?.rect.x + list_cmd.?.rect.w - 1.0, .y = list_cmd.?.rect.y + 5.0 },
+        &text_buf,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, sel2, "allocations.\n\n• Ultra high throughput") != null);
+
+    // 3. Selection across list items
+    var l1_cmd: ?DrawCommand = null;
+    var l2_cmd: ?DrawCommand = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Ultra")) l1_cmd = c;
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Precise")) l2_cmd = c;
+    }
+    try std.testing.expect(l1_cmd != null);
+    try std.testing.expect(l2_cmd != null);
+
+    const sel3 = extractSelectionText(
+        cmds[0..count],
+        .{ .x = l1_cmd.?.rect.x + 2.0, .y = l1_cmd.?.rect.y + 5.0 },
+        .{ .x = l2_cmd.?.rect.x + l2_cmd.?.rect.w - 1.0, .y = l2_cmd.?.rect.y + 5.0 },
+        &text_buf,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, sel3, "Ultra high throughput\n• Precise") != null);
 }

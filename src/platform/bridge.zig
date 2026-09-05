@@ -38,6 +38,7 @@ pub extern "c" fn platform_draw_text(
     is_bold: c_int,
     is_italic: c_int,
     is_mono: c_int,
+    is_heading: c_int,
     r: u8,
     g: u8,
     b: u8,

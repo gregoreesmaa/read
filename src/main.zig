@@ -172,6 +172,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 const is_bold: c_int = if (cmd.style.bold) 1 else 0;
                 const is_italic: c_int = if (cmd.style.italic) 1 else 0;
                 const is_mono: c_int = if (cmd.style.code) 1 else 0;
+                const is_heading: c_int = if (cmd.style.heading) 1 else 0;
 
                 const url_ptr = if (cmd.link_target) |t| t.ptr else null;
                 const url_len: c_int = if (cmd.link_target) |t| @intCast(t.len) else 0;
@@ -185,6 +186,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     is_bold,
                     is_italic,
                     is_mono,
+                    is_heading,
                     cmd.color.r,
                     cmd.color.g,
                     cmd.color.b,

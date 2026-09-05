@@ -15,7 +15,9 @@ typedef struct {
     float h;
     float font_size;
     int is_bold;
+    int is_italic;
     int is_mono;
+    int is_heading;
     char text[512];
     int len;
     char link_url[256];
@@ -43,6 +45,76 @@ static NSPoint g_select_start = {0, 0}; // Stored in document coordinates
 static NSPoint g_select_end = {0, 0};   // Stored in document coordinates
 static BOOL g_select_all = NO;
 
+static void register_app_fonts(void) {
+    static BOOL registered = NO;
+    if (registered) return;
+    registered = YES;
+
+    NSArray* paths = @[
+        @"assets/fonts/IBMPlexSerif-Regular.ttf",
+        @"assets/fonts/IBMPlexSerif-Bold.ttf",
+        @"assets/fonts/IBMPlexSerif-Italic.ttf",
+        @"assets/fonts/SpaceGrotesk.ttf",
+        @"assets/fonts/JetBrainsMono.ttf",
+    ];
+
+    for (NSString* relPath in paths) {
+        NSURL* url = [NSURL fileURLWithPath:relPath];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:[url path]]) {
+            CFErrorRef err = NULL;
+            CTFontManagerRegisterFontsForURL((__bridge CFURLRef)url, kCTFontManagerScopeProcess, &err);
+        }
+    }
+}
+
+static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
+    register_app_fonts();
+
+    if (is_mono) {
+        NSFont* f = [NSFont fontWithName:@"JetBrainsMono-Regular" size:font_size];
+        if (!f) f = [NSFont fontWithName:@"JetBrains Mono" size:font_size];
+        if (!f) f = [NSFont fontWithName:@"Menlo" size:font_size];
+        if (!f) f = [NSFont userFixedPitchFontOfSize:font_size];
+        return f;
+    }
+    if (is_heading) {
+        NSFont* f = nil;
+        if (is_bold) {
+            f = [NSFont fontWithName:@"SpaceGrotesk-Light_Bold" size:font_size];
+            if (!f) f = [NSFont fontWithName:@"SpaceGrotesk-Bold" size:font_size];
+        }
+        if (!f) f = [NSFont fontWithName:@"SpaceGrotesk-Light_Regular" size:font_size];
+        if (!f) f = [NSFont fontWithName:@"SpaceGrotesk-Regular" size:font_size];
+        if (!f) f = [NSFont fontWithName:@"Space Grotesk" size:font_size];
+        if (!f) f = [NSFont boldSystemFontOfSize:font_size];
+        return f;
+    }
+    // Body text: IBM Plex Serif
+    NSFont* f = nil;
+    if (is_bold && is_italic) {
+        f = [NSFont fontWithName:@"IBMPlexSerif-BoldItalic" size:font_size];
+        if (!f) f = [NSFont fontWithName:@"IBMPlexSerif-Bold" size:font_size];
+    } else if (is_bold) {
+        f = [NSFont fontWithName:@"IBMPlexSerif-Bold" size:font_size];
+    } else if (is_italic) {
+        f = [NSFont fontWithName:@"IBMPlexSerif-Italic" size:font_size];
+    } else {
+        f = [NSFont fontWithName:@"IBMPlexSerif-Regular" size:font_size];
+    }
+    if (!f) f = [NSFont fontWithName:@"IBM Plex Serif" size:font_size];
+    if (!f) {
+        // Fallback to Georgia or system serif
+        if (is_bold && is_italic) f = [NSFont fontWithName:@"Georgia-BoldItalic" size:font_size];
+        else if (is_bold) f = [NSFont fontWithName:@"Georgia-Bold" size:font_size];
+        else if (is_italic) f = [NSFont fontWithName:@"Georgia-Italic" size:font_size];
+        else f = [NSFont fontWithName:@"Georgia" size:font_size];
+    }
+    if (!f) {
+        f = is_bold ? [NSFont boldSystemFontOfSize:font_size] : [NSFont systemFontOfSize:font_size];
+    }
+    return f;
+}
+
 static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     if (x_offset <= 0) return 0;
     if (x_offset >= rec->w) return rec->len;
@@ -50,8 +122,7 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:rec->len encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (int)roundf((x_offset / rec->w) * rec->len);
 
-    NSFont* nsFont = rec->is_mono ? [NSFont userFixedPitchFontOfSize:rec->font_size] :
-                    (rec->is_bold ? [NSFont boldSystemFontOfSize:rec->font_size] : [NSFont systemFontOfSize:rec->font_size]);
+    NSFont* nsFont = get_font_for_style(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
     NSDictionary* attrs = @{(id)kCTFontAttributeName: nsFont};
     NSAttributedString* as = [[NSAttributedString alloc] initWithString:str attributes:attrs];
     CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
@@ -71,8 +142,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:char_idx encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (float)char_idx / rec->len * rec->w;
 
-    NSFont* nsFont = rec->is_mono ? [NSFont userFixedPitchFontOfSize:rec->font_size] :
-                    (rec->is_bold ? [NSFont boldSystemFontOfSize:rec->font_size] : [NSFont systemFontOfSize:rec->font_size]);
+    NSFont* nsFont = get_font_for_style(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
     NSDictionary* attrs = @{(id)kCTFontAttributeName: nsFont};
     NSAttributedString* as = [[NSAttributedString alloc] initWithString:str attributes:attrs];
     CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
@@ -160,32 +230,28 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
                 int c_start = 0;
                 int c_end = rec->len;
 
-                if (is_single_line) {
+                BOOL is_first_line = (min_y >= r_top && min_y <= r_bot);
+                BOOL is_last_line = (max_y >= r_top && max_y <= r_bot);
+
+                if (is_first_line && is_last_line) {
                     float left_x = fminf(top_pt.x, bot_pt.x);
                     float right_x = fmaxf(top_pt.x, bot_pt.x);
-
                     if (rec->x + rec->w < left_x || rec->x > right_x) continue;
-
                     c_start = get_char_index_at_x(rec, left_x - rec->x);
                     c_end = get_char_index_at_x(rec, right_x - rec->x);
+                } else if (is_first_line) {
+                    float start_x = top_pt.x;
+                    if (rec->x + rec->w < start_x) continue;
+                    c_start = get_char_index_at_x(rec, start_x - rec->x);
+                    c_end = rec->len;
+                } else if (is_last_line) {
+                    float end_x = bot_pt.x;
+                    if (rec->x > end_x) continue;
+                    c_start = 0;
+                    c_end = get_char_index_at_x(rec, end_x - rec->x);
                 } else {
-                    BOOL is_first_line = (r_top <= min_y && r_bot >= min_y);
-                    BOOL is_last_line = (r_top <= max_y && r_bot >= max_y);
-
-                    if (is_first_line) {
-                        float start_x = top_pt.x;
-                        if (rec->x + rec->w < start_x) continue;
-                        c_start = get_char_index_at_x(rec, start_x - rec->x);
-                        c_end = rec->len;
-                    } else if (is_last_line) {
-                        float end_x = bot_pt.x;
-                        if (rec->x > end_x) continue;
-                        c_start = 0;
-                        c_end = get_char_index_at_x(rec, end_x - rec->x);
-                    } else {
-                        c_start = 0;
-                        c_end = rec->len;
-                    }
+                    c_start = 0;
+                    c_end = rec->len;
                 }
 
                 if (c_end > c_start) {
@@ -464,8 +530,12 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
             QuadTextRecord* rec = &g_text_records[q];
             NSString* s = [[NSString alloc] initWithBytes:rec->text length:rec->len encoding:NSUTF8StringEncoding];
             if (s) {
-                if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 12.0f) {
-                    [result appendString:@"\n"];
+                if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 10.0f) {
+                    if (fabs(rec->doc_y - last_doc_y) > 35.0f) {
+                        [result appendString:@"\n\n"];
+                    } else {
+                        [result appendString:@"\n"];
+                    }
                 } else if (last_doc_y > -9000.0f) {
                     [result appendString:@" "];
                 }
@@ -482,7 +552,6 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 
         float min_y = top_pt.y;
         float max_y = bot_pt.y;
-        BOOL is_single_line = (fabs(max_y - min_y) < 18.0f);
 
         float last_doc_y = -9999.0f;
 
@@ -496,39 +565,39 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
             int c_start = 0;
             int c_end = rec->len;
 
-            if (is_single_line) {
+            BOOL is_first_line = (min_y >= r_top && min_y <= r_bot);
+            BOOL is_last_line = (max_y >= r_top && max_y <= r_bot);
+
+            if (is_first_line && is_last_line) {
                 float left_x = fminf(top_pt.x, bot_pt.x);
                 float right_x = fmaxf(top_pt.x, bot_pt.x);
-
                 if (rec->x + rec->w < left_x || rec->x > right_x) continue;
-
                 c_start = get_char_index_at_x(rec, left_x - rec->x);
                 c_end = get_char_index_at_x(rec, right_x - rec->x);
+            } else if (is_first_line) {
+                float start_x = top_pt.x;
+                if (rec->x + rec->w < start_x) continue;
+                c_start = get_char_index_at_x(rec, start_x - rec->x);
+                c_end = rec->len;
+            } else if (is_last_line) {
+                float end_x = bot_pt.x;
+                if (rec->x > end_x) continue;
+                c_start = 0;
+                c_end = get_char_index_at_x(rec, end_x - rec->x);
             } else {
-                BOOL is_first_line = (r_top <= min_y && r_bot >= min_y);
-                BOOL is_last_line = (r_top <= max_y && r_bot >= max_y);
-
-                if (is_first_line) {
-                    float start_x = top_pt.x;
-                    if (rec->x + rec->w < start_x) continue;
-                    c_start = get_char_index_at_x(rec, start_x - rec->x);
-                    c_end = rec->len;
-                } else if (is_last_line) {
-                    float end_x = bot_pt.x;
-                    if (rec->x > end_x) continue;
-                    c_start = 0;
-                    c_end = get_char_index_at_x(rec, end_x - rec->x);
-                } else {
-                    c_start = 0;
-                    c_end = rec->len;
-                }
+                c_start = 0;
+                c_end = rec->len;
             }
 
             if (c_end > c_start && c_start >= 0 && c_end <= rec->len) {
                 NSString* s = [[NSString alloc] initWithBytes:&rec->text[c_start] length:(c_end - c_start) encoding:NSUTF8StringEncoding];
                 if (s) {
-                    if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 12.0f) {
-                        [result appendString:@"\n"];
+                    if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 10.0f) {
+                        if (fabs(rec->doc_y - last_doc_y) > 35.0f) {
+                            [result appendString:@"\n\n"];
+                        } else {
+                            [result appendString:@"\n"];
+                        }
                     } else if (last_doc_y > -9000.0f) {
                         [result appendString:@" "];
                     }
@@ -635,7 +704,7 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     [g_window setTitle:[NSString stringWithUTF8String:title]];
     [g_window setTitlebarAppearsTransparent:YES];
     [g_window setTitleVisibility:NSWindowTitleHidden];
-    [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:0.08 green:0.08 blue:0.09 alpha:1.0]];
+    [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:18.0f/255.0f green:18.0f/255.0f blue:18.0f/255.0f alpha:1.0]];
     [g_window center];
 
     ReadView* view = [[ReadView alloc] initWithFrame:frame];
@@ -687,15 +756,14 @@ void platform_register_code_block(float x, float y, float w, float h, const char
     }
 }
 
-void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
+void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
     if (!g_current_cg_context || len <= 0 || !text) return;
     CGContextRef ctx = g_current_cg_context;
 
     NSString* str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
     if (!str) return;
 
-    NSFont* nsFont = is_mono ? [NSFont userFixedPitchFontOfSize:font_size] :
-                    (is_bold ? [NSFont boldSystemFontOfSize:font_size] : [NSFont systemFontOfSize:font_size]);
+    NSFont* nsFont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
     CTFontRef font = (__bridge CTFontRef)nsFont;
 
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
@@ -723,7 +791,9 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         rec->h = (float)(ascent + descent);
         rec->font_size = font_size;
         rec->is_bold = is_bold;
+        rec->is_italic = is_italic;
         rec->is_mono = is_mono;
+        rec->is_heading = is_heading;
         int copy_len = len < 511 ? len : 511;
         memcpy(rec->text, text, copy_len);
         rec->text[copy_len] = '\0';
@@ -762,8 +832,7 @@ float platform_measure_text(const char* text, int len, float font_size, int is_b
     }
     if (!str) return (float)len * font_size * 0.60f;
 
-    NSFont* nsFont = is_mono ? [NSFont userFixedPitchFontOfSize:font_size] :
-                    (is_bold ? [NSFont boldSystemFontOfSize:font_size] : [NSFont systemFontOfSize:font_size]);
+    NSFont* nsFont = get_font_for_style(font_size, is_bold, 0, is_mono, 0);
     CTFontRef font = (__bridge CTFontRef)nsFont;
 
     NSDictionary* attributes = @{

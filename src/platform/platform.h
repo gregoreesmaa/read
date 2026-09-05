@@ -18,7 +18,7 @@ void platform_request_redraw(void);
 void platform_sync_scroll(float scroll_y);
 
 void platform_draw_rect(float x, float y, float w, float h, unsigned char r, unsigned char g, unsigned char b, unsigned char a);
-void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len);
+void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len);
 void platform_register_code_block(float x, float y, float w, float h, const char* code_text, int code_len);
 float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono);
 

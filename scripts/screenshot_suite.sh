@@ -13,9 +13,9 @@ zig build -Doptimize=ReleaseFast
 echo "Capturing visual regression screenshots into $OUTPUT_DIR..."
 
 ./zig-out/bin/read --screenshot "$OUTPUT_DIR/showcase_top.png" showcase.md
-./zig-out/bin/read --screenshot "$OUTPUT_DIR/showcase_quotes_lists.png" --scroll 750 showcase.md
-./zig-out/bin/read --screenshot "$OUTPUT_DIR/showcase_tasks_code.png" --scroll 1500 showcase.md
-./zig-out/bin/read --screenshot "$OUTPUT_DIR/showcase_tables.png" --scroll 2400 showcase.md
+./zig-out/bin/read --screenshot "$OUTPUT_DIR/showcase_quotes_lists.png" --scroll 1200 showcase.md
+./zig-out/bin/read --screenshot "$OUTPUT_DIR/showcase_tasks_code.png" --scroll 3100 showcase.md
+./zig-out/bin/read --screenshot "$OUTPUT_DIR/showcase_tables.png" --scroll 4000 showcase.md
 
 echo "Screenshot regression captures complete in $OUTPUT_DIR:"
 ls -lh "$OUTPUT_DIR"

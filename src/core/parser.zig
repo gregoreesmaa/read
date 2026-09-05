@@ -7,6 +7,8 @@ pub const SpanStyle = packed struct {
     code: bool = false,
     strikethrough: bool = false,
     link: bool = false,
+    heading: bool = false,
+    _pad: u2 = 0,
 };
 
 pub const InlineSpan = struct {
