@@ -133,10 +133,9 @@ Read supports all major image and vector formats through zero-dependency native 
 
 ### Animated GIF — Rotating Earth (44 frames, public domain)
 
-Animated GIFs are loaded via native ImageIO; the first frame is displayed in static
-reading mode. Source: Wikimedia Commons.
+Animated GIFs are loaded via native ImageIO. Source: Wikimedia Commons.
 
-![Rotating Earth — Animated GIF (first frame shown)](assets/images/sample_animated.gif)
+![Rotating Earth — Animated GIF](assets/images/sample_animated.gif)
 
 
 ### High Efficiency Image Container (HEIC)

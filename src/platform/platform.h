@@ -15,6 +15,8 @@ typedef struct {
 int platform_init(const char* title, int width, int height, PlatformCallbacks callbacks);
 void platform_run_loop(void);
 void platform_request_redraw(void);
+void platform_request_redraw_rect(float x, float y, float w, float h);
+int platform_get_pending_damage(float* x, float* y, float* w, float* h);
 void platform_sync_scroll(float scroll_y);
 
 void platform_draw_rect(float x, float y, float w, float h, unsigned char r, unsigned char g, unsigned char b, unsigned char a);
@@ -26,6 +28,7 @@ void platform_register_scrollable_block(int block_id, float x, float y, float w,
 void platform_begin_clip(float x, float y, float w, float h);
 void platform_end_clip(void);
 float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono);
+void platform_glyph_cache_stats(unsigned long long* hits, unsigned long long* misses, unsigned long long* flushes);
 
 int platform_render_to_png(const char* output_path, int width, int height, void (*render_fn)(int width, int height));
 

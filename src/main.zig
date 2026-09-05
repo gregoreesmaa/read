@@ -4,6 +4,7 @@ const mmap = @import("core/mmap.zig");
 const simd = @import("core/simd.zig");
 const parser = @import("core/parser.zig");
 const layout = @import("layout/viewport.zig");
+const damage = @import("layout/damage.zig");
 const bridge = @import("platform/bridge.zig");
 
 const DEFAULT_DOC =
@@ -169,6 +170,17 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     bridge.platform_sync_scroll(g_app.scroll_y);
 
+    // Damage tracking: AppKit reports the dirty rect for this draw.
+    // Full-screen redraw happens only when the pending rect covers the view
+    // (resize, scroll, theme toggle) or is absent (headless, first draw).
+    // Partial damage culls off-region pixel commands below.
+    var pdx: f32 = 0.0;
+    var pdy: f32 = 0.0;
+    var pdw: f32 = 0.0;
+    var pdh: f32 = 0.0;
+    const has_pending = bridge.platform_get_pending_damage(&pdx, &pdy, &pdw, &pdh) != 0;
+    const dmg = damage.Damage.fromPending(has_pending, pdx, pdy, pdw, pdh, g_app.window_width, g_app.window_height);
+
     const vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
@@ -189,11 +201,15 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     for (g_commands_buffer[0..cmd_count]) |cmd| {
         switch (cmd.kind) {
             .fill_rect => {
+                // Background fills are clipped to the damage; off-region
+                // pixels are skipped entirely on partial redraws.
+                const r = dmg.clip(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h);
+                if (r.isEmpty()) continue;
                 bridge.platform_draw_rect(
-                    cmd.rect.x,
-                    cmd.rect.y,
-                    cmd.rect.w,
-                    cmd.rect.h,
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
                     cmd.color.r,
                     cmd.color.g,
                     cmd.color.b,
@@ -201,16 +217,21 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 );
             },
             .code_block_bg => {
-                bridge.platform_draw_rect(
-                    cmd.rect.x,
-                    cmd.rect.y,
-                    cmd.rect.w,
-                    cmd.rect.h,
-                    cmd.color.r,
-                    cmd.color.g,
-                    cmd.color.b,
-                    cmd.color.a,
-                );
+                // Hit-test registration is state, not pixels: always process
+                // so hover survives partial redraws. Only pixels are culled.
+                const r = dmg.clip(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h);
+                if (!r.isEmpty()) {
+                    bridge.platform_draw_rect(
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        cmd.color.r,
+                        cmd.color.g,
+                        cmd.color.b,
+                        cmd.color.a,
+                    );
+                }
                 bridge.platform_register_code_block(
                     cmd.rect.x,
                     cmd.rect.y,
@@ -246,6 +267,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 bridge.platform_end_clip();
             },
             .line => {
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
                 bridge.platform_draw_rect(
                     cmd.rect.x,
                     cmd.rect.y,
@@ -258,6 +280,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 );
             },
             .text_run => {
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
                 const is_bold: c_int = if (cmd.style.bold) 1 else 0;
                 const is_italic: c_int = if (cmd.style.italic) 1 else 0;
                 const is_mono: c_int = if (cmd.style.code) 1 else 0;
@@ -285,6 +308,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 );
             },
             .image => {
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
                 const url_ptr = if (cmd.link_target) |t| t.ptr else null;
                 const url_len: c_int = if (cmd.link_target) |t| @intCast(t.len) else 0;
                 bridge.platform_draw_image(
@@ -300,7 +324,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     }
 
     // Draw minimalist ambient reading progress indicator (thin 2px filament on right)
-    if (g_app.max_scroll_y > 0) {
+    if (g_app.max_scroll_y > 0 and dmg.keeps(g_app.window_width - 3.0, 0.0, 2.0, g_app.window_height)) {
         const progress = g_app.scroll_y / g_app.max_scroll_y;
         const bar_height: f32 = 40.0;
         const bar_y = progress * (g_app.window_height - bar_height);

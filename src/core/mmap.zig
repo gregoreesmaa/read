@@ -91,6 +91,15 @@ pub const MappedFile = struct {
         }
     }
 
+    /// Volatile release: drop clean pages outside the resident window.
+    /// Best-effort MADV_DONTNEED hint; the mapping stays open and zero-copy,
+    /// faulted pages are re-read from the file on next access. Zero heap
+    /// allocations. Never call on the open/layout hot path; invoke only when
+    /// the Goldilocks window moves (e.g. after a scroll settles).
+    pub fn releaseOutside(self: *const MappedFile, keep_start: usize, keep_end: usize) void {
+        releaseOutsideWindow(self.bytes, keep_start, keep_end);
+    }
+
     pub fn close(self: *MappedFile) void {
         if (self.bytes.len > 0) {
             if (builtin.os.tag == .windows) {
@@ -107,3 +116,78 @@ pub const MappedFile = struct {
         self.* = undefined;
     }
 };
+
+/// Goldilocks window: keep the viewport plus exactly one screen-height above
+/// and below resident; pages far outside get MADV_DONTNEED (see ideas.txt:3).
+pub const goldilocks_screens_above: usize = 1;
+pub const goldilocks_screens_below: usize = 1;
+
+/// Files smaller than this never trigger madvise; the hint costs more than
+/// it saves and risks EINVAL noise on tiny mappings.
+pub const min_advise_bytes: usize = 64 * 1024;
+
+/// Pure arithmetic: expand a visible byte range by one screen of bytes in
+/// each direction, clamped to [0, total_len). No syscalls, no allocations.
+pub fn goldilocksWindow(
+    visible_start: usize,
+    visible_end: usize,
+    total_len: usize,
+    window_hint_bytes: usize,
+) struct { start: usize, end: usize } {
+    const above = window_hint_bytes * goldilocks_screens_above;
+    const below = window_hint_bytes * goldilocks_screens_below;
+    return .{
+        .start = if (visible_start > above) visible_start - above else 0,
+        .end = @min(if (visible_end > total_len - below) total_len else visible_end + below, total_len),
+    };
+}
+
+fn runtimePageSize() usize {
+    if (builtin.os.tag == .windows) return 4096;
+    const sc = std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE));
+    if (sc > 0) return @intCast(sc);
+    return std.heap.page_size_min;
+}
+
+fn dontNeedRange(addr: usize, len: usize) void {
+    if (len == 0) return;
+    if (builtin.os.tag == .windows) return;
+    const ptr: [*]u8 = @ptrFromInt(addr);
+    const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(ptr);
+    _ = std.c.madvise(
+        @ptrCast(aligned),
+        len,
+        std.c.MADV.DONTNEED,
+    );
+}
+
+/// Release pages of `bytes` outside [keep_start, keep_end).
+/// Ranges are page-aligned outward (keep window never shrinks); unaligned
+/// slivers are kept resident. Best-effort: failures are silently ignored
+/// since dropped pages fault back from the file. Zero allocations.
+/// Platform note: on Linux this actively discards clean pages; on Darwin the
+/// hint succeeds but clean file-backed pages are already implicitly
+/// reclaimable, so mincore residency only drops under memory pressure.
+/// Either way the mapping stays correct and zero-copy.
+pub fn releaseOutsideWindow(bytes: []const u8, keep_start: usize, keep_end: usize) void {
+    if (bytes.len < min_advise_bytes) return;
+    if (builtin.os.tag == .windows) return;
+
+    const ks = @min(keep_start, bytes.len);
+    const ke = @min(@max(keep_end, ks), bytes.len);
+    const base = @intFromPtr(bytes.ptr);
+    const page = runtimePageSize();
+
+    // Head: [0, alignDown(keep_start)) -- whole pages strictly before the window.
+    const head_end = std.mem.alignBackward(usize, base + ks, page);
+    if (head_end > base) {
+        dontNeedRange(base, head_end - base);
+    }
+
+    // Tail: [alignUp(keep_end), len) -- whole pages strictly after the window.
+    const tail_start = std.mem.alignForward(usize, base + ke, page);
+    const end = base + bytes.len;
+    if (tail_start < end) {
+        dontNeedRange(tail_start, end - tail_start);
+    }
+}

@@ -16,6 +16,10 @@ pub extern "c" fn platform_init(
 
 pub extern "c" fn platform_run_loop() void;
 pub extern "c" fn platform_request_redraw() void;
+pub extern "c" fn platform_request_redraw_rect(x: f32, y: f32, w: f32, h: f32) void;
+/// Returns 1 and fills out the dirty rect AppKit reported for this draw,
+/// or 0 when there is no pending damage (headless render, first draw).
+pub extern "c" fn platform_get_pending_damage(x: *f32, y: *f32, w: *f32, h: *f32) c_int;
 pub extern "c" fn platform_sync_scroll(scroll_y: f32) void;
 
 pub extern "c" fn platform_draw_rect(
@@ -97,6 +101,12 @@ pub extern "c" fn platform_measure_text(
     is_bold: c_int,
     is_mono: c_int,
 ) f32;
+
+pub extern "c" fn platform_glyph_cache_stats(
+    hits: *u64,
+    misses: *u64,
+    flushes: *u64,
+) void;
 
 pub extern "c" fn platform_render_to_png(
     output_path: [*:0]const u8,

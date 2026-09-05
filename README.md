@@ -1,6 +1,15 @@
 # Read
 
-An ultra-minimalist, zero-dependency, microsecond-grade Markdown reader built in **Zig** with a native platform layer.
+[![CI](https://github.com/gregoreesmaa/read/actions/workflows/ci.yml/badge.svg)](https://github.com/gregoreesmaa/read/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/gregoreesmaa/read)](LICENSE)
+[![Zig 0.16](https://img.shields.io/badge/zig-0.16-orange)](https://ziglang.org)
+
+> **Read** — an ultra-minimalist, zero-dependency, microsecond-grade Markdown reader in pure Zig with a native macOS Cocoa/CoreText layer.
+
+A **zig markdown reader** with **zero-dependency** binaries under 500 KB: zero-copy file access via
+**mmap**, branchless **SIMD** line scanning at gigabytes per second, a virtualized viewport with
+**microsecond** layout latency, and native **Core Text** typography on **macOS**. No Electron, no
+WebKit, no UI toolkit, no package dependencies — just Zig and OS headers.
 
 ```
        _____                 _ 
@@ -21,11 +30,13 @@ All metrics are codified in `src/core/strict_benchmarks.zig` and verified on App
 
 | Metric | Typical Markdown App (Electron / WebTech) | Standard Native Reader | **Read** (Zig 0.16) | Target Guaranteed |
 | :--- | :--- | :--- | :--- | :--- |
-| **Binary Size** | ~180 MB | ~15 – 35 MB | **473 KB** (`ReleaseFast`) | **< 500 KB** |
-| **Document Open Time** | 350 – 1,200 ms | 20 – 60 ms | **9 – 10 µs** (Zero-copy `mmap`) | $\le 45\text{ µs}$ |
-| **SIMD Line Scanning** | ~100 ms | 15 – 25 ms | **~300 µs for 50,000 lines** (**> 7.1 GB/s**) | $\ge 2.5\text{ GB/s}$ |
-| **Viewport Layout Latency** | 8 – 16 ms | 1 – 3 ms | **4 – 6 µs** (0.005 ms) | $\le 50\text{ µs}$ |
-| **Substring Search (50k lines)** | ~50 ms | 5 – 10 ms | **60 µs** (0.06 ms) | $\le 150\text{ µs}$ |
+| **Binary Size** | ~180 MB | ~15 – 35 MB | **< 500 KB** (`ReleaseFast`) | **< 500 KB** |
+| **Document Open Time** | 350 – 1,200 ms | 20 – 60 ms | **≤ 20 µs** (Zero-copy `mmap`) | **≤ 20 µs** |
+| **SIMD Line Scanning** | ~100 ms | 15 – 25 ms | **≤ 450 µs for 50,000 lines** (**≥ 5.0 GB/s**) | **≥ 5.0 GB/s, ≤ 450 µs** |
+| **Viewport Layout Latency** | 8 – 16 ms | 1 – 3 ms | **≤ 12 µs** | **≤ 12 µs** |
+| **Substring Search (50k lines)** | ~50 ms | 5 – 10 ms | **≤ 85 µs** | **≤ 85 µs** |
+| **Deep-Scroll Layout (line 45k+)** | 8 – 16 ms | 1 – 3 ms | **≤ 12 µs** (checkpointed) | **≤ 12 µs** |
+| **Line Index Footprint** | — | — | **8-byte packed `Line` struct** | **8 bytes** |
 | **Hot Path Heap Allocations** | Millions | Thousands | **0** (Zero heap allocations) | **0** |
 | **Active Memory (MaxRSS)** | 150 – 400 MB | 30 – 80 MB | **< 6 MB** | Minimal OS page footprint |
 | **Third-Party Dependencies** | Hundreds (`node_modules`) | Multiple UI toolkits | **0** (Pure Zig + Native OS headers) | Zero external packages |
@@ -60,7 +71,7 @@ All metrics are codified in `src/core/strict_benchmarks.zig` and verified on App
 2. **Branchless SIMD Line Scanner (`src/core/simd.zig`)**
    - Scans 32 bytes per iteration using hardware vector registers (`@Vector(32, u8)`).
    - High-speed classification identifies headings, code fences, blockquotes, lists, task checkboxes, tables, and horizontal rules at > 7.0 GB/s.
-   - Outputs a compact 10-byte `Line` index array.
+   - Outputs a compact 8-byte packed `Line` index array.
 
 3. **Virtualized Viewport Layout (`src/layout/viewport.zig`)**
    - Elements outside the viewport window are culled instantly. Only tokens visibly intersecting the screen are tokenized and laid out.
@@ -131,21 +142,41 @@ Strictly conforms to CommonMark Spec and Daring Fireball syntax (HTML rendering 
 
 ---
 
-## 🛠 Building & Verification
+## 📸 Screenshots
+
+Visual regression captures (regenerated via `./scripts/screenshot_suite.sh screenshots` — see
+[showcase.md](showcase.md) for the full demo document):
+
+| Text wrapping & typography | Spacings & headings |
+| :---: | :---: |
+| ![Text wrapping](screenshots/text_wrapping.png) | ![Spacings and headings](screenshots/spacings_headings.png) |
+
+| Code blocks & task lists | Tables formatting |
+| :---: | :---: |
+| ![Code and tasks](screenshots/code_and_tasks.png) | ![Tables formatting](screenshots/tables_formatting.png) |
+
+| Scrollable document (scrolled viewport) |
+| :---: |
+| ![Scrollable doc](screenshots/scrollable_doc.png) |
+
+---
+
+## 🛠 Quickstart
 
 ### Prerequisites
-- [Zig](https://ziglang.org) (v0.16.0 or later)
-- macOS with Xcode Command Line Tools (for Apple Cocoa/CoreText platform layer)
+- [Zig](https://ziglang.org) 0.16.0 or later (`zig version` should print `0.16.0`)
+- macOS with Xcode Command Line Tools (Cocoa/CoreText platform layer; core
+  `zig build test` also runs on Linux, but the native window and screenshots need macOS)
 
 ### Build & Run
 ```bash
-# Run 100% of unit tests and strict microsecond benchmarks
+# Run 100% of unit tests and strict microsecond benchmarks (required gate)
 zig build test -Doptimize=ReleaseFast --summary all
 
-# Build optimized ReleaseFast executable
+# Build optimized ReleaseFast executable (< 500 KB)
 zig build -Doptimize=ReleaseFast
 
-# Open a Markdown document
+# Open a Markdown document (try the full demo)
 ./zig-out/bin/read showcase.md
 
 # Headless screenshot capture
@@ -155,6 +186,8 @@ zig build -Doptimize=ReleaseFast
 # Regenerate complete visual regression screenshot suite
 ./scripts/screenshot_suite.sh screenshots
 ```
+
+New contributors: read [CONTRIBUTING.md](CONTRIBUTING.md) for the pre-commit protocol first.
 
 ---
 

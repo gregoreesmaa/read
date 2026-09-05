@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  # Full gate on macOS: strict benchmarks + release build + screenshot smoke test.
+  # The native Cocoa/CoreText window and headless screenshots only run here.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Release build
+        run: zig build -Doptimize=ReleaseFast
+      - name: Screenshot smoke test
+        run: ./zig-out/bin/read --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
+
+  # Portability check: core tests + build must also pass on Linux.
+  # (Cocoa frameworks link only on Darwin; see build.zig.)
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Release build
+        run: zig build -Doptimize=ReleaseFast

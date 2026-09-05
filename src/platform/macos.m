@@ -9,6 +9,17 @@ static CGContextRef g_current_cg_context = NULL;
 static float g_scroll_y = 0.0f;
 static NSPoint g_mouse_pos = {-9999.0f, -9999.0f};
 
+// Idle policy (mirrors src/platform/idle.zig): mouse motion alone never
+// redraws. Only a hover-state transition re-arms a draw. The last hover
+// state is cached here so mouseMoved can compare instead of redrawing.
+static BOOL g_last_link_hover = NO;
+static BOOL g_last_code_btn_hover = NO;
+// Monotonic draw pass counter. GIF records stamp it when actually painted;
+// a frame tick whose stamp is stale means the image left the viewport, so
+// the animation chain parks instead of waking the loop.
+static unsigned long g_draw_seq = 0;
+static BOOL gif_window_visible(void); // defined with the image cache below
+
 typedef struct {
     float x;
     float doc_y; // Document Y (y + g_scroll_y)
@@ -56,6 +67,53 @@ static int g_selection_mode = 0; // 0 = none, 1 = range, 2 = word, 3 = line, 4 =
 static NSPoint g_select_start = {0, 0}; // Stored in document coordinates
 static NSPoint g_select_end = {0, 0};   // Stored in document coordinates
 static BOOL g_select_all = NO;
+
+// ---------------------------------------------------------------------------
+// Damage tracking (dirty rectangles): submit only the changed region to the
+// OS compositor. Full-screen redraw happens only when every pixel may have
+// changed (resize, scroll, theme toggle).
+// ---------------------------------------------------------------------------
+static NSRect g_pending_dirty = {{0, 0}, {0, 0}};
+static BOOL g_pending_dirty_valid = NO;
+static int g_hovered_code_btn = -1;
+
+static NSView* damage_target_view(void) {
+    if (g_main_view) return g_main_view;
+    if (g_window) return [g_window contentView];
+    return nil;
+}
+
+static void invalidate_rect(NSRect r) {
+    if (NSIsEmptyRect(r)) return;
+    NSView* v = damage_target_view();
+    if (v) [v setNeedsDisplayInRect:r];
+}
+
+static NSRect union_rect(NSRect a, NSRect b) {
+    if (NSIsEmptyRect(a)) return b;
+    if (NSIsEmptyRect(b)) return a;
+    return NSUnionRect(a, b);
+}
+
+// Current selection bounds in VIEW coordinates, expanded by pad.
+// This is the exact damage box for cursor/selection changes.
+static NSRect selection_bounds_expanded(float pad) {
+    if (g_select_all) {
+        NSView* v = damage_target_view();
+        if (!v) return NSZeroRect;
+        return NSInsetRect([v bounds], -pad, -pad);
+    }
+    if (!g_has_selection) return NSZeroRect;
+    float x1 = fminf(g_select_start.x, g_select_end.x);
+    float x2 = fmaxf(g_select_start.x, g_select_end.x);
+    float y1 = fminf(g_select_start.y, g_select_end.y) - g_scroll_y;
+    float y2 = fmaxf(g_select_start.y, g_select_end.y) - g_scroll_y;
+    return NSMakeRect(x1 - pad, y1 - pad, (x2 - x1) + 2.0f * pad, (y2 - y1) + 2.0f * pad);
+}
+
+static NSRect copy_button_rect_for_block(CodeBlockRecord* b) {
+    return NSMakeRect(b->x + b->w - 64.0f - 8.0f, b->y + 8.0f, 64.0f, 24.0f);
+}
 
 static void register_app_fonts(void) {
     static BOOL registered = NO;
@@ -127,9 +185,264 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
     return f;
 }
 
+// ---------------------------------------------------------------------------
+// Shaping economy: word-level shaped-run cache + packed atlas.
+//
+// Contract (mirrored by src/platform/glyph_cache.zig, which pins it in
+// cross-platform tests): runs are keyed by (FNV-1a of text bytes + style),
+// held in a direct-mapped table (collision = evict), and rasterized ONCE
+// into a single packed atlas (shelf packing, 2x supersampled coverage
+// mask). Per-frame rendering is textured quads only — ClipToMask + FillRect
+// from the atlas, composited by the GPU — with no CTLineCreate, no
+// NSAttributedString, and no per-pixel CPU work on the steady path.
+// Steady-state hot path performs zero allocations: table + atlas live in
+// static storage / one malloc-at-startup pixel buffer.
+// ---------------------------------------------------------------------------
+
+#define SHAPE_CACHE_CAP 1024
+#define ATLAS_PX 2048
+#define RASTER_SCALE 2
+
+typedef struct {
+    uint64_t key;      // FNV-1a(text bytes, style, font size bits)
+    int len;           // byte length (exact-match guard)
+    char head[8];      // first bytes (cheap collision guard)
+    CTLineRef line;    // retained shaped run, NULL when empty
+    CGImageRef slice;  // retained no-copy view into g_atlas_img, made once
+    float w, h;        // shaped advance incl. trailing space
+    float ascent, descent;
+    short ax, ay, aw, ah; // atlas UV rect in device px (aw==0 => not rasterized)
+    uint8_t occupied;
+} ShapedEntry;
+
+static ShapedEntry g_shape_cache[SHAPE_CACHE_CAP]; // BSS: no binary cost
+static unsigned char* g_atlas_px = NULL;  // one 4 MiB buffer, malloc-once
+static CGContextRef g_atlas_ctx = NULL;
+// Single persistent atlas image: provider-backed LIVE view of g_atlas_px,
+// created once — never copied, never rebuilt (verified live via probe:
+// mutations of the pixel buffer are visible through the same image object).
+static CGImageRef g_atlas_img = NULL;
+static int g_atlas_x = 0, g_atlas_y = 0, g_atlas_shelf_h = 0;
+static uint64_t g_shape_hits = 0, g_shape_misses = 0, g_atlas_flushes = 0;
+
+static uint64_t shape_key(const char* text, int len, float font_size,
+                          int is_bold, int is_italic, int is_mono, int is_heading) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < len; i++) {
+        h ^= (unsigned char)text[i];
+        h *= 0x100000001b3ULL;
+    }
+    uint32_t style = ((uint32_t)(is_bold ? 1 : 0))
+                   | ((uint32_t)(is_italic ? 2 : 0))
+                   | ((uint32_t)(is_mono ? 4 : 0))
+                   | ((uint32_t)(is_heading ? 8 : 0));
+    uint32_t fbits = 0;
+    memcpy(&fbits, &font_size, 4);
+    uint64_t tail = ((uint64_t)style << 32) | fbits;
+    for (int i = 0; i < 8; i++) {
+        h ^= (unsigned char)(tail >> (i * 8));
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Shelf-pack `pw x ph` device px into the atlas. Returns 1 on success.
+static int atlas_alloc(int pw, int ph, short* out_x, short* out_y) {
+    if (pw <= 0 || ph <= 0 || pw > ATLAS_PX || ph > ATLAS_PX) return 0;
+    if (g_atlas_x + pw > ATLAS_PX) {
+        g_atlas_y += g_atlas_shelf_h;
+        g_atlas_x = 0;
+        g_atlas_shelf_h = 0;
+    }
+    if (g_atlas_y + ph > ATLAS_PX) return 0;
+    *out_x = (short)g_atlas_x;
+    *out_y = (short)g_atlas_y;
+    g_atlas_x += pw;
+    if (ph > g_atlas_shelf_h) g_atlas_shelf_h = ph;
+    return 1;
+}
+
+// Drop a cached entry's raster state (used on eviction and image rebuild).
+static void shape_drop_raster(ShapedEntry* e) {
+    if (e->slice) {
+        CGImageRelease(e->slice);
+        e->slice = NULL;
+    }
+    e->aw = 0;
+    e->ah = 0;
+}
+
+// Generational flush: wipe pixels, reset cursor, keep shaped lines cached
+// (they re-rasterize lazily via the aw==0 sentinel).
+static void atlas_flush(void) {
+    if (g_atlas_px) memset(g_atlas_px, 0, (size_t)ATLAS_PX * ATLAS_PX);
+    g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
+    for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
+    g_atlas_flushes++;
+}
+
+static void atlas_ensure(void) {
+    if (g_atlas_ctx) return;
+    g_atlas_px = (unsigned char*)calloc((size_t)ATLAS_PX * ATLAS_PX, 1);
+    if (!g_atlas_px) return;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+    g_atlas_ctx = CGBitmapContextCreate(g_atlas_px, ATLAS_PX, ATLAS_PX, 8,
+                                        ATLAS_PX, cs,
+                                        (CGBitmapInfo)kCGImageAlphaNone);
+    // Y-down so drawing uses the same orientation as the flipped view.
+    CGContextTranslateCTM(g_atlas_ctx, 0, ATLAS_PX);
+    CGContextScaleCTM(g_atlas_ctx, 1.0f, -1.0f);
+    // Persistent live image over the same pixels: zero copies, ever.
+    CGDataProviderRef prov = CGDataProviderCreateWithData(
+        NULL, g_atlas_px, (size_t)ATLAS_PX * ATLAS_PX, NULL);
+    if (prov) {
+        g_atlas_img = CGImageCreate(ATLAS_PX, ATLAS_PX, 8, 8, ATLAS_PX, cs,
+                                    (CGBitmapInfo)kCGImageAlphaNone, prov, NULL, false,
+                                    kCGRenderingIntentDefault);
+        CGDataProviderRelease(prov);
+    }
+    CGColorSpaceRelease(cs);
+}
+
+static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str);
+
+// Shape (or hit) a run. On hit returns the entry with zero shaping work.
+// On miss shapes exactly once, retains the CTLine, and rasterizes into the
+// atlas when `rasterize` is set (measure-only callers pass 0 and the rect
+// is produced lazily on first draw). NULL only when text is not cacheable.
+static ShapedEntry* shape_run(const char* text, int len, float font_size,
+                              int is_bold, int is_italic, int is_mono, int is_heading,
+                              int rasterize) {
+    if (!text || len <= 0 || len >= 511) return NULL;
+    uint64_t key = shape_key(text, len, font_size, is_bold, is_italic, is_mono, is_heading);
+    ShapedEntry* e = &g_shape_cache[key % SHAPE_CACHE_CAP];
+    if (e->occupied && e->key == key && e->len == len &&
+        memcmp(e->head, text, len < 8 ? len : 8) == 0) {
+        g_shape_hits++;
+        if (rasterize && e->aw == 0 && e->line) {
+            // Shaped earlier by the measure path; rasterize lazily now.
+            NSString* rstr = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
+            if (rstr) {
+                NSFont* rfont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
+                shape_rasterize_entry(e, rfont, rstr);
+            }
+        }
+        return e;
+    }
+    g_shape_misses++;
+
+    NSString* str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
+    if (!str) return NULL;
+    NSFont* nsFont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
+    NSDictionary* attrs = @{(id)kCTFontAttributeName: nsFont};
+    NSAttributedString* as = [[NSAttributedString alloc] initWithString:str attributes:attrs];
+    CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+    if (!line) return NULL;
+
+    CGFloat ascent, descent, leading;
+    double mw = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
+    double trailing = CTLineGetTrailingWhitespaceWidth(line);
+
+    if (e->occupied) {
+        if (e->line) CFRelease(e->line);
+        shape_drop_raster(e);
+    }
+    e->key = key;
+    e->len = len;
+    memcpy(e->head, text, len < 8 ? len : 8);
+    e->line = line; // retained by Create; cache owns it now
+    e->w = (float)(mw + trailing);
+    e->h = (float)(ascent + descent);
+    e->ascent = (float)ascent;
+    e->descent = (float)descent;
+    e->aw = 0;
+    e->ah = 0;
+    e->occupied = 1;
+
+    if (rasterize) shape_rasterize_entry(e, nsFont, str);
+    return e;
+}
+
+// Rasterize an already-shaped entry into the atlas (idempotent).
+static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str) {
+    if (!e || !e->line || e->aw != 0) return;
+    atlas_ensure();
+    if (!g_atlas_ctx) return;
+
+    int pw = (int)ceil(e->w * RASTER_SCALE);
+    int ph = (int)ceil(e->h * RASTER_SCALE);
+    if (pw <= 0 || ph <= 0) return;
+    short ax = 0, ay = 0;
+    if (!atlas_alloc(pw, ph, &ax, &ay)) {
+        atlas_flush();
+        if (!atlas_alloc(pw, ph, &ax, &ay)) return; // larger than atlas: caller draws direct
+    }
+
+    // White coverage mask, 2x supersampled for Retina-crisp blits.
+    NSDictionary* white = @{
+        (id)kCTFontAttributeName: nsFont,
+        (id)kCTForegroundColorAttributeName: (__bridge id)[NSColor whiteColor].CGColor,
+    };
+    NSAttributedString* was = [[NSAttributedString alloc] initWithString:str attributes:white];
+    CTLineRef wline = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)was);
+    if (!wline) return;
+
+    // NOTE: stored vertically mirrored: the per-frame ClipToMask blit in the
+    // flipped view context maps image rows bottom-up, so a mirrored mask
+    // blits upright (verified visually via /tmp/shape_probe renders).
+    CGContextSaveGState(g_atlas_ctx);
+    CGContextTranslateCTM(g_atlas_ctx, ax, ay + (float)ph - e->ascent * RASTER_SCALE);
+    CGContextScaleCTM(g_atlas_ctx, (float)RASTER_SCALE, (float)RASTER_SCALE);
+    CGContextSetTextPosition(g_atlas_ctx, 0, 0);
+    CTLineDraw(wline, g_atlas_ctx);
+    CGContextRestoreGState(g_atlas_ctx);
+    CFRelease(wline);
+
+    e->ax = ax;
+    e->ay = ay;
+    e->aw = (short)pw;
+    e->ah = (short)ph;
+    // Slice once: the atlas image is a live view, so it already sees the
+    // pixels just drawn — no refresh, no copy, no per-frame allocation.
+    if (g_atlas_img) {
+        CGRect src = CGRectMake(ax, ay, pw, ph);
+        e->slice = CGImageCreateWithImageInRect(g_atlas_img, src);
+    }
+}
+
+// Read-only probe for selection/measure fast paths (no insert, no raster).
+static CTLineRef shape_cached_line(const char* text, int len, float font_size,
+                                   int is_bold, int is_italic, int is_mono, int is_heading) {
+    if (!text || len <= 0 || len >= 511) return NULL;
+    uint64_t key = shape_key(text, len, font_size, is_bold, is_italic, is_mono, is_heading);
+    ShapedEntry* e = &g_shape_cache[key % SHAPE_CACHE_CAP];
+    if (e->occupied && e->key == key && e->len == len &&
+        memcmp(e->head, text, len < 8 ? len : 8) == 0 && e->line) {
+        g_shape_hits++;
+        return e->line;
+    }
+    return NULL;
+}
+
+void platform_glyph_cache_stats(uint64_t* hits, uint64_t* misses, uint64_t* flushes) {
+    if (hits) *hits = g_shape_hits;
+    if (misses) *misses = g_shape_misses;
+    if (flushes) *flushes = g_atlas_flushes;
+}
+
 static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     if (x_offset <= 0) return 0;
     if (x_offset >= rec->w) return rec->len;
+
+    // Shaping-economy fast path: hit-test on the cached run, no new CTLine.
+    CTLineRef cached = shape_cached_line(rec->text, rec->len, rec->font_size,
+                                         rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
+    if (cached) {
+        CFIndex idx = CTLineGetStringIndexForPosition(cached, CGPointMake(x_offset, 0));
+        if (idx < 0) idx = 0;
+        if (idx > rec->len) idx = rec->len;
+        return (int)idx;
+    }
 
     NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:rec->len encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (int)roundf((x_offset / rec->w) * rec->len);
@@ -150,6 +463,14 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
 static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     if (char_idx <= 0) return 0.0f;
     if (char_idx >= rec->len) return rec->w;
+
+    // Shaping-economy fast path: measure the prefix on the cached run.
+    CTLineRef cached = shape_cached_line(rec->text, rec->len, rec->font_size,
+                                         rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
+    if (cached) {
+        CGFloat off = CTLineGetOffsetForStringIndex(cached, char_idx, NULL);
+        return (float)off;
+    }
 
     NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:char_idx encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (float)char_idx / rec->len * rec->w;
@@ -187,16 +508,20 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
     NSTrackingArea* area = [[NSTrackingArea alloc] initWithRect:self.bounds
-                                                       options:NSTrackingMouseMoved | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
+                                                       options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
                                                          owner:self
                                                       userInfo:nil];
     [self addTrackingArea:area];
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
-    (void)dirtyRect;
+    // Record the compositor's dirty rect so the Zig draw callback can cull
+    // off-region commands. Never ignored: partial damage skips pixels.
+    g_pending_dirty = dirtyRect;
+    g_pending_dirty_valid = YES;
     CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
     if (!ctx) return;
+    g_draw_seq++;
 
     g_text_record_count = 0;
     g_code_block_count = 0;
@@ -328,6 +653,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     }
 
     g_current_cg_context = NULL;
+    g_pending_dirty_valid = NO;
 }
 
 - (void)mouseMoved:(NSEvent *)event {
@@ -365,31 +691,78 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
         [[NSCursor IBeamCursor] set];
     }
 
-    [self setNeedsDisplay:YES];
+    // Damage: cursor changes need no repaint. Only the hover Copy button
+    // changing visibility dirties pixels: invalidate old + new button rects.
+    int new_hover_btn = -1;
+    NSRect new_btn_rect = NSZeroRect;
+    for (int b_idx = 0; b_idx < g_code_block_count; b_idx++) {
+        CodeBlockRecord* b = &g_code_blocks[b_idx];
+        if (g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
+            g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
+            new_hover_btn = b_idx;
+            new_btn_rect = copy_button_rect_for_block(b);
+            break;
+        }
+    }
+    // Idle-gated link highlight (mirrors idle.zig shouldRedrawOnHover): pure
+    // mouse motion never redraws. A link-highlight flip re-arms one gated
+    // full redraw (no exact record handy); copy-button-only flips stay
+    // rect-precise below.
+    if (g_text_record_count > 0 && over_link != g_last_link_hover) {
+        g_last_link_hover = over_link;
+        [self setNeedsDisplay:YES];
+    }
+    g_last_code_btn_hover = over_code_btn;
+    if (new_hover_btn != g_hovered_code_btn) {
+        if (g_hovered_code_btn >= 0 && g_hovered_code_btn < g_code_block_count) {
+            invalidate_rect(copy_button_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
+        }
+        if (new_hover_btn >= 0) {
+            invalidate_rect(new_btn_rect);
+        }
+        g_hovered_code_btn = new_hover_btn;
+    }
 }
 
+- (void)mouseExited:(NSEvent *)event {
+    (void)event;
+    g_mouse_pos = NSMakePoint(-9999.0f, -9999.0f);
+    // Clear button hover with its exact rect; link hover via one gated redraw.
+    if (g_hovered_code_btn >= 0 && g_hovered_code_btn < g_code_block_count) {
+        invalidate_rect(copy_button_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
+        g_hovered_code_btn = -1;
+    }
+    if (g_last_link_hover || g_last_code_btn_hover) {
+        g_last_link_hover = NO;
+        g_last_code_btn_hover = NO;
+        [[NSCursor IBeamCursor] set];
+        [self setNeedsDisplay:YES];
+    }
+}
 - (void)mouseDown:(NSEvent *)event {
     NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
 
     // Check if clicked Copy button on a code block
     for (int b_idx = 0; b_idx < g_code_block_count; b_idx++) {
         CodeBlockRecord* b = &g_code_blocks[b_idx];
-        float btn_w = 64.0f;
-        float btn_h = 24.0f;
-        float btn_x = b->x + b->w - btn_w - 8.0f;
-        float btn_y = b->y + 8.0f;
-        if (view_pt.x >= btn_x && view_pt.x <= btn_x + btn_w &&
-            view_pt.y >= btn_y && view_pt.y <= btn_y + btn_h) {
+        NSRect btn = copy_button_rect_for_block(b);
+        if (view_pt.x >= btn.origin.x && view_pt.x <= btn.origin.x + btn.size.width &&
+            view_pt.y >= btn.origin.y && view_pt.y <= btn.origin.y + btn.size.height) {
             NSPasteboard* pb = [NSPasteboard generalPasteboard];
             [pb clearContents];
             NSString* s = [[NSString alloc] initWithBytes:b->text length:b->len encoding:NSUTF8StringEncoding];
             if (s) [pb setString:s forType:NSPasteboardTypeString];
             g_copied_block_idx = b_idx;
             g_copied_timestamp = [NSDate timeIntervalSinceReferenceDate];
-            [self setNeedsDisplay:YES];
+            // Damage: only the button label flips to "Copied!".
+            invalidate_rect(btn);
             return;
         }
     }
+
+    // Damage: capture pre-click selection bounds; the redraw covers
+    // old bounds + new caret/word/line box only.
+    NSRect old_sel = selection_bounds_expanded(24.0f);
 
     g_select_all = NO;
     g_has_selection = YES;
@@ -431,23 +804,33 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
         g_selection_mode = 1;
     }
 
-    [self setNeedsDisplay:YES];
+    // Damage: old selection bounds + new caret/word/line box only.
+    invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
 }
 
 - (void)mouseDragged:(NSEvent *)event {
     if (g_selection_mode <= 1) {
         NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
+        NSPoint prev_end = g_select_end;
         g_select_end = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
-        [self setNeedsDisplay:YES];
+        // Damage: only the strip between previous and new cursor-end changed.
+        float y1 = fminf(prev_end.y, g_select_end.y) - g_scroll_y;
+        float y2 = fmaxf(prev_end.y, g_select_end.y) - g_scroll_y;
+        float x1 = fminf(prev_end.x, g_select_end.x);
+        float x2 = fmaxf(prev_end.x, g_select_end.x);
+        invalidate_rect(NSMakeRect(x1 - 24.0f, y1 - 24.0f, (x2 - x1) + 48.0f, (y2 - y1) + 48.0f));
     }
 }
 
 - (void)mouseUp:(NSEvent *)event {
     if (g_selection_mode >= 2) {
-        // Prohibit mouseUp from moving g_select_end on double or triple click
-        [self setNeedsDisplay:YES];
+        // Prohibit mouseUp from moving g_select_end on double or triple click.
+        // Damage: selection did not change, so no repaint is needed.
         return;
     }
+
+    // Damage: capture pre-release bounds; invalidate old + final only.
+    NSRect old_sel = selection_bounds_expanded(24.0f);
 
     NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
     NSPoint end_doc = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
@@ -472,12 +855,15 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
                     break;
                 }
             }
+            // Damage: cleared selection repaints its old bounds only.
+            invalidate_rect(old_sel);
+            return;
         }
     } else {
         g_select_end = end_doc;
     }
 
-    [self setNeedsDisplay:YES];
+    invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
 }
 
 - (NSMenu *)menuForEvent:(NSEvent *)event {
@@ -644,10 +1030,16 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 
 - (void)scrollWheel:(NSEvent *)event {
     if (g_callbacks.on_scroll) {
+        // Both the finger phase and the kinetic momentum phase are honored
+        // (mirrors idle.zig isGestureEnd). Momentum delivers its own event
+        // stream, so redraws stay armed exactly while it is live and the
+        // loop returns to idle the instant either phase ends.
         NSEventPhase phase = [event phase];
-        if (phase == NSEventPhaseEnded || phase == NSEventPhaseCancelled) {
+        NSEventPhase momentum = [event momentumPhase];
+        if (phase == NSEventPhaseEnded || phase == NSEventPhaseCancelled ||
+            momentum == NSEventPhaseEnded || momentum == NSEventPhaseCancelled) {
             g_callbacks.on_scroll(0.0f, 0.0f, -1);
-            [self setNeedsDisplay:YES];
+            // Damage: scroll-lock reset changes no pixels, so no repaint.
             return;
         }
 
@@ -690,19 +1082,33 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 
     if ([chars length] > 0) {
         unichar c = [chars characterAtIndex:0];
+        int hovered_block_id = -1;
+        for (int i = 0; i < g_scrollable_block_count; i++) {
+            ScrollableBlockRecord* b = &g_scrollable_blocks[i];
+            if (g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
+                g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
+                hovered_block_id = b->id;
+                break;
+            }
+        }
         if (g_callbacks.on_key) {
-            int hovered_block_id = -1;
+            g_callbacks.on_key((int)c, hovered_block_id);
+        }
+        // Damage: h/l nudge one hovered block -> its exact box only.
+        // j/k/Space scroll and t theme-toggle repaint every pixel -> full.
+        if ((c == 'h' || c == 'l') && hovered_block_id >= 0) {
             for (int i = 0; i < g_scrollable_block_count; i++) {
                 ScrollableBlockRecord* b = &g_scrollable_blocks[i];
-                if (g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
-                    g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
-                    hovered_block_id = b->id;
+                if (b->id == hovered_block_id) {
+                    invalidate_rect(NSInsetRect(NSMakeRect(b->x, b->y, b->w, b->h), -2.0f, -2.0f));
                     break;
                 }
             }
-            g_callbacks.on_key((int)c, hovered_block_id);
+        } else if (c == 'h' || c == 'l') {
+            // No hovered block: scroll offsets unchanged, no repaint.
+        } else {
+            [self setNeedsDisplay:YES];
         }
-        [self setNeedsDisplay:YES];
     }
 }
 
@@ -729,6 +1135,19 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
     (void)sender;
     return YES;
+}
+
+// Visibility changes are OS events, not wakeups: a single redraw on restore
+// lets platform_draw_image re-arm any parked animation chain. While hidden,
+// parked chains schedule nothing, so idle stays at zero wakeups.
+- (void)windowDidDeminiaturize:(NSNotification *)notification {
+    (void)notification;
+    [g_main_view setNeedsDisplay:YES];
+}
+
+- (void)windowDidChangeOcclusionState:(NSNotification *)notification {
+    (void)notification;
+    if (gif_window_visible()) [g_main_view setNeedsDisplay:YES];
 }
 
 @end
@@ -772,6 +1191,10 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
 }
 
 void platform_run_loop(void) {
+    // Strictly OS blocking events: [NSApp run] parks the thread in the
+    // kernel event wait until input, window, or scheduled-callback events
+    // arrive. No spin, no polling loop, and no persistent frame clock exists
+    // in this codebase, so a static screen costs zero wakeups (0% CPU).
     [NSApp run];
 }
 
@@ -779,6 +1202,23 @@ void platform_request_redraw(void) {
     if (g_window && [g_window contentView]) {
         [[g_window contentView] setNeedsDisplay:YES];
     }
+}
+
+// Damage tracking: submit an exact bounding box to the OS compositor
+// instead of a full-screen redraw (cursor blink, keystroke line, GIF tick).
+void platform_request_redraw_rect(float x, float y, float w, float h) {
+    invalidate_rect(NSMakeRect(x, y, w, h));
+}
+
+// Returns the dirty rect AppKit reported for the in-progress draw, for
+// compositor culling in the Zig draw callback. 0 = no pending damage.
+int platform_get_pending_damage(float* x, float* y, float* w, float* h) {
+    if (!g_pending_dirty_valid) return 0;
+    if (x) *x = g_pending_dirty.origin.x;
+    if (y) *y = g_pending_dirty.origin.y;
+    if (w) *w = g_pending_dirty.size.width;
+    if (h) *h = g_pending_dirty.size.height;
+    return 1;
 }
 
 void platform_sync_scroll(float scroll_y) {
@@ -834,10 +1274,73 @@ void platform_end_clip(void) {
     CGContextRestoreGState(g_current_cg_context);
 }
 
+// Record quad for mouse text selection & copying (anchored to document Y).
+static void record_text_quad(const char* text, int len, float x, float y, float w, float h,
+                             float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
+                             const char* link_url, int link_url_len) {
+    if (g_text_record_count >= MAX_QUAD_RECORDS) return;
+    QuadTextRecord* rec = &g_text_records[g_text_record_count++];
+    rec->x = x;
+    rec->doc_y = y + g_scroll_y;
+    rec->w = w;
+    rec->h = h;
+    rec->font_size = font_size;
+    rec->is_bold = is_bold;
+    rec->is_italic = is_italic;
+    rec->is_mono = is_mono;
+    rec->is_heading = is_heading;
+    int copy_len = len < 511 ? len : 511;
+    memcpy(rec->text, text, copy_len);
+    rec->text[copy_len] = '\0';
+    rec->len = copy_len;
+
+    int copy_url = (link_url && link_url_len > 0) ? (link_url_len < 255 ? link_url_len : 255) : 0;
+    if (copy_url > 0) {
+        memcpy(rec->link_url, link_url, copy_url);
+        rec->link_url[copy_url] = '\0';
+    } else {
+        rec->link_url[0] = '\0';
+    }
+}
+
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
     if (!g_current_cg_context || len <= 0 || !text) return;
     CGContextRef ctx = g_current_cg_context;
 
+    // Shaping economy: one shape + one rasterize per unique run; every later
+    // frame is a textured quad (atlas mask blit, GPU-composited).
+    ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading, 1);
+    if (e && e->aw != 0) {
+        record_text_quad(text, len, x, y, e->w, e->h, font_size,
+                         is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+
+        // Per-frame render is ONE retained slice blit: no shaping, no copy,
+        // no allocation, no CPU compositing.
+        if (e->slice) {
+            // Destination: same geometry as the old CTLineDraw baseline
+            // (y + size*0.85, ascent above) so layout is pixel-identical.
+            float dest_y = y + font_size * 0.85f - e->ascent;
+            CGRect dest = CGRectMake(x, dest_y, e->w, e->h);
+            CGContextSaveGState(ctx);
+            CGContextClipToMask(ctx, dest, e->slice);
+            CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+            CGContextFillRect(ctx, dest);
+            CGContextRestoreGState(ctx);
+            return; // textured quad done: no shaping, no CPU compositing
+        }
+        // Atlas image unavailable: fall through to direct cached-line draw.
+        if (e->line) {
+            CGContextSaveGState(ctx);
+            CGContextTranslateCTM(ctx, x, y + font_size * 0.85f);
+            CGContextScaleCTM(ctx, 1.0f, -1.0f);
+            CGContextSetTextPosition(ctx, 0, 0);
+            CTLineDraw(e->line, ctx);
+            CGContextRestoreGState(ctx);
+            return;
+        }
+    }
+
+    // Uncacheable run (>510 bytes): legacy direct path, unchanged geometry.
     NSString* str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
     if (!str) return;
 
@@ -860,31 +1363,8 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     double measuredWidth = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading);
     double trailing = CTLineGetTrailingWhitespaceWidth(ctLine);
 
-    // Record quad for mouse text selection & copying (anchored to document Y)
-    if (g_text_record_count < MAX_QUAD_RECORDS) {
-        QuadTextRecord* rec = &g_text_records[g_text_record_count++];
-        rec->x = x;
-        rec->doc_y = y + g_scroll_y;
-        rec->w = (float)(measuredWidth + trailing);
-        rec->h = (float)(ascent + descent);
-        rec->font_size = font_size;
-        rec->is_bold = is_bold;
-        rec->is_italic = is_italic;
-        rec->is_mono = is_mono;
-        rec->is_heading = is_heading;
-        int copy_len = len < 511 ? len : 511;
-        memcpy(rec->text, text, copy_len);
-        rec->text[copy_len] = '\0';
-        rec->len = copy_len;
-
-        int copy_url = (link_url && link_url_len > 0) ? (link_url_len < 255 ? link_url_len : 255) : 0;
-        if (copy_url > 0) {
-            memcpy(rec->link_url, link_url, copy_url);
-            rec->link_url[copy_url] = '\0';
-        } else {
-            rec->link_url[0] = '\0';
-        }
-    }
+    record_text_quad(text, len, x, y, (float)(measuredWidth + trailing), (float)(ascent + descent),
+                     font_size, is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
 
     CGContextSaveGState(ctx);
 
@@ -916,6 +1396,14 @@ typedef struct {
     float       natural_h;
     BOOL        loading;        // async load in flight
     BOOL        failed;
+    BOOL        parked;         // animation chain parked: no timer scheduled
+    unsigned long last_draw_seq; // g_draw_seq of the pass that last painted this image
+    // Last drawn rect in DOCUMENT coordinates for exact GIF-tick damage.
+    float       last_doc_x;
+    float       last_doc_y;
+    float       last_w;
+    float       last_h;
+    BOOL        has_rect;
 } CachedImageRecord;
 
 #define MAX_IMAGE_CACHE 64
@@ -924,20 +1412,57 @@ static int  g_image_cache_count = 0;
 
 // Forward declarations
 static void gif_schedule_next_frame(CachedImageRecord* rec);
+static BOOL gif_window_visible(void);
 
-// GIF animation timer callback
+// The window is a valid animation sink only while it is actually on screen.
+// Hidden, miniaturized, or fully occluded windows never advance or schedule:
+// the chain parks and consumes zero wakeups until the next genuine draw.
+static BOOL gif_window_visible(void) {
+    if (!g_window) return NO;
+    if ([g_window isMiniaturized]) return NO;
+    if (![g_window isVisible]) return NO;
+    if (([g_window occlusionState] & NSWindowOcclusionStateVisible) == 0) return NO;
+    return YES;
+}
+
+// GIF animation timer callback. There is deliberately no persistent frame
+// clock (no display link, no repeating timer): each tick re-arms at most one
+// successor, and only while the image is visibly animating (mirrors
+// idle.zig GifGate.shouldAdvance). The instant the window hides or the image
+// scrolls out of the painted viewport, the chain parks: no timer remains
+// scheduled and the run loop sleeps. platform_draw_image re-arms it on the
+// next event-driven draw.
+// GIF animation timer callback: damage is the frame's exact bounding box.
 static void gif_advance_frame(CachedImageRecord* rec) {
     if (!rec || rec->frame_count <= 1) return;
+    if (!gif_window_visible() || rec->last_draw_seq != g_draw_seq) {
+        rec->parked = YES;
+        return;
+    }
     rec->cur_frame = (rec->cur_frame + 1) % rec->frame_count;
-    [g_main_view setNeedsDisplay:YES];
+    if (rec->has_rect) {
+        // Document -> view coordinates at current scroll offset.
+        invalidate_rect(NSMakeRect(
+            rec->last_doc_x,
+            rec->last_doc_y - g_scroll_y,
+            rec->last_w,
+            rec->last_h));
+    } else if (g_main_view) {
+        [g_main_view setNeedsDisplay:YES];
+    }
     gif_schedule_next_frame(rec);
 }
 
 static void gif_schedule_next_frame(CachedImageRecord* rec) {
     if (!rec || rec->frame_count <= 1) return;
+    if (!gif_window_visible()) {
+        rec->parked = YES;
+        return;
+    }
+    rec->parked = NO;
     double delay = rec->frame_delays[rec->cur_frame];
     if (delay < 0.02) delay = 0.1; // clamp degenerate GIFs
-    // Schedule on main run-loop
+    // One-shot wakeup on the main run-loop only; never a repeating driver.
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
         dispatch_get_main_queue(),
@@ -1070,6 +1595,16 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 
     CachedImageRecord* rec = get_or_load_image_record(url, url_len);
 
+    // Record the frame rect in document coordinates so GIF ticks can
+    // invalidate exactly this box (scroll-compensated at tick time).
+    if (rec) {
+        rec->last_doc_x = x;
+        rec->last_doc_y = y + g_scroll_y;
+        rec->last_w = w;
+        rec->last_h = h;
+        rec->has_rect = YES;
+    }
+
     // Still loading — draw subtle placeholder outline
     if (!rec || rec->loading) {
         CGContextSaveGState(ctx);
@@ -1092,6 +1627,12 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 
     // The layout engine passes exactly the right draw_w / draw_h (natural size capped
     // to content width with proper aspect ratio), so we just draw at (x,y,w,h).
+    // Stamp this pass: proves the image is inside the painted viewport, and
+    // re-arms a parked animation chain from this genuine event-driven draw.
+    rec->last_draw_seq = g_draw_seq;
+    if (rec->parked && rec->frame_count > 1) {
+        gif_schedule_next_frame(rec);
+    }
     CGImageRef frame = rec->frames[rec->cur_frame];
     if (!frame) return;
 
@@ -1105,6 +1646,13 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 
 float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono) {
     if (!text || len <= 0) return 0.0f;
+
+    // Shaping-economy fast path: shape-only (no atlas raster yet; the first
+    // draw rasterizes lazily). Shares entries with the draw path wherever
+    // the style bits coincide (plain body/mono runs, i.e. the hot case).
+    ShapedEntry* e = shape_run(text, len, font_size, is_bold, 0, is_mono, 0, 0);
+    if (e) return e->w;
+    // Uncacheable run: fall through to direct measure below.
 
     NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)text length:len encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) {
@@ -1157,6 +1705,8 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     g_code_block_count = 0;
     g_scrollable_block_count = 0;
     g_current_cg_context = ctx;
+    // Headless render has no AppKit dirty rect: full redraw.
+    g_pending_dirty_valid = NO;
 
     render_fn(width, height);
 

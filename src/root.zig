@@ -4,6 +4,10 @@ pub const mmap = @import("core/mmap.zig");
 pub const simd = @import("core/simd.zig");
 pub const parser = @import("core/parser.zig");
 pub const layout = @import("layout/viewport.zig");
+pub const block_index = @import("core/block_index.zig");
+pub const idle = @import("platform/idle.zig");
+pub const damage = @import("layout/damage.zig");
+pub const glyph_cache = @import("platform/glyph_cache.zig");
 pub const strict_benchmarks = @import("core/strict_benchmarks.zig");
 pub const controls_test = @import("tests/controls_test.zig");
 pub const spec_compliance_test = @import("tests/spec_compliance_test.zig");
@@ -12,6 +16,10 @@ test {
     _ = strict_benchmarks;
     _ = controls_test;
     _ = spec_compliance_test;
+    _ = block_index;
+    _ = idle;
+    _ = damage;
+    _ = glyph_cache;
 }
 
 test "simd line scanner and block classification" {
