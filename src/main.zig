@@ -98,6 +98,7 @@ fn updateDocumentMetrics() void {
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
+        .image_size_fn = bridge.platform_get_image_size,
     };
     const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
@@ -175,6 +176,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .block_scroll_x = g_app.block_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
+        .image_size_fn = bridge.platform_get_image_size,
     };
 
     const cmd_count = layout.layoutViewport(

@@ -4,6 +4,7 @@
 
 static PlatformCallbacks g_callbacks = {0};
 static NSWindow* g_window = nil;
+static NSView*   g_main_view = nil;   // set in platform_init for async image → setNeedsDisplay
 static CGContextRef g_current_cg_context = NULL;
 static float g_scroll_y = 0.0f;
 static NSPoint g_mouse_pos = {-9999.0f, -9999.0f};
@@ -761,6 +762,7 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     [g_window center];
 
     ReadView* view = [[ReadView alloc] initWithFrame:frame];
+    g_main_view = view;  // for async image load → setNeedsDisplay callbacks
     [g_window setContentView:view];
     [g_window setDelegate:delegate];
     [g_window makeKeyAndOrderFront:nil];
@@ -899,101 +901,205 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     CGColorSpaceRelease(colorSpace);
 }
 
+// ---------------------------------------------------------------------------
+// Image Cache: async load + animated GIF frame cycling
+// ---------------------------------------------------------------------------
+
 typedef struct {
-    char url[512];
-    NSImage* image;
-    BOOL failed;
+    char     url[512];
+    // Decoded frames (NULL = not yet loaded, count 0 = failed)
+    CGImageRef* frames;         // malloc'd array of CGImageRef
+    double*     frame_delays;   // malloc'd array of per-frame delay in seconds
+    int         frame_count;
+    int         cur_frame;      // current display frame index
+    float       natural_w;      // logical pixel size at 72 dpi
+    float       natural_h;
+    BOOL        loading;        // async load in flight
+    BOOL        failed;
 } CachedImageRecord;
 
 #define MAX_IMAGE_CACHE 64
 static CachedImageRecord g_image_cache[MAX_IMAGE_CACHE];
-static int g_image_cache_count = 0;
+static int  g_image_cache_count = 0;
 
-static NSImage* get_or_load_image(const char* url, int url_len) {
-    if (!url || url_len <= 0 || url_len >= 512) return nil;
+// Forward declarations
+static void gif_schedule_next_frame(CachedImageRecord* rec);
 
-    for (int i = 0; i < g_image_cache_count; i++) {
-        if (strncmp(g_image_cache[i].url, url, url_len) == 0 && g_image_cache[i].url[url_len] == '\0') {
-            return g_image_cache[i].failed ? nil : g_image_cache[i].image;
-        }
+// GIF animation timer callback
+static void gif_advance_frame(CachedImageRecord* rec) {
+    if (!rec || rec->frame_count <= 1) return;
+    rec->cur_frame = (rec->cur_frame + 1) % rec->frame_count;
+    [g_main_view setNeedsDisplay:YES];
+    gif_schedule_next_frame(rec);
+}
+
+static void gif_schedule_next_frame(CachedImageRecord* rec) {
+    if (!rec || rec->frame_count <= 1) return;
+    double delay = rec->frame_delays[rec->cur_frame];
+    if (delay < 0.02) delay = 0.1; // clamp degenerate GIFs
+    // Schedule on main run-loop
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+        dispatch_get_main_queue(),
+        ^{ gif_advance_frame(rec); }
+    );
+}
+
+// Resolve relative path to absolute
+static NSString* resolve_image_path(NSString* pathStr) {
+    if ([pathStr hasPrefix:@"http://"] || [pathStr hasPrefix:@"https://"]) return pathStr;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:pathStr]) return pathStr;
+    NSString* cwd = [[NSFileManager defaultManager] currentDirectoryPath];
+    NSString* full = [cwd stringByAppendingPathComponent:pathStr];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:full]) return full;
+    return nil;
+}
+
+// Decode all frames from a CGImageSource into the cache record
+static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecord* rec) {
+    size_t count = CGImageSourceGetCount(src);
+    if (count == 0) { rec->failed = YES; return; }
+
+    // Get natural pixel size from first frame
+    CGImageRef first = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    if (!first) { rec->failed = YES; return; }
+    rec->natural_w = (float)CGImageGetWidth(first);
+    rec->natural_h = (float)CGImageGetHeight(first);
+
+    rec->frames       = (CGImageRef*)malloc(sizeof(CGImageRef) * count);
+    rec->frame_delays = (double*)malloc(sizeof(double) * count);
+    rec->frame_count  = (int)count;
+    rec->frames[0]    = first; // already retained by Create
+
+    for (size_t i = 1; i < count; i++) {
+        rec->frames[i] = CGImageSourceCreateImageAtIndex(src, i, NULL);
     }
 
-    if (g_image_cache_count >= MAX_IMAGE_CACHE) return nil;
+    // Extract per-frame delays (GIF {GIFDelayTime} property)
+    for (size_t i = 0; i < count; i++) {
+        double delay = 0.1;
+        NSDictionary* props = (__bridge_transfer NSDictionary*)
+            CGImageSourceCopyPropertiesAtIndex(src, i, NULL);
+        NSDictionary* gifProps = props[(id)kCGImagePropertyGIFDictionary];
+        if (gifProps) {
+            NSNumber* d = gifProps[(id)kCGImagePropertyGIFUnclampedDelayTime];
+            if (!d || [d doubleValue] <= 0)
+                d = gifProps[(id)kCGImagePropertyGIFDelayTime];
+            if (d) delay = [d doubleValue];
+        }
+        rec->frame_delays[i] = delay;
+    }
+}
 
-    NSString* pathStr = [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding];
-    if (!pathStr) return nil;
-
-    NSImage* img = nil;
+// Synchronously populate a cache slot from a URL/path string
+static void load_image_sync(CachedImageRecord* rec, NSString* pathStr) {
+    CGImageSourceRef src = nil;
     if ([pathStr hasPrefix:@"http://"] || [pathStr hasPrefix:@"https://"]) {
         NSURL* u = [NSURL URLWithString:pathStr];
-        if (u) img = [[NSImage alloc] initWithContentsOfURL:u];
-    } else {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:pathStr]) {
-            img = [[NSImage alloc] initWithContentsOfFile:pathStr];
-        } else {
-            NSString* cwd = [[NSFileManager defaultManager] currentDirectoryPath];
-            NSString* fullPath = [cwd stringByAppendingPathComponent:pathStr];
-            if ([[NSFileManager defaultManager] fileExistsAtPath:fullPath]) {
-                img = [[NSImage alloc] initWithContentsOfFile:fullPath];
-            }
+        if (u) {
+            NSData* data = [NSData dataWithContentsOfURL:u];
+            if (data) src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
         }
+    } else {
+        NSURL* fu = [NSURL fileURLWithPath:pathStr];
+        if (fu) src = CGImageSourceCreateWithURL((__bridge CFURLRef)fu, NULL);
     }
 
+    if (src) {
+        load_image_source_into_record(src, rec);
+        CFRelease(src);
+    } else {
+        rec->failed = YES;
+    }
+    rec->loading = NO;
+}
+
+// Returns existing or initiates async load; returns NULL if not yet ready
+static CachedImageRecord* get_or_load_image_record(const char* url, int url_len) {
+    if (!url || url_len <= 0 || url_len >= 512) return NULL;
+
+    // Cache hit
+    for (int i = 0; i < g_image_cache_count; i++) {
+        if (strncmp(g_image_cache[i].url, url, url_len) == 0 &&
+            g_image_cache[i].url[url_len] == '\0') {
+            return &g_image_cache[i];
+        }
+    }
+    if (g_image_cache_count >= MAX_IMAGE_CACHE) return NULL;
+
+    // Allocate slot
     CachedImageRecord* rec = &g_image_cache[g_image_cache_count++];
+    memset(rec, 0, sizeof(*rec));
     memcpy(rec->url, url, url_len);
     rec->url[url_len] = '\0';
-    rec->image = img;
-    rec->failed = (img == nil);
-    return img;
+    rec->loading = YES;
+
+    NSString* pathStr = [[NSString alloc] initWithBytes:url length:url_len
+                                               encoding:NSUTF8StringEncoding];
+    NSString* resolved = resolve_image_path(pathStr);
+    if (!resolved) { rec->failed = YES; rec->loading = NO; return rec; }
+
+    // Capture for block
+    NSString* resolvedCopy = [resolved copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        load_image_sync(rec, resolvedCopy);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [g_main_view setNeedsDisplay:YES];
+            // Kick off GIF animation if multi-frame
+            if (!rec->failed && rec->frame_count > 1) {
+                gif_schedule_next_frame(rec);
+            }
+        });
+    });
+
+    return rec;
+}
+
+// Query natural pixel dimensions of an image (returns 0,0 if not yet loaded)
+void platform_get_image_size(const char* url, int url_len, float* out_w, float* out_h) {
+    *out_w = 0; *out_h = 0;
+    CachedImageRecord* rec = get_or_load_image_record(url, url_len);
+    if (!rec || rec->loading || rec->failed) return;
+    *out_w = rec->natural_w;
+    *out_h = rec->natural_h;
 }
 
 void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h) {
     if (!g_current_cg_context || w <= 0 || h <= 0) return;
     CGContextRef ctx = g_current_cg_context;
 
-    NSImage* img = get_or_load_image(url, url_len);
-    if (img) {
-        NSSize imgSize = [img size];
-        if (imgSize.width > 0 && imgSize.height > 0) {
-            float scale_w = w / (float)imgSize.width;
-            float scale_h = h / (float)imgSize.height;
-            float scale = (scale_w < scale_h) ? scale_w : scale_h;
-            if (scale > 1.5f && (float)imgSize.width < w && (float)imgSize.height < h) {
-                scale = 1.0f;
-            }
-            float draw_w = (float)imgSize.width * scale;
-            float draw_h = (float)imgSize.height * scale;
-            float draw_x = x + (w - draw_w) * 0.5f;
-            float draw_y = y + (h - draw_h) * 0.5f;
+    CachedImageRecord* rec = get_or_load_image_record(url, url_len);
 
-            CGContextSaveGState(ctx);
-            CGContextSetRGBFillColor(ctx, 22.0f / 255.0f, 22.0f / 255.0f, 24.0f / 255.0f, 0.6f);
-            NSRect cardRect = NSMakeRect(draw_x - 4.0f, draw_y - 4.0f, draw_w + 8.0f, draw_h + 8.0f);
-            CGContextFillRect(ctx, cardRect);
-
-            NSRect destRect = NSMakeRect(draw_x, draw_y, draw_w, draw_h);
-            CGImageRef cgImg = [img CGImageForProposedRect:&destRect context:nil hints:nil];
-            if (cgImg) {
-                CGContextTranslateCTM(ctx, draw_x, draw_y + draw_h);
-                CGContextScaleCTM(ctx, 1.0f, -1.0f);
-                CGContextDrawImage(ctx, CGRectMake(0, 0, draw_w, draw_h), cgImg);
-            } else {
-                NSGraphicsContext* nsCtx = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
-                [NSGraphicsContext saveGraphicsState];
-                [NSGraphicsContext setCurrentContext:nsCtx];
-                [img drawInRect:destRect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0 respectFlipped:YES hints:nil];
-                [NSGraphicsContext restoreGraphicsState];
-            }
-            CGContextRestoreGState(ctx);
-            return;
-        }
+    // Still loading — draw subtle placeholder outline
+    if (!rec || rec->loading) {
+        CGContextSaveGState(ctx);
+        CGContextSetRGBFillColor(ctx, 28.0f/255, 28.0f/255, 32.0f/255, 0.5f);
+        CGContextFillRect(ctx, CGRectMake(x, y, w, h));
+        CGContextSetRGBStrokeColor(ctx, 60.0f/255, 60.0f/255, 70.0f/255, 0.6f);
+        CGContextStrokeRect(ctx, CGRectMake(x, y, w, h));
+        CGContextRestoreGState(ctx);
+        return;
+    }
+    if (rec->failed || rec->frame_count == 0) {
+        CGContextSaveGState(ctx);
+        CGContextSetRGBFillColor(ctx, 28.0f/255, 28.0f/255, 32.0f/255, 1.0f);
+        CGContextFillRect(ctx, CGRectMake(x, y, w, h));
+        CGContextSetRGBStrokeColor(ctx, 80.0f/255, 40.0f/255, 40.0f/255, 1.0f);
+        CGContextStrokeRect(ctx, CGRectMake(x, y, w, h));
+        CGContextRestoreGState(ctx);
+        return;
     }
 
+    // The layout engine passes exactly the right draw_w / draw_h (natural size capped
+    // to content width with proper aspect ratio), so we just draw at (x,y,w,h).
+    CGImageRef frame = rec->frames[rec->cur_frame];
+    if (!frame) return;
+
     CGContextSaveGState(ctx);
-    CGContextSetRGBFillColor(ctx, 28.0f / 255.0f, 28.0f / 255.0f, 32.0f / 255.0f, 1.0f);
-    CGContextFillRect(ctx, CGRectMake(x, y, w, h));
-    CGContextSetRGBStrokeColor(ctx, 60.0f / 255.0f, 60.0f / 255.0f, 70.0f / 255.0f, 1.0f);
-    CGContextStrokeRect(ctx, CGRectMake(x, y, w, h));
+    // Flip Y for CG coordinate system
+    CGContextTranslateCTM(ctx, x, y + h);
+    CGContextScaleCTM(ctx, 1.0f, -1.0f);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), frame);
     CGContextRestoreGState(ctx);
 }
 

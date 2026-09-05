@@ -240,6 +240,10 @@ pub const ViewportConfig = struct {
     line_height: f32 = 29.75,
     is_dark_theme: bool = true,
     checkpoints: []const Checkpoint = &.{},
+    /// Optional callback: query natural pixel size of an image by URL.
+    /// Signature: fn(url_ptr, url_len, out_w, out_h) void
+    /// When null, images fall back to a fixed 240px default height.
+    image_size_fn: ?*const fn (url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void = null,
 };
 
 pub const ScrollAxisLock = enum {
@@ -885,7 +889,22 @@ pub fn layoutViewport(
                 }
             }
 
-            const img_h: f32 = 240.0;
+            // Compute display dimensions: natural size capped to content_width,
+            // maintaining aspect ratio. Falls back to 240px if not yet loaded.
+            var nat_w: f32 = 0.0;
+            var nat_h: f32 = 0.0;
+            if (config.image_size_fn) |fn_ptr| {
+                if (img_url.len > 0) {
+                    fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w, &nat_h);
+                }
+            }
+
+            const img_w: f32 = if (nat_w > 0.0) @min(nat_w, content_width) else content_width;
+            const img_h: f32 = if (nat_w > 0.0 and nat_h > 0.0)
+                nat_h * (img_w / nat_w)
+            else
+                240.0;
+
             const margin_top: f32 = 18.0;
             const margin_bottom: f32 = 18.0;
             const has_caption = alt_text.len > 0;
@@ -897,9 +916,9 @@ pub fn layoutViewport(
                 commands_out[cmd_count] = .{
                     .kind = .image,
                     .rect = .{
-                        .x = content_x,
+                        .x = content_x,      // left-aligned like web
                         .y = cur_y,
-                        .w = content_width,
+                        .w = img_w,
                         .h = img_h,
                     },
                     .text = alt_text,
@@ -912,11 +931,10 @@ pub fn layoutViewport(
                 const caption_y = cur_y + img_h + 6.0;
                 if (caption_y + config.line_height >= 0 and caption_y <= vp_bottom and cmd_count < commands_out.len) {
                     const caption_w = measureTextEx(alt_text, config.base_font_size * 0.85, false, true, false, false);
-                    const caption_x = content_x + (content_width - @min(content_width, caption_w)) * 0.5;
                     commands_out[cmd_count] = .{
                         .kind = .text_run,
                         .rect = .{
-                            .x = caption_x,
+                            .x = content_x,  // left-aligned caption
                             .y = caption_y,
                             .w = caption_w,
                             .h = config.line_height * 0.85,
@@ -932,6 +950,7 @@ pub fn layoutViewport(
 
             cur_y += img_h + caption_h + margin_bottom;
             continue;
+
         }
 
         // ----------------------------------------------------
@@ -1353,18 +1372,37 @@ pub fn computeDocumentHeightEx(
             var text_slice = line_bytes;
             while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
             var alt_len: usize = 0;
+            var img_url: []const u8 = "";
             if (text_slice.len >= 5 and text_slice[0] == '!' and text_slice[1] == '[') {
                 var cb: usize = 2;
                 while (cb < text_slice.len and text_slice[cb] != ']') : (cb += 1) {}
                 alt_len = cb - 2;
+                if (cb + 1 < text_slice.len and text_slice[cb + 1] == '(') {
+                    var cp: usize = cb + 2;
+                    while (cp < text_slice.len and text_slice[cp] != ')') : (cp += 1) {}
+                    img_url = text_slice[cb + 2 .. cp];
+                }
             }
-            const img_h: f32 = 240.0;
+            // Use natural size if callback available, else fixed fallback
+            var nat_w2: f32 = 0.0;
+            var nat_h2: f32 = 0.0;
+            if (config.image_size_fn) |fn_ptr| {
+                if (img_url.len > 0) {
+                    fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w2, &nat_h2);
+                }
+            }
+            const disp_w2: f32 = if (nat_w2 > 0.0) @min(nat_w2, content_width) else content_width;
+            const img_h: f32 = if (nat_w2 > 0.0 and nat_h2 > 0.0)
+                nat_h2 * (disp_w2 / nat_w2)
+            else
+                240.0;
             const margin_top: f32 = 18.0;
             const margin_bottom: f32 = 18.0;
             const caption_h: f32 = if (alt_len > 0) (config.line_height * 0.85 + 8.0) else 0.0;
             cur_y += margin_top + img_h + caption_h + margin_bottom;
             continue;
         }
+
 
         // 6. Blockquote
         if (line_info.block_type == .quote) {

@@ -56,6 +56,13 @@ pub extern "c" fn platform_draw_image(
     h: f32,
 ) void;
 
+pub extern "c" fn platform_get_image_size(
+    url: ?[*]const u8,
+    url_len: c_int,
+    out_w: *f32,
+    out_h: *f32,
+) void;
+
 pub extern "c" fn platform_register_code_block(
     x: f32,
     y: f32,
