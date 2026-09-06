@@ -17,6 +17,8 @@ jobs:
           version: 0.16.0
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Parser short fuzz (malformed + huge inputs, issue #34)
+        run: sh scripts/fuzz_parser.sh
       - name: Release build
         run: zig build -Doptimize=ReleaseFast
       - name: Binary size budget (ship binary, see AGENTS.md §1)
@@ -37,5 +39,7 @@ jobs:
           version: 0.16.0
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Parser short fuzz (malformed + huge inputs, issue #34)
+        run: sh scripts/fuzz_parser.sh
       - name: Release build
         run: zig build -Doptimize=ReleaseFast
