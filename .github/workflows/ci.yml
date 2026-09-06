@@ -25,6 +25,19 @@ jobs:
         run: ./zig-out/bin/read-test --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
       - name: Damage parity (selection records under partial redraws)
         run: sh scripts/damage_parity.sh ./zig-out/bin/read-test showcase.md
+      - name: Render short fuzz (scroll/select/drag/damage/scale/atlas oracles)
+        run: ./scripts/fuzz_render.sh ./zig-out/bin/read-test showcase.md 2
+      - name: test_cases discipline (exactly 1 scrollable-doc case)
+        run: sh scripts/check_test_cases.sh
+      - name: Screenshot suite (visual regression captures)
+        run: ./scripts/screenshot_suite.sh screenshots
+      - name: Attach screenshots to the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+          retention-days: 14
 
   # Portability check: core tests + build must also pass on Linux.
   # (Cocoa frameworks link only on Darwin; see build.zig.)
@@ -37,5 +50,7 @@ jobs:
           version: 0.16.0
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: test_cases discipline (exactly 1 scrollable-doc case)
+        run: sh scripts/check_test_cases.sh
       - name: Release build
         run: zig build -Doptimize=ReleaseFast
