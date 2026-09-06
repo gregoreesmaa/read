@@ -1521,11 +1521,11 @@ const scroll_shadow_strip_w: f32 = 3.0;
 /// Edge -> inward alphas (strongest at the clipped edge, fading to content).
 /// Kept low: the band should whisper, not shout.
 const scroll_shadow_alphas = [_]u8{ 18, 11, 6, 3 };
-/// Vertical end-insets per strip, outer -> inward. Staggering strip ends
-/// approximates a ~9px rounded corner so the band fades out at the block's
-/// top and bottom instead of cutting off sharp (bright square corners
-/// against the page background read as jarring).
-const scroll_shadow_end_insets = [_]f32{ 9.0, 5.0, 2.0, 0.0 };
+/// Vertical end-insets per strip, outer -> inward. The outer strip runs full
+/// height so the band sits flush and straight on the clip edge (like a real
+/// shadow cast from a straight edge); inner strips recede, rounding the band
+/// toward the content instead of cutting off in square corners.
+const scroll_shadow_end_insets = [_]f32{ 0.0, 2.0, 5.0, 9.0 };
 
 fn emitScrollShadows(
     commands_out: []DrawCommand,
@@ -2884,8 +2884,8 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
     try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 255));
     try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 0));
 
-    // Rounded ends: the brightest (outermost) strip starts lower and is
-    // shorter than the dimmest (innermost) full-height strip.
+    // Rounded ends, straight on the clip edge: the brightest (outermost)
+    // strip runs full height while the dimmest (innermost) recedes.
     var outer: ?DrawCommand = null;
     var inner: ?DrawCommand = null;
     for (cmds[0..count]) |c| {
@@ -2896,8 +2896,8 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
         if (inner == null or c.color.a < inner.?.color.a) inner = c;
     }
     try std.testing.expect(outer != null and inner != null);
-    try std.testing.expect(outer.?.rect.y > inner.?.rect.y);
-    try std.testing.expect(outer.?.rect.h < inner.?.rect.h);
+    try std.testing.expect(outer.?.rect.y < inner.?.rect.y);
+    try std.testing.expect(outer.?.rect.h > inner.?.rect.h);
 }
 
 test "scroll shadows: scrolled-right code block shows left-edge fade, no right fade" {

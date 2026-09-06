@@ -533,6 +533,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (args_it.next()) |sc_str| {
                 g_app.scroll_y = parseF32(sc_str);
             }
+        } else if (std.mem.eql(u8, arg, "--scroll-x-end")) {
+            // Screenshot affordance (mirrors --scroll): park every
+            // horizontal block at its end so end-state shadows (left
+            // edge) can be captured. Layout clamps each to its max.
+            for (&g_app.block_scroll_x) |*s| s.* = std.math.inf(f32);
         } else {
             // Document paths land in file_path from any position; hook
             // flags (and their consumed values, taken above) never do, so

@@ -28,6 +28,14 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # Case 4: Table structure, cell padding, column alignment, dividers
 ./zig-out/bin/read --screenshot "$OUTPUT_DIR/tables_formatting.png" test_cases/tables_formatting.md
 
+# Cases 4b/4c: End-scrolled horizontal state of the SAME docs above (no new
+# test cases, no new test_cases/*.md files): every block parked at its max
+# via --scroll-x-end, so the shadow sits on the left edge with reversed
+# rounding. Vertical viewport stays initial, so scrollable_doc.md remains
+# the single scrolled-viewport test.
+./zig-out/bin/read --screenshot "$OUTPUT_DIR/code_and_tasks_scroll_end.png" --scroll-x-end test_cases/code_and_tasks.md
+./zig-out/bin/read --screenshot "$OUTPUT_DIR/tables_formatting_scroll_end.png" --scroll-x-end test_cases/tables_formatting.md
+
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
 
