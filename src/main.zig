@@ -1070,3 +1070,15 @@ test "retina atlas text stays crisp (no-blur regression)" {
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
     }
 }
+
+test "native window tabbing enabled (two-call contract, #49)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the crisp test above). Only the read-test binary executes
+    // it, against the exact helper platform_init uses.
+    if (build_options.test_hooks) {
+        try std.testing.expectEqual(
+            @as(c_int, 1),
+            bridge.platform_test_tabbing(),
+        );
+    }
+}
