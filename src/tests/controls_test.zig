@@ -347,3 +347,51 @@ test "controls: accurate document height computation ensures tables and end of d
     try std.testing.expect(found_table_content);
 }
 
+test "controls: smooth scroll eases toward target without overshoot and settles" {
+    var s = layout.SmoothScroll{};
+    s.setTarget(40.0, 1000.0);
+
+    var prev: f32 = 0.0;
+    var frames: usize = 0;
+    while (!s.settled()) : (frames += 1) {
+        if (frames > 240) break; // 2s at 120Hz cap; must settle before this
+        _ = s.tick(1.0 / 120.0);
+        // Monotonic approach with no overshoot past the target.
+        try std.testing.expect(s.current >= prev);
+        try std.testing.expect(s.current <= 40.0);
+        prev = s.current;
+    }
+    try std.testing.expect(s.settled());
+    try std.testing.expectEqual(@as(f32, 40.0), s.current);
+    try std.testing.expect(frames < 120);
+}
+
+test "controls: smooth scroll clamps target and snaps scrollbar drags" {
+    var s = layout.SmoothScroll{};
+    s.setTarget(5000.0, 1000.0);
+    try std.testing.expectEqual(@as(f32, 1000.0), s.target);
+
+    // Scrollbar drags stay 1:1: displayed offset jumps with the target.
+    s.snapTo(250.0, 1000.0);
+    try std.testing.expect(s.settled());
+    try std.testing.expectEqual(@as(f32, 250.0), s.current);
+    try std.testing.expectEqual(@as(f32, 250.0), s.target);
+}
+
+test "controls: smooth scroll converges across frame rates" {
+    var slow = layout.SmoothScroll{};
+    slow.setTarget(480.0, 4000.0);
+    var n_slow: usize = 0;
+    while (!slow.settled() and n_slow < 600) : (n_slow += 1) _ = slow.tick(1.0 / 30.0);
+
+    var fast = layout.SmoothScroll{};
+    fast.setTarget(480.0, 4000.0);
+    var n_fast: usize = 0;
+    while (!fast.settled() and n_fast < 2400) : (n_fast += 1) _ = fast.tick(1.0 / 240.0);
+
+    try std.testing.expect(slow.settled());
+    try std.testing.expect(fast.settled());
+    try std.testing.expectEqual(@as(f32, 480.0), slow.current);
+    try std.testing.expectEqual(@as(f32, 480.0), fast.current);
+}
+
