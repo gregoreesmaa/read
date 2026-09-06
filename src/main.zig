@@ -97,7 +97,9 @@ fn snapScroll(v: f32) void {
     g_app.scroll_y = g_smooth.current;
 }
 
-const MAX_CHECKPOINTS = 2048;
+// 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
+// previous 2048 x 128-line coverage exactly (~98 KB static, zero heap).
+const MAX_CHECKPOINTS = 8192;
 var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
 var g_checkpoint_count: usize = 0;
 
@@ -150,6 +152,11 @@ var g_sweep_step: f32 = 0.0;
 // Two-phase drag-back residue test state (read-test binary only): selection A
 // then shrink to B, painted incrementally on one bitmap. See --select-drag.
 var g_drag_active: bool = false;
+// First-paint gate for deferred image decodes (see platform_arm_images):
+// image records park until the first frame is committed, then decode.
+// Headless one-shot screenshots never arm (deterministic placeholders).
+var g_first_paint_done: bool = false;
+var g_headless_oneshot: bool = false;
 var g_drag_vals: [8]f32 = [_]f32{0.0} ** 8;
 
 fn onScrollTo(scroll_y: f32) callconv(.c) void {
@@ -543,6 +550,14 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         bridge.platform_end_clip();
     }
 
+    // First frame committed: image decodes may start now, off the startup
+    // critical path. Headless one-shots skip this (placeholders are the
+    // deterministic expected output there); settle runs arm explicitly.
+    if (!g_first_paint_done) {
+        g_first_paint_done = true;
+        if (!g_headless_oneshot) bridge.platform_arm_images();
+    }
+
     // Scroll-sweep profiler row (read-test binary only): per-offset phase
     // timings plus workload counters. Compiled out of ship builds.
     if (build_options.test_hooks and g_sweep_active) {
@@ -607,6 +622,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     g_app.scroll_y = parseF32(sc_str);
                     g_smooth.snapTo(g_app.scroll_y, std.math.inf(f32));
                 }
+            } else if (std.mem.eql(u8, arg, "--scroll-x-end")) {
+                // Screenshot affordance (mirrors --scroll): park every
+                // horizontal block at its end so end-state shadows (left
+                // edge) can be captured. Layout clamps each to its max.
+                for (&g_app.block_scroll_x) |*s| s.* = std.math.inf(f32);
             } else {
             // Document paths land in file_path from any position; hook
             // flags (and their consumed values, taken above) never do, so
@@ -730,6 +750,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Let async image decodes finish, then relayout with real sizes.
         // TEST_HOOKS only; ship screenshots render immediately.
         if (build_options.test_hooks and settle_images_ms > 0) {
+            // Settle runs want images: arm the parked decodes first, then
+            // wait for them to drain as before.
+            bridge.platform_arm_images();
             const t0 = getTimestampMs();
             const req = std.posix.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
             while (bridge.platform_images_pending() > 0 and
@@ -749,6 +772,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // of A-then-B on one bitmap, compared by the caller against a fresh
         // full render of B. Any byte difference is leftover highlight.
         if (build_options.test_hooks and g_drag_active) {
+            // Multi-phase determinism: like plain one-shots, the drag
+            // residue test compares incremental vs fresh renders pixel-wise,
+            // so decodes must not land mid-test. Placeholders throughout.
+            g_headless_oneshot = true;
             const v = g_drag_vals;
             const r = bridge.platform_render_select_drag_png(sc_path, 1200, 900, onDraw,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
@@ -781,6 +808,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             std.c.exit(0);
         }
+        // Plain one-shot: placeholders are the expected output (decodes
+        // never win the race today either); suppress the first-paint arm
+        // so no decode CPU lands in the startup window at all.
+        g_headless_oneshot = true;
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});
