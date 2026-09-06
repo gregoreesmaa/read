@@ -179,9 +179,9 @@ zig build -Doptimize=ReleaseFast
 # Open a Markdown document (try the full demo)
 ./zig-out/bin/read showcase.md
 
-# Headless screenshot capture
-./zig-out/bin/read --screenshot output.png showcase.md
-./zig-out/bin/read --screenshot output_scrolled.png --scroll 500 showcase.md
+# Headless screenshot capture (testing binary; the ship binary opens documents only)
+./zig-out/bin/read-test --screenshot output.png showcase.md
+./zig-out/bin/read-test --screenshot output_scrolled.png --scroll 500 showcase.md
 
 # Regenerate complete visual regression screenshot suite
 ./scripts/screenshot_suite.sh screenshots

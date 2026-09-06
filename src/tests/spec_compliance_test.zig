@@ -3,6 +3,46 @@ const simd = @import("../core/simd.zig");
 const parser = @import("../core/parser.zig");
 const layout = @import("../layout/viewport.zig");
 
+/// Fully-wired render harness: reference definitions scanned cold plus
+/// frame scratch for entities and cross-line joints, mirroring main.zig.
+const FullStore = struct {
+    defs: [16]simd.RefDef = undefined,
+    def_count: usize = 0,
+    entities: layout.EntityStore = .{},
+    join: [layout.JOIN_BUF_LEN]u8 = undefined,
+};
+
+fn renderFull(doc: []const u8, lines: []simd.Line, n: usize, cmds: []layout.DrawCommand, st: *FullStore) usize {
+    // NOTE: layout reserves 16 command slots of headroom; cmds must be
+    // well over 16 entries or rendering stops after the background fill.
+    std.debug.assert(cmds.len > 32);
+    st.def_count = simd.scanRefDefs(doc, lines[0..n], &st.defs);
+    st.entities.reset();
+    const config = layout.ViewportConfig{
+        .window_width = 1200.0,
+        .window_height = 900.0,
+        .scroll_y = 0.0,
+        .ref_defs = st.defs[0..st.def_count],
+        .entities = &st.entities,
+        .join_buf = &st.join,
+    };
+    return layout.layoutViewport(doc, lines[0..n], config, cmds);
+}
+
+fn hasRun(cmds: []layout.DrawCommand, text: []const u8) bool {
+    for (cmds) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, text)) return true;
+    }
+    return false;
+}
+
+fn hasLink(cmds: []layout.DrawCommand, text: []const u8) bool {
+    for (cmds) |c| {
+        if (c.kind == .text_run and c.style.link and std.mem.eql(u8, c.text, text)) return true;
+    }
+    return false;
+}
+
 test "spec compliance: ATX headings h1 through h6 and trailing hashes" {
     const doc =
         \\# Heading 1
@@ -1226,4 +1266,153 @@ test "regression: checkpoints agree on continuation-heavy documents" {
     }
 }
 
+test "regression: entities decode inline, bare amps stay literal" {
+    const doc =
+        \\AT&amp;T and fish & chips
+    ;
+    var lines: [4]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    try std.testing.expect(hasRun(cmds[0..m], "AT&T"));
+    try std.testing.expect(hasRun(cmds[0..m], "&"));
+}
+
+test "regression: reference links resolve and defs are hidden" {
+    const doc =
+        \\Foo [bar][1].
+        \\
+        \\[1]: /url/  "Title"
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    try std.testing.expect(hasLink(cmds[0..m], "bar"));
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) try std.testing.expect(std.mem.indexOf(u8, c.text, "[1]") == null);
+    }
+}
+
+test "regression: cross-line reference joints stay links" {
+    const doc =
+        \\Foo [bar]
+        \\[1].
+        \\
+        \\[1]: /url/
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    try std.testing.expect(hasLink(cmds[0..m], "bar"));
+}
+
+test "regression: indented ref-like lines stay code, not defs" {
+    const doc =
+        \\    [four]: /url
+    ;
+    var lines: [4]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    var saw_code = false;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .code_block_bg) saw_code = true;
+    }
+    try std.testing.expect(saw_code);
+    try std.testing.expect(hasRun(cmds[0..m], "[four]: /url"));
+}
+
+test "regression: html comments are hidden" {
+    const doc =
+        \\before
+        \\<!-- hidden -->
+        \\<!--
+        \\also hidden
+        \\-->
+        \\after
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    try std.testing.expect(hasRun(cmds[0..m], "before"));
+    try std.testing.expect(hasRun(cmds[0..m], "after"));
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) try std.testing.expect(std.mem.indexOf(u8, c.text, "<!--") == null);
+    }
+}
+
+test "regression: hard wrap never starts a list" {
+    const doc =
+        \\Version
+        \\8. stays text
+        \\
+        \\* criminey
+        \\2. stays text
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    // Hard-wrapped continuation lines stay text even when they look like
+    // ordered markers; `* criminey` after a blank line is a genuine list
+    // (Markdown 1.0), so exactly one bullet exists and `2.` stays text.
+    try std.testing.expect(hasRun(cmds[0..m], "8."));
+    try std.testing.expect(hasRun(cmds[0..m], "criminey"));
+    // `2.` stays literal text: echoed with its trailing space when no
+    // marker store is wired, corrected to `2.` in production.
+    var saw_2 = false;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run and std.mem.startsWith(u8, c.text, "2.")) saw_2 = true;
+    }
+    try std.testing.expect(saw_2);
+    var bullets: usize = 0;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "•")) bullets += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), bullets);
+}
+
+test "regression: spaced hr and tab bullets with ordered tabs" {
+    const doc = "- - -\n\n*\ttabbed\n\n1.\ttabbed\n";
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [48]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    try std.testing.expectEqual(simd.BlockType.hr, lines[0].block_type);
+    try std.testing.expect(!hasRun(cmds[0..m], "-"));
+    try std.testing.expect(hasRun(cmds[0..m], "•"));
+    try std.testing.expect(hasRun(cmds[0..m], "tabbed"));
+}
+
+test "regression: quoted titles keep link and referral def resolves" {
+    const doc =
+        \\Foo [bar](/url/ "Title with "quotes" inside").
+        \\
+        \\[bar]: /url/
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    try std.testing.expect(hasLink(cmds[0..m], "bar"));
+}
 

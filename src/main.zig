@@ -66,11 +66,36 @@ pub const AppState = struct {
 var g_app: AppState = .{};
 // Caller-owned scratch for corrected ordered-list markers, reset per frame.
 var g_markers: layout.OrderedMarkerStore = .{};
+// Caller-owned scratch for decoded entities, reset per frame.
+var g_entities: layout.EntityStore = .{};
+// Cross-line reference joint scratch (frame-lived borrows like markers).
+var g_joinbuf: [layout.JOIN_BUF_LEN]u8 = undefined;
+// Reference definitions scanned once per document load (cold path).
+var g_refdefs: [simd.MAX_REF_DEFS]simd.RefDef = undefined;
+var g_refdef_count: usize = 0;
 // Headless command-stream probe flag (set by --dump-commands under TEST_HOOKS).
 var g_dump_commands: bool = false;
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
+// Smooth-scroll animation state: inputs retarget, a 120Hz platform tick
+// eases g_app.scroll_y (displayed) toward the target. Anchor jumps and
+// resizes snap both so they stay 1:1.
+var g_smooth: layout.SmoothScroll = .{};
+
+/// Retarget the animated scroll offset and arm the platform tick while the
+/// displayed offset is still settling. No-op when already settled.
+fn retargetScroll(target: f32) void {
+    g_smooth.setTarget(target, g_app.max_scroll_y);
+    if (!g_smooth.settled()) bridge.platform_smooth_kick();
+}
+
+/// Snap displayed and target offsets together (anchor jumps, resizes,
+/// startup offsets): no animation, never diverged.
+fn snapScroll(v: f32) void {
+    g_smooth.snapTo(v, g_app.max_scroll_y);
+    g_app.scroll_y = g_smooth.current;
+}
 
 // 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
 // previous 2048 x 128-line coverage exactly (~98 KB static, zero heap).
@@ -115,7 +140,7 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-// Headless scroll-sweep profiler state (needs -Dtest-hooks): renders a
+// Headless scroll-sweep profiler state (read-test binary only): renders a
 // range of scroll offsets in one process — caches stay warm exactly like
 // live scrolling — and prints per-offset phase timings. Compiled out of
 // ship builds.
@@ -124,17 +149,23 @@ var g_sweep_from: f32 = 0.0;
 var g_sweep_to: f32 = 0.0;
 var g_sweep_step: f32 = 0.0;
 
-// Two-phase drag-back residue test state (needs -Dtest-hooks): selection A
+// Two-phase drag-back residue test state (read-test binary only): selection A
 // then shrink to B, painted incrementally on one bitmap. See --select-drag.
 var g_drag_active: bool = false;
 var g_drag_vals: [8]f32 = [_]f32{0.0} ** 8;
+
+fn onScrollTo(scroll_y: f32) callconv(.c) void {
+    // Scrollbar drag target from the platform layer. Already clamped there
+    // against the synced max, but clamp again: metrics may have moved.
+    g_app.scroll_y = std.math.clamp(scroll_y, 0.0, g_app.max_scroll_y);
+}
 
 fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void {
     const now_ms = getTimestampMs();
     const locked = g_scroll_lock.processScroll(delta_x, delta_y, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
-        g_app.scroll_y = std.math.clamp(g_app.scroll_y - locked.dy, 0.0, g_app.max_scroll_y);
+        retargetScroll(g_smooth.target - locked.dy);
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);
@@ -146,12 +177,25 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) vo
     }
 }
 
+/// Display-link tick (dt in ms): ease the displayed offset toward the
+/// target. Returns 1 while more frames are needed, 0 when settled (the
+/// platform parks its timer on 0, so a static screen costs zero wakeups).
+fn onTick(dt_ms: f32) callconv(.c) c_int {
+    g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
+    const settled = g_smooth.tick(dt_ms / 1000.0);
+    g_app.scroll_y = g_smooth.current;
+    return if (settled) 0 else 1;
+}
+
 fn updateDocumentMetrics() void {
     const vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
         .image_size_fn = bridge.platform_get_image_size,
+        .ref_defs = g_refdefs[0..g_refdef_count],
+        .entities = &g_entities,
+        .join_buf = &g_joinbuf,
     };
     const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
@@ -167,7 +211,7 @@ fn onResize(w: c_int, h: c_int) callconv(.c) void {
     g_app.window_width = @floatFromInt(w);
     g_app.window_height = @floatFromInt(h);
     updateDocumentMetrics();
-    g_app.scroll_y = std.math.clamp(g_app.scroll_y, 0.0, g_app.max_scroll_y);
+    snapScroll(g_app.scroll_y);
 }
 
 fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
@@ -182,6 +226,9 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
         .image_size_fn = bridge.platform_get_image_size,
+        .ref_defs = g_refdefs[0..g_refdef_count],
+        .entities = &g_entities,
+        .join_buf = &g_joinbuf,
     };
     const target = layout.anchorScrollY(
         g_app.bytes,
@@ -189,17 +236,17 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
         vp_config,
         frag,
     ) orelse return;
-    g_app.scroll_y = std.math.clamp(target, 0.0, g_app.max_scroll_y);
+    snapScroll(target);
     bridge.platform_request_redraw();
 }
 
 fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
     switch (key_code) {
         'j' => {
-            g_app.scroll_y = std.math.clamp(g_app.scroll_y + 40.0, 0.0, g_app.max_scroll_y);
+            retargetScroll(g_smooth.target + 40.0);
         },
         'k' => {
-            g_app.scroll_y = std.math.clamp(g_app.scroll_y - 40.0, 0.0, g_app.max_scroll_y);
+            retargetScroll(g_smooth.target - 40.0);
         },
         'h' => {
             if (hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
@@ -222,7 +269,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
             }
         },
         ' ' => {
-            g_app.scroll_y = std.math.clamp(g_app.scroll_y + g_app.window_height * 0.8, 0.0, g_app.max_scroll_y);
+            retargetScroll(g_smooth.target + g_app.window_height * 0.8);
         },
         't' => {
             g_app.is_dark_theme = !g_app.is_dark_theme;
@@ -256,6 +303,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     }
 
     bridge.platform_sync_scroll(g_app.scroll_y);
+    bridge.platform_set_scroll_info(g_app.scroll_y, g_app.max_scroll_y, g_app.window_height);
 
     // Damage tracking: AppKit reports the dirty rect for this draw.
     // Full-screen redraw happens only when the pending rect covers the view
@@ -269,6 +317,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     const dmg = damage.Damage.fromPending(has_pending, pdx, pdy, pdw, pdh, g_app.window_width, g_app.window_height);
 
     g_markers.reset();
+    g_entities.reset();
     const vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
@@ -278,6 +327,9 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
         .image_size_fn = bridge.platform_get_image_size,
         .ordered_markers = &g_markers,
+        .ref_defs = g_refdefs[0..g_refdef_count],
+        .entities = &g_entities,
+        .join_buf = &g_joinbuf,
     };
 
     var t_layout_ns: u64 = 0;
@@ -291,7 +343,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     var t_paint_ns: u64 = 0;
     if (build_options.test_hooks and g_sweep_active) t_paint_ns = nowNs();
 
-    // Headless layout probe (needs -Dtest-hooks): dump the emitted command
+    // Headless layout probe (read-test binary only): dump the emitted command
     // stream so partial-damage renders can be diffed against the full
     // stream. Compiled out of ship builds.
     if (build_options.test_hooks and g_dump_commands) {
@@ -471,9 +523,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     // Draw minimalist ambient reading progress indicator (thin 2px filament on right)
     if (g_app.max_scroll_y > 0 and dmg.keeps(g_app.window_width - 3.0, 0.0, 2.0, g_app.window_height)) {
-        const progress = g_app.scroll_y / g_app.max_scroll_y;
-        const bar_height: f32 = 40.0;
-        const bar_y = progress * (g_app.window_height - bar_height);
+        const bar_height: f32 = layout.SCROLLBAR_THUMB_H;
+        const bar_y = layout.scrollbarThumbY(g_app.scroll_y, g_app.max_scroll_y, g_app.window_height);
         const bar_color = if (g_app.is_dark_theme)
             layout.Color{ .r = 90, .g = 160, .b = 255, .a = 180 }
         else
@@ -494,7 +545,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         bridge.platform_end_clip();
     }
 
-    // Scroll-sweep profiler row (needs -Dtest-hooks): per-offset phase
+    // Scroll-sweep profiler row (read-test binary only): per-offset phase
     // timings plus workload counters. Compiled out of ship builds.
     if (build_options.test_hooks and g_sweep_active) {
         const t_end_ns = nowNs();
@@ -519,28 +570,56 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var in_fence = false;
     var file_path: ?[]const u8 = null;
 
-    // Parse command line arguments
+    // Parse command line arguments.
+    // Production ships a positional document path only. The whole headless
+    // test CLI (--screenshot, --scroll, --scroll-sweep, --damage,
+    // --dump-*, --select*, --probe-px, --force-scale, --settle-images)
+    // lives behind ONE comptime gate so the ship binary contains none of
+    // it; it runs only in the read-test binary. Trust the compiler.
     var args_it = std.process.Args.Iterator.init(init.args);
     _ = args_it.next(); // skip exe name
     var screenshot_path: ?[*:0]const u8 = null;
     var dump_records = false;
     var settle_images_ms: i64 = 0;
 
-    while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--screenshot")) {
-            if (args_it.next()) |sc_path| {
-                screenshot_path = @ptrCast(sc_path.ptr);
+    if (!build_options.test_hooks) {
+        // Production owns no test flags; the reset stores keep the hook
+        // vars observably settled on this path.
+        screenshot_path = null;
+        dump_records = false;
+        settle_images_ms = 0;
+        while (args_it.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "--")) {
+                const pre = "Unknown option (testing flags live in read-test): ";
+                _ = std.c.write(std.posix.STDERR_FILENO, pre, pre.len);
+                _ = std.c.write(std.posix.STDERR_FILENO, arg.ptr, arg.len);
+                _ = std.c.write(std.posix.STDERR_FILENO, "\n", 1);
+                std.c.exit(2);
             }
-        } else if (std.mem.eql(u8, arg, "--scroll")) {
-            if (args_it.next()) |sc_str| {
-                g_app.scroll_y = parseF32(sc_str);
-            }
-        } else {
+            file_path = arg;
+        }
+    } else {
+        while (args_it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--screenshot")) {
+                if (args_it.next()) |sc_path| {
+                    screenshot_path = @ptrCast(sc_path.ptr);
+                }
+            } else if (std.mem.eql(u8, arg, "--scroll")) {
+                if (args_it.next()) |sc_str| {
+                    g_app.scroll_y = parseF32(sc_str);
+                    g_smooth.snapTo(g_app.scroll_y, std.math.inf(f32));
+                }
+            } else if (std.mem.eql(u8, arg, "--scroll-x-end")) {
+                // Screenshot affordance (mirrors --scroll): park every
+                // horizontal block at its end so end-state shadows (left
+                // edge) can be captured. Layout clamps each to its max.
+                for (&g_app.block_scroll_x) |*s| s.* = std.math.inf(f32);
+            } else {
             // Document paths land in file_path from any position; hook
             // flags (and their consumed values, taken above) never do, so
             // a missing document still falls back to the default doc.
             if (!std.mem.startsWith(u8, arg, "--")) file_path = arg;
-            // Headless test-hooks matching (needs -Dtest-hooks): ONE
+            // Headless test-hooks matching (read-test binary only): ONE
             // comptime gate for the whole tail, so ship builds emit zero
             // bytes here — no per-flag scaffolding, no flag literals, no
             // page-boundary cascade (__TEXT budget; see size_gate.sh).
@@ -619,7 +698,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 }
             }
         }
-    }
+        } // end while (test CLI arg parse)
+    } // end test-CLI else (ship builds skip all of the above)
 
     if (file_path) |path| {
         const mapped = mmap.MappedFile.open(path) catch {
@@ -641,12 +721,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Index lines with SIMD scanner
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
     g_app.lines = g_lines_buffer[0..g_app.line_count];
+    // Reference definitions once per load (cold; geometry depends on them).
+    g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
 
     // Compute accurate total document height and max scroll limit
     updateDocumentMetrics();
 
-    // Headless screenshot mode
-    if (screenshot_path) |sc_path| {
+    // Headless screenshot mode (test binary only: the comptime gate keeps
+    // this block out of ship-build analysis entirely).
+    if (build_options.test_hooks) {
+        if (screenshot_path) |sc_path| {
         g_app.window_width = 1200.0;
         g_app.window_height = 900.0;
         updateDocumentMetrics();
@@ -668,7 +752,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             updateDocumentMetrics();
         }
-        // Drag-back residue test (needs -Dtest-hooks): incremental repaint
+        // Drag-back residue test (read-test binary only): incremental repaint
         // of A-then-B on one bitmap, compared by the caller against a fresh
         // full render of B. Any byte difference is leftover highlight.
         if (build_options.test_hooks and g_drag_active) {
@@ -683,7 +767,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 std.c.exit(1);
             }
         }
-        // Scroll-sweep profiler (needs -Dtest-hooks): one render per offset,
+        // Scroll-sweep profiler (read-test binary only): one render per offset,
         // caches warm across offsets exactly like live scrolling. Each
         // render prints a SWEEP timing row from onDraw.
         if (build_options.test_hooks and g_sweep_active) {
@@ -719,6 +803,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("Failed to generate screenshot (code {d})\n", .{rc});
             std.c.exit(1);
         }
+        }
     }
 
     const callbacks = bridge.PlatformCallbacks{
@@ -727,8 +812,208 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_key = onKey,
         .on_draw = onDraw,
         .on_link = onLink,
+        .on_tick = onTick,
+        .on_scroll_to = onScrollTo,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);
     bridge.platform_run_loop();
+}
+
+// ---------------------------------------------------------------------------
+// No-blur regression: the Retina atlas blit path must stay crisp. Renders a
+// few text runs at fractional origins (what real layout always produces)
+// through the live 2x atlas path headlessly, decodes the PNG in-test with
+// zero new platform API, and asserts edge acutance. Blurry blits smear glyph
+// edges over 4-6px of mid-gray; snapped 1:1 blits hold 1-2px transitions.
+// Runs only in the read-test binary (needs --force-scale plumbing).
+// ---------------------------------------------------------------------------
+
+const CRISP_PNG_W: c_int = 600;
+const CRISP_PNG_H: c_int = 260;
+const CRISP_PNG_PATH = "/tmp/crisp_regression.png";
+// Calibrated (2026-09, arm64, bundled IBM Plex Serif / Space Grotesk /
+// JetBrains Mono): blurry atlas blits score acutance 155.2 with edge_frac
+// 0.1340 (stable across runs); snapped 1:1 blits score 182.5 with 0.0765.
+// Thresholds sit at the midpoints with margin on both sides.
+const CRISP_ACUTANCE_MIN: f64 = 169.0;
+const CRISP_EDGE_FRAC_MAX: f64 = 0.105;
+
+fn crispRenderFn(w: c_int, h: c_int) callconv(.c) void {
+    bridge.platform_draw_rect(0, 0, @floatFromInt(w), @floatFromInt(h), 0x12, 0x12, 0x12, 255);
+    const R: u8 = 0xE0;
+    const G: u8 = 0xE0;
+    const B: u8 = 0xE0;
+    const A: u8 = 255;
+    const Run = struct {
+        text: []const u8,
+        x: f32,
+        y: f32,
+        size: f32,
+        bold: c_int,
+        italic: c_int,
+        mono: c_int,
+        heading: c_int,
+    };
+    // Fractional origins on purpose: integer-aligned runs can look crisp
+    // even through a blurry blit path, which would neuter this test.
+    const runs = [_]Run{
+        .{ .text = "Pack my box with five dozen liquor jugs.", .x = 50.33, .y = 40.67, .size = 17.0, .bold = 0, .italic = 0, .mono = 0, .heading = 0 },
+        .{ .text = "The quick brown fox jumps over.", .x = 50.71, .y = 90.29, .size = 17.0, .bold = 1, .italic = 0, .mono = 0, .heading = 0 },
+        .{ .text = "const crisp = pixels * 2;", .x = 50.17, .y = 140.83, .size = 14.96, .bold = 0, .italic = 0, .mono = 1, .heading = 0 },
+        .{ .text = "Crisp Headings", .x = 50.55, .y = 190.41, .size = 28.9, .bold = 1, .italic = 0, .mono = 0, .heading = 1 },
+    };
+    for (runs) |r| {
+        bridge.platform_draw_text(r.text.ptr, @intCast(r.text.len), r.x, r.y, r.size, r.bold, r.italic, r.mono, r.heading, R, G, B, A, null, 0);
+    }
+}
+
+const CrispMetrics = struct {
+    acutance: f64,
+    edge_frac: f64,
+};
+
+fn crispPngMetrics(allocator: std.mem.Allocator, path: []const u8) !CrispMetrics {
+    // Zero-copy read through the app's own mmap layer (no std.fs dependency).
+    var mapped = try mmap.MappedFile.open(path);
+    defer mapped.close();
+    const bytes = mapped.bytes;
+    if (bytes.len < 8 or !std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return error.NotPng;
+
+    var img_w: usize = 0;
+    var img_h: usize = 0;
+    var color_type: u8 = 0;
+    var idat: std.ArrayList(u8) = .empty;
+    defer idat.deinit(allocator);
+    var pos: usize = 8;
+    while (pos + 8 <= bytes.len) {
+        const ln = std.mem.readInt(u32, bytes[pos..][0..4], .big);
+        const typ = bytes[pos + 4 ..][0..4];
+        if (bytes.len < pos + 12 + ln) return error.TruncatedPng;
+        const body = bytes[pos + 8 ..][0..ln];
+        pos += 12 + ln;
+        if (std.mem.eql(u8, typ, "IHDR")) {
+            img_w = std.mem.readInt(u32, body[0..4], .big);
+            img_h = std.mem.readInt(u32, body[4..8], .big);
+            if (body[8] != 8 or body[12] != 0) return error.UnsupportedPng;
+            color_type = body[9];
+        } else if (std.mem.eql(u8, typ, "IDAT")) {
+            try idat.appendSlice(allocator, body);
+        } else if (std.mem.eql(u8, typ, "IEND")) {
+            break;
+        }
+    }
+    const ch: usize = switch (color_type) {
+        2 => 3,
+        6 => 4,
+        else => return error.UnsupportedPng,
+    };
+    if (img_w == 0 or img_h == 0) return error.EmptyPng;
+    const stride = img_w * ch;
+
+    const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(window);
+    var input: std.Io.Reader = .fixed(idat.items);
+    var decomp = std.compress.flate.Decompress.init(&input, .zlib, window);
+    const raw = try decomp.reader.readAlloc(allocator, (stride + 1) * img_h);
+    defer allocator.free(raw);
+
+    // Unfilter scanlines to luma, then score gradient energy over the
+    // central content band (margins carry no text).
+    const prev = try allocator.alloc(u8, stride);
+    defer allocator.free(prev);
+    @memset(prev, 0);
+    var edge_sum: f64 = 0;
+    var edge_n: usize = 0;
+    var total: usize = 0;
+    const x0 = img_w / 4;
+    const x1 = 3 * img_w / 4;
+    const luma_prev_row = try allocator.alloc(u8, img_w);
+    defer allocator.free(luma_prev_row);
+    @memset(luma_prev_row, 0);
+    const luma_row = try allocator.alloc(u8, img_w);
+    defer allocator.free(luma_row);
+    var y: usize = 0;
+    while (y < img_h) : (y += 1) {
+        const f = raw[y * (stride + 1)];
+        const line = raw[y * (stride + 1) + 1 ..][0..stride];
+        var i: usize = 0;
+        while (i < stride) : (i += 1) {
+            const a: u16 = if (i >= ch) line[i - ch] else 0;
+            const b: u16 = prev[i];
+            const c: u16 = if (i >= ch) prev[i - ch] else 0;
+            const filt: u16 = switch (f) {
+                0 => 0,
+                1 => a,
+                2 => b,
+                3 => (a + b) >> 1,
+                4 => blk: {
+                    const pa: u16 = if (b >= c) b - c else c - b;
+                    const pb: u16 = if (a >= c) a - c else c - a;
+                    const ac: u16 = if (a >= b) a - b else b - a;
+                    const pc: u16 = ac + (if ((a + b) >= 2 * c) (a + b - 2 * c) else (2 * c - a - b));
+                    break :blk if (pa <= pb and pa <= pc) a else if (pb <= pc) b else c;
+                },
+                else => return error.UnsupportedPng,
+            };
+            line[i] = @intCast((@as(u16, line[i]) + filt) & 255);
+        }
+        @memcpy(prev, line);
+        var x: usize = 0;
+        while (x < img_w) : (x += 1) {
+            const r = line[ch * x];
+            const g = line[ch * x + 1];
+            const bl = line[ch * x + 2];
+            luma_row[x] = @intCast((@as(u16, r) * 77 + @as(u16, g) * 150 + @as(u16, bl) * 29) >> 8);
+        }
+        if (y > 0) {
+            var x2: usize = x0;
+            while (x2 < x1) : (x2 += 1) {
+                const gx: u16 = if (luma_row[x2 + 1] >= luma_row[x2 - 1]) luma_row[x2 + 1] - luma_row[x2 - 1] else luma_row[x2 - 1] - luma_row[x2 + 1];
+                const gy: u16 = if (luma_row[x2] >= luma_prev_row[x2]) luma_row[x2] - luma_prev_row[x2] else luma_prev_row[x2] - luma_row[x2];
+                const grad = @as(f64, @floatFromInt(gx + gy));
+                total += 1;
+                if (grad > 60.0) {
+                    edge_n += 1;
+                    edge_sum += grad;
+                }
+            }
+        }
+        @memcpy(luma_prev_row, luma_row);
+    }
+    if (edge_n == 0) return error.NoTextFound;
+    return .{
+        .acutance = edge_sum / @as(f64, @floatFromInt(edge_n)),
+        .edge_frac = @as(f64, @floatFromInt(edge_n)) / @as(f64, @floatFromInt(total)),
+    };
+}
+
+test "retina atlas text stays crisp (no-blur regression)" {
+    // Ship builds carry no test hooks: the whole body below is comptime-dead
+    // there (same gate pattern as main(), so TEST_HOOKS-only symbols never
+    // leak into the ship link) and the test passes trivially. Only the
+    // read-test binary executes it. NOTE: do not "fix" this with
+    // `return error.Skip` — this toolchain counts a skipped test as failed.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const alloc = t.allocator;
+
+        // Prove the render below actually exercises the atlas blit path
+        // (rasterizations performed), not a direct-draw fallback.
+        var misses0: u64 = 0;
+        var tmp: u64 = 0;
+        bridge.platform_glyph_cache_stats(&tmp, &misses0, &tmp);
+        bridge.platform_set_test_scale(2.0);
+        defer bridge.platform_set_test_scale(0.0);
+        const rc = bridge.platform_render_to_png(CRISP_PNG_PATH, CRISP_PNG_W, CRISP_PNG_H, crispRenderFn);
+        try t.expectEqual(@as(c_int, 0), rc);
+        var misses1: u64 = 0;
+        bridge.platform_glyph_cache_stats(&tmp, &misses1, &tmp);
+        try t.expect(misses1 > misses0);
+
+        const m = try crispPngMetrics(alloc, CRISP_PNG_PATH);
+        std.debug.print("\n[CRISP] acutance={d:.1} edge_frac={d:.4}\n", .{ m.acutance, m.edge_frac });
+        try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
+        try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
+    }
 }

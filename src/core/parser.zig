@@ -24,6 +24,40 @@ fn isAsciiPunct(ch: u8) bool {
     };
 }
 
+/// Closing run for a code span opened with `run_len` backticks starting at
+/// `from` (index just past the opener). Only a run of exactly `run_len`
+/// closes; shorter/longer runs are content (so `` \ `` yields "`").
+/// Returns content bounds plus the index past the closer.
+fn codeSpanClose(line: []const u8, from: usize, run_len: usize) ?struct { start: usize, end: usize, close_end: usize } {
+    var p = from;
+    while (p < line.len) {
+        if (line[p] != '`') {
+            p += 1;
+            continue;
+        }
+        var q = p;
+        while (q < line.len and line[q] == '`') : (q += 1) {}
+        if (q - p == run_len) return .{ .start = from, .end = p, .close_end = q };
+        p = q;
+    }
+    return null;
+}
+
+/// Strips one leading/trailing space when the content is not all spaces
+/// (code spans render `` ` `` as "`", not " ").
+fn stripCodeSpan(content: []const u8) []const u8 {
+    if (content.len >= 2 and content[0] == ' ' and content[content.len - 1] == ' ') {
+        for (content) |ch| {
+            if (ch != ' ') return content[1 .. content.len - 1];
+        }
+    }
+    return content;
+}
+
+/// Title-end scanner lives in simd.zig (shared with reference definitions
+/// without an import cycle).
+const parseTitleEnd = simd.parseTitleEnd;
+
 /// Parsed `(destination "optional title")` tail of an inline link or image.
 /// `dest_start..dest_end` bounds the URL (angle brackets excluded); `close`
 /// is the index of the final `)`. Titles are validated but dropped: the
@@ -85,49 +119,9 @@ fn parseLinkTail(line: []const u8, paren_open: usize) ?LinkTail {
     if (pos >= line.len) return null;
     if (line[pos] == ')') return .{ .dest_start = dest_start, .dest_end = dest_end, .close = pos };
 
-    // Optional title: "...", '...', or (...). A raw inner quote of the
-    // same kind ends the title, so `("a "b" c")` fails and stays literal.
-    const q = line[pos];
-    if (q == '"' or q == '\'') {
-        var j = pos + 1;
-        var closed = false;
-        while (j < line.len) {
-            if (line[j] == '\\' and j + 1 < line.len) {
-                j += 2;
-                continue;
-            }
-            if (line[j] == q) {
-                closed = true;
-                break;
-            }
-            j += 1;
-        }
-        if (!closed) return null;
-        pos = j + 1;
-    } else if (q == '(') {
-        var depth: usize = 1;
-        var j = pos + 1;
-        var closed = false;
-        while (j < line.len) {
-            if (line[j] == '\\' and j + 1 < line.len) {
-                j += 2;
-                continue;
-            } else if (line[j] == '(') {
-                depth += 1;
-            } else if (line[j] == ')') {
-                depth -= 1;
-                if (depth == 0) {
-                    closed = true;
-                    break;
-                }
-            }
-            j += 1;
-        }
-        if (!closed) return null;
-        pos = j + 1;
-    } else {
-        return null;
-    }
+    // Optional title ("...", '...', or (...)), validated but dropped.
+    const title_end = parseTitleEnd(line, pos, true) orelse return null;
+    pos = title_end + 1;
 
     while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
     if (pos >= line.len or line[pos] != ')') return null;
@@ -136,9 +130,24 @@ fn parseLinkTail(line: []const u8, paren_open: usize) ?LinkTail {
 
 /// High-speed inline parser for viewport lines.
 /// Zero heap allocations: tokens are stored directly into caller's slice.
+/// Reference links need document state; use `parseInlinesWithDefs` when a
+/// definition table is available (the plain form resolves inline links,
+/// code, emphasis, and autolinks only).
 pub fn parseInlines(
     line: []const u8,
     spans_out: []InlineSpan,
+) usize {
+    return parseInlinesWithDefs(line, spans_out, &.{});
+}
+
+/// Full inline parser with reference-link resolution (`[t][l]`, `[t][]`,
+/// `[t]`, and the single-space Markdown.pl form `[t] [l]`). `defs` borrows
+/// the same document buffer as `line` (zero-copy link targets). Cross-line
+/// references (`[t]` newline `[l]`) stay literal text.
+pub fn parseInlinesWithDefs(
+    line: []const u8,
+    spans_out: []InlineSpan,
+    defs: []const simd.RefDef,
 ) usize {
     if (line.len == 0 or spans_out.len == 0) return 0;
 
@@ -174,32 +183,30 @@ pub fn parseInlines(
             }
         }
 
-        // Inline code `...`
+        // Inline code `...` (matched-length closer, stripped padding).
         if (c == '`') {
-            if (i > span_start) {
-                spans_out[span_count] = .{
-                    .text = line[span_start..i],
-                    .style = cur_style,
-                };
-                span_count += 1;
-                if (span_count >= spans_out.len) break;
-            }
+            var run: usize = 0;
+            while (i + run < line.len and line[i + run] == '`') : (run += 1) {}
+            if (codeSpanClose(line, i + run, run)) |cs| {
+                if (i > span_start) {
+                    spans_out[span_count] = .{
+                        .text = line[span_start..i],
+                        .style = cur_style,
+                    };
+                    span_count += 1;
+                    if (span_count >= spans_out.len) break;
+                }
 
-            const code_start = i + 1;
-            var code_end = code_start;
-            while (code_end < line.len and line[code_end] != '`') : (code_end += 1) {}
-
-            if (code_end < line.len) {
                 spans_out[span_count] = .{
-                    .text = line[code_start..code_end],
+                    .text = stripCodeSpan(line[cs.start..cs.end]),
                     .style = .{ .code = true },
                 };
                 span_count += 1;
-                i = code_end + 1;
+                i = cs.close_end;
                 span_start = i;
                 continue;
             } else {
-                // Unterminated backtick, treat as regular text
+                // No matching closer, treat as regular text
                 i += 1;
                 continue;
             }
@@ -287,39 +294,113 @@ pub fn parseInlines(
             }
         }
 
-        // Link [text](url "optional title")
+        // Link [text](url), [text][label], [text][], [text], [text] [label].
+        // Bracket-balanced text scan so nested `[a [b]]` resolves as one.
         if (c == '[') {
             var close_bracket = i + 1;
-            while (close_bracket < line.len and line[close_bracket] != ']') : (close_bracket += 1) {}
+            var depth: usize = 0;
+            var balanced = false;
+            while (close_bracket < line.len) {
+                if (line[close_bracket] == '\\' and close_bracket + 1 < line.len) {
+                    close_bracket += 2;
+                    continue;
+                }
+                if (line[close_bracket] == '[') {
+                    depth += 1;
+                } else if (line[close_bracket] == ']') {
+                    if (depth == 0) {
+                        balanced = true;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                close_bracket += 1;
+            }
 
-            if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
-                if (parseLinkTail(line, close_bracket + 1)) |tail| {
-                    // Flush preceding plain text
-                    if (i > span_start) {
+            if (balanced) {
+                if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
+                    if (parseLinkTail(line, close_bracket + 1)) |tail| {
+                        // Flush preceding plain text
+                        if (i > span_start) {
+                            spans_out[span_count] = .{
+                                .text = line[span_start..i],
+                                .style = cur_style,
+                            };
+                            span_count += 1;
+                            if (span_count >= spans_out.len) break;
+                        }
+
+                        const link_text = line[i + 1 .. close_bracket];
+                        const link_url = line[tail.dest_start..tail.dest_end];
+
+                        var link_style = cur_style;
+                        link_style.link = true;
+
                         spans_out[span_count] = .{
-                            .text = line[span_start..i],
-                            .style = cur_style,
+                            .text = link_text,
+                            .style = link_style,
+                            .link_target = link_url,
                         };
                         span_count += 1;
-                        if (span_count >= spans_out.len) break;
+
+                        i = tail.close + 1;
+                        span_start = i;
+                        continue;
                     }
+                }
 
+                // Reference forms (need a definition table).
+                if (defs.len > 0) {
                     const link_text = line[i + 1 .. close_bracket];
-                    const link_url = line[tail.dest_start..tail.dest_end];
+                    var ref_label: ?[]const u8 = null;
+                    var ref_end: usize = close_bracket;
+                    if (close_bracket + 1 < line.len and line[close_bracket + 1] == '[') {
+                        var lb = close_bracket + 2;
+                        while (lb < line.len and line[lb] != ']') : (lb += 1) {}
+                        if (lb < line.len) {
+                            const raw = line[close_bracket + 2 .. lb];
+                            ref_label = if (raw.len == 0) link_text else raw;
+                            ref_end = lb;
+                        }
+                    } else if (close_bracket + 2 < line.len and
+                        (line[close_bracket + 1] == ' ' or line[close_bracket + 1] == '\t') and
+                        line[close_bracket + 2] == '[')
+                    {
+                        var lb = close_bracket + 3;
+                        while (lb < line.len and line[lb] != ']') : (lb += 1) {}
+                        if (lb < line.len) {
+                            ref_label = line[close_bracket + 3 .. lb];
+                            ref_end = lb;
+                        }
+                    } else {
+                        ref_label = link_text;
+                    }
+                    if (ref_label) |lab| {
+                        if (simd.findRefDef(defs, lab)) |def| {
+                            if (i > span_start) {
+                                spans_out[span_count] = .{
+                                    .text = line[span_start..i],
+                                    .style = cur_style,
+                                };
+                                span_count += 1;
+                                if (span_count >= spans_out.len) break;
+                            }
 
-                    var link_style = cur_style;
-                    link_style.link = true;
+                            var link_style = cur_style;
+                            link_style.link = true;
 
-                    spans_out[span_count] = .{
-                        .text = link_text,
-                        .style = link_style,
-                        .link_target = link_url,
-                    };
-                    span_count += 1;
+                            spans_out[span_count] = .{
+                                .text = link_text,
+                                .style = link_style,
+                                .link_target = def.url,
+                            };
+                            span_count += 1;
 
-                    i = tail.close + 1;
-                    span_start = i;
-                    continue;
+                            i = ref_end + 1;
+                            span_start = i;
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -514,21 +595,20 @@ pub fn parseInlinesStream(
             }
         }
 
-        // Inline code `...` (atomic content token, like parseInlines)
+        // Inline code `...` (matched-length closer, stripped padding).
         if (c == '`') {
-            em.flushText(span_start, i);
-
-            const code_start = i + 1;
-            var code_end = code_start;
-            while (code_end < line.len and line[code_end] != '`') : (code_end += 1) {}
-
-            if (code_end < line.len) {
-                em.emitSlice(.code_span, code_start, code_end);
-                i = code_end + 1;
+            var run: usize = 0;
+            while (i + run < line.len and line[i + run] == '`') : (run += 1) {}
+            if (codeSpanClose(line, i + run, run)) |cs| {
+                em.flushText(span_start, i);
+                const stripped = stripCodeSpan(line[cs.start..cs.end]);
+                const rel = @intFromPtr(stripped.ptr) - @intFromPtr(line.ptr);
+                em.emitSlice(.code_span, rel, rel + stripped.len);
+                i = cs.close_end;
                 span_start = i;
                 continue;
             } else {
-                // Unterminated backtick, treat as regular text
+                // No matching closer, treat as regular text
                 i += 1;
                 continue;
             }
@@ -820,192 +900,14 @@ pub fn entityLengthAt(line: []const u8, i: usize) usize {
     return semi - i + 1;
 }
 
-/// One link reference definition (`[label]: /url "title"`). Slices borrow
-/// the document buffer (zero-copy); titles validate the definition but are
-/// dropped (no tooltip surface). Only single-line definitions are collected;
-/// a title continued on the next line stays literal text.
-pub const RefDef = struct {
-    label: []const u8,
-    url: []const u8,
-    line_idx: u32,
-};
-
-/// Cold-path upper bound for definitions per document.
-pub const MAX_REF_DEFS: usize = 128;
-
-/// Parses a single-line reference definition. Up to 3 leading spaces (a tab
-/// or 4th space makes it indented code, never a definition). Returns the
-/// label and URL slices, or null when the line is not a valid definition
-/// (including a malformed trailing title, which invalidates the whole def).
-pub fn parseRefDefLine(line: []const u8) ?struct { label: []const u8, url: []const u8 } {
-    var pos: usize = 0;
-    var indent: usize = 0;
-    while (pos < line.len and line[pos] == ' ') : (pos += 1) {
-        indent += 1;
-    }
-    if (indent >= 4) return null;
-    if (pos < line.len and line[pos] == '\t') return null;
-    if (pos >= line.len or line[pos] != '[') return null;
-
-    // Label: first raw `]` ends it; raw `[` inside invalidates.
-    var j = pos + 1;
-    var label_end: ?usize = null;
-    while (j < line.len) {
-        if (line[j] == '\\' and j + 1 < line.len) {
-            j += 2;
-            continue;
-        }
-        if (line[j] == ']') {
-            label_end = j;
-            break;
-        }
-        if (line[j] == '[') return null;
-        j += 1;
-    }
-    const le = label_end orelse return null;
-    var label = line[pos + 1 .. le];
-    while (label.len > 0 and (label[0] == ' ' or label[0] == '\t')) : (label = label[1..]) {}
-    while (label.len > 0 and (label[label.len - 1] == ' ' or label[label.len - 1] == '\t')) : (label = label[0 .. label.len - 1]) {}
-    if (label.len == 0 or label.len > 999) return null;
-
-    pos = le + 1;
-    if (pos >= line.len or line[pos] != ':') return null;
-    pos += 1;
-    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
-    if (pos >= line.len) return null;
-
-    var url_start: usize = pos;
-    var url_end: usize = pos;
-    if (line[pos] == '<') {
-        const gt = std.mem.indexOfScalarPos(u8, line, pos + 1, '>') orelse return null;
-        url_start = pos + 1;
-        url_end = gt;
-        pos = gt + 1;
-    } else {
-        var end = pos;
-        var depth: usize = 0;
-        while (end < line.len) {
-            const c = line[end];
-            if (c == '(') {
-                depth += 1;
-            } else if (c == ')') {
-                if (depth == 0) break;
-                depth -= 1;
-            } else if (c == ' ' or c == '\t' or c < 0x20) {
-                break;
-            }
-            end += 1;
-        }
-        if (end == pos) return null;
-        url_end = end;
-        pos = end;
-    }
-
-    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
-    if (pos >= line.len) return .{ .label = label, .url = line[url_start..url_end] };
-
-    // Optional same-line title; anything else invalidates the definition.
-    const q = line[pos];
-    if (q == '"' or q == '\'') {
-        var k = pos + 1;
-        var closed = false;
-        while (k < line.len) {
-            if (line[k] == '\\' and k + 1 < line.len) {
-                k += 2;
-                continue;
-            }
-            if (line[k] == q) {
-                closed = true;
-                break;
-            }
-            k += 1;
-        }
-        if (!closed) return null;
-        pos = k + 1;
-    } else if (q == '(') {
-        var depth: usize = 1;
-        var k = pos + 1;
-        var closed = false;
-        while (k < line.len) {
-            if (line[k] == '\\' and k + 1 < line.len) {
-                k += 2;
-                continue;
-            } else if (line[k] == '(') {
-                depth += 1;
-            } else if (line[k] == ')') {
-                depth -= 1;
-                if (depth == 0) {
-                    closed = true;
-                    break;
-                }
-            }
-            k += 1;
-        }
-        if (!closed) return null;
-        pos = k + 1;
-    } else {
-        return null;
-    }
-    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) : (pos += 1) {}
-    if (pos != line.len) return null;
-    return .{ .label = label, .url = line[url_start..url_end] };
-}
-
-/// Cold-path scan of all single-line reference definitions in a document.
-/// Zero heap allocations; writes at most `out.len` entries, returns the
-/// stored count. First definition wins on duplicate labels (CommonMark).
-pub fn scanRefDefs(bytes: []const u8, lines: []const simd.Line, out: []RefDef) usize {
-    var count: usize = 0;
-    for (lines, 0..) |ln, idx| {
-        if (ln.block_type != .paragraph) continue;
-        const text = bytes[ln.offset..][0..ln.len];
-        if (parseRefDefLine(text)) |d| {
-            if (count >= out.len) break;
-            out[count] = .{ .label = d.label, .url = d.url, .line_idx = @intCast(idx) };
-            count += 1;
-        }
-    }
-    return count;
-}
-
-/// ASCII case-insensitive label match with inner whitespace collapsed
-/// (CommonMark reference matching, line-local edition).
-fn matchLabel(a: []const u8, b: []const u8) bool {
-    var x = a;
-    var y = b;
-    while (x.len > 0 and (x[0] == ' ' or x[0] == '\t')) : (x = x[1..]) {}
-    while (x.len > 0 and (x[x.len - 1] == ' ' or x[x.len - 1] == '\t')) : (x = x[0 .. x.len - 1]) {}
-    while (y.len > 0 and (y[0] == ' ' or y[0] == '\t')) : (y = y[1..]) {}
-    while (y.len > 0 and (y[y.len - 1] == ' ' or y[y.len - 1] == '\t')) : (y = y[0 .. y.len - 1]) {}
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < x.len and j < y.len) {
-        const sx = x[i] == ' ' or x[i] == '\t';
-        const sy = y[j] == ' ' or y[j] == '\t';
-        if (sx or sy) {
-            if (!(sx and sy)) return false;
-            while (i < x.len and (x[i] == ' ' or x[i] == '\t')) : (i += 1) {}
-            while (j < y.len and (y[j] == ' ' or y[j] == '\t')) : (j += 1) {}
-            continue;
-        }
-        var cx = x[i];
-        var cy = y[j];
-        if (cx >= 'A' and cx <= 'Z') cx += 32;
-        if (cy >= 'A' and cy <= 'Z') cy += 32;
-        if (cx != cy) return false;
-        i += 1;
-        j += 1;
-    }
-    return i >= x.len and j >= y.len;
-}
-
-/// First definition whose label matches (case-insensitive, collapsed).
-pub fn findRefDef(defs: []const RefDef, label: []const u8) ?RefDef {
-    for (defs) |d| {
-        if (matchLabel(d.label, label)) return d;
-    }
-    return null;
-}
+/// Reference-definition machinery lives in simd.zig next to the block
+/// classifier (scan-time detection needs it without a parser import
+/// cycle); re-exported here for inline resolution and tests.
+pub const RefDef = simd.RefDef;
+pub const MAX_REF_DEFS = simd.MAX_REF_DEFS;
+pub const parseRefDefLine = simd.parseRefDefLine;
+pub const scanRefDefs = simd.scanRefDefs;
+pub const findRefDef = simd.findRefDef;
 
 fn linkTargetOf(line: []const u8) ?[]const u8 {
     var spans: [8]InlineSpan = undefined;
@@ -1040,9 +942,12 @@ test "inline links: titles validate, destinations exclude brackets" {
     // Balanced parens inside a bare destination are kept.
     try std.testing.expectEqualStrings("u(v)w", linkTargetOf("[a](u(v)w)").?);
 
-    // Literal quotes inside a double-quoted title invalidate the link:
-    // the source must stay literal text (no link spans at all).
-    try std.testing.expect(linkTargetOf("Foo [bar](/url/ \"Title with \"quotes\" inside\").") == null);
+    // Literal quotes inside a double-quoted title still link (Markdown 1.0
+    // greedy titles); the inner text is preserved, target stays clean.
+    try std.testing.expectEqualStrings(
+        "/url/",
+        linkTargetOf("Foo [bar](/url/ \"Title with \"quotes\" inside\").").?,
+    );
 
     // Unterminated title also stays literal.
     try std.testing.expect(linkTargetOf("[a](/u \"no end") == null);
@@ -1057,6 +962,34 @@ test "inline links: titles validate, destinations exclude brackets" {
         }
     }
     try std.testing.expect(found_img);
+}
+
+test "code spans: matched closers and padding strip" {
+    // Double-backtick span holding an escaped backtick (backslash doc).
+    var spans: [8]InlineSpan = undefined;
+    const n = parseInlines("Backtick: `` \\` ``", &spans);
+    var found = false;
+    for (spans[0..n]) |s| {
+        if (s.style.code and std.mem.eql(u8, s.text, "\\`")) found = true;
+    }
+    try std.testing.expect(found);
+
+    // Single spans are unchanged; padded singles strip one space.
+    var s2: [8]InlineSpan = undefined;
+    const n2 = parseInlines("`<http://example.com/>`", &s2);
+    try std.testing.expect(n2 == 1 and s2[0].style.code);
+    try std.testing.expectEqualStrings("<http://example.com/>", s2[0].text);
+    var s3: [8]InlineSpan = undefined;
+    const n3 = parseInlines("` pad `", &s3);
+    try std.testing.expect(n3 == 1 and s3[0].style.code);
+    try std.testing.expectEqualStrings("pad", s3[0].text);
+
+    // Unterminated backticks stay literal text (no code spans at all).
+    var s4: [8]InlineSpan = undefined;
+    const n4 = parseInlines("a ` b", &s4);
+    for (s4[0..n4]) |s| {
+        try std.testing.expect(!s.style.code);
+    }
 }
 
 test "entities: named and numeric references decode" {
@@ -1100,8 +1033,11 @@ test "refdefs: single-line definitions scan, indent and titles gate" {
     try std.testing.expect(parseRefDefLine("    [four]: /url") == null);
     try std.testing.expect(parseRefDefLine("\t[tab]: /url") == null);
 
-    // Malformed trailing titles invalidate the whole definition.
-    try std.testing.expect(parseRefDefLine("[bar]: /url/ \"Title with \"quotes\" inside\"") == null);
+    // Greedy quote titles keep the definition valid (Markdown 1.0); only
+    // trailing garbage invalidates it.
+    const dq = parseRefDefLine("[bar]: /url/ \"Title with \"quotes\" inside\"");
+    try std.testing.expect(dq != null);
+    try std.testing.expectEqualStrings("/url/", dq.?.url);
     try std.testing.expect(parseRefDefLine("[a]: /url garbage") == null);
 
     // Use sites are not definitions.
@@ -1118,6 +1054,60 @@ test "refdefs: single-line definitions scan, indent and titles gate" {
     try std.testing.expectEqualStrings("/url", findRefDef(&defs, "ONCE").?.url);
     try std.testing.expectEqualStrings("/u2", findRefDef(&defs, "a b").?.url);
     try std.testing.expect(findRefDef(&defs, "missing") == null);
+}
+
+fn linkTargetOfDefs(line: []const u8, defs: []const simd.RefDef) ?[]const u8 {
+    var spans: [8]InlineSpan = undefined;
+    const n = parseInlinesWithDefs(line, &spans, defs);
+    for (spans[0..n]) |s| {
+        if (s.style.link) return s.link_target;
+    }
+    return null;
+}
+
+fn linkTextOfDefs(line: []const u8, defs: []const simd.RefDef) ?[]const u8 {
+    var spans: [8]InlineSpan = undefined;
+    const n = parseInlinesWithDefs(line, &spans, defs);
+    for (spans[0..n]) |s| {
+        if (s.style.link) return s.text;
+    }
+    return null;
+}
+
+test "ref links: full, collapsed, shortcut, spaced forms resolve" {
+    const doc =
+        "Foo [bar] [1].\n" ++
+        "With [embedded [brackets]] [b].\n" ++
+        "Indented [once][].\n" ++
+        "Indented [twice].\n" ++
+        "Indented [four][] times.\n" ++
+        "\n" ++
+        " [once]: /url\n" ++
+        "[twice]: /url\n" ++
+        "    [four]: /url\n" ++
+        "[1]: /url/  \"Title\"\n" ++
+        "[b]: /url/\n";
+    var lines: [16]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var defs: [8]simd.RefDef = undefined;
+    const m = simd.scanRefDefs(doc, lines[0..n], &defs);
+    try std.testing.expectEqual(@as(usize, 4), m);
+
+    // Space-separated full form (Markdown.pl compatibility).
+    try std.testing.expectEqualStrings("/url/", linkTargetOfDefs("Foo [bar] [1].", defs[0..m]).?);
+    // Nested brackets in the text resolve as one link.
+    try std.testing.expectEqualStrings("/url/", linkTargetOfDefs("With [embedded [brackets]] [b].", defs[0..m]).?);
+    try std.testing.expectEqualStrings("embedded [brackets]", linkTextOfDefs("With [embedded [brackets]] [b].", defs[0..m]).?);
+    // Collapsed and shortcut forms.
+    try std.testing.expectEqualStrings("/url", linkTargetOfDefs("Indented [once][].", defs[0..m]).?);
+    try std.testing.expectEqualStrings("/url", linkTargetOfDefs("Indented [twice].", defs[0..m]).?);
+    // Four-space definition is code: use stays literal.
+    try std.testing.expect(linkTargetOfDefs("Indented [four][] times.", defs[0..m]) == null);
+    // Unknown labels stay literal.
+    try std.testing.expect(linkTargetOfDefs("[missing] here.", defs[0..m]) == null);
+    // Without a table nothing resolves (plain parseInlines path).
+    try std.testing.expect(linkTargetOf("Foo [bar] [1].") == null);
 }
 
 test "refdefs: amps document yields two definitions" {
