@@ -36,6 +36,7 @@ static unsigned long g_draw_seq = 0;
 #ifdef READ_ANIMATED_GIF
 static BOOL gif_window_visible(void); // defined with the image cache below
 #endif
+static void apply_native_tabbing(NSWindow* w); // defined at end-of-file
 
 typedef struct {
     float x;
@@ -1563,6 +1564,10 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     [g_window setTitle:[NSString stringWithUTF8String:title]];
     [g_window setTitlebarAppearsTransparent:YES];
     [g_window setTitleVisibility:NSWindowTitleHidden];
+    // Native tabbing (#49): group multi-document windows into the system
+    // tab bar. Two calls, no custom chrome; a single document shows no tab
+    // bar (macOS default). See apply_native_tabbing at end-of-file.
+    apply_native_tabbing(g_window);
     [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:18.0f/255.0f green:18.0f/255.0f blue:18.0f/255.0f alpha:1.0]];
     [g_window center];
 
@@ -2636,5 +2641,33 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
                                 error:NULL];
 
     return success ? 0 : -5;
+}
+#endif
+
+// Native window tabbing (#49): two AppKit calls, no custom chrome. Kept at
+// end-of-file per the SIZE NOTE (mid-file bytes shift hot layout and cost
+// ~3x via page-boundary cascade; see prime_frame_decode above).
+static void apply_native_tabbing(NSWindow* w) {
+    if (!w) return;
+    w.tabbingMode = NSWindowTabbingModePreferred;
+    [NSWindow setAllowsAutomaticWindowTabbing:YES];
+}
+
+#ifdef TEST_HOOKS
+// Contract probe: configures a scratch window through the exact helper
+// platform_init uses and reports whether the preference stuck. Headless-safe
+// (the window is never shown); restores the class default it overwrote.
+int platform_test_tabbing(void) {
+    [NSApplication sharedApplication];
+    BOOL prev = [NSWindow allowsAutomaticWindowTabbing];
+    NSWindow* w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 100, 100)
+        styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    if (!w) { [NSWindow setAllowsAutomaticWindowTabbing:prev]; return 0; }
+    apply_native_tabbing(w);
+    int ok = ([w tabbingMode] == NSWindowTabbingModePreferred &&
+        [NSWindow allowsAutomaticWindowTabbing]) ? 1 : 0;
+    [w close];
+    [NSWindow setAllowsAutomaticWindowTabbing:prev];
+    return ok;
 }
 #endif
