@@ -633,6 +633,134 @@ fn scanDoc(doc: []const u8, lines: []simd.Line) usize {
     return simd.scanLines(doc, lines, &fence);
 }
 
+fn runY(cmds: []layout.DrawCommand, text: []const u8) ?f32 {
+    for (cmds) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, text)) return c.rect.y;
+    }
+    return null;
+}
+
+fn runColor(cmds: []layout.DrawCommand, text: []const u8) ?layout.Color {
+    for (cmds) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, text)) return c.color;
+    }
+    return null;
+}
+
+fn countRuns(cmds: []layout.DrawCommand, text: []const u8) usize {
+    var k: usize = 0;
+    for (cmds) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, text)) k += 1;
+    }
+    return k;
+}
+
+fn countLines(cmds: []layout.DrawCommand) usize {
+    var k: usize = 0;
+    for (cmds) |c| {
+        if (c.kind == .line) k += 1;
+    }
+    return k;
+}
+
+test "spec compliance: tight lists stay compact, loose lists breathe" {
+    // The blank-line rule separates tight from loose; loose item gaps
+    // must exceed tight ones under the same config.
+    const tight_doc = "- a\n- b\n";
+    const loose_doc = "- a\n\n- b\n";
+    var tlines: [8]simd.Line = undefined;
+    const tn = scanDoc(tight_doc, &tlines);
+    var tcmds: [128]layout.DrawCommand = undefined;
+    const tm = layout.layoutViewport(tight_doc, tlines[0..tn], testCfg(), &tcmds);
+    var llines: [8]simd.Line = undefined;
+    const ln = scanDoc(loose_doc, &llines);
+    var lcmds: [128]layout.DrawCommand = undefined;
+    const lm = layout.layoutViewport(loose_doc, llines[0..ln], testCfg(), &lcmds);
+    const tight_gap = (runY(tcmds[0..tm], "b") orelse return error.MissingRun) -
+        (runY(tcmds[0..tm], "a") orelse return error.MissingRun);
+    const loose_gap = (runY(lcmds[0..lm], "b") orelse return error.MissingRun) -
+        (runY(lcmds[0..lm], "a") orelse return error.MissingRun);
+    try std.testing.expect(loose_gap > tight_gap);
+}
+
+test "spec compliance: task items check boxes, mute when done" {
+    const doc =
+        \\- [ ] todo
+        \\- [x] done
+        \\- [X] DONE
+    ;
+    var lines: [8]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    for (lines[0..n]) |l| {
+        try std.testing.expectEqual(simd.BlockType.task_list, l.block_type);
+    }
+    var cmds: [256]layout.DrawCommand = undefined;
+    const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    try std.testing.expect(hasRun(cmds[0..m], "todo"));
+    try std.testing.expect(hasRun(cmds[0..m], "done"));
+    try std.testing.expect(hasRun(cmds[0..m], "DONE"));
+    // Both checked forms draw a tick; only the open item keeps full text.
+    try std.testing.expectEqual(@as(usize, 2), countRuns(cmds[0..m], "✓"));
+    try std.testing.expectEqual(layout.Theme.dark.text, runColor(cmds[0..m], "todo") orelse return error.MissingRun);
+    try std.testing.expectEqual(layout.Theme.dark.muted, runColor(cmds[0..m], "done") orelse return error.MissingRun);
+    try std.testing.expectEqual(layout.Theme.dark.muted, runColor(cmds[0..m], "DONE") orelse return error.MissingRun);
+}
+
+test "spec compliance: --- after a paragraph is setext H2, never hr" {
+    // The disambiguation: exactly three dashes underline H2 when text
+    // precedes, and draw a rule only when standing alone.
+    const doc =
+        \\Title
+        \\---
+    ;
+    var lines: [8]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    var cmds: [128]layout.DrawCommand = undefined;
+    const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    var headed = false;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Title")) {
+            headed = c.style.heading;
+            try std.testing.expect(c.font_size > testCfg().base_font_size);
+        }
+    }
+    try std.testing.expect(headed);
+    try std.testing.expectEqual(@as(usize, 0), countLines(cmds[0..m]));
+
+    const hr_doc = "---\n";
+    var hlines: [8]simd.Line = undefined;
+    const hn = scanDoc(hr_doc, &hlines);
+    try std.testing.expectEqual(simd.BlockType.hr, hlines[0].block_type);
+    var hcmds: [128]layout.DrawCommand = undefined;
+    const hm = layout.layoutViewport(hr_doc, hlines[0..hn], testCfg(), &hcmds);
+    try std.testing.expectEqual(@as(usize, 1), countLines(hcmds[0..hm]));
+}
+
+test "spec compliance: inline HTML renders as literal text" {
+    // HTML rendering is unsupported by design: tags stay visible runs,
+    // never links, images, or hidden blocks (inline_html_* fixtures).
+    const doc =
+        \\<div>hi</div>
+        \\
+        \\text with <span>x</span> inline
+    ;
+    var lines: [16]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    try std.testing.expectEqual(simd.BlockType.paragraph, lines[0].block_type);
+    var cmds: [128]layout.DrawCommand = undefined;
+    const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    try std.testing.expect(hasRun(cmds[0..m], "<div>hi</div>"));
+    try std.testing.expect(hasRun(cmds[0..m], "<span>x</span>"));
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) {
+            try std.testing.expect(!c.style.link);
+            try std.testing.expect(!c.style.image);
+            try std.testing.expect(!c.style.code);
+        }
+    }
+}
+
 test "regression: lazy blockquote continuation keeps quote styling and bar" {
     const doc =
         \\> This is a blockquote with two paragraphs. Lorem ipsum dolor sit amet,
