@@ -405,6 +405,23 @@ test "controls: smooth scroll steps on whole points and settles exactly" {
     try std.testing.expectEqual(@as(f32, 40.3), f.current);
 }
 
+test "controls: smooth scroll whole-point steps hold at 60Hz cadence" {
+    // The platform now ticks at the hosting screen's rate (60Hz panels stop
+    // paying 120 wakeups/s): mid-flight positions must be whole points at
+    // 60Hz too, with exact settle and no stall.
+    var s = layout.SmoothScroll{};
+    s.setTarget(40.0, 1000.0);
+    var frames: usize = 0;
+    while (!s.settled() and frames < 240) : (frames += 1) {
+        _ = s.tick(1.0 / 60.0);
+        if (!s.settled()) {
+            try std.testing.expectEqual(@round(s.current), s.current);
+        }
+    }
+    try std.testing.expect(s.settled());
+    try std.testing.expectEqual(@as(f32, 40.0), s.current);
+}
+
 test "controls: smooth scroll converges across frame rates" {
     var slow = layout.SmoothScroll{};
     slow.setTarget(480.0, 4000.0);
