@@ -36,6 +36,10 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_scroll_end.png" --scroll-x-end test_cases/code_and_tasks.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/tables_formatting_scroll_end.png" --scroll-x-end test_cases/tables_formatting.md
 
+# Case 4d: Plugin fallback rendering (RFC #41) — unknown plugin fences render
+# as plain code blocks, source intact.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_fallback.png" test_cases/plugin_fallback.md
+
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
 
