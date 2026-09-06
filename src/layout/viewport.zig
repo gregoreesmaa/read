@@ -2277,7 +2277,9 @@ pub fn renderViewportCore(
                                 if (c_idx < col_count) {
                                     const this_col_w = col_widths[c_idx];
                                     if (cell_text.len > 0 and cmd_count < commands_out.len) {
-                                        const cell_spans = parser.parseInlines(cell_text, &span_buf);
+                                        // Reference links resolve in cells like
+                                        // every other flow context ([#16]).
+                                        const cell_spans = parser.parseInlinesWithDefs(cell_text, &span_buf, config.ref_defs);
                                         const cell_color = if (is_header) theme.accent else theme.text;
 
                                         var span_x = cur_col_x + 8.0;
