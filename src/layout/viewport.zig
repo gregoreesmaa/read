@@ -2880,7 +2880,7 @@ test "strict scroll smoothness across enumerations, lists, headings, and mixed b
         \\1. Ordered step_one: initialize memory map
         \\2. Ordered step_two: scan SIMD vector chunk line boundaries with microsecond throughput
         \\3. Ordered step_three: calculate visible viewport draw commands strictly without layout jitter or jumps
-        \\4. Ordered step_four: render frame to native macOS Cocoa CoreText buffer
+        \\4. Ordered step_four: render frame to the native platform text buffer
         \\
         \\- [x] Completed task_one with checkmark
         \\- [ ] Incomplete task_two that requires user action and spans across several words
