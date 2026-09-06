@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const parser = @import("../core/parser.zig");
+const highlight = @import("../core/highlight.zig");
 
 // Calibrated ASCII advance widths for IBM Plex Serif Regular (in 1/1000 em)
 pub const SERIF_FONT_WIDTHS = [128]u16{
@@ -142,6 +143,8 @@ pub const Color = struct {
     pub const text_muted_dark = Color{ .r = 140, .g = 140, .b = 145, .a = 255 };
     pub const accent_dark = Color{ .r = 96, .g = 165, .b = 250, .a = 255 };
     pub const code_bg_dark = Color{ .r = 26, .g = 26, .b = 28, .a = 255 };
+    pub const code_string_dark = Color{ .r = 134, .g = 239, .b = 172, .a = 255 };
+    pub const code_number_dark = Color{ .r = 232, .g = 161, .b = 92, .a = 255 };
     pub const quote_bar_dark = Color{ .r = 70, .g = 70, .b = 80, .a = 255 };
     pub const hr_dark = Color{ .r = 40, .g = 40, .b = 45, .a = 255 };
     pub const table_border_dark = Color{ .r = 45, .g = 45, .b = 52, .a = 255 };
@@ -153,6 +156,8 @@ pub const Color = struct {
     pub const text_muted_light = Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
     pub const accent_light = Color{ .r = 37, .g = 99, .b = 235, .a = 255 };
     pub const code_bg_light = Color{ .r = 240, .g = 241, .b = 243, .a = 255 };
+    pub const code_string_light = Color{ .r = 22, .g = 128, .b = 60, .a = 255 };
+    pub const code_number_light = Color{ .r = 184, .g = 92, .b = 20, .a = 255 };
     pub const quote_bar_light = Color{ .r = 203, .g = 213, .b = 225, .a = 255 };
     pub const hr_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
     pub const table_border_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
@@ -184,6 +189,10 @@ pub const Theme = struct {
     muted: Color,
     accent: Color,
     code_bg: Color,
+    code_keyword: Color,
+    code_string: Color,
+    code_comment: Color,
+    code_number: Color,
     quote_bar: Color,
     hr: Color,
     table_border: Color,
@@ -195,6 +204,10 @@ pub const Theme = struct {
         .muted = Color.text_muted_dark,
         .accent = Color.accent_dark,
         .code_bg = Color.code_bg_dark,
+        .code_keyword = Color.accent_dark,
+        .code_string = Color.code_string_dark,
+        .code_comment = Color.text_muted_dark,
+        .code_number = Color.code_number_dark,
         .quote_bar = Color.quote_bar_dark,
         .hr = Color.hr_dark,
         .table_border = Color.table_border_dark,
@@ -207,12 +220,28 @@ pub const Theme = struct {
         .muted = Color.text_muted_light,
         .accent = Color.accent_light,
         .code_bg = Color.code_bg_light,
+        .code_keyword = Color.accent_light,
+        .code_string = Color.code_string_light,
+        .code_comment = Color.text_muted_light,
+        .code_number = Color.code_number_light,
         .quote_bar = Color.quote_bar_light,
         .hr = Color.hr_light,
         .table_border = Color.table_border_light,
         .table_header_bg = Color.table_header_bg_light,
     };
 };
+
+/// Tint for a syntax class (issue #39). Plain falls back to body text so
+/// untinted runs are pixel-identical to the pre-highlight renderer.
+pub fn codeClassColor(theme: Theme, class: highlight.Class) Color {
+    return switch (class) {
+        .plain => theme.text,
+        .keyword => theme.code_keyword,
+        .string => theme.code_string,
+        .comment => theme.code_comment,
+        .number => theme.code_number,
+    };
+}
 
 pub const MAX_SCROLLABLE_BLOCKS = 128;
 
@@ -2079,6 +2108,15 @@ pub fn renderViewportCore(
                     cmd_count += 1;
                 }
 
+                // Syntax tinting (issue #39): language from the fence info
+                // string, tokenized per visible line only. Unknown/missing
+                // info string (or untokenizable lines) falls back to the
+                // single plain run, exactly as before.
+                const fence_line = bytes[lines[i].offset..][0..lines[i].len];
+                const fence_lang = highlight.langFromFenceLine(fence_line);
+                const mono_size = config.base_font_size * 0.88;
+                const mono_advance = mono_size * 0.60;
+
                 var code_y = cur_y + 12.0;
                 var draw_i = i + 1;
                 while (draw_i < scan_i and draw_i < lines.len) : (draw_i += 1) {
@@ -2088,20 +2126,62 @@ pub fn renderViewportCore(
                     const c_bytes = bytes[c_line.offset..][0..c_line.len];
 
                     if (code_y + 20.0 >= 0 and code_y <= vp_bottom) {
-                        commands_out[cmd_count] = .{
-                            .kind = .text_run,
-                            .rect = .{
-                                .x = content_x - cur_scroll_x,
-                                .y = code_y,
-                                .w = content_width,
-                                .h = config.line_height * 0.88,
-                            },
-                            .color = theme.text,
-                            .text = c_bytes,
-                            .font_size = config.base_font_size * 0.88,
-                            .style = .{ .code = true },
-                        };
-                        cmd_count += 1;
+                        var seg_buf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+                        const segs = highlight.tokenize(fence_lang, c_bytes, &seg_buf);
+                        if (segs) |runs| {
+                            if (runs.len == 0) {
+                                // Empty line: same plain run as before.
+                                commands_out[cmd_count] = .{
+                                    .kind = .text_run,
+                                    .rect = .{
+                                        .x = content_x - cur_scroll_x,
+                                        .y = code_y,
+                                        .w = content_width,
+                                        .h = config.line_height * 0.88,
+                                    },
+                                    .color = theme.text,
+                                    .text = c_bytes,
+                                    .font_size = mono_size,
+                                    .style = .{ .code = true },
+                                };
+                                cmd_count += 1;
+                            }
+                            for (runs) |run| {
+                                if (cmd_count >= commands_out.len - 16) break;
+                                const run_text = c_bytes[run.start..run.end];
+                                const run_x = content_x - cur_scroll_x +
+                                    @as(f32, @floatFromInt(run.start)) * mono_advance;
+                                commands_out[cmd_count] = .{
+                                    .kind = .text_run,
+                                    .rect = .{
+                                        .x = run_x,
+                                        .y = code_y,
+                                        .w = @as(f32, @floatFromInt(run_text.len)) * mono_advance,
+                                        .h = config.line_height * 0.88,
+                                    },
+                                    .color = codeClassColor(theme, run.class),
+                                    .text = run_text,
+                                    .font_size = mono_size,
+                                    .style = .{ .code = true },
+                                };
+                                cmd_count += 1;
+                            }
+                        } else {
+                            commands_out[cmd_count] = .{
+                                .kind = .text_run,
+                                .rect = .{
+                                    .x = content_x - cur_scroll_x,
+                                    .y = code_y,
+                                    .w = content_width,
+                                    .h = config.line_height * 0.88,
+                                },
+                                .color = theme.text,
+                                .text = c_bytes,
+                                .font_size = mono_size,
+                                .style = .{ .code = true },
+                            };
+                            cmd_count += 1;
+                        }
                     }
                     code_y += config.line_height * 0.88;
                 }
@@ -3152,6 +3232,61 @@ test "strict cross-element copying across headings, paragraphs, lists, tables, a
         &text_buf,
     );
     try std.testing.expect(std.mem.indexOf(u8, sel3, "Ultra high throughput\n• Precise") != null);
+}
+
+test "syntax highlight: zig fence tints keyword/string/comment/number, unknown fence stays plain" {
+    const test_doc =
+        \\```zig
+        \\const s = "hi"; // set s
+        \\const n = 42;
+        \\```
+        \\
+        \\```rust
+        \\const r = 7;
+        \\```
+    ;
+
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    var saw_keyword = false;
+    var saw_string = false;
+    var saw_comment = false;
+    var saw_number = false;
+    var rust_runs: usize = 0;
+    var rust_plain = false;
+    for (cmds[0..count]) |c| {
+        if (c.kind != .text_run or !c.style.code) continue;
+        if (std.mem.eql(u8, c.text, "const") and c.color.r == Theme.dark.code_keyword.r and
+            c.color.g == Theme.dark.code_keyword.g and c.color.b == Theme.dark.code_keyword.b)
+        {
+            saw_keyword = true;
+        }
+        if (std.mem.eql(u8, c.text, "\"hi\"") and c.color.r == Theme.dark.code_string.r) saw_string = true;
+        if (std.mem.eql(u8, c.text, "// set s") and c.color.r == Theme.dark.code_comment.r) saw_comment = true;
+        if (std.mem.eql(u8, c.text, "42") and c.color.r == Theme.dark.code_number.r) saw_number = true;
+        if (std.mem.eql(u8, c.text, "const r = 7;")) {
+            rust_runs += 1;
+            rust_plain = c.color.r == Theme.dark.text.r and c.color.g == Theme.dark.text.g and
+                c.color.b == Theme.dark.text.b;
+        }
+    }
+    try std.testing.expect(saw_keyword);
+    try std.testing.expect(saw_string);
+    try std.testing.expect(saw_comment);
+    try std.testing.expect(saw_number);
+    // Unknown info string: exactly one run, body-text color, as before.
+    try std.testing.expectEqual(@as(usize, 1), rust_runs);
+    try std.testing.expect(rust_plain);
 }
 
 /// Counts scroll-shadow strips (`fill_rect`s of shadow-strip width in the
