@@ -190,11 +190,13 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
+    // A top level step for running all tests. The two runners execute
+    // SEQUENTIALLY (exe tests after mod tests): running them in parallel
+    // halves each binary's share of CI vCPUs and inflates the wall-clock
+    // strict microsecond benchmarks with self-inflicted contention.
+    // Thresholds are unchanged; only measurement interference is removed.
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
+    run_exe_tests.step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
