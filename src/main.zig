@@ -61,6 +61,9 @@ pub const AppState = struct {
     block_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
     block_max_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
     is_dark_theme: bool = true,
+    /// Manual `t` override of the system appearance (#47). Null = following
+    /// the system; set by `t`, cleared by the next system change (or launch).
+    theme_override: ?bool = null,
 };
 
 var g_app: AppState = .{};
@@ -240,6 +243,18 @@ fn updateDocumentMetrics() void {
     g_app.max_scroll_y = @max(0.0, total_height - g_app.window_height + 400.0);
 }
 
+/// System appearance changed (platform effectiveAppearance, #47):
+/// override-until-next-system-change — any manual `t` override is dropped
+/// and the system value wins. Redraws only on a real flip.
+fn onAppearance(is_dark: c_int) callconv(.c) void {
+    g_app.theme_override = null;
+    const d = is_dark != 0;
+    if (g_app.is_dark_theme != d) {
+        g_app.is_dark_theme = d;
+        bridge.platform_request_redraw();
+    }
+}
+
 fn onResize(w: c_int, h: c_int) callconv(.c) void {
     g_app.window_width = @floatFromInt(w);
     g_app.window_height = @floatFromInt(h);
@@ -305,7 +320,9 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
             retargetScroll(g_smooth.target + g_app.window_height * 0.8);
         },
         't' => {
+            // Manual override (#47): wins until the next system change.
             g_app.is_dark_theme = !g_app.is_dark_theme;
+            g_app.theme_override = g_app.is_dark_theme;
         },
         'q' => {
             std.c.exit(0);
@@ -867,6 +884,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_tick = onTick,
         .on_scroll_to = onScrollTo,
         .on_images_changed = onImagesChanged,
+        .on_appearance = onAppearance,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);
@@ -1068,5 +1086,47 @@ test "retina atlas text stays crisp (no-blur regression)" {
         std.debug.print("\n[CRISP] acutance={d:.1} edge_frac={d:.4}\n", .{ m.acutance, m.edge_frac });
         try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
+    }
+}
+
+test "theme follows system, t overrides until next change (#47)" {
+    // Pure Zig state machine: no platform needed, runs in every binary.
+    const t = std.testing;
+    const saved_dark = g_app.is_dark_theme;
+    const saved_ov = g_app.theme_override;
+    defer {
+        g_app.is_dark_theme = saved_dark;
+        g_app.theme_override = saved_ov;
+    }
+    g_app.is_dark_theme = true;
+    g_app.theme_override = null;
+
+    onAppearance(0); // system -> light
+    try t.expect(!g_app.is_dark_theme);
+    try t.expect(g_app.theme_override == null);
+
+    onKey('t', -1); // user override -> dark
+    try t.expect(g_app.is_dark_theme);
+    try t.expect(g_app.theme_override != null and g_app.theme_override.?);
+
+    onAppearance(0); // system re-affirms light: override cleared, system wins
+    try t.expect(!g_app.is_dark_theme);
+    try t.expect(g_app.theme_override == null);
+
+    onKey('t', -1); // override again -> dark
+    try t.expect(g_app.is_dark_theme);
+    onAppearance(1); // system -> dark: override cleared (already in sync)
+    try t.expect(g_app.is_dark_theme);
+    try t.expect(g_app.theme_override == null);
+}
+
+test "appearance mapping contract: DarkAqua dark, Aqua light (#47)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the crisp test). Only the read-test binary executes it.
+    if (build_options.test_hooks) {
+        try std.testing.expectEqual(
+            @as(c_int, 1),
+            bridge.platform_test_appearance(),
+        );
     }
 }
