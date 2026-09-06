@@ -12,7 +12,7 @@ non-negotiables:
    ```
    100% of tests and strict performance benchmarks must pass. The targets in
    `src/core/strict_benchmarks.zig` (5.5 GB/s scan, 400 µs/50k lines, 18 µs mmap open,
-   8 µs viewport, 11 µs deep-scroll, 0 hot-path allocations, 8-byte `Line`, < 500 KB
+   8 µs viewport, 11 µs deep-scroll, 0 hot-path allocations, 8-byte `Line`, < 180 KiB
    binary) are **immutable** — if your change misses one, optimize the implementation,
    never loosen the target.
 2. **Run the damage parity check** (selection/hover record model must be
@@ -25,7 +25,7 @@ non-negotiables:
    ./scripts/screenshot_suite.sh screenshots
    ```
    Stage the regenerated PNGs in your commit so reviewers can diff them visually.
-3. **`test_cases/` discipline:** keep the five distinct cases (text wrapping, spacings &
+4. **`test_cases/` discipline:** keep the five distinct cases (text wrapping, spacings &
    headings, code & tasks, tables, one scrollable doc). **Max 1 scrollable document** —
    do not add more scrolling tests.
 
