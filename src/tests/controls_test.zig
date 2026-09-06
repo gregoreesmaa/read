@@ -614,3 +614,146 @@ test "controls: anchored arrival keeps below-content pixel-locked" {
     // while a real anchoring miss would read ~160px.
     try std.testing.expect(@abs(view_before - view_after) < 0.01);
 }
+
+fn layoutDoc(doc: []const u8, out: []layout.DrawCommand) usize {
+    var lines_buf: [64]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &in_fence);
+    return layout.layoutViewport(doc, lines_buf[0..n], .{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+    }, out);
+}
+
+test "controls: rtl paragraph right-aligns, ltr paragraph stays left (issue #50)" {
+    // 1000px window, 600px column: content spans x in [200, 800].
+    var cmds: [64]layout.DrawCommand = undefined;
+    const n_rtl = layoutDoc("שלום עולם\n", &cmds);
+    try std.testing.expect(n_rtl > 0);
+    // Per visual row, the row's first word ends exactly at the right
+    // column edge (later words extend left); nothing escapes the column.
+    var row_y: [8]f32 = [_]f32{-1} ** 8;
+    var row_right: [8]f32 = [_]f32{0} ** 8;
+    var row_count: usize = 0;
+    var rtl_runs: usize = 0;
+    for (cmds[0..n_rtl]) |c| {
+        if (c.kind != .text_run) continue;
+        rtl_runs += 1;
+        try std.testing.expect(c.rect.x >= 200.0 - 0.05);
+        try std.testing.expect(c.rect.x + c.rect.w <= 800.0 + 0.05);
+        var ri: usize = 0;
+        while (ri < row_count and @abs(row_y[ri] - c.rect.y) > 0.01) : (ri += 1) {}
+        if (ri == row_count and row_count < row_y.len) {
+            row_y[row_count] = c.rect.y;
+            row_count += 1;
+        }
+        if (ri < row_right.len) row_right[ri] = @max(row_right[ri], c.rect.x + c.rect.w);
+    }
+    try std.testing.expect(rtl_runs == 2);
+    try std.testing.expect(row_count == 1);
+    for (row_right[0..row_count]) |r| {
+        try std.testing.expectApproxEqAbs(@as(f32, 800.0), r, 0.05);
+    }
+
+    const n_ltr = layoutDoc("Hello world\n", &cmds);
+    var ltr_runs: usize = 0;
+    var min_x: f32 = 1e9;
+    for (cmds[0..n_ltr]) |c| {
+        if (c.kind != .text_run) continue;
+        ltr_runs += 1;
+        min_x = @min(min_x, c.rect.x);
+        try std.testing.expect(c.rect.x + c.rect.w <= 800.0 + 0.05);
+    }
+    try std.testing.expect(ltr_runs == 2);
+    // LTR still starts exactly at the left column edge (pen-start guard).
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0), min_x, 0.05);
+}
+
+test "controls: rtl direction is per-paragraph (issue #50)" {
+    var cmds: [128]layout.DrawCommand = undefined;
+    const n = layoutDoc("Hello\n\nשלום עולם\n\nWorld\n", &cmds);
+    var saw_left = false;
+    var saw_right = false;
+    for (cmds[0..n]) |c| {
+        if (c.kind != .text_run) continue;
+        if (c.rect.x <= 200.05) saw_left = true;
+        if (c.rect.x + c.rect.w >= 799.95) saw_right = true;
+    }
+    try std.testing.expect(saw_left and saw_right);
+}
+
+test "controls: rtl list markers mirror right (issue #50)" {
+    var cmds: [64]layout.DrawCommand = undefined;
+    const n_rtl = layoutDoc("- שלום\n", &cmds);
+    var marker_x: f32 = -1;
+    var text_x: f32 = -1;
+    for (cmds[0..n_rtl]) |c| {
+        if (c.kind != .text_run) continue;
+        if (std.mem.eql(u8, c.text, "•")) {
+            marker_x = c.rect.x;
+        } else if (text_x < 0) {
+            text_x = c.rect.x;
+        }
+    }
+    try std.testing.expect(marker_x > 0 and text_x > 0);
+    // Mirrored: bullet sits right of the item text.
+    try std.testing.expect(marker_x > text_x);
+    try std.testing.expectApproxEqAbs(@as(f32, 786.0), marker_x, 0.05);
+
+    const n_ltr = layoutDoc("- Hello\n", &cmds);
+    marker_x = -1;
+    text_x = -1;
+    for (cmds[0..n_ltr]) |c| {
+        if (c.kind != .text_run) continue;
+        if (std.mem.eql(u8, c.text, "•")) {
+            marker_x = c.rect.x;
+        } else if (text_x < 0) {
+            text_x = c.rect.x;
+        }
+    }
+    try std.testing.expect(marker_x >= 0 and text_x >= 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0), marker_x, 0.05);
+    try std.testing.expect(marker_x < text_x);
+}
+
+test "controls: rtl quote bars mirror right (issue #50)" {
+    var cmds: [64]layout.DrawCommand = undefined;
+    const n_rtl = layoutDoc("> שלום\n", &cmds);
+    var bar_x: f32 = -1;
+    for (cmds[0..n_rtl]) |c| {
+        if (c.kind == .fill_rect and c.rect.w == 3.0) bar_x = c.rect.x;
+    }
+    // LTR bar sits at content_x + 16 - 12 = 204; the RTL bar is its exact
+    // column mirror: 2*200 + 600 - 204 - 3 = 793.
+    try std.testing.expectApproxEqAbs(@as(f32, 793.0), bar_x, 0.05);
+
+    const n_ltr = layoutDoc("> Hello\n", &cmds);
+    bar_x = -1;
+    for (cmds[0..n_ltr]) |c| {
+        if (c.kind == .fill_rect and c.rect.w == 3.0) bar_x = c.rect.x;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 204.0), bar_x, 0.05);
+}
+
+test "controls: rtl heading right-aligns (issue #50)" {
+    var cmds: [64]layout.DrawCommand = undefined;
+    const n_rtl = layoutDoc("# שלום\n", &cmds);
+    var max_right: f32 = 0;
+    var runs: usize = 0;
+    for (cmds[0..n_rtl]) |c| {
+        if (c.kind != .text_run) continue;
+        runs += 1;
+        max_right = @max(max_right, c.rect.x + c.rect.w);
+    }
+    try std.testing.expect(runs > 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 800.0), max_right, 0.05);
+
+    const n_ltr = layoutDoc("# Hello\n", &cmds);
+    var min_x: f32 = 1e9;
+    for (cmds[0..n_ltr]) |c| {
+        if (c.kind != .text_run) continue;
+        min_x = @min(min_x, c.rect.x);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0), min_x, 0.05);
+}

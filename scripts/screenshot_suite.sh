@@ -39,6 +39,10 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
 
+# Case 6: RTL/bidi paragraphs, headings, lists, quotes (issue #50). Plain
+# initial viewport like cases 1-4 (not a scrolling test).
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/rtl_bidi.png" test_cases/rtl_bidi.md
+
 # Cases 6+: Original MarkdownTest 1.0 suite (.text sources copied verbatim to
 # test_cases/mdtest_*.md). scrollable_doc.md remains the single
 # scrolled-viewport *test case*; the per-file scroll steps below capture the
