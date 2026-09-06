@@ -1538,3 +1538,114 @@ test "regression: multi-line quoted indented code renders mono with bars" {
     try std.testing.expect(hasRun(cmds[0..m], "Example:"));
 }
 
+test "spec compliance: reference images resolve in full, collapsed, shortcut forms" {
+    const doc =
+        \\See ![Logo][l] and ![Icon][] and ![Mark] here.
+        \\
+        \\[l]: /logo.png
+        \\[icon]: /icon.png "Icon"
+        \\[mark]: /mark.png
+    ;
+    var lines: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    // Alt text renders as linked runs; definition lines stay hidden.
+    try std.testing.expect(hasLink(cmds[0..m], "Logo"));
+    try std.testing.expect(hasLink(cmds[0..m], "Icon"));
+    try std.testing.expect(hasLink(cmds[0..m], "Mark"));
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) {
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "[l]:") == null);
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "[icon]:") == null);
+        }
+    }
+    // Parser level: image flag set with zero-copy targets from the table.
+    var defs: [8]simd.RefDef = undefined;
+    const dn = simd.scanRefDefs(doc, lines[0..n], &defs);
+    var spans: [8]parser.InlineSpan = undefined;
+    const sn = parser.parseInlinesWithDefs("![Logo][l]", &spans, defs[0..dn]);
+    var found_img = false;
+    for (spans[0..sn]) |s| {
+        if (s.style.image and std.mem.eql(u8, s.text, "Logo")) {
+            found_img = true;
+            try std.testing.expectEqualStrings("/logo.png", s.link_target.?);
+        }
+    }
+    try std.testing.expect(found_img);
+}
+
+test "spec compliance: reference labels match case-insensitively, titles validate" {
+    // `[A]` resolves against a lowercase definition; titles in all three
+    // quote forms validate on inline links and definitions alike.
+    const doc =
+        \\Read [Manual][A] now.
+        \\
+        \\[a]: /manual
+    ;
+    var lines: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    try std.testing.expect(hasLink(cmds[0..m], "Manual"));
+
+    var spans: [8]parser.InlineSpan = undefined;
+    const sq = parser.parseInlines("[t](/u 'sq')", &spans);
+    var found_sq = false;
+    for (spans[0..sq]) |s| {
+        if (s.style.link and std.mem.eql(u8, s.text, "t")) {
+            found_sq = true;
+            try std.testing.expectEqualStrings("/u", s.link_target.?);
+        }
+    }
+    try std.testing.expect(found_sq);
+    const pq = parser.parseInlines("[t](/u (pq))", &spans);
+    var found_pq = false;
+    for (spans[0..pq]) |s| {
+        if (s.style.link and std.mem.eql(u8, s.text, "t")) found_pq = true;
+    }
+    try std.testing.expect(found_pq);
+    try std.testing.expect(simd.parseRefDefLine("[a]: /u (pt)") != null);
+}
+
+test "spec compliance: undefined reference labels stay literal" {
+    const doc =
+        \\See [missing] and ![gone][x] here.
+        \\
+        \\[other]: /url
+    ;
+    var lines: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    // No link runs at all; the bracket syntax renders as plain text.
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) try std.testing.expect(!c.style.link);
+    }
+    try std.testing.expect(hasRun(cmds[0..m], "[missing]"));
+}
+
+test "spec compliance: reference links resolve inside table cells" {
+    const doc =
+        \\| Name | Link |
+        \\| --- | --- |
+        \\| Manual | [read][m] |
+        \\
+        \\[m]: /manual
+    ;
+    var lines: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    try std.testing.expectEqual(simd.BlockType.table_row, lines[0].block_type);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    try std.testing.expect(hasLink(cmds[0..m], "read"));
+}
+
