@@ -713,14 +713,18 @@ fn lineIndentWidth(bytes: []const u8, line: simd.Line) usize {
     return indentWidth(bytes[line.offset..][0..line.len]);
 }
 
-/// True for a tab-indented or >= n-spaces-indented line.
+/// True for a line indented at least n columns: spaces count 1, each tab
+/// advances to the next multiple of 4 (CommonMark), so `  \tfoo` (col 4)
+/// counts as indented while a spaces-only scan would miss it.
 fn isIndentedBy(bytes: []const u8, line: simd.Line, n: usize) bool {
     const raw = bytes[line.offset..][0..line.len];
-    if (raw.len > 0 and raw[0] == '\t') return true;
     var w: usize = 0;
     for (raw) |c| {
-        if (c != ' ') break;
-        w += 1;
+        if (c == ' ') {
+            w += 1;
+        } else if (c == '\t') {
+            w += 4 - (w % 4);
+        } else break;
         if (w >= n) return true;
     }
     return w >= n;
@@ -818,9 +822,21 @@ fn parseListNumber(text: []const u8) u32 {
 /// top-level blocks; 4-space/tab remainder is indented code.
 fn classifyQuoteBody(body: []const u8) QuoteBody {
     if (body.len == 0) return .{ .kind = .text };
-    if (body[0] == '\t' or (body.len >= 4 and body[0] == ' ' and body[1] == ' ' and body[2] == ' ' and body[3] == ' ')) {
-        const rest = if (body[0] == '\t') body[1..] else body[4..];
-        return .{ .kind = .code, .code_text = rest };
+    // One indent level stripped with tab stops at multiples of 4, so
+    // ` \tcode` (col 4) is code exactly like tab- or 4-space-indented.
+    {
+        var rest = body;
+        var col: usize = 0;
+        while (rest.len > 0 and col < 4) {
+            if (rest[0] == ' ') {
+                col += 1;
+                rest = rest[1..];
+            } else if (rest[0] == '\t') {
+                col += 4 - (col % 4);
+                rest = rest[1..];
+            } else break;
+        }
+        if (col >= 4) return .{ .kind = .code, .code_text = rest };
     }
     var t = body;
     while (t.len > 0 and (t[0] == ' ' or t[0] == '\t')) : (t = t[1..]) {}
@@ -1744,11 +1760,21 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
     return .{ .y = pen.y + ux.config.line_height + 4.0, .consumed = j - i };
 }
 
-/// Strips one indent level (4 spaces or 1 tab) for code content.
+/// Strips one indent level (up to 4 columns; tabs stop at multiples of 4)
+/// for code content. Shorter indents are not code and return unstripped.
 fn stripCodeIndent(raw: []const u8) []const u8 {
-    if (raw.len > 0 and raw[0] == '\t') return raw[1..];
-    if (raw.len >= 4 and raw[0] == ' ' and raw[1] == ' ' and raw[2] == ' ' and raw[3] == ' ') return raw[4..];
-    return raw;
+    var rest = raw;
+    var col: usize = 0;
+    while (rest.len > 0 and col < 4) {
+        if (rest[0] == ' ') {
+            col += 1;
+            rest = rest[1..];
+        } else if (rest[0] == '\t') {
+            col += 4 - (col % 4);
+            rest = rest[1..];
+        } else break;
+    }
+    return if (col >= 4) rest else raw;
 }
 
 /// Lays out an indented code block: card background (with copy text),
