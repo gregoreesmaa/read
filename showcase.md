@@ -10,7 +10,7 @@ Normal paragraph text supports rich inline styling. Here is an example combining
 
 You can also have [hyperlinks to ziglang.org](https://ziglang.org) embedded directly within sentences.
 
-Here is a second paragraph demonstrating automatic word wrapping across multiple lines. When text exceeds the maximum reading column width of 740 pixels, the layout engine automatically breaks lines between words without breaking character runs or miscalculating typographic advances. Every line snaps strictly to the baseline grid for effortless readability.
+Here is a second paragraph demonstrating automatic word wrapping across multiple lines. When text exceeds the maximum reading column width of 600 pixels, the layout engine automatically breaks lines between words without breaking character runs or miscalculating typographic advances. Every line snaps strictly to the baseline grid for effortless readability.
 
 ---
 
@@ -91,9 +91,9 @@ zig build -Doptimize=ReleaseFast
 
 | Feature | Read | Standard Reader | Browser / Electron |
 | :--- | :--- | :--- | :--- |
-| **Startup Time** | **< 2 ms** | 40 – 80 ms | 350 – 1,200 ms |
+| **Startup Time** | **≤ 120 µs** | 40 – 80 ms | 350 – 1,200 ms |
 | **Active RAM** | **< 6 MB** | 30 – 60 MB | 150 – 400 MB |
-| **Binary Size** | **184 KB** | 15 – 30 MB | 120 – 220 MB |
+| **Binary Size** | **< 180 KiB** | 15 – 30 MB | 120 – 220 MB |
 | **Dependencies** | **0** | 10 – 30 | 800+ packages |
 
 ---

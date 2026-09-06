@@ -25,6 +25,13 @@ pub fn isAsciiPunct(ch: u8) bool {
     };
 }
 
+/// Email half of `<...>` autolink detection, shared by both inline passes
+/// (parseInlines / parseInlinesWithDefs): `user@domain` with no spaces.
+/// One non-inline copy; the two scans inside stay `inline` via findByte.
+fn isEmailAutolink(inner: []const u8) bool {
+    return simd.findByte(inner, 0, '@') != null and simd.findByte(inner, 0, ' ') == null;
+}
+
 /// Closing run for a code span opened with `run_len` backticks starting at
 /// `from` (index just past the opener). Only a run of exactly `run_len`
 /// closes; shorter/longer runs are content (so `` \ `` yields "`").
@@ -1617,7 +1624,7 @@ pub fn parseInlinesStream(
                 const is_url = std.mem.startsWith(u8, inner, "http://") or
                     std.mem.startsWith(u8, inner, "https://") or
                     std.mem.startsWith(u8, inner, "mailto:") or
-                    (std.mem.indexOfScalar(u8, inner, '@') != null and std.mem.indexOfScalar(u8, inner, ' ') == null);
+                    isEmailAutolink(inner);
 
                 if (is_url) {
                     em.flushText(span_start, i);
@@ -1749,7 +1756,7 @@ test "pass2: parseLineStream slices one mmap line with zero copies" {
 /// auml`); numeric references are complete per spec (1-7 decimal or 1-6 hex
 /// digits, NUL/surrogate/overflow mapping to U+FFFD).
 pub fn decodeEntityAfterAmp(rest: []const u8, out: []u8) usize {
-    const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return 0;
+    const semi = simd.findByte(rest, 0, ';') orelse return 0;
     if (semi == 0 or semi > 32) return 0;
     const body = rest[0..semi];
     const named: ?[]const u8 = if (std.mem.eql(u8, body, "amp"))
@@ -1834,7 +1841,7 @@ pub fn decodeEntityAfterAmp(rest: []const u8, out: []u8) usize {
 /// "is there an entity" question for measurement pre-scans.
 pub fn entityLengthAt(line: []const u8, i: usize) usize {
     if (i >= line.len or line[i] != '&') return 0;
-    const semi = std.mem.indexOfScalarPos(u8, line, i + 1, ';') orelse return 0;
+    const semi = simd.findByte(line, i + 1, ';') orelse return 0;
     if (semi - (i + 1) == 0 or semi - (i + 1) > 32) return 0;
     var tmp: [4]u8 = undefined;
     const n = decodeEntityAfterAmp(line[i + 1 ..], tmp[0..]);

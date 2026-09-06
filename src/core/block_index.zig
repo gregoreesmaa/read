@@ -93,86 +93,6 @@ pub fn buildInto(lines: []const simd.Line, blocks_out: []Block) usize {
     return count;
 }
 
-/// Owning store for app load-time use. Allocation happens once at document
-/// load (cold path). Per-frame hot-path accessors (`slice`, `text`,
-/// `findAtOrBefore`) never allocate.
-pub const BlockStore = struct {
-    blocks: std.MultiArrayList(Block) = .{},
-
-    pub fn initFromLines(allocator: std.mem.Allocator, lines: []const simd.Line) !BlockStore {
-        // Cold path only (document load): one bounded temp buffer, sized by
-        // the 1-block-per-line upper bound, then a single exact-capacity fill.
-        const tmp = try allocator.alloc(Block, @max(lines.len, 1));
-        defer allocator.free(tmp);
-        const n = buildInto(lines, tmp);
-        var self = BlockStore{};
-        errdefer self.deinit(allocator);
-        try self.blocks.ensureTotalCapacity(allocator, n);
-        for (tmp[0..n]) |b| try self.blocks.append(allocator, b);
-        return self;
-    }
-
-    pub fn deinit(self: *BlockStore, allocator: std.mem.Allocator) void {
-        self.blocks.deinit(allocator);
-    }
-
-    pub fn slice(self: *const BlockStore) std.MultiArrayList(Block).Slice {
-        return self.blocks.slice();
-    }
-
-    pub fn len(self: *const BlockStore) usize {
-        return self.blocks.len;
-    }
-
-    /// Zero-copy text of block `idx` into `bytes`. Caller guarantees `bytes`
-    /// is the same mmap buffer the store was built from.
-    pub fn text(self: *const BlockStore, bytes: []const u8, idx: usize) []const u8 {
-        const s = self.blocks.items(.start)[idx];
-        const l = self.blocks.items(.len)[idx];
-        return bytes[s..][0..l];
-    }
-
-    /// Binary search: index of the last block with `start <= offset`.
-    /// Returns null when no block starts at or before `offset`.
-    pub fn findAtOrBefore(self: *const BlockStore, offset: u32) ?usize {
-        const starts = self.blocks.items(.start);
-        var left: usize = 0;
-        var right: usize = starts.len;
-        var best: ?usize = null;
-        while (left < right) {
-            const mid = left + (right - left) / 2;
-            if (starts[mid] <= offset) {
-                best = mid;
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        return best;
-    }
-};
-
-/// Goldilocks byte range for a visible line window: byte span of
-/// `lines[first_vis..last_vis]` expanded by `lookahead_lines` of context on
-/// each side (spatial hysteresis, one screen above/below). Pure arithmetic
-/// over zero-copy line offsets; feed the result to
-/// `mmap.releaseOutsideWindow`. No allocations, no syscalls.
-pub fn residentByteRange(
-    lines: []const simd.Line,
-    first_vis: usize,
-    last_vis: usize,
-    lookahead_lines: usize,
-) struct { start: usize, end: usize } {
-    if (lines.len == 0) return .{ .start = 0, .end = 0 };
-    const context: usize = @min(lookahead_lines, 1 << 20) * 80; // ~bytes/line estimate
-    const first_off: usize = lines[@min(first_vis, lines.len - 1)].offset;
-    const hi_line = lines[@min(last_vis, lines.len - 1)];
-    return .{
-        .start = if (first_off > context) first_off - context else 0,
-        .end = @as(usize, hi_line.offset) + hi_line.len + context,
-    };
-}
-
 test "block store: 8-byte Line invariance" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(simd.Line));
     comptime {
@@ -225,38 +145,25 @@ test "block store: fold lines into flat SoA blocks with u32 links" {
     try std.testing.expect(std.mem.indexOf(u8, fence_text, "const y = 2;") != null);
 }
 
-test "block store: MultiArrayList owns SoA columns; binary search works" {
-    const allocator = std.testing.allocator;
+test "block store: fold output is ordered with chained siblings" {
     const md = "# A\nBody line here.\nBody line two.\n> Quote.\n";
     var lines: [8]simd.Line = undefined;
     var in_fence: simd.FenceState = .{};
     const n_lines = simd.scanLines(md, &lines, &in_fence);
 
-    var store = try BlockStore.initFromLines(allocator, lines[0..n_lines]);
-    defer store.deinit(allocator);
+    var buf: [8]Block = undefined;
+    const n = buildInto(lines[0..n_lines], &buf);
 
-    try std.testing.expectEqual(@as(usize, 3), store.len());
-    // SoA columns are dense and parallel.
-    try std.testing.expectEqual(store.len(), store.blocks.items(.start).len);
-    try std.testing.expectEqual(store.len(), store.blocks.items(.next_sibling).len);
-
-    try std.testing.expectEqualStrings("# A", store.text(md, 0));
-    try std.testing.expectEqual(@as(?usize, 0), store.findAtOrBefore(0));
-    try std.testing.expectEqual(@as(?usize, 1), store.findAtOrBefore(store.blocks.items(.start)[1]));
-    try std.testing.expectEqual(@as(?usize, 2), store.findAtOrBefore(@as(u32, @intCast(md.len))));
-}
-
-test "block store: resident byte range expands visible window" {
-    var lines: [4]simd.Line = undefined;
-    var in_fence: simd.FenceState = .{};
-    const md = "l0\nl1\nl2\nl3\n";
-    const n = simd.scanLines(md, &lines, &in_fence);
-    const r = residentByteRange(lines[0..n], 1, 2, 1);
-    try std.testing.expect(r.start <= lines[1].offset);
-    try std.testing.expect(r.end >= @as(usize, lines[2].offset) + lines[2].len);
-    const empty = residentByteRange(&.{}, 0, 0, 8);
-    try std.testing.expectEqual(@as(usize, 0), empty.start);
-    try std.testing.expectEqual(@as(usize, 0), empty.end);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("# A", md[buf[0].start..][0..buf[0].len]);
+    // Blocks are ordered, non-overlapping, sibling-chained.
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        if (k > 0) try std.testing.expect(buf[k].start >= buf[k - 1].start + buf[k - 1].len);
+        const want_next = if (k + 1 < n) @as(u32, @intCast(k + 1)) else NULL_IDX;
+        try std.testing.expectEqual(want_next, buf[k].next_sibling);
+    }
+    try std.testing.expect(buf[n - 1].start + buf[n - 1].len <= md.len);
 }
 
 test "mmap: Goldilocks window math clamps to file bounds" {

@@ -199,6 +199,13 @@ static void register_app_fonts(void) {
     if (registered) return;
     registered = YES;
 
+    // Fast path (2026-09: parsing the 5 bundled TTFs costs ~20 ms on the
+    // first-paint critical path): if the families already resolve — user
+    // installed fonts, managed lab image — skip file registration entirely.
+    // One sentinel probe per process; a miss falls through to the file
+    // loop below exactly as before.
+    if ([NSFont fontWithName:@"IBMPlexSerif-Regular" size:12.0]) return;
+
     NSArray* paths = @[
         @"assets/fonts/IBMPlexSerif-Regular.ttf",
         @"assets/fonts/IBMPlexSerif-Bold.ttf",
@@ -1380,7 +1387,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         NSEventPhase momentum = [event momentumPhase];
         if (phase == NSEventPhaseEnded || phase == NSEventPhaseCancelled ||
             momentum == NSEventPhaseEnded || momentum == NSEventPhaseCancelled) {
-            g_callbacks.on_scroll(0.0f, 0.0f, -1);
+            g_callbacks.on_scroll(0.0f, 0.0f, -1, 1);
             // Damage: scroll-lock reset changes no pixels, so no repaint.
 #ifdef TEST_HOOKS
             DBGLOG("EV scroll_end");
@@ -1405,7 +1412,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 break;
             }
         }
-        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id);
+        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id, (int)[event hasPreciseScrollingDeltas]);
 #ifdef TEST_HOOKS
         DBGLOG("EV scroll t=%llu dx=%.1f dy=%.1f hover=%d phase=%lu mom=%lu", dbg_t_ms(), dx, dy, hovered_block_id,
             (unsigned long)phase, (unsigned long)momentum);
@@ -1477,7 +1484,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
 @end
 
-@interface ReadAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+// SIZE NOTE: no formal <NSApplicationDelegate>/<NSWindowDelegate> adoption.
+// AppKit delivers delegate callbacks via respondsToSelector:, so the formal
+// conformance only cost ~3.7 KB of protocol metadata. Behaviorally identical;
+// zero new compiler warnings (verified).
+@interface ReadAppDelegate : NSObject
 @end
 
 @implementation ReadAppDelegate
@@ -1910,6 +1921,7 @@ typedef struct {
     float       natural_h;
     BOOL        loading;        // async load in flight
     BOOL        failed;
+    BOOL        kick_pending;   // resolved but decode not yet dispatched (pre-first-paint)
     BOOL        parked;         // animation chain parked: no timer scheduled
     unsigned long last_draw_seq; // g_draw_seq of the pass that last painted this image
     // Last drawn rect in DOCUMENT coordinates for exact GIF-tick damage.
@@ -2137,7 +2149,83 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
     rec->natural_h = (float)pts.height;
 }
 
-// Returns existing or initiates async load; returns NULL if not yet ready
+// Startup economy: image decodes are dispatched only once g_images_armed
+// is set (after first paint, or explicitly for headless settle runs).
+// Before that, records resolve synchronously — fast-fail pixels are
+// identical — but park with kick_pending instead of spawning 9 contending
+// GCD decodes into the first-frame window (profiled 2026-09: +40 ms real,
+// +100 ms user on showcase.md). Call only from the main thread.
+static BOOL g_images_armed = NO;
+
+static void kick_image_load(CachedImageRecord* rec, NSString* resolved);
+
+void platform_arm_images(void) {
+    if (g_images_armed) return;
+    g_images_armed = YES;
+    for (int i = 0; i < g_image_cache_count; i++) {
+        CachedImageRecord* rec = &g_image_cache[i];
+        if (!rec->kick_pending || rec->failed) continue;
+        rec->kick_pending = NO;
+        NSString* pathStr = [[NSString alloc] initWithBytes:rec->url
+                                                     length:strlen(rec->url)
+                                                   encoding:NSUTF8StringEncoding];
+        NSString* resolved = resolve_image_path(pathStr);
+        if (!resolved) { rec->failed = YES; rec->loading = NO; continue; }
+        kick_image_load(rec, resolved);
+    }
+}
+
+static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
+    // Capture for block
+    NSString* resolvedCopy = [resolved copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        load_image_sync(rec, resolvedCopy);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Sizes just went live: recompute metrics and anchor scroll
+            // BEFORE the repaint below, so the draw uses fresh geometry
+            // and content below doesn't jump. Failures keep the fallback
+            // box (no geometry change), so only successes notify, with the
+            // above-viewport height delta: laid-out new height (same
+            // aspect-fit math as laidOutImageHeight in viewport.zig,
+            // pinned by contract tests) minus the last drawn height, when
+            // the drawn box sits fully above the viewport top — else 0.
+            // last_h advances to the new height so a repeat arrival for
+            // the same image reports zero instead of shifting twice (the
+            // next genuine draw re-stamps the rect anyway).
+            float delta_above = 0.0f;
+            if (!rec->failed && rec->frame_count > 0 && rec->has_rect) {
+                __unsafe_unretained NSView* av = damage_target_view();
+                float vw = av ? (float)[av bounds].size.width : 0.0f;
+                float cw = vw > 600.0f ? 600.0f : fmaxf(vw - 64.0f, 100.0f);
+                float new_h = (rec->natural_w > 0.0f && rec->natural_h > 0.0f)
+                    ? rec->natural_h * (fminf(rec->natural_w, cw) / rec->natural_w)
+                    : 240.0f;
+                if (rec->last_doc_y + rec->last_h <= g_scroll_y) {
+                    delta_above = new_h - rec->last_h;
+                }
+                rec->last_h = new_h;
+            }
+            if (g_callbacks.on_images_changed) {
+                g_callbacks.on_images_changed(delta_above);
+            }
+            [g_main_view setNeedsDisplay:YES];
+#ifdef TEST_HOOKS
+            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
+                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
+                rec->natural_w, rec->natural_h);
+#endif
+#ifdef READ_ANIMATED_GIF
+            // Kick off GIF animation if multi-frame
+            if (!rec->failed && rec->frame_count > 1) {
+                gif_schedule_next_frame(rec);
+            }
+#endif
+        });
+    });
+}
+
+// Returns existing or allocates a record; dispatches the async decode only
+// when armed (see above) — otherwise parks it for platform_arm_images.
 static CachedImageRecord* get_or_load_image_record(const char* url, int url_len) {
     if (!url || url_len <= 0 || url_len >= 512) return NULL;
 
@@ -2162,25 +2250,11 @@ static CachedImageRecord* get_or_load_image_record(const char* url, int url_len)
     NSString* resolved = resolve_image_path(pathStr);
     if (!resolved) { rec->failed = YES; rec->loading = NO; return rec; }
 
-    // Capture for block
-    NSString* resolvedCopy = [resolved copy];
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        load_image_sync(rec, resolvedCopy);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [g_main_view setNeedsDisplay:YES];
-#ifdef TEST_HOOKS
-            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
-                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
-                rec->natural_w, rec->natural_h);
-#endif
-#ifdef READ_ANIMATED_GIF
-            // Kick off GIF animation if multi-frame
-            if (!rec->failed && rec->frame_count > 1) {
-                gif_schedule_next_frame(rec);
-            }
-#endif
-        });
-    });
+    if (!g_images_armed) {
+        rec->kick_pending = YES;
+        return rec;
+    }
+    kick_image_load(rec, resolved);
 
     return rec;
 }
@@ -2296,41 +2370,6 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
     CGContextScaleCTM(ctx, 1.0f, -1.0f);
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), frame);
     CGContextRestoreGState(ctx);
-}
-
-float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono) {
-    if (!text || len <= 0) return 0.0f;
-
-    // Shaping-economy fast path: shape-only (no atlas raster yet; the first
-    // draw rasterizes lazily). Shares entries with the draw path wherever
-    // the style bits coincide (plain body/mono runs, i.e. the hot case).
-    ShapedEntry* e = shape_run(text, len, font_size, is_bold, 0, is_mono, 0, 0);
-    if (e) return e->w;
-    // Uncacheable run: fall through to direct measure below.
-
-    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)text length:len encoding:NSUTF8StringEncoding freeWhenDone:NO];
-    if (!str) {
-        str = [[NSString alloc] initWithBytes:text length:len encoding:NSISOLatin1StringEncoding];
-    }
-    if (!str) return (float)len * font_size * 0.60f;
-
-    NSFont* nsFont = get_font_for_style(font_size, is_bold, 0, is_mono, 0);
-    CTFontRef font = (__bridge CTFontRef)nsFont;
-
-    NSDictionary* attributes = @{
-        (id)kCTFontAttributeName: (__bridge id)font,
-    };
-
-    NSAttributedString* attrStr = [[NSAttributedString alloc] initWithString:str attributes:attributes];
-    CTLineRef ctLine = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)attrStr);
-    if (!ctLine) return (float)len * font_size * 0.60f;
-
-    CGFloat ascent, descent, leading;
-    double measuredWidth = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading);
-    double trailing = CTLineGetTrailingWhitespaceWidth(ctLine);
-    CFRelease(ctLine);
-
-    return (float)(measuredWidth + trailing);
 }
 
 // Headless screenshot engine: renders directly to a PNG image file
