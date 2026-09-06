@@ -60,7 +60,9 @@ test "simd line scanner and block classification" {
     try std.testing.expectEqual(simd.BlockType.code_line, lines[10].block_type); // const x: i32 = 42;
     try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[11].block_type); // ```
     try std.testing.expectEqual(simd.BlockType.hr, lines[12].block_type); // ---
-    try std.testing.expectEqual(simd.BlockType.table_row, lines[13].block_type); // | Col 1 | Col 2 |
+    // | Col 1 | Col 2 | has no delimiter row, so [#15] demotes it from
+    // table_row back to paragraph (invalid delimiter = not a table).
+    try std.testing.expectEqual(simd.BlockType.paragraph, lines[13].block_type); // | Col 1 | Col 2 |
 }
 
 test "inline parser tokenization" {
