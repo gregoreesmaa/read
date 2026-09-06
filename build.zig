@@ -49,6 +49,11 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
         .optimize = optimize,
+        // mmap.zig and the test blocks use std.c (close/fstat/madvise/write).
+        // Zig 0.16 requires an explicit libc edge on Linux; without it the
+        // test-linux CI job fails to compile. No-op on Darwin (libSystem is
+        // always linked) and no effect on the binary size budget.
+        .link_libc = true,
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -80,6 +85,9 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            // main.zig uses std.c (write/exit/nanosleep): same explicit
+            // libc edge as the read module, required for the Linux CI build.
+            .link_libc = true,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
@@ -123,36 +131,43 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkFramework("CoreGraphics", .{});
     }
 
+    // The ship binary is a native Cocoa app: it only links on Darwin, where
+    // macos.m and the system frameworks provide the platform_* symbols.
+    // Elsewhere (Linux CI portability job) there is no windowed product, so
+    // `zig build` installs nothing and succeeds; portability is covered by
+    // `zig build test` (see README: the native window needs macOS).
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
-    b.installArtifact(exe);
+    if (target.result.os.tag.isDarwin()) {
+        b.installArtifact(exe);
 
-    // This creates a top level step. Top level steps have a name and can be
-    // invoked by name when running `zig build` (e.g. `zig build run`).
-    // This will evaluate the `run` step rather than the default step.
-    // For a top level step to actually do something, it must depend on other
-    // steps (e.g. a Run step, as we will see in a moment).
-    const run_step = b.step("run", "Run the app");
+        // This creates a top level step. Top level steps have a name and can be
+        // invoked by name when running `zig build` (e.g. `zig build run`).
+        // This will evaluate the `run` step rather than the default step.
+        // For a top level step to actually do something, it must depend on other
+        // steps (e.g. a Run step, as we will see in a moment).
+        const run_step = b.step("run", "Run the app");
 
-    // This creates a RunArtifact step in the build graph. A RunArtifact step
-    // invokes an executable compiled by Zig. Steps will only be executed by the
-    // runner if invoked directly by the user (in the case of top level steps)
-    // or if another step depends on it, so it's up to you to define when and
-    // how this Run step will be executed. In our case we want to run it when
-    // the user runs `zig build run`, so we create a dependency link.
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
+        // This creates a RunArtifact step in the build graph. A RunArtifact step
+        // invokes an executable compiled by Zig. Steps will only be executed by the
+        // runner if invoked directly by the user (in the case of top level steps)
+        // or if another step depends on it, so it's up to you to define when and
+        // how this Run step will be executed. In our case we want to run it when
+        // the user runs `zig build run`, so we create a dependency link.
+        const run_cmd = b.addRunArtifact(exe);
+        run_step.dependOn(&run_cmd.step);
 
-    // By making the run step depend on the default step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    run_cmd.step.dependOn(b.getInstallStep());
+        // By making the run step depend on the default step, it will be run from the
+        // installation directory rather than directly from within the cache directory.
+        run_cmd.step.dependOn(b.getInstallStep());
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+        // This allows the user to pass arguments to the application in the build
+        // command itself, like this: `zig build run -- arg1 arg2 etc`
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
     }
 
     // Creates an executable that will run `test` blocks from the provided module.
