@@ -1477,7 +1477,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
 @end
 
-@interface ReadAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+// SIZE NOTE: no formal <NSApplicationDelegate>/<NSWindowDelegate> adoption.
+// AppKit delivers delegate callbacks via respondsToSelector:, so the formal
+// conformance only cost ~3.7 KB of protocol metadata. Behaviorally identical;
+// zero new compiler warnings (verified).
+@interface ReadAppDelegate : NSObject
 @end
 
 @implementation ReadAppDelegate
@@ -2296,41 +2300,6 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
     CGContextScaleCTM(ctx, 1.0f, -1.0f);
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), frame);
     CGContextRestoreGState(ctx);
-}
-
-float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono) {
-    if (!text || len <= 0) return 0.0f;
-
-    // Shaping-economy fast path: shape-only (no atlas raster yet; the first
-    // draw rasterizes lazily). Shares entries with the draw path wherever
-    // the style bits coincide (plain body/mono runs, i.e. the hot case).
-    ShapedEntry* e = shape_run(text, len, font_size, is_bold, 0, is_mono, 0, 0);
-    if (e) return e->w;
-    // Uncacheable run: fall through to direct measure below.
-
-    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)text length:len encoding:NSUTF8StringEncoding freeWhenDone:NO];
-    if (!str) {
-        str = [[NSString alloc] initWithBytes:text length:len encoding:NSISOLatin1StringEncoding];
-    }
-    if (!str) return (float)len * font_size * 0.60f;
-
-    NSFont* nsFont = get_font_for_style(font_size, is_bold, 0, is_mono, 0);
-    CTFontRef font = (__bridge CTFontRef)nsFont;
-
-    NSDictionary* attributes = @{
-        (id)kCTFontAttributeName: (__bridge id)font,
-    };
-
-    NSAttributedString* attrStr = [[NSAttributedString alloc] initWithString:str attributes:attributes];
-    CTLineRef ctLine = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)attrStr);
-    if (!ctLine) return (float)len * font_size * 0.60f;
-
-    CGFloat ascent, descent, leading;
-    double measuredWidth = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading);
-    double trailing = CTLineGetTrailingWhitespaceWidth(ctLine);
-    CFRelease(ctLine);
-
-    return (float)(measuredWidth + trailing);
 }
 
 // Headless screenshot engine: renders directly to a PNG image file

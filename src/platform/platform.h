@@ -36,7 +36,6 @@ void platform_register_code_block(float x, float y, float w, float h, const char
 void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x);
 void platform_begin_clip(float x, float y, float w, float h);
 void platform_end_clip(void);
-float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono);
 void platform_glyph_cache_stats(unsigned long long* hits, unsigned long long* misses, unsigned long long* flushes);
 
 int platform_render_to_png(const char* output_path, int width, int height, void (*render_fn)(int width, int height));

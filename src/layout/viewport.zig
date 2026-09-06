@@ -570,10 +570,10 @@ pub fn flowSourceLine(
         // `&amp;` is literal). Measurement flows the same decoded slices,
         // so wrap geometry always matches the draw.
         if (!style.code and ctx.entities != null) {
-            if (std.mem.indexOfScalar(u8, txt, '&') != null) {
+            if (simd.findByte(txt, 0, '&') != null) {
                 if (ctx.entities.?.decodeInto(txt)) |d| txt = d;
             }
-            if (tgt != null and std.mem.indexOfScalar(u8, tgt.?, '&') != null) {
+            if (tgt != null and simd.findByte(tgt.?, 0, '&') != null) {
                 if (ctx.entities.?.decodeInto(tgt.?)) |d| tgt = d;
             }
         }
@@ -754,10 +754,10 @@ fn resolveHeadingSpans(config: ViewportConfig, h_text: []const u8, span_buf: []p
     const ents = config.entities orelse return n;
     for (span_buf[0..n]) |*s| {
         if (s.style.code) continue;
-        if (std.mem.indexOfScalar(u8, s.text, '&') != null) {
+        if (simd.findByte(s.text, 0, '&') != null) {
             if (ents.decodeInto(s.text)) |d| s.text = d;
         }
-        if (s.link_target != null and std.mem.indexOfScalar(u8, s.link_target.?, '&') != null) {
+        if (s.link_target != null and simd.findByte(s.link_target.?, 0, '&') != null) {
             if (ents.decodeInto(s.link_target.?)) |d| s.link_target = d;
         }
     }
