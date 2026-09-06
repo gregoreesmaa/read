@@ -146,6 +146,7 @@ pub extern "c" fn platform_glyph_cache_stats(
 ) void;
 
 pub extern "c" fn platform_test_image_draws() c_ulong;
+pub extern "c" fn platform_open_url_external(url: [*]const u8, url_len: c_int) void;
 pub extern "c" fn platform_test_image_primed(total_frames: *c_ulong, primed_frames: *c_ulong) void;
 pub extern "c" fn platform_set_test_scale(s: f32) void;
 pub extern "c" fn platform_render_select_drag_png(

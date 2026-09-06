@@ -4380,10 +4380,18 @@ pub fn layoutViewportJIT(
 // ============================================================================
 
 /// GitHub-style slug: lowercase ASCII, keep alnum/underscore/hyphen/space,
-/// drop the rest, spaces become hyphens. Writes into the caller buffer.
+/// drop the rest, spaces become hyphens. Non-ASCII bytes (UTF-8) pass
+/// through untouched — GitHub keeps unicode letters, and both sides slugify
+/// identically so `#日本語` resolves. Writes into the caller buffer.
 pub fn slugifyHeading(text: []const u8, out: []u8) usize {
     var n: usize = 0;
     for (text) |c| {
+        if (c >= 0x80) {
+            if (n >= out.len) break;
+            out[n] = c;
+            n += 1;
+            continue;
+        }
         var ch = c;
         if (ch >= 'A' and ch <= 'Z') ch += 'a' - 'A';
         const keep = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or
@@ -4465,6 +4473,22 @@ fn matchAcronym(anchor: []const u8, slug: []const u8) bool {
         si = if (wend < slug.len) wend + 1 else wend;
     }
     return ai == anchor.len;
+}
+
+/// GitHub duplicate-heading suffix: `#base-N` (N >= 1) addresses the
+/// (N+1)-th heading slugging to `base`. Null when the anchor carries no
+/// such suffix. Hand-rolled digits: cold path, keeps std.fmt out of ship.
+fn parseDupeSuffix(anchor: []const u8) ?struct { base: []const u8, index: usize } {
+    const li = std.mem.lastIndexOfScalar(u8, anchor, '-') orelse return null;
+    if (li == 0 or li + 1 >= anchor.len) return null;
+    var n: usize = 0;
+    for (anchor[li + 1 ..]) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + @as(usize, @intCast(c - '0'));
+        if (n > 9999) return null;
+    }
+    if (n == 0) return null;
+    return .{ .base = anchor[0..li], .index = n };
 }
 
 /// Anchor-to-slug match tier (lower wins). Exact GitHub slugs beat every
@@ -4563,7 +4587,19 @@ pub fn anchorScrollY(
     const cx = contentXOf(config);
     var text_buf: [512]u8 = undefined;
     var slug_buf: [128]u8 = undefined;
+    // GitHub dupe suffixes (`#slug-1` = the 2nd `slug` heading), resolved on
+    // the exact walk below: exact slugs always win over the dupe reading
+    // (`#chapter-1` = singleton "Chapter 1", never the 2nd "Chapter").
+    var dupe_base: []const u8 = &.{};
+    var dupe_want: usize = 0;
+    if (parseDupeSuffix(anchor)) |db| {
+        dupe_base = db.base;
+        dupe_want = db.index;
+    }
     var tier: u3 = 0;
+    var exact_y: ?f32 = null;
+    var dupe_y: ?f32 = null;
+    var dupe_seen: usize = 0;
     while (true) {
         var y: f32 = 50.0;
         var i: usize = 0;
@@ -4597,7 +4633,14 @@ pub fn anchorScrollY(
                     }
                 }
                 const slen = slugifyHeading(text_buf[0..used], &slug_buf);
-                if (anchorTier(anchor, slug_buf[0..slen])) |t| {
+                const slug = slug_buf[0..slen];
+                if (tier == 0) {
+                    if (exact_y == null and std.mem.eql(u8, slug, anchor)) exact_y = y;
+                    if (dupe_y == null and dupe_base.len > 0 and std.mem.eql(u8, slug, dupe_base)) {
+                        dupe_seen += 1;
+                        if (dupe_seen == dupe_want + 1) dupe_y = y;
+                    }
+                } else if (anchorTier(anchor, slug)) |t| {
                     if (t == tier) return y;
                 }
             }
@@ -4605,9 +4648,64 @@ pub fn anchorScrollY(
             y += u.height;
             i += @max(u.consumed, 1);
         }
+        if (tier == 0) {
+            // Exact beats dupe beats fuzzy: resolve before fallback tiers.
+            // (Tier 0 replays would find nothing new — exact is proven
+            // absent when exact_y is null — so the loop resumes at tier 1.)
+            if (exact_y) |ey| return ey;
+            if (dupe_y) |dy| return dy;
+            tier = 1;
+            continue;
+        }
         if (tier == 7) return null;
         tier += 1;
     }
+}
+
+test "anchor jump: GitHub slug edge cases (dupes, unicode, punctuation)" {
+    const t = std.testing;
+    const doc_raw =
+        \\# Chapter 1
+        \\
+        \\# Heading
+        \\
+        \\Some body text here.
+        \\
+        \\# Heading
+        \\
+        \\More body text here.
+        \\
+        \\# Hello, World!
+        \\
+        \\# 日本語の見出し
+    ;
+    const doc = doc_raw ++ "\n";
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    const cfg = ViewportConfig{ .window_width = 1200, .window_height = 900, .scroll_y = 0 };
+
+    // First "Heading" wins the bare slug; `-1` addresses the duplicate.
+    const yf = anchorScrollY(doc, lines, cfg, "heading").?;
+    const ys = anchorScrollY(doc, lines, cfg, "heading-1").?;
+    try t.expect(ys > yf);
+    // Exact singleton ending in -1 beats the dupe reading (2nd "Heading").
+    const y_ch1 = anchorScrollY(doc, lines, cfg, "chapter-1").?;
+    try t.expectEqual(@as(f32, 50.0), y_ch1);
+    try t.expect(y_ch1 < yf);
+    // Punctuation dropped, spaces hyphenated, ASCII lowercased.
+    const y_hw = anchorScrollY(doc, lines, cfg, "hello-world").?;
+    try t.expect(y_hw > ys);
+    // Unicode passes through the slugger on both sides.
+    const y_uni = anchorScrollY(doc, lines, cfg, "日本語の見出し").?;
+    try t.expect(y_uni > y_hw);
+    // Missing anchor: the no-op signal (callers must not error). Note the
+    // anchor must clear every legacy fuzzy tier too (affix/subsequence):
+    // "zzz-quux-qqq" shares no letter run with any slug above.
+    try t.expect(anchorScrollY(doc, lines, cfg, "zzz-quux-qqq") == null);
+    // Empty fragment: document top.
+    try t.expectEqual(@as(?f32, 0.0), anchorScrollY(doc, lines, cfg, ""));
 }
 
 const virtual_test_doc =

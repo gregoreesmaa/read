@@ -247,13 +247,98 @@ fn onResize(w: c_int, h: c_int) callconv(.c) void {
     snapScroll(g_app.scroll_y);
 }
 
-fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
-    if (url_len <= 0) return;
-    const url = url_ptr[0..@as(usize, @intCast(url_len))];
-    // External links stay in the platform layer; only `#fragment`
-    // section links scroll in-document.
-    if (url.len == 0 or url[0] != '#') return;
-    const frag = url[1..];
+// Document directory for resolving relative `.md` links (#46): dirname of
+// the currently open file, empty when reading the built-in default doc.
+// Fixed buffer, cold path only — zero hot-path allocations.
+var g_doc_dir_buf: [2048]u8 = undefined;
+var g_doc_dir: []const u8 = "";
+
+fn setDocDir(path: []const u8) void {
+    const dir = if (std.mem.lastIndexOfScalar(u8, path, '/')) |li| path[0..li] else "";
+    const take = @min(dir.len, g_doc_dir_buf.len);
+    @memcpy(g_doc_dir_buf[0..take], dir[0..take]);
+    g_doc_dir = g_doc_dir_buf[0..take];
+}
+
+pub const LinkKind = enum { anchor, md_file, external };
+
+fn hasSchemePrefix(url: []const u8, scheme: []const u8) bool {
+    if (url.len < scheme.len) return false;
+    for (scheme, 0..) |c, i| {
+        var u = url[i];
+        if (u >= 'A' and u <= 'Z') u += 'a' - 'A';
+        if (u != c) return false;
+    }
+    return true;
+}
+
+fn endsWithFold(path: []const u8, suffix: []const u8) bool {
+    if (path.len < suffix.len) return false;
+    const tail = path[path.len - suffix.len ..];
+    for (tail, suffix) |a, b| {
+        var x = a;
+        if (x >= 'A' and x <= 'Z') x += 'a' - 'A';
+        if (x != b) return false;
+    }
+    return true;
+}
+
+/// Route a clicked link (#46): `#frag` scrolls in-app, local `.md` files
+/// open in the same window, everything else (http(s), other schemes,
+/// non-md locals) opens externally. Pure: unit-tested below.
+pub fn classifyLink(url: []const u8) LinkKind {
+    if (url.len == 0) return .external;
+    if (url[0] == '#') return .anchor;
+    var path = url;
+    if (std.mem.indexOfScalar(u8, path, '#')) |hi| path = path[0..hi];
+    if (std.mem.indexOfScalar(u8, path, '?')) |qi| path = path[0..qi];
+    // External http(s) behavior is unchanged — even `https://…/x.md`.
+    if (hasSchemePrefix(path, "http://") or hasSchemePrefix(path, "https://")) return .external;
+    var local = path;
+    if (hasSchemePrefix(local, "file://")) local = local["file://".len..];
+    // Any other URI scheme (mailto:, ftp:, app:) stays external: only
+    // scheme-less paths and file:// URLs open in-app.
+    if (std.mem.indexOfScalar(u8, local, ':')) |ci| {
+        if (std.mem.indexOfScalar(u8, local, '/')) |si| {
+            if (ci < si) return .external;
+        } else return .external;
+    }
+    if (endsWithFold(local, ".md") or endsWithFold(local, ".markdown")) return .md_file;
+    return .external;
+}
+
+/// Split a same-window `.md` target into filesystem path + `#fragment`
+/// (`doc.md#sec` opens the doc, then lands on the section). Strips
+/// `file://` and query strings. Pure: unit-tested below.
+pub fn splitLinkTarget(url: []const u8) struct { path: []const u8, frag: []const u8 } {
+    var rest = url;
+    if (hasSchemePrefix(rest, "file://")) rest = rest["file://".len..];
+    var frag: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, rest, '#')) |hi| {
+        frag = rest[hi + 1 ..];
+        rest = rest[0..hi];
+    }
+    if (std.mem.indexOfScalar(u8, rest, '?')) |qi| rest = rest[0..qi];
+    return .{ .path = rest, .frag = frag };
+}
+
+/// Resolve a link path against the document directory (absolute paths pass
+/// through; the kernel resolves ./ and ../). Null on empty/overlong input.
+fn resolveDocPath(rel: []const u8, out: []u8) ?[]const u8 {
+    if (rel.len == 0 or rel.len > out.len) return null;
+    if (rel[0] == '/' or g_doc_dir.len == 0) {
+        @memcpy(out[0..rel.len], rel);
+        return out[0..rel.len];
+    }
+    if (g_doc_dir.len + 1 + rel.len > out.len) return null;
+    @memcpy(out[0..g_doc_dir.len], g_doc_dir);
+    out[g_doc_dir.len] = '/';
+    @memcpy(out[g_doc_dir.len + 1 ..][0..rel.len], rel);
+    return out[0 .. g_doc_dir.len + 1 + rel.len];
+}
+
+/// Document y of the heading targeted by `#fragment` (null = missing).
+fn anchorTargetY(frag: []const u8) ?f32 {
     const vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
@@ -263,14 +348,65 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
     };
-    const target = layout.anchorScrollY(
+    return layout.anchorScrollY(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
         vp_config,
         frag,
-    ) orelse return;
-    snapScroll(target);
+    );
+}
+
+/// Open a sibling `.md` document in the same window (#46): swap the mmap,
+/// rescan, reset viewport state, optionally land on `#frag`. Any failure
+/// (missing file, overlong path) is a silent no-op — never an error dialog.
+fn openDocumentInPlace(link_path: []const u8, frag: []const u8) void {
+    var abs_buf: [2048]u8 = undefined;
+    const abs = resolveDocPath(link_path, &abs_buf) orelse return;
+    const mapped = mmap.MappedFile.open(abs) catch return;
+    // Swap only after the new mapping opens: a missing file keeps the
+    // current document untouched.
+    if (g_app.mapped_file) |*m| m.close();
+    g_app.mapped_file = mapped;
+    g_app.bytes = mapped.bytes;
+    setDocDir(abs);
+    var in_fence: simd.FenceState = .{};
+    g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
+    g_app.lines = g_lines_buffer[0..g_app.line_count];
+    g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
+    for (&g_app.block_scroll_x) |*s| s.* = 0.0;
+    for (&g_app.block_max_scroll_x) |*s| s.* = 0.0;
+    updateDocumentMetrics();
+    snapScroll(0.0);
+    if (frag.len > 0) {
+        // `doc.md#sec`: land on the section (missing anchor stays on top).
+        if (anchorTargetY(frag)) |target| snapScroll(target);
+    }
     bridge.platform_request_redraw();
+}
+
+fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
+    if (url_len <= 0) return;
+    const url = url_ptr[0..@as(usize, @intCast(url_len))];
+    switch (classifyLink(url)) {
+        .anchor => {
+            // `#fragment` section links scroll in-document; a missing
+            // anchor is a no-op, never an error dialog.
+            const target = anchorTargetY(url[1..]) orelse return;
+            snapScroll(target);
+            bridge.platform_request_redraw();
+        },
+        .md_file => {
+            // Relative `.md` links open in the same window, replacing the
+            // document (history/back navigation is out of scope).
+            const tgt = splitLinkTarget(url);
+            openDocumentInPlace(tgt.path, tgt.frag);
+        },
+        .external => {
+            // http(s), other schemes, non-md locals: unchanged behavior —
+            // the platform opens them outside the reader.
+            bridge.platform_open_url_external(url_ptr, url_len);
+        },
+    }
 }
 
 fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
@@ -755,6 +891,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         g_app.mapped_file = mapped;
         g_app.bytes = mapped.bytes;
+        // Anchor relative `.md` links (and image paths) to this file's dir.
+        setDocDir(path);
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
@@ -1069,4 +1207,48 @@ test "retina atlas text stays crisp (no-blur regression)" {
         try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
     }
+}
+
+test "link routing: anchors, local .md, external (#46)" {
+    const t = std.testing;
+    // Anchors scroll in-app (bare `#` = top, same as empty fragment).
+    try t.expectEqual(LinkKind.anchor, classifyLink("#section"));
+    try t.expectEqual(LinkKind.anchor, classifyLink("#"));
+    // Local .md files open in the same window (case, nesting, fragment).
+    try t.expectEqual(LinkKind.md_file, classifyLink("other.md"));
+    try t.expectEqual(LinkKind.md_file, classifyLink("./sub/doc.MD"));
+    try t.expectEqual(LinkKind.md_file, classifyLink("../a/b.markdown"));
+    try t.expectEqual(LinkKind.md_file, classifyLink("other.md#sec"));
+    try t.expectEqual(LinkKind.md_file, classifyLink("/abs/path.md"));
+    try t.expectEqual(LinkKind.md_file, classifyLink("file:///abs/path.md"));
+    try t.expectEqual(LinkKind.md_file, classifyLink("other.md?x=1"));
+    // External http(s) is unchanged — even an .md URL on the web.
+    try t.expectEqual(LinkKind.external, classifyLink("https://example.com/x.md"));
+    try t.expectEqual(LinkKind.external, classifyLink("HTTP://EXAMPLE.COM/"));
+    try t.expectEqual(LinkKind.external, classifyLink("mailto:foo@bar.com"));
+    try t.expectEqual(LinkKind.external, classifyLink("ftp://h/x.md"));
+    // Non-md locals keep the open-externally path.
+    try t.expectEqual(LinkKind.external, classifyLink("image.png"));
+    try t.expectEqual(LinkKind.external, classifyLink(""));
+    // Target splitting: path + fragment for the in-place opener.
+    const a = splitLinkTarget("other.md#sec");
+    try t.expectEqualStrings("other.md", a.path);
+    try t.expectEqualStrings("sec", a.frag);
+    const b = splitLinkTarget("sub/a.md?x=1#f");
+    try t.expectEqualStrings("sub/a.md", b.path);
+    try t.expectEqualStrings("f", b.frag);
+    const c = splitLinkTarget("file:///abs/p.md");
+    try t.expectEqualStrings("/abs/p.md", c.path);
+    try t.expectEqualStrings("", c.frag);
+    // Doc-relative resolution against the open file's directory.
+    const saved_dir = g_doc_dir;
+    var saved_buf: [2048]u8 = undefined;
+    @memcpy(saved_buf[0..saved_dir.len], saved_dir);
+    defer g_doc_dir = saved_buf[0..saved_dir.len];
+    setDocDir("/docs/sub/file.md");
+    var rbuf: [128]u8 = undefined;
+    try t.expectEqualStrings("/docs/sub/other.md", resolveDocPath("other.md", &rbuf).?);
+    try t.expectEqualStrings("/docs/sub/sub/nested.md", resolveDocPath("sub/nested.md", &rbuf).?);
+    try t.expectEqualStrings("/abs/x.md", resolveDocPath("/abs/x.md", &rbuf).?);
+    try t.expect(resolveDocPath("", &rbuf) == null);
 }

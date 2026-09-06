@@ -1180,12 +1180,17 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->link_url[0] != '\0' &&
                     end_doc.x >= rec->x && end_doc.x <= rec->x + rec->w &&
                     end_doc.y >= rec->doc_y && end_doc.y <= rec->doc_y + rec->h) {
-                    // Section links scroll in-document via the Zig layout
-                    // layer; everything else opens in the browser.
-                    if (rec->link_url[0] == '#' && g_callbacks.on_link) {
+                    // In-app navigation (#46): section links always route to
+                    // Zig, as does every other non-http(s) link, so relative
+                    // `.md` files open in the same window (Zig bounces
+                    // genuine externals back via platform_open_url_external).
+                    // http(s) keeps the direct NSWorkspace path, unchanged.
+                    NSString* urlStr = [NSString stringWithUTF8String:rec->link_url];
+                    NSString* lower = [urlStr lowercaseString];
+                    BOOL isHttp = [lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"];
+                    if (!isHttp && g_callbacks.on_link) {
                         g_callbacks.on_link(rec->link_url, (int)strlen(rec->link_url));
                     } else {
-                        NSString* urlStr = [NSString stringWithUTF8String:rec->link_url];
                         NSURL* url = [NSURL URLWithString:urlStr];
                         if (url) {
                             [[NSWorkspace sharedWorkspace] openURL:url];
@@ -2638,3 +2643,16 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     return success ? 0 : -5;
 }
 #endif
+
+// External link opener (#46): the Zig router bounces non-# non-.md links
+// back here so http(s), other schemes, and non-md locals keep their exact
+// historical NSWorkspace path. Ship code (called from onLink), at EOF per
+// the SIZE NOTE (see prime_frame_decode above).
+void platform_open_url_external(const char* url, int url_len) {
+    if (!url || url_len <= 0) return;
+    NSString* urlStr = [[NSString alloc] initWithBytes:url
+        length:(NSUInteger)url_len encoding:NSUTF8StringEncoding];
+    if (!urlStr) return;
+    NSURL* nsurl = [NSURL URLWithString:urlStr];
+    if (nsurl) [[NSWorkspace sharedWorkspace] openURL:nsurl];
+}
