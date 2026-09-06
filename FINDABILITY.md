@@ -52,7 +52,8 @@ Read — microsecond-grade Markdown in pure Zig. <180 KiB. Zero dependencies.
 
 ## 5. After applying (verify)
 
-- [ ] Repo header shows description + website + topics.
+- [x] Repo header shows description + website + topics. (Applied 2026-09-06 via API.)
+- [x] Discussions enabled (issue templates link there).
 - [ ] `https://github.com/gregoreesmaa/read` search-matches "zig markdown reader mmap simd".
-- [ ] Social card renders on the repo page and in link unfurls.
+- [ ] Social card renders on the repo page and in link unfurls. (Needs web UI upload, §4.)
 - [ ] CI badge in README is green (`.github/workflows/ci.yml` on default branch).

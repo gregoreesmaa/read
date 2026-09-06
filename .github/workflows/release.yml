@@ -1,0 +1,41 @@
+name: Release
+
+# Tag-driven showcase releases: `git tag v0.1.0 && git push origin v0.1.0`.
+# The full strict gate runs first — a red build publishes nothing.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Release build
+        run: zig build -Doptimize=ReleaseFast
+      - name: Binary size budget (ship binary, see AGENTS.md §1)
+        run: ./scripts/size_gate.sh zig-out/bin/read
+      - name: Demo screenshot for release notes
+        run: ./zig-out/bin/read-test --screenshot /tmp/showcase.png showcase.md && ls -lh /tmp/showcase.png
+      - name: Package ship binary + checksums
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cp zig-out/bin/read "read-${TAG}-macos-arm64"
+          shasum -a 256 "read-${TAG}-macos-arm64" > "read-${TAG}-macos-arm64.sha256"
+      - name: Publish GitHub Release
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            "read-${TAG}-macos-arm64" "read-${TAG}-macos-arm64.sha256" /tmp/showcase.png \
+            --title "$TAG" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

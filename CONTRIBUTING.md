@@ -36,3 +36,12 @@ non-negotiables:
   AGENTS.md.
 - Rare/complex Markdown features that threaten the zero-allocation budget (recursive
   ASTs, large Unicode tables, …): ask first, per AGENTS.md §5.
+
+## Releasing (maintainer)
+
+1. Bump `.version` in `build.zig.zon` (semver; stay `0.x` until the public showcase).
+2. Tag and push: `git tag v0.1.0 && git push origin v0.1.0`
+3. `.github/workflows/release.yml` runs the full strict gate, the size budget,
+   builds the ship binary, captures a `showcase.md` screenshot, and publishes the
+   GitHub Release with SHA-256 checksums. If the gate fails, nothing is published —
+   fix `main` first, then re-tag.

@@ -7,3 +7,5 @@ artifacts/
 !screenshots/*.png
 !assets/images/*.png
 .zig-cache-global/
+.muse/
+.agents/
