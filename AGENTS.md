@@ -82,7 +82,7 @@ Every agent working on this repository MUST strictly follow these principles.
   - Lists: Unordered (`*`, `-`, `+`), Ordered (`1.`, `1)`), Task lists (`- [ ]`, `- [x]`)
   - Tables: GFM table rows with column measurement and cell dividers
   - Inlines: Code spans, emphasis (`*`, `_`), strong emphasis (`**`, `__`), triple emphasis (`***`, `___`), strikethrough (`~~`), inline links (`[text](url)`), autolinks (`<https://...>`, `<email>`), images (`![alt](url)`), and backslash escapes (`\*`, `\_`, etc.).
-- **HTML Exclusion**: HTML rendering is intentionally unsupported.
+- **HTML Scope**: Only the blessed subset renders — inline `br`/`kbd`/`sub`/`sup`/`mark`/`del`/`s`, `details`/`summary` stripping; everything else stays visible muted-mono runs, never links, images, or hidden blocks. Full HTML rendering remains unsupported.
 - **Ask Before Heavy Features**: If a rare or complex Markdown feature threatens the zero-allocation, microsecond-grade architecture (e.g. multi-level recursive dynamic ASTs or 100KB Unicode normalization tables), **ask the user** before implementing.
 
 ---

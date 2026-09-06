@@ -945,8 +945,10 @@ test "spec compliance: --- after a paragraph is setext H2, never hr" {
 }
 
 test "spec compliance: inline HTML renders as literal text" {
-    // HTML rendering is unsupported by design: tags stay visible runs,
-    // never links, images, or hidden blocks (inline_html_* fixtures).
+    // Full HTML rendering is unsupported by design; the blessed subset
+    // (issue #40: br/kbd/sub/sup/mark/del render, comments/details strip)
+    // applies, and everything else stays visible muted-mono runs — never
+    // links, images, or hidden blocks (inline_html_* fixtures).
     const doc =
         \\<div>hi</div>
         \\
@@ -954,20 +956,35 @@ test "spec compliance: inline HTML renders as literal text" {
     ;
     var lines: [16]simd.Line = undefined;
     const n = scanDoc(doc, &lines);
-    try std.testing.expectEqual(simd.BlockType.paragraph, lines[0].block_type);
+    // Tag-led line with content is an HTML block (CommonMark type 6), not
+    // a paragraph; it still lays out through the muted-mono fallback.
+    try std.testing.expectEqual(simd.BlockType.html_block, lines[0].block_type);
     var cmds: [128]layout.DrawCommand = undefined;
     const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    // The html_block line emits one whole-line muted-mono run; the
+    // inline line splits tags out of the text but every source byte stays
+    // visible across the runs.
     try std.testing.expect(hasRun(cmds[0..m], "<div>hi</div>"));
-    try std.testing.expect(hasRun(cmds[0..m], "<span>x</span>"));
+    try std.testing.expect(hasRun(cmds[0..m], "<span>"));
+    try std.testing.expect(hasRun(cmds[0..m], "x"));
+    try std.testing.expect(hasRun(cmds[0..m], "</span>"));
     for (cmds[0..m]) |c| {
-        if (c.kind == .text_run) {
-            try std.testing.expect(!c.style.link);
-            try std.testing.expect(!c.style.image);
-            // No blanket !code: tag-opening lines take the #26 muted-mono
-            // fallback (still visible literal runs, never links/images).
-            // Mid-line spans never do — the "inline" line stays serif.
-            if (std.mem.eql(u8, c.text, "<span>x</span>"))
-                try std.testing.expect(!c.style.code);
+        if (c.kind != .text_run) continue;
+        try std.testing.expect(!c.style.link);
+        try std.testing.expect(!c.style.image);
+        // Out-of-subset tags render muted mono (code-styled html_tag);
+        // the block line content takes the same fallback (issue #26).
+        if (std.mem.eql(u8, c.text, "<div>hi</div>")) {
+            // Whole-line block fallback: muted mono, no tag flags.
+            try std.testing.expect(c.style.code and !c.style.html_tag);
+            try std.testing.expectEqual(layout.Theme.dark.muted, c.color);
+        } else if (std.mem.eql(u8, c.text, "<span>") or
+            std.mem.eql(u8, c.text, "</span>"))
+        {
+            try std.testing.expect(c.style.code and c.style.html_tag);
+            try std.testing.expectEqual(layout.Theme.dark.muted, c.color);
+        } else {
+            try std.testing.expect(!c.style.code);
         }
     }
 }
