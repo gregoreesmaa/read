@@ -145,6 +145,8 @@ Strictly conforms to CommonMark Spec and Daring Fireball syntax (HTML rendering 
 | `h` / `l` | Scroll hovered code block or table horizontally (30px) |
 | `Trackpad Swipe` | Horizontal scroll on hovered code block or table |
 | `t` | Toggle Dark / Light theme |
+| `?` | Toggle keyboard-shortcut cheat sheet |
+| `Esc` | Dismiss cheat sheet |
 | `Cmd+C` | Copy selection to system clipboard |
 | `Cmd+A` | Select all text in document |
 | `q` | Quit |

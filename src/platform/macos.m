@@ -1438,6 +1438,14 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
     if ([chars length] > 0) {
         unichar c = [chars characterAtIndex:0];
+        // '?' arrives as '/' once Shift is ignored (US layout: Shift+/).
+        // The cheat-sheet binding is '?', so restore it from the
+        // modifier-aware characters. Layouts whose '?' needs no Shift are
+        // unaffected (c is already '?', or never '/'-with-'?').
+        if (c == '/') {
+            NSString* withMod = [event characters];
+            if ([withMod length] > 0 && [withMod characterAtIndex:0] == '?') c = '?';
+        }
         int hovered_block_id = -1;
         for (int i = 0; i < g_scrollable_block_count; i++) {
             ScrollableBlockRecord* b = &g_scrollable_blocks[i];
