@@ -51,6 +51,11 @@ typedef struct {
     int len;
     char link_url[256];
     int line_index;
+    // Innermost scroll-container clip (code/table card, view space) active
+    // when the run was recorded. The selection painter intersects fills
+    // with it so highlight never paints past clipped-away text.
+    float clip_x, clip_y, clip_w, clip_h;
+    int has_clip;
 } QuadTextRecord;
 
 #define MAX_QUAD_RECORDS 16384
@@ -110,6 +115,38 @@ static NSRect union_rect(NSRect a, NSRect b) {
     if (NSIsEmptyRect(a)) return b;
     if (NSIsEmptyRect(b)) return a;
     return NSUnionRect(a, b);
+}
+
+// ---------------------------------------------------------------------------
+// Scroll-container clip stack (mirrors the CGContext save/restore nesting
+// in platform_begin/end_clip, including the outer damage clip). Text runs
+// recorded inside a code/table card capture the innermost rect so the
+// selection painter can clip highlight to visible text.
+// ---------------------------------------------------------------------------
+#define CLIP_STACK_CAP 4
+static float g_clip_stack[CLIP_STACK_CAP][4]; // x, y, w, h (view space)
+static int g_clip_depth = 0;
+
+static void clip_stack_push(float x, float y, float w, float h) {
+    if (g_clip_depth < CLIP_STACK_CAP) {
+        g_clip_stack[g_clip_depth][0] = x;
+        g_clip_stack[g_clip_depth][1] = y;
+        g_clip_stack[g_clip_depth][2] = w;
+        g_clip_stack[g_clip_depth][3] = h;
+    }
+    // On overflow the top is replaced: depth stays balanced with the
+    // graphics state and the innermost rect (the one that matters) wins.
+    else {
+        g_clip_stack[CLIP_STACK_CAP - 1][0] = x;
+        g_clip_stack[CLIP_STACK_CAP - 1][1] = y;
+        g_clip_stack[CLIP_STACK_CAP - 1][2] = w;
+        g_clip_stack[CLIP_STACK_CAP - 1][3] = h;
+    }
+    g_clip_depth++;
+}
+
+static void clip_stack_pop(void) {
+    if (g_clip_depth > 0) g_clip_depth--;
 }
 
 #ifdef TEST_HOOKS
@@ -192,6 +229,14 @@ static NSRect selection_bounds_expanded(float pad) {
 
 static NSRect copy_button_rect_for_block(CodeBlockRecord* b) {
     return NSMakeRect(b->x + b->w - 64.0f - 8.0f, b->y + 8.0f, 64.0f, 24.0f);
+}
+
+// Damage rect for Copy-button show/hide: the drawn pill strokes a 1px
+// outline straddling the rect edge, so antialiased pixels land up to 1px
+// outside it. Invalidating the exact rect leaves a faint outline remnant
+// (2026-09: Copy-button ghost after hover-out). 2px margin covers it.
+static NSRect copy_button_damage_rect_for_block(CodeBlockRecord* b) {
+    return NSInsetRect(copy_button_rect_for_block(b), -2.0f, -2.0f);
 }
 
 static void register_app_fonts(void) {
@@ -638,6 +683,26 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     [self addTrackingArea:area];
 }
 
+// One highlight fill intersected with the record's scroll-container clip
+// (view space, captured at record time). Runs scrolled out of a code or
+// table card must not paint past the card edge: their pixels were clipped
+// away, but the painter runs outside the graphics-state clip (2026-09:
+// selection bar overflowed the codeblock bounds).
+static __attribute__((noinline)) void fill_highlight_clipped(CGContextRef ctx, QuadTextRecord* rec,
+                                                             float x, float y, float w, float h) {
+    if (w <= 0.0f || h <= 0.0f) return;
+    if (rec->has_clip) {
+        float lo_x = fmaxf(x, rec->clip_x);
+        float hi_x = fminf(x + w, rec->clip_x + rec->clip_w);
+        float lo_y = fmaxf(y, rec->clip_y);
+        float hi_y = fminf(y + h, rec->clip_y + rec->clip_h);
+        if (hi_x > lo_x && hi_y > lo_y)
+            CGContextFillRect(ctx, CGRectMake(lo_x, lo_y, hi_x - lo_x, hi_y - lo_y));
+    } else {
+        CGContextFillRect(ctx, CGRectMake(x, y, w, h));
+    }
+}
+
 // Flowing per-line selection highlight over the rebuilt text records.
 // Shared by live drawRect and headless screenshots so --select captures
 // exercise the real painter (regression: highlight used to render as a
@@ -651,7 +716,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         for (int q = 0; q < g_text_record_count; q++) {
             QuadTextRecord* rec = &g_text_records[q];
             float view_y = rec->doc_y - g_scroll_y;
-            CGContextFillRect(ctx, CGRectMake(rec->x, view_y, rec->w, rec->h));
+            fill_highlight_clipped(ctx, rec, rec->x, view_y, rec->w, rec->h);
         }
     } else {
         NSPoint pt1 = g_select_start;
@@ -776,7 +841,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                     float glo = fmaxf(prev->x + prev->w, span_lo);
                     float ghi = fminf(rec->x, span_hi);
                     if (ghi > glo)
-                        CGContextFillRect(ctx, CGRectMake(glo, view_y, ghi - glo, rec->h));
+                        fill_highlight_clipped(ctx, rec, glo, view_y, ghi - glo, rec->h);
                 }
             }
 
@@ -832,7 +897,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
 #endif
-                CGContextFillRect(ctx, CGRectMake(x1, view_y, x2 - x1, rec->h));
+                fill_highlight_clipped(ctx, rec, x1, view_y, x2 - x1, rec->h);
             }
         }
     }
@@ -970,7 +1035,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         if (g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
             g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
             new_hover_btn = b_idx;
-            new_btn_rect = copy_button_rect_for_block(b);
+            new_btn_rect = copy_button_damage_rect_for_block(b);
             break;
         }
     }
@@ -988,7 +1053,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     g_last_code_btn_hover = over_code_btn;
     if (new_hover_btn != g_hovered_code_btn) {
         if (g_hovered_code_btn >= 0 && g_hovered_code_btn < g_code_block_count) {
-            invalidate_rect(copy_button_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
+            invalidate_rect(copy_button_damage_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
         }
         if (new_hover_btn >= 0) {
             invalidate_rect(new_btn_rect);
@@ -1000,9 +1065,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 - (void)mouseExited:(NSEvent *)event {
     (void)event;
     g_mouse_pos = NSMakePoint(-9999.0f, -9999.0f);
-    // Clear button hover with its exact rect; link hover via one gated redraw.
+    // Clear button hover with its damage rect; link hover via one gated redraw.
     if (g_hovered_code_btn >= 0 && g_hovered_code_btn < g_code_block_count) {
-        invalidate_rect(copy_button_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
+        invalidate_rect(copy_button_damage_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
         g_hovered_code_btn = -1;
     }
     if (g_last_link_hover || g_last_code_btn_hover) {
@@ -1488,7 +1553,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
     // Instrumented-build tag: bump on every hooks rebuild so log forensics
     // can prove which binary wrote which launch. Keep in sync manually.
-    DBGLOG("EV build tag=B6-row-span-gap");
+    DBGLOG("EV build tag=B7-clip-copybtn");
 #endif
 }
 
@@ -1748,11 +1813,13 @@ void platform_begin_clip(float x, float y, float w, float h) {
     if (!g_current_cg_context) return;
     CGContextSaveGState(g_current_cg_context);
     CGContextClipToRect(g_current_cg_context, CGRectMake(x, y, w, h));
+    clip_stack_push(x, y, w, h);
 }
 
 void platform_end_clip(void) {
     if (!g_current_cg_context) return;
     CGContextRestoreGState(g_current_cg_context);
+    clip_stack_pop();
 }
 
 // Record quad for mouse text selection & copying (anchored to document Y).
@@ -1783,6 +1850,20 @@ static __attribute__((noinline)) void record_text_quad(const char* text, int len
         rec->link_url[copy_url] = '\0';
     } else {
         rec->link_url[0] = '\0';
+    }
+
+    // Capture the innermost active scroll-container clip (view space).
+    // Partial passes also push the damage rect; intersecting with it is a
+    // no-op since fills already live inside the damage box.
+    if (g_clip_depth > 0) {
+        int top = g_clip_depth < CLIP_STACK_CAP ? g_clip_depth - 1 : CLIP_STACK_CAP - 1;
+        rec->clip_x = g_clip_stack[top][0];
+        rec->clip_y = g_clip_stack[top][1];
+        rec->clip_w = g_clip_stack[top][2];
+        rec->clip_h = g_clip_stack[top][3];
+        rec->has_clip = 1;
+    } else {
+        rec->has_clip = 0;
     }
 }
 
