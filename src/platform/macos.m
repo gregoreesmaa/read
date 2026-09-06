@@ -414,22 +414,32 @@ static void atlas_ensure(void) {
     CGColorSpaceRelease(cs);
 }
 
-static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str);
+static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str, float kern_pts);
 
 // One shared attributed-line constructor for the three CTLine creation sites
 // (shape miss, atlas rasterize, legacy draw): a single noinline copy keeps
 // __TEXT small, and every line shares identical attribute construction.
-static __attribute__((noinline)) CTLineRef ctline_with_font(NSString* str, NSFont* nsFont, CGColorRef fg) {
+// Standard ligatures are always on; `kern_pts` tightens display headings
+// (issue #21: Space Grotesk at showcase sizes needs -0.015em tracking to
+// kill the double-gap look — must match heading_tracking_em in viewport.zig).
+static __attribute__((noinline)) CTLineRef ctline_with_font(NSString* str, NSFont* nsFont, CGColorRef fg, float kern_pts) {
     if (!str || !nsFont) return NULL;
-    NSDictionary* attrs = fg ? @{
+    NSMutableDictionary* attrs = fg ? [@{
         (id)kCTFontAttributeName: nsFont,
         (id)kCTForegroundColorAttributeName: (__bridge id)fg,
-    } : @{
+    } mutableCopy] : [@{
         (id)kCTFontAttributeName: nsFont,
-    };
+    } mutableCopy];
+    attrs[(id)kCTLigatureAttributeName] = @1;
+    if (kern_pts != 0.0f) attrs[(id)kCTKernAttributeName] = @(kern_pts);
     NSAttributedString* as = [[NSAttributedString alloc] initWithString:str attributes:attrs];
     if (!as) return NULL;
     return CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+}
+
+// Heading tracking in points for a run at font_size. Zero for body text.
+static inline float heading_kern_pts(float font_size, int is_heading) {
+    return is_heading ? -0.015f * font_size : 0.0f;
 }
 
 // Shape (or hit) a run. On hit returns the entry with zero shaping work.
@@ -450,7 +460,7 @@ static ShapedEntry* shape_run(const char* text, int len, float font_size,
             NSString* rstr = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
             if (rstr) {
                 NSFont* rfont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
-                shape_rasterize_entry(e, rfont, rstr);
+                shape_rasterize_entry(e, rfont, rstr, heading_kern_pts(font_size, is_heading));
             }
         }
         return e;
@@ -460,7 +470,7 @@ static ShapedEntry* shape_run(const char* text, int len, float font_size,
     NSString* str = [[NSString alloc] initWithBytes:text length:len encoding:NSUTF8StringEncoding];
     if (!str) return NULL;
     NSFont* nsFont = get_font_for_style(font_size, is_bold, is_italic, is_mono, is_heading);
-    CTLineRef line = ctline_with_font(str, nsFont, NULL);
+    CTLineRef line = ctline_with_font(str, nsFont, NULL, heading_kern_pts(font_size, is_heading));
     if (!line) return NULL;
 
     CGFloat ascent, descent, leading;
@@ -483,12 +493,12 @@ static ShapedEntry* shape_run(const char* text, int len, float font_size,
     e->ah = 0;
     e->occupied = 1;
 
-    if (rasterize) shape_rasterize_entry(e, nsFont, str);
+    if (rasterize) shape_rasterize_entry(e, nsFont, str, heading_kern_pts(font_size, is_heading));
     return e;
 }
 
 // Rasterize an already-shaped entry into the atlas (idempotent).
-static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str) {
+static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str, float kern_pts) {
     if (!e || !e->line || e->aw != 0) return;
     atlas_ensure();
     if (!g_atlas_ctx) return;
@@ -503,7 +513,7 @@ static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str)
     }
 
     // White coverage mask, 2x supersampled for Retina-crisp blits.
-    CTLineRef wline = ctline_with_font(str, nsFont, [NSColor whiteColor].CGColor);
+    CTLineRef wline = ctline_with_font(str, nsFont, [NSColor whiteColor].CGColor, kern_pts);
     if (!wline) return;
 
     // NOTE: stored vertically mirrored: the per-frame ClipToMask blit in the
@@ -1826,7 +1836,7 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGFloat components[4] = { r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f };
     CGColorRef fontColor = CGColorCreate(colorSpace, components);
-    CTLineRef ctLine = ctline_with_font(str, nsFont, fontColor);
+    CTLineRef ctLine = ctline_with_font(str, nsFont, fontColor, heading_kern_pts(font_size, is_heading));
     if (ctLine && do_record) {
         // Uncacheable run: measure for the record. The shaped call site
         // already recorded exact dims, so it passes do_record=0 and skips

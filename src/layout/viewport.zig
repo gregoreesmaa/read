@@ -82,11 +82,22 @@ pub const SERIF_FONT_ITALIC_WIDTHS = [128]u16{
     570, 453, 453, 299, 312, 299, 550, 424,
 };
 
+/// Space Grotesk heading tracking, in em. Tightens showcase-size headings so
+/// inter-letter air matches the typeface's display intent (issue #21).
+/// Mirrors the CoreText kern applied in macos.m (`ctline_with_font`):
+/// both must move together or layout and pixels diverge.
+pub const heading_tracking_em: f32 = -0.015;
+/// Heading word space, in em. The raw Space Grotesk space (~0.25em) reads as
+/// a double-gap at H1 sizes; 0.22em keeps words distinct without the hole.
+pub const heading_word_space_em: f32 = 0.22;
+
 pub fn measureCharEx(c: u8, font_size: f32, is_bold: bool, is_italic: bool, is_mono: bool, is_heading: bool) f32 {
     if (is_mono) return font_size * 0.60;
     const idx = if (c < 128) c else 32;
     if (is_heading) {
-        return @as(f32, @floatFromInt(HEADING_FONT_WIDTHS[idx])) * font_size / 1000.0;
+        if (c == ' ') return font_size * heading_word_space_em;
+        return @as(f32, @floatFromInt(HEADING_FONT_WIDTHS[idx])) * font_size / 1000.0 +
+            heading_tracking_em * font_size;
     }
     const width_table = if (is_bold)
         &SERIF_FONT_BOLD_WIDTHS
@@ -99,10 +110,17 @@ pub fn measureCharEx(c: u8, font_size: f32, is_bold: bool, is_italic: bool, is_m
 
 pub fn measureTextEx(text: []const u8, font_size: f32, is_bold: bool, is_italic: bool, is_mono: bool, is_heading: bool) f32 {
     if (is_mono) return @as(f32, @floatFromInt(text.len)) * font_size * 0.60;
+    if (is_heading) {
+        // Same per-glyph math as measureCharEx (tracking + word space), so
+        // whole-run and per-word measurement always agree.
+        var total: f32 = 0;
+        for (text) |c| {
+            total += measureCharEx(c, font_size, is_bold, is_italic, false, true);
+        }
+        return total;
+    }
     var total: f32 = 0;
-    const width_table = if (is_heading)
-        &HEADING_FONT_WIDTHS
-    else if (is_bold)
+    const width_table = if (is_bold)
         &SERIF_FONT_BOLD_WIDTHS
     else if (is_italic)
         &SERIF_FONT_ITALIC_WIDTHS
@@ -3402,6 +3420,35 @@ test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
         try std.testing.expectApproxEqAbs(cmd_a.rect.w, cmd_b.rect.w, 0.01);
         try std.testing.expectApproxEqAbs(cmd_a.rect.h, cmd_b.rect.h, 0.01);
     }
+}
+
+test "design #21: heading tracking in -0.02..-0.01em, word space ~0.22em" {
+    // Acceptance band: letter-spacing −0.01…−0.02em, word space ~0.22em.
+    try std.testing.expect(heading_tracking_em <= -0.01 and heading_tracking_em >= -0.02);
+    try std.testing.expectApproxEqAbs(heading_word_space_em, 0.22, 0.005);
+
+    const fs: f32 = 34.0; // showcase H1 size
+    // Heading word space is tighter than the serif body space: no double-gap.
+    const hsp = measureCharEx(' ', fs, false, false, false, true);
+    const bsp = measureCharEx(' ', fs, false, false, false, false);
+    try std.testing.expectApproxEqAbs(hsp, fs * 0.22, 0.01);
+    try std.testing.expect(hsp < bsp);
+    // Tracking tightens every non-space glyph vs the raw table advance.
+    const hw = measureCharEx('T', fs, false, false, false, true);
+    const raw = @as(f32, @floatFromInt(HEADING_FONT_WIDTHS['T'])) * fs / 1000.0;
+    try std.testing.expectApproxEqAbs(hw, raw + heading_tracking_em * fs, 0.001);
+    try std.testing.expect(hw < raw);
+    // Whole-run and per-glyph measurement agree (wrap == draw).
+    const run = measureTextEx("Text Wrapping", fs, false, false, false, true);
+    var sum: f32 = 0;
+    for ("Text Wrapping") |c| sum += measureCharEx(c, fs, false, false, false, true);
+    try std.testing.expectApproxEqAbs(run, sum, 0.01);
+    // Mono runs are untouched by heading tracking.
+    try std.testing.expectApproxEqAbs(
+        measureCharEx('T', fs, false, false, true, true),
+        fs * 0.60,
+        0.001,
+    );
 }
 
 // ============================================================================
