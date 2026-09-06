@@ -33,6 +33,8 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
 void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h);
 void platform_get_image_size(const char* url, int url_len, float* out_w, float* out_h);
 void platform_register_code_block(float x, float y, float w, float h, const char* code_text, int code_len);
+// Cold-path fence: drop borrowed text/code aliases on document load.
+void platform_invalidate_text_records(void);
 void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x);
 void platform_begin_clip(float x, float y, float w, float h);
 void platform_end_clip(void);

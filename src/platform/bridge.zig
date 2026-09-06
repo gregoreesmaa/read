@@ -116,6 +116,9 @@ pub extern "c" fn platform_register_code_block(
     code_len: c_int,
 ) void;
 
+/// Cold-path fence: drop borrowed text/code aliases on document load.
+pub extern "c" fn platform_invalidate_text_records() void;
+
 pub extern "c" fn platform_register_scrollable_block(
     block_id: c_int,
     x: f32,

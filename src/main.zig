@@ -715,6 +715,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
+    // The mapping just swapped: drop borrowed platform text/code aliases
+    // before any draw rebuilds them (cold path only, zero hot-path cost).
+    bridge.platform_invalidate_text_records();
 
     // Index lines with SIMD scanner
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);

@@ -54,7 +54,17 @@ typedef struct {
     int is_italic;
     int is_mono;
     int is_heading;
-    char text[512];
+    // BORROWED text, not owned: points into the Zig command slice (mmap
+    // document bytes or frame-lived BSS scratch in main.zig). No inline
+    // copy: the old text[512] dominated BSS and duplicated mmap bytes.
+    // Lifetime: records rebuild on every draw (drawRect resets the count
+    // first, single-threaded, so no consumer can observe a stale entry
+    // mid-rebuild); the document mapping lives for the whole process and
+    // the frame scratch outlives the frame it was filled in. Cleared on
+    // document load via platform_invalidate_text_records. len keeps the
+    // old 511-byte truncation so every index compare sees byte-identical
+    // prefixes; consumers must use explicit lengths (never NUL).
+    const char* text_ptr;
     int len;
     char link_url[256];
     int line_index;
@@ -65,14 +75,21 @@ typedef struct {
     int has_clip;
 } QuadTextRecord;
 
-#define MAX_QUAD_RECORDS 16384
+// Capped at the real emit ceiling: one text_run command yields exactly one
+// record and the command buffer holds MAX_COMMANDS 2048 (src/main.zig).
+// Was 16384 x ~832 B ~= 13.6 MiB BSS; now 2048 x ~80 B ~= 160 KiB.
+#define MAX_QUAD_RECORDS 2048
 static QuadTextRecord g_text_records[MAX_QUAD_RECORDS];
 static int g_text_record_count = 0;
 
 #define MAX_CODE_BLOCKS 64
 typedef struct {
     float x, y, w, h;
-    char text[8192];
+    // BORROWED code bytes (same lifetime story as QuadTextRecord.text_ptr).
+    // The only consumer needing bytes is the copy-button clipboard path,
+    // which reads them with an explicit length between draws. len keeps
+    // the old 8191-byte truncation.
+    const char* text_ptr;
     int len;
 } CodeBlockRecord;
 
@@ -334,12 +351,29 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
 // once ~500 runs were resident, evicting shaped lines mid-scroll and forcing
 // re-shape + re-raster churn on every frame (2026-09 scroll-storm hunt).
 #define SHAPE_CACHE_CAP 4096
-// 4096px = 16 MiB coverage cache, malloc-once on the cold path (BSS/file
-// size unaffected). A 2048px atlas thrashed on ordinary files at 2x
-// (flush + full re-raster storm every ~60 scroll frames, 2026-09 blackout
-// hunt); the live working set fits comfortably here.
-#define ATLAS_PX 4096
+// Two-tier coverage cache, malloc-once per tier on the cold path (BSS/file
+// size unaffected). The 2048px primary tier (4 MiB) holds the steady-state
+// working set; the 4096px tier (16 MiB) is entered only when RASTER_SCALE==2
+// AND the flush counter proves thrash (2026-09: a bare 2048px atlas flushed
+// + re-rastered every ~60 scroll frames at 2x). Growth is one-way: once the
+// working set proves it needs 4096px, shrinking back would just re-thrash.
+// A single run wider than the base tier also promotes (measured: the
+// direct-draw fallback renders visibly different pixels than the atlas
+// path, so oversize runs must take the 4096px path to stay identical).
+#define ATLAS_PX_BASE 2048
+#define ATLAS_PX_LARGE 4096
 #define RASTER_SCALE 2
+// Thrash proof: this many flushes inside the trailing draw window promotes
+// the atlas to the large tier. Conservative on purpose: one stray overflow
+// (a single giant run) must not cost 12 MiB forever.
+#define ATLAS_THRASH_FLUSHES 3
+#define ATLAS_THRASH_WINDOW_DRAWS 180
+// Shelf retention journal: every committed shelf row records its band and
+// the draw seq that last packed into it, so flush logs can show whether the
+// working set is churning (all shelves young) or stable. Fixed 128 slots,
+// BSS-resident (~1 KiB), zero hot-path allocations.
+#define ATLAS_MAX_SHELVES 128
+typedef struct { short y0; short h; unsigned long last_use; } AtlasShelf;
 
 typedef struct {
     uint64_t key;      // FNV-1a(text bytes, style, font size bits)
@@ -354,7 +388,12 @@ typedef struct {
 } ShapedEntry;
 
 static ShapedEntry g_shape_cache[SHAPE_CACHE_CAP]; // BSS: no binary cost
-static unsigned char* g_atlas_px = NULL;  // one 16 MiB buffer, malloc-once
+static unsigned char* g_atlas_px = NULL;  // one buffer per tier, malloc-once
+static int g_atlas_dim = ATLAS_PX_BASE;   // live tier dimension (px)
+static AtlasShelf g_atlas_shelves[ATLAS_MAX_SHELVES]; // BSS: no binary cost
+static int g_atlas_shelf_count = 0;
+static unsigned long g_atlas_window_draw = 0; // draw seq at thrash-window start
+static int g_atlas_window_flushes = 0;        // flushes inside the window
 static CGContextRef g_atlas_ctx = NULL;
 // Single persistent atlas image: provider-backed LIVE view of g_atlas_px,
 // created once — never copied, never rebuilt (verified live via probe:
@@ -392,14 +431,24 @@ static uint64_t shape_key(const char* text, int len, float font_size,
 }
 
 // Shelf-pack `pw x ph` device px into the atlas. Returns 1 on success.
+// Committed shelf rows are journaled for the retention stats in flush logs.
 static int atlas_alloc(int pw, int ph, short* out_x, short* out_y) {
-    if (pw <= 0 || ph <= 0 || pw > ATLAS_PX || ph > ATLAS_PX) return 0;
-    if (g_atlas_x + pw > ATLAS_PX) {
+    int dim = g_atlas_dim;
+    if (pw <= 0 || ph <= 0 || pw > dim || ph > dim) return 0;
+    if (g_atlas_x + pw > dim) {
+        // Commit the finished shelf row to the retention journal before
+        // advancing: its band + draw stamp survive until the next flush.
+        if (g_atlas_shelf_h > 0 && g_atlas_shelf_count < ATLAS_MAX_SHELVES) {
+            g_atlas_shelves[g_atlas_shelf_count].y0 = (short)g_atlas_y;
+            g_atlas_shelves[g_atlas_shelf_count].h = (short)g_atlas_shelf_h;
+            g_atlas_shelves[g_atlas_shelf_count].last_use = g_draw_seq;
+            g_atlas_shelf_count++;
+        }
         g_atlas_y += g_atlas_shelf_h;
         g_atlas_x = 0;
         g_atlas_shelf_h = 0;
     }
-    if (g_atlas_y + ph > ATLAS_PX) return 0;
+    if (g_atlas_y + ph > dim) return 0;
     *out_x = (short)g_atlas_x;
     *out_y = (short)g_atlas_y;
     g_atlas_x += pw;
@@ -417,25 +466,53 @@ static void shape_drop_raster(ShapedEntry* e) {
     e->ah = 0;
 }
 
-// Generational flush: wipe pixels, reset cursor, keep shaped lines cached
-// (they re-rasterize lazily via the aw==0 sentinel).
+static void atlas_grow(void); // defined after atlas_ensure (needs teardown)
+
+// Flush-time clear with base-identical semantics: the whole live tier is
+// zeroed, so every reused row reads exactly what a fresh calloc would give.
+// A MADV_DONTNEED-reclaim + zero-on-alloc variant was measured pixel-diver-
+// gent vs the 4096px renderer (fringe pixels on rare 2x runs), so the flush
+// keeps the explicit wipe; at 4 MiB it dirties a quarter of what the old
+// 16 MiB wipe did, flushes stay rare, and the steady-state win (4 MiB
+// resident vs 16 MiB) is untouched.
+static void atlas_reclaim(void) {
+    size_t n = (size_t)g_atlas_dim * (size_t)g_atlas_dim;
+    if (!g_atlas_px) return;
+    memset(g_atlas_px, 0, n);
+}
+
+// Generational flush: reclaim pixels, reset cursor, keep shaped lines cached
+// (they re-rasterize lazily via the aw==0 sentinel). Promotes to the large
+// tier when the flush counter proves thrash at 2x.
 static void atlas_flush(void) {
-    if (g_atlas_px) memset(g_atlas_px, 0, (size_t)ATLAS_PX * ATLAS_PX);
+    atlas_reclaim();
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
+    g_atlas_shelf_count = 0;
     for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
     g_atlas_flushes++;
+    // Thrash window: roll the window when it ages out, then count.
+    if (g_draw_seq - g_atlas_window_draw > ATLAS_THRASH_WINDOW_DRAWS) {
+        g_atlas_window_draw = g_draw_seq;
+        g_atlas_window_flushes = 0;
+    }
+    g_atlas_window_flushes++;
+    if (g_atlas_dim == ATLAS_PX_BASE && RASTER_SCALE == 2 &&
+        g_atlas_window_flushes >= ATLAS_THRASH_FLUSHES)
+        atlas_grow();
 #ifdef TEST_HOOKS
-    DBGLOG("EV atlas_flush t=%llu n=%llu", dbg_t_ms(), (unsigned long long)g_atlas_flushes);
+    DBGLOG("EV atlas_flush t=%llu n=%llu dim=%d shelves=%d", dbg_t_ms(),
+        (unsigned long long)g_atlas_flushes, g_atlas_dim, g_atlas_shelf_count);
 #endif
 }
 
 static void atlas_ensure(void) {
     if (g_atlas_ctx) return;
-    g_atlas_px = (unsigned char*)calloc((size_t)ATLAS_PX * ATLAS_PX, 1);
+    g_atlas_px = (unsigned char*)calloc((size_t)g_atlas_dim * (size_t)g_atlas_dim, 1);
     if (!g_atlas_px) return;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-    g_atlas_ctx = CGBitmapContextCreate(g_atlas_px, ATLAS_PX, ATLAS_PX, 8,
-                                        ATLAS_PX, cs,
+    size_t dim = (size_t)g_atlas_dim;
+    g_atlas_ctx = CGBitmapContextCreate(g_atlas_px, dim, dim, 8,
+                                        dim, cs,
                                         (CGBitmapInfo)kCGImageAlphaNone);
     // Crisp masks: the coverage edges baked here are the sharpest the blit
     // path can ever show, so rasterize with full hinted smoothing on.
@@ -445,18 +522,39 @@ static void atlas_ensure(void) {
     CGContextSetShouldSmoothFonts(g_atlas_ctx, true);
     CGContextSetAllowsFontSmoothing(g_atlas_ctx, true);
     // Y-down so drawing uses the same orientation as the flipped view.
-    CGContextTranslateCTM(g_atlas_ctx, 0, ATLAS_PX);
+    CGContextTranslateCTM(g_atlas_ctx, 0, (CGFloat)dim);
     CGContextScaleCTM(g_atlas_ctx, 1.0f, -1.0f);
     // Persistent live image over the same pixels: zero copies, ever.
     CGDataProviderRef prov = CGDataProviderCreateWithData(
-        NULL, g_atlas_px, (size_t)ATLAS_PX * ATLAS_PX, NULL);
+        NULL, g_atlas_px, dim * dim, NULL);
     if (prov) {
-        g_atlas_img = CGImageCreate(ATLAS_PX, ATLAS_PX, 8, 8, ATLAS_PX, cs,
+        g_atlas_img = CGImageCreate(dim, dim, 8, 8, dim, cs,
                                     (CGBitmapInfo)kCGImageAlphaNone, prov, NULL, false,
                                     kCGRenderingIntentDefault);
         CGDataProviderRelease(prov);
     }
     CGColorSpaceRelease(cs);
+}
+
+// One-way promotion to the large tier: tear down the base buffer, context,
+// and image, then re-create at 4096px. Slices reference the old image, so
+// every entry's raster state is dropped first (shaped lines survive and
+// re-rasterize lazily). Cold path only: zero hot-path allocations.
+static void atlas_grow(void) {
+    if (g_atlas_dim >= ATLAS_PX_LARGE) return;
+    for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
+    if (g_atlas_img) { CGImageRelease(g_atlas_img); g_atlas_img = NULL; }
+    if (g_atlas_ctx) { CGContextRelease(g_atlas_ctx); g_atlas_ctx = NULL; }
+    if (g_atlas_px) { free(g_atlas_px); g_atlas_px = NULL; }
+    g_atlas_dim = ATLAS_PX_LARGE;
+    g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
+    g_atlas_shelf_count = 0;
+    g_atlas_window_flushes = 0;
+    g_atlas_window_draw = g_draw_seq;
+    atlas_ensure();
+#ifdef TEST_HOOKS
+    DBGLOG("EV atlas_grow t=%llu dim=%d", dbg_t_ms(), g_atlas_dim);
+#endif
 }
 
 static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str);
@@ -543,8 +641,19 @@ static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str)
     if (pw <= 0 || ph <= 0) return;
     short ax = 0, ay = 0;
     if (!atlas_alloc(pw, ph, &ax, &ay)) {
-        atlas_flush();
-        if (!atlas_alloc(pw, ph, &ax, &ay)) return; // larger than atlas: caller draws direct
+        // Oversize for the tier (not fragmentation): a run wider than the
+        // 2048px tier rasterized fine at 4096px, and the direct-draw fallback
+        // renders visibly different pixels — so promote one tier and retry
+        // (cold path, one-way). Runs beyond even 4096px still draw direct,
+        // exactly as before.
+        if (g_atlas_dim == ATLAS_PX_BASE && RASTER_SCALE == 2 &&
+            (pw > g_atlas_dim || ph > g_atlas_dim)) {
+            atlas_grow();
+            if (!atlas_alloc(pw, ph, &ax, &ay)) return;
+        } else {
+            atlas_flush();
+            if (!atlas_alloc(pw, ph, &ax, &ay)) return; // larger than atlas: caller draws direct
+        }
     }
 
     // White coverage mask, 2x supersampled for Retina-crisp blits.
@@ -605,7 +714,7 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     if (x_offset >= rec->w) return rec->len;
 
     // Shaping-economy fast path: hit-test on the cached run, no new CTLine.
-    CTLineRef cached = shape_cached_line(rec->text, rec->len, rec->font_size,
+    CTLineRef cached = shape_cached_line(rec->text_ptr, rec->len, rec->font_size,
                                          rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
     if (cached) {
         CFIndex idx = CTLineGetStringIndexForPosition(cached, CGPointMake(x_offset, 0));
@@ -619,7 +728,7 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
         return (int)idx;
     }
 
-    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:rec->len encoding:NSUTF8StringEncoding freeWhenDone:NO];
+    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text_ptr length:rec->len encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (int)roundf((x_offset / rec->w) * rec->len);
 
     NSFont* nsFont = get_font_for_style(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
@@ -641,14 +750,14 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     if (char_idx >= rec->len) return rec->w;
 
     // Shaping-economy fast path: measure the prefix on the cached run.
-    CTLineRef cached = shape_cached_line(rec->text, rec->len, rec->font_size,
+    CTLineRef cached = shape_cached_line(rec->text_ptr, rec->len, rec->font_size,
                                          rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
     if (cached) {
         CGFloat off = CTLineGetOffsetForStringIndex(cached, char_idx, NULL);
         return (float)off;
     }
 
-    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:char_idx encoding:NSUTF8StringEncoding freeWhenDone:NO];
+    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text_ptr length:char_idx encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (float)char_idx / rec->len * rec->w;
 
     NSFont* nsFont = get_font_for_style(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
@@ -794,7 +903,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (r_bot < min_y - 4.0f || r_top > max_y + 4.0f) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+                    DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.*s", q, rec->doc_y, rec->h, min_y, max_y, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                 continue;
             }
@@ -813,7 +922,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (!in_min_row && !in_max_row && (min_y > r_bot || max_y < r_top)) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+                    DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.*s", q, rec->doc_y, rec->h, min_y, max_y, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                 continue;
             }
@@ -858,7 +967,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->x + rec->w < left_x || rec->x > right_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
-                        DBGLOG("EV hlskip xrow q=%d x=%.1f w=%.1f l=%.1f r=%.1f txt=%.12s", q, rec->x, rec->w, left_x, right_x, rec->text);
+                        DBGLOG("EV hlskip xrow q=%d x=%.1f w=%.1f l=%.1f r=%.1f txt=%.*s", q, rec->x, rec->w, left_x, right_x, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                     continue;
                 }
@@ -869,7 +978,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->x + rec->w < start_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
-                        DBGLOG("EV hlskip xfirst q=%d x=%.1f w=%.1f s=%.1f txt=%.12s", q, rec->x, rec->w, start_x, rec->text);
+                        DBGLOG("EV hlskip xfirst q=%d x=%.1f w=%.1f s=%.1f txt=%.*s", q, rec->x, rec->w, start_x, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                     continue;
                 }
@@ -880,7 +989,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->x > end_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
-                        DBGLOG("EV hlskip xlast q=%d x=%.1f w=%.1f e=%.1f txt=%.12s", q, rec->x, rec->w, end_x, rec->text);
+                        DBGLOG("EV hlskip xlast q=%d x=%.1f w=%.1f e=%.1f txt=%.*s", q, rec->x, rec->w, end_x, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                     continue;
                 }
@@ -894,7 +1003,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (c_end <= c_start) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f miny=%.2f maxy=%.2f sx=%.2f sy=%.2f ex=%.2f ey=%.2f txt=%.12s", q, c_start, c_end, rec->len, rec->x, rec->w, min_y, max_y, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, rec->text);
+                    DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f miny=%.2f maxy=%.2f sx=%.2f sy=%.2f ex=%.2f ey=%.2f txt=%.*s", q, c_start, c_end, rec->len, rec->x, rec->w, min_y, max_y, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
             }
             if (c_end > c_start) {
@@ -902,7 +1011,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 float x2 = rec->x + get_x_for_char_index(rec, c_end);
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
+                    DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.*s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                 fill_highlight_clipped(ctx, rec, x1, view_y, x2 - x1, rec->h);
             }
@@ -1114,7 +1223,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             view_pt.y >= btn.origin.y && view_pt.y <= btn.origin.y + btn.size.height) {
             NSPasteboard* pb = [NSPasteboard generalPasteboard];
             [pb clearContents];
-            NSString* s = [[NSString alloc] initWithBytes:b->text length:b->len encoding:NSUTF8StringEncoding];
+            NSString* s = [[NSString alloc] initWithBytes:b->text_ptr length:b->len encoding:NSUTF8StringEncoding];
             if (s) [pb setString:s forType:NSPasteboardTypeString];
             g_copied_block_idx = b_idx;
             g_copied_timestamp = [NSDate timeIntervalSinceReferenceDate];
@@ -1356,7 +1465,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         float last_doc_y = -9999.0f;
         for (int q = 0; q < g_text_record_count; q++) {
             QuadTextRecord* rec = &g_text_records[q];
-            NSString* s = [[NSString alloc] initWithBytes:rec->text length:rec->len encoding:NSUTF8StringEncoding];
+            NSString* s = [[NSString alloc] initWithBytes:rec->text_ptr length:rec->len encoding:NSUTF8StringEncoding];
             if (s) {
                 if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 10.0f) {
                     if (fabs(rec->doc_y - last_doc_y) > 35.0f) {
@@ -1418,7 +1527,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
 
             if (c_end > c_start && c_start >= 0 && c_end <= rec->len) {
-                NSString* s = [[NSString alloc] initWithBytes:&rec->text[c_start] length:(c_end - c_start) encoding:NSUTF8StringEncoding];
+                NSString* s = [[NSString alloc] initWithBytes:&rec->text_ptr[c_start] length:(c_end - c_start) encoding:NSUTF8StringEncoding];
                 if (s) {
                     if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 10.0f) {
                         if (fabs(rec->doc_y - last_doc_y) > 35.0f) {
@@ -1916,15 +2025,25 @@ void platform_register_code_block(float x, float y, float w, float h, const char
     b->y = y;
     b->w = w;
     b->h = h;
-    int copy_len = (code_text && code_len > 0) ? (code_len < 8191 ? code_len : 8191) : 0;
-    if (copy_len > 0) {
-        memcpy(b->text, code_text, copy_len);
-        b->text[copy_len] = '\0';
-        b->len = copy_len;
+    // Alias, not copy: the caller-owned slice (mmap document bytes) lives
+    // for the whole process and records rebuild every draw. Same 8191-byte
+    // truncation the old inline copy applied, so the clipboard path sees
+    // byte-identical prefixes.
+    if (code_text && code_len > 0) {
+        b->text_ptr = code_text;
+        b->len = code_len < 8191 ? code_len : 8191;
     } else {
-        b->text[0] = '\0';
+        b->text_ptr = "";
         b->len = 0;
     }
+}
+
+// Document-load fence: drop every borrowed alias the moment the mapping is
+// swapped, so selection/copy/hit-test between load and the next draw can
+// never read the old buffer. Called from the Zig load path (cold only).
+void platform_invalidate_text_records(void) {
+    g_text_record_count = 0;
+    g_code_block_count = 0;
 }
 
 void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x) {
@@ -1953,8 +2072,8 @@ void platform_end_clip(void) {
 }
 
 // Record quad for mouse text selection & copying (anchored to document Y).
-// noinline: called from 4 sites (register/draw/legacy); one shared copy keeps
-// __TEXT off the next page boundary (binary budget < 180 KiB).
+// noinline: called from 4 sites (register/draw/legacy); one shared alias
+// keeps __TEXT off the next page boundary (binary budget < 180 KiB).
 static __attribute__((noinline)) void record_text_quad(const char* text, int len, float x, float y, float w, float h,
                              float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
                              const char* link_url, int link_url_len) {
@@ -1969,10 +2088,11 @@ static __attribute__((noinline)) void record_text_quad(const char* text, int len
     rec->is_italic = is_italic;
     rec->is_mono = is_mono;
     rec->is_heading = is_heading;
-    int copy_len = len < 511 ? len : 511;
-    memcpy(rec->text, text, copy_len);
-    rec->text[copy_len] = '\0';
-    rec->len = copy_len;
+    // Alias, not copy (see text_ptr contract on the struct). The 511-byte
+    // truncation matches the old inline copy exactly, so hit-test, shaping
+    // fast paths, and clipboard slices see byte-identical prefixes.
+    rec->text_ptr = text ? text : "";
+    rec->len = len < 511 ? len : 511;
 
     int copy_url = (link_url && link_url_len > 0) ? (link_url_len < 255 ? link_url_len : 255) : 0;
     if (copy_url > 0) {
