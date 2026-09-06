@@ -3404,6 +3404,114 @@ test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
     }
 }
 
+test "scroll: preallocated ring reused across frames, output is pure (issue #13)" {
+    // Pins the #13 contract at the layout layer: a scroll session renders
+    // every frame into the SAME caller-owned Line/DrawCommand buffers with
+    // no allocator anywhere on the path (zero hot-path allocations by
+    // construction), and output is a pure function of (document, scroll
+    // offset) — scrolling away and back reproduces the frame bit-identically,
+    // i.e. unchanged text reuses cached state instead of re-shaping. The
+    // shaped-run cache half lives in platform/glyph_cache.zig (hit-rate
+    // pinned there); damage-rect scoping in layout/damage.zig.
+    // Stack-built document (~55 lines, ~1600px): mixed blocks plus filler
+    // body so 40px key steps genuinely travel instead of clamping.
+    var doc_buf: [4096]u8 = undefined;
+    var doc_len: usize = 0;
+    const head =
+        \\# Ring Reuse Probe
+        \\Paragraph one with **bold** and *italic* words for shaping.
+        \\Paragraph two carrying a [link](https://ziglang.org) and `code`.
+        \\> A quoted line to vary the command stream.
+        \\- bullet alpha
+        \\- bullet beta
+        \\1. ordered gamma
+        \\
+    ;
+    const filler = "Body filler line for scroll depth with several words.\n";
+    const tail =
+        \\```
+        \\code line inside fence
+        \\```
+        \\| cell a | cell b |
+        \\Final paragraph closing the probe document body here.
+        \\
+    ;
+    @memcpy(doc_buf[doc_len..][0..head.len], head);
+    doc_len += head.len;
+    var fi: usize = 0;
+    while (fi < 40) : (fi += 1) {
+        @memcpy(doc_buf[doc_len..][0..filler.len], filler);
+        doc_len += filler.len;
+    }
+    @memcpy(doc_buf[doc_len..][0..tail.len], tail);
+    doc_len += tail.len;
+    const doc = doc_buf[0..doc_len];
+
+    var lines_buf: [128]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(doc, &lines_buf, &fence);
+    try std.testing.expect(line_count > 50);
+    const lines = lines_buf[0..line_count];
+
+    // One ring, reused for the whole session — mirrors main.zig's static
+    // g_commands_buffer rented frame after frame.
+    var ring: [512]DrawCommand = undefined;
+
+    const frame_cfg = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+    const n0 = layoutViewport(doc, lines, frame_cfg, &ring);
+    try std.testing.expect(n0 > 0);
+    var first: [512]DrawCommand = undefined;
+    @memcpy(first[0..n0], ring[0..n0]);
+
+    // 30 key-step frames (1200px) scrolling down: every frame must render
+    // from the same ring, and mid-scroll content must actually move
+    // (guards a vacuous all-clamped session).
+    var f: usize = 1;
+    while (f <= 30) : (f += 1) {
+        const cfg = ViewportConfig{
+            .window_width = 800.0,
+            .window_height = 600.0,
+            .scroll_y = @as(f32, @floatFromInt(f)) * 40.0,
+        };
+        const n = layoutViewport(doc, lines, cfg, &ring);
+        try std.testing.expect(n > 0);
+    }
+    const mid_cfg = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 400.0,
+    };
+    var mid_ring: [512]DrawCommand = undefined;
+    const n_mid = layoutViewport(doc, lines, mid_cfg, &mid_ring);
+    try std.testing.expect(n_mid > 0);
+    var moved = false;
+    const probe_n = @min(n0, n_mid);
+    var pi: usize = 0;
+    while (pi < probe_n) : (pi += 1) {
+        if (first[pi].rect.y != mid_ring[pi].rect.y) {
+            moved = true;
+            break;
+        }
+    }
+    try std.testing.expect(moved);
+    // Scroll back: frame at 0 must equal the first frame bit-for-bit.
+    const n_back = layoutViewport(doc, lines, frame_cfg, &ring);
+    try std.testing.expectEqual(n0, n_back);
+    for (first[0..n0], 0..) |cmd_a, idx| {
+        const cmd_b = ring[idx];
+        try std.testing.expectEqual(cmd_a.kind, cmd_b.kind);
+        try std.testing.expectEqual(cmd_a.rect.x, cmd_b.rect.x);
+        try std.testing.expectEqual(cmd_a.rect.y, cmd_b.rect.y);
+        try std.testing.expectEqual(cmd_a.rect.w, cmd_b.rect.w);
+        try std.testing.expectEqual(cmd_a.rect.h, cmd_b.rect.h);
+        try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+    }
+}
+
 // ============================================================================
 // Virtualized lazy layout: time-sliced amortized layout + Goldilocks buffer
 // + estimated heights with just-in-time refinement.
