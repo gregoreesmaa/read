@@ -50,6 +50,7 @@ no number here is repeated anywhere else in the repo.
 - [docs/architecture.md](docs/architecture.md) — how it stays fast
 - [docs/spec.md](docs/spec.md) — supported Markdown inventory
 - [docs/keys.md](docs/keys.md) — selection, scrolling, keybindings
+- [docs/privacy.md](docs/privacy.md) — remote-image policy (indicator, `i` toggle, HTTPS-only)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — pre-commit protocol (tests, screenshots, gates)
 - [AGENTS.md](AGENTS.md) — contributor contract and immutable targets
 

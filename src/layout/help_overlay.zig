@@ -18,6 +18,7 @@ pub const Action = enum {
     block_right,
     page_down,
     toggle_theme,
+    toggle_images,
     toggle_help,
     dismiss_help,
     quit,
@@ -34,12 +35,14 @@ pub const Binding = struct {
 pub const KEY_QUIT: c_int = 'q';
 pub const KEY_HELP: c_int = '?';
 pub const KEY_ESC: c_int = 27;
+pub const KEY_IMAGES: c_int = 'i';
 
 pub const BINDINGS: []const Binding = &.{
     .{ .key = 'j', .label = "j", .desc = "Scroll down (40px)", .action = .scroll_down },
     .{ .key = 'k', .label = "k", .desc = "Scroll up (40px)", .action = .scroll_up },
     .{ .key = ' ', .label = "Space", .desc = "Page down (80% window height)", .action = .page_down },
     .{ .key = 't', .label = "t", .desc = "Toggle dark / light theme", .action = .toggle_theme },
+    .{ .key = 'i', .label = "i", .desc = "Toggle remote images (privacy)", .action = .toggle_images },
     .{ .key = 'h', .label = "h", .desc = "Scroll hovered code block or table left", .action = .block_left },
     .{ .key = 'l', .label = "l", .desc = "Scroll hovered code block or table right", .action = .block_right },
     .{ .key = '?', .label = "?", .desc = "Toggle this cheat sheet", .action = .toggle_help },
@@ -160,7 +163,7 @@ pub fn emitOverlay(
 
 test "help overlay: table covers every documented binding exactly once" {
     // AGENTS.md §4 navigation bindings.
-    const required = [_]c_int{ 'j', 'k', ' ', 't', 'h', 'l', 'q' };
+    const required = [_]c_int{ 'j', 'k', ' ', 't', 'i', 'h', 'l', 'q' };
     for (required) |k| {
         var hits: usize = 0;
         for (BINDINGS) |b| {

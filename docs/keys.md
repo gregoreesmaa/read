@@ -10,6 +10,7 @@
 | `h` / `l` | Scroll hovered code block or table horizontally (30px) |
 | Trackpad swipe | Horizontal scroll on hovered code block or table |
 | `t` | Toggle dark / light theme |
+| `i` | Toggle remote images (privacy, see [privacy.md](privacy.md)) |
 | `?` | Toggle keyboard-shortcut cheat sheet |
 | `Esc` | Dismiss cheat sheet |
 | `Cmd+C` | Copy selection to system clipboard |
