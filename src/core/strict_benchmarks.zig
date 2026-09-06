@@ -18,6 +18,12 @@ pub const TARGET_MAX_SUBSTRING_SEARCH_TIME_US: i128 = 50; // Max 50 µs to searc
 pub const TARGET_MAX_HOT_PATH_ALLOCATIONS: usize = 0;     // Zero allocations on hot render path
 pub const TARGET_MAX_LINE_STRUCT_BYTES: usize = 8;        // Strict 64-bit packed line structure
 pub const TARGET_MAX_DEEP_SCROLL_LAYOUT_TIME_US: i128 = 11;// Max 11 µs for deep scroll (line 45k+) with checkpoints (tightened from 20 µs -> 12 µs -> 11 µs)
+// ADDITIVE startup gate (2026-09 showcase probe): existing targets above are
+// immutable and untouched. End-to-end Zig-side startup for showcase.md
+// (mmap open + scanLines + full document metrics + first layoutViewport).
+// Measured ~15 µs warm on Apple silicon; 120 µs leaves 8x headroom for CI
+// variance while still failing loudly on any real startup regression.
+pub const TARGET_MAX_SHOWCASE_STARTUP_TIME_US: i128 = 120;
 
 test "STRICT: SIMD Line Scanner Throughput and Latency" {
     const allocator = std.testing.allocator;
@@ -128,6 +134,75 @@ test "STRICT: Zero-Copy mmap Open Latency" {
     std.debug.print("[STRICT BENCHMARK] mmap Open Latency: {d} µs\n", .{min_elapsed_us});
 
     try std.testing.expect(min_elapsed_us <= TARGET_MAX_MMAP_OPEN_TIME_US);
+}
+
+test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
+    // Mirrors main() startup on the doc reviewers actually open: mmap the
+    // file, scan lines, compute full document metrics, lay out the first
+    // viewport. Min of 5 runs, same convention as the sibling gates.
+    // Platform work (fonts, first-frame shaping, images, PNG) is out of
+    // scope here — see the spike notes on spike/startup-10x-showcase.
+    var lines_buf: [512]simd.Line = undefined;
+    var checkpoints: [128]layout.Checkpoint = undefined;
+    var commands: [2048]layout.DrawCommand = undefined;
+
+    var min_elapsed_us: i128 = 999999;
+    var last_line_count: usize = 0;
+    var iter: usize = 0;
+    while (iter < 5) : (iter += 1) {
+        var ts_start: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+
+        var mapped = try mmap.MappedFile.open("showcase.md");
+        const bytes = mapped.bytes;
+        var in_fence: bool = false;
+        const line_count = simd.scanLines(bytes, &lines_buf, &in_fence);
+        const vp_config = layout.ViewportConfig{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = 0.0,
+        };
+        var cp_count: usize = 0;
+        _ = layout.computeDocumentHeightEx(
+            bytes,
+            lines_buf[0..line_count],
+            vp_config,
+            &checkpoints,
+            &cp_count,
+        );
+        const deep_config = layout.ViewportConfig{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = 0.0,
+            .checkpoints = checkpoints[0..cp_count],
+        };
+        const cmd_count = layout.layoutViewport(
+            bytes,
+            lines_buf[0..line_count],
+            deep_config,
+            &commands,
+        );
+        mapped.close();
+
+        var ts_end: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+
+        last_line_count = line_count;
+        try std.testing.expect(cmd_count > 0);
+
+        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
+        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
+        const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
+        if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
+    }
+
+    std.debug.print("[STRICT BENCHMARK] Showcase Startup (148-line doc): {d} µs ({d} lines)\n", .{
+        min_elapsed_us,
+        last_line_count,
+    });
+
+    try std.testing.expect(last_line_count > 100);
+    try std.testing.expect(min_elapsed_us <= TARGET_MAX_SHOWCASE_STARTUP_TIME_US);
 }
 
 test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {

@@ -199,6 +199,13 @@ static void register_app_fonts(void) {
     if (registered) return;
     registered = YES;
 
+    // Fast path (2026-09: parsing the 5 bundled TTFs costs ~20 ms on the
+    // first-paint critical path): if the families already resolve — user
+    // installed fonts, managed lab image — skip file registration entirely.
+    // One sentinel probe per process; a miss falls through to the file
+    // loop below exactly as before.
+    if ([NSFont fontWithName:@"IBMPlexSerif-Regular" size:12.0]) return;
+
     NSArray* paths = @[
         @"assets/fonts/IBMPlexSerif-Regular.ttf",
         @"assets/fonts/IBMPlexSerif-Bold.ttf",
@@ -1910,6 +1917,7 @@ typedef struct {
     float       natural_h;
     BOOL        loading;        // async load in flight
     BOOL        failed;
+    BOOL        kick_pending;   // resolved but decode not yet dispatched (pre-first-paint)
     BOOL        parked;         // animation chain parked: no timer scheduled
     unsigned long last_draw_seq; // g_draw_seq of the pass that last painted this image
     // Last drawn rect in DOCUMENT coordinates for exact GIF-tick damage.
@@ -2137,7 +2145,56 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
     rec->natural_h = (float)pts.height;
 }
 
-// Returns existing or initiates async load; returns NULL if not yet ready
+// Startup economy: image decodes are dispatched only once g_images_armed
+// is set (after first paint, or explicitly for headless settle runs).
+// Before that, records resolve synchronously — fast-fail pixels are
+// identical — but park with kick_pending instead of spawning 9 contending
+// GCD decodes into the first-frame window (profiled 2026-09: +40 ms real,
+// +100 ms user on showcase.md). Call only from the main thread.
+static BOOL g_images_armed = NO;
+
+static void kick_image_load(CachedImageRecord* rec, NSString* resolved);
+
+void platform_arm_images(void) {
+    if (g_images_armed) return;
+    g_images_armed = YES;
+    for (int i = 0; i < g_image_cache_count; i++) {
+        CachedImageRecord* rec = &g_image_cache[i];
+        if (!rec->kick_pending || rec->failed) continue;
+        rec->kick_pending = NO;
+        NSString* pathStr = [[NSString alloc] initWithBytes:rec->url
+                                                     length:strlen(rec->url)
+                                                   encoding:NSUTF8StringEncoding];
+        NSString* resolved = resolve_image_path(pathStr);
+        if (!resolved) { rec->failed = YES; rec->loading = NO; continue; }
+        kick_image_load(rec, resolved);
+    }
+}
+
+static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
+    // Capture for block
+    NSString* resolvedCopy = [resolved copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        load_image_sync(rec, resolvedCopy);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [g_main_view setNeedsDisplay:YES];
+#ifdef TEST_HOOKS
+            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
+                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
+                rec->natural_w, rec->natural_h);
+#endif
+#ifdef READ_ANIMATED_GIF
+            // Kick off GIF animation if multi-frame
+            if (!rec->failed && rec->frame_count > 1) {
+                gif_schedule_next_frame(rec);
+            }
+#endif
+        });
+    });
+}
+
+// Returns existing or allocates a record; dispatches the async decode only
+// when armed (see above) — otherwise parks it for platform_arm_images.
 static CachedImageRecord* get_or_load_image_record(const char* url, int url_len) {
     if (!url || url_len <= 0 || url_len >= 512) return NULL;
 
@@ -2162,25 +2219,11 @@ static CachedImageRecord* get_or_load_image_record(const char* url, int url_len)
     NSString* resolved = resolve_image_path(pathStr);
     if (!resolved) { rec->failed = YES; rec->loading = NO; return rec; }
 
-    // Capture for block
-    NSString* resolvedCopy = [resolved copy];
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        load_image_sync(rec, resolvedCopy);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [g_main_view setNeedsDisplay:YES];
-#ifdef TEST_HOOKS
-            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
-                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
-                rec->natural_w, rec->natural_h);
-#endif
-#ifdef READ_ANIMATED_GIF
-            // Kick off GIF animation if multi-frame
-            if (!rec->failed && rec->frame_count > 1) {
-                gif_schedule_next_frame(rec);
-            }
-#endif
-        });
-    });
+    if (!g_images_armed) {
+        rec->kick_pending = YES;
+        return rec;
+    }
+    kick_image_load(rec, resolved);
 
     return rec;
 }
