@@ -56,6 +56,11 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
         .optimize = optimize,
+        // mmap.zig and the test blocks use std.c (close/fstat/madvise/write).
+        // Zig 0.16 requires an explicit libc edge on Linux; without it the
+        // test-linux CI job fails to compile. No-op on Darwin (libSystem is
+        // always linked) and no effect on the binary size budget.
+        .link_libc = true,
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -87,6 +92,9 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            // main.zig uses std.c (write/exit/nanosleep): same explicit
+            // libc edge as the read module, required for the Linux CI build.
+            .link_libc = true,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
@@ -108,6 +116,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Same sources as the ship binary: same libc requirement.
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "read", .module = mod },
                 .{ .name = "build_options", .module = hooks_options.createModule() },
@@ -115,6 +125,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Post-link `strip -x` on the ship binary (Darwin, non-Debug only).
+    // Set inside the Darwin block; wired to the install below.
+    var strip_ship: ?*std.Build.Step.Run = null;
     if (target.result.os.tag.isDarwin()) {
         // -Os for the platform glue TU only: its cost is dominated by
         // CoreText/CG/UIColor calls, while the microsecond hot paths (scan,
@@ -134,6 +147,18 @@ pub fn build(b: *std.Build) void {
             e.root_module.linkFramework("CoreGraphics", .{});
         }
         if (optimize != .Debug) exe.root_module.strip = true;
+        // Binary diet: post-link `strip -x` on the ship binary only. The
+        // linker's own strip leaves ~238 local symbols (OUTLINED_FUNCTION_*,
+        // EH/data locals); -x drops them while keeping dynamic symbols, for
+        // ~9 KB of file. Never applied to read-test or Debug (backtraces).
+        // (wired to install_exe below: exe -> strip -> copy, so the
+        // installed file is always the stripped one.)
+        if (optimize != .Debug) {
+            const s = b.addSystemCommand(&.{ "strip", "-x" });
+            s.addFileArg(exe.getEmittedBin());
+            s.step.dependOn(&exe.step);
+            strip_ship = s;
+        }
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
             .flags = &.{"-fobjc-arc", "-Os", "-DREAD_ANIMATED_GIF=1"},
@@ -144,37 +169,48 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    // The ship binary is a native Cocoa app: it only links on Darwin, where
+    // macos.m and the system frameworks provide the platform_* symbols.
+    // Elsewhere (Linux CI portability job) there is no windowed product, so
+    // `zig build` installs nothing and succeeds; portability is covered by
+    // `zig build test` (see README: the native window needs macOS).
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
-    b.installArtifact(exe);
-    b.installArtifact(exe_test);
+    if (target.result.os.tag.isDarwin()) {
+        const install_exe = b.addInstallArtifact(exe, .{});
+        b.installArtifact(exe_test);
+        // Serialize strip before the install copy (sibling steps under the
+        // install step otherwise race: the copy could read pre-strip bytes).
+        if (strip_ship) |s| install_exe.step.dependOn(&s.step);
+        b.getInstallStep().dependOn(&install_exe.step);
 
-    // This creates a top level step. Top level steps have a name and can be
-    // invoked by name when running `zig build` (e.g. `zig build run`).
-    // This will evaluate the `run` step rather than the default step.
-    // For a top level step to actually do something, it must depend on other
-    // steps (e.g. a Run step, as we will see in a moment).
-    const run_step = b.step("run", "Run the app");
+        // This creates a top level step. Top level steps have a name and can be
+        // invoked by name when running `zig build` (e.g. `zig build run`).
+        // This will evaluate the `run` step rather than the default step.
+        // For a top level step to actually do something, it must depend on other
+        // steps (e.g. a Run step, as we will see in a moment).
+        const run_step = b.step("run", "Run the app");
 
-    // This creates a RunArtifact step in the build graph. A RunArtifact step
-    // invokes an executable compiled by Zig. Steps will only be executed by the
-    // runner if invoked directly by the user (in the case of top level steps)
-    // or if another step depends on it, so it's up to you to define when and
-    // how this Run step will be executed. In our case we want to run it when
-    // the user runs `zig build run`, so we create a dependency link.
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
+        // This creates a RunArtifact step in the build graph. A RunArtifact step
+        // invokes an executable compiled by Zig. Steps will only be executed by the
+        // runner if invoked directly by the user (in the case of top level steps)
+        // or if another step depends on it, so it's up to you to define when and
+        // how this Run step will be executed. In our case we want to run it when
+        // the user runs `zig build run`, so we create a dependency link.
+        const run_cmd = b.addRunArtifact(exe);
+        run_step.dependOn(&run_cmd.step);
 
-    // By making the run step depend on the default step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    run_cmd.step.dependOn(b.getInstallStep());
+        // By making the run step depend on the default step, it will be run from the
+        // installation directory rather than directly from within the cache directory.
+        run_cmd.step.dependOn(b.getInstallStep());
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+        // This allows the user to pass arguments to the application in the build
+        // command itself, like this: `zig build run -- arg1 arg2 etc`
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
     }
 
     // Creates an executable that will run `test` blocks from the provided module.
@@ -187,30 +223,40 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // The read-test binary shares main.zig with hooks on: it must keep
-    // compiling (its test CLI lives behind the same comptime gate).
-    const exe_hooks_tests = b.addTest(.{
-        .root_module = exe_test.root_module,
-    });
-    const run_exe_hooks_tests = b.addRunArtifact(exe_hooks_tests);
-
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
+    // A top level step for running all tests.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_exe_hooks_tests.step);
+
+    // App-shell tests drive the Cocoa platform layer (draw/render/glyph
+    // calls with no non-Darwin implementation) so they link Darwin-only.
+    // The Linux portability job covers core through mod_tests above.
+    if (target.result.os.tag.isDarwin()) {
+        // Creates an executable that will run `test` blocks from the executable's
+        // root module. Note that test executables only test one module at a time,
+        // hence why we have to create two separate ones.
+        const exe_tests = b.addTest(.{
+            .root_module = exe.root_module,
+        });
+
+        // A run step that will run the second test executable.
+        const run_exe_tests = b.addRunArtifact(exe_tests);
+
+        // The read-test binary shares main.zig with hooks on: it must keep
+        // compiling (its test CLI lives behind the same comptime gate).
+        const exe_hooks_tests = b.addTest(.{
+            .root_module = exe_test.root_module,
+        });
+        const run_exe_hooks_tests = b.addRunArtifact(exe_hooks_tests);
+
+        // The runners execute SEQUENTIALLY (mod, then exe, then hooks):
+        // running them in parallel splits CI vCPUs across binaries and
+        // inflates the wall-clock strict microsecond benchmarks with
+        // self-inflicted contention. Thresholds are unchanged; only
+        // measurement interference is removed.
+        run_exe_tests.step.dependOn(&run_mod_tests.step);
+        run_exe_hooks_tests.step.dependOn(&run_exe_tests.step);
+        test_step.dependOn(&run_exe_hooks_tests.step);
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

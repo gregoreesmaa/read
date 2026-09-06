@@ -27,6 +27,9 @@ Every agent working on this repository MUST strictly follow these principles.
 - **Strict Benchmarks are Immutable**:
   - The metrics codified in `src/core/strict_benchmarks.zig` (e.g., > 5.0 GB/s scanner throughput, < 450 µs for 50,000 lines, < 12 µs viewport layout latency, < 12 µs deep-scroll latency, 8-byte packed Line struct, 0 hot path allocations) are **non-negotiable**.
   - **Rule**: If an implementation change fails a strict performance target, **NEVER loosen or change the benchmark target**. Always optimize the implementation until it meets the target.
+- **Premium Scroll Feel is Immutable**:
+  - The scroll-feel targets codified alongside the benchmarks (`TARGET_MIN_SCROLL_FIRST_FRAME_FRAC`, `TARGET_MAX_SCROLL_SETTLE_FRAMES_40PX`: first 120Hz frame covers ≥ 20% of a step, 40px key steps snap within 24 frames with zero overshoot, precise trackpad/Magic Mouse input stays synchronous 1:1 from the displayed offset, wheel notches glide via retarget) are **non-negotiable**.
+  - **Rule**: Same as benchmarks — if a change makes scrolling laggy, floaty, or steppy, fix the implementation, never relax the scroll targets. Pin behavior with tests, not frozen constants: any future curve must still clear these bounds.
 
 ---
 

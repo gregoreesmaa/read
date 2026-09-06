@@ -78,9 +78,9 @@ var g_dump_commands: bool = false;
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
-// Smooth-scroll animation state: inputs retarget, a 120Hz platform tick
-// eases g_app.scroll_y (displayed) toward the target. Anchor jumps and
-// resizes snap both so they stay 1:1.
+// Smooth-scroll animation state: inputs retarget, a platform tick at the
+// hosting screen's frame rate eases g_app.scroll_y (displayed) toward the
+// target. Anchor jumps and resizes snap both so they stay 1:1.
 var g_smooth: layout.SmoothScroll = .{};
 
 /// Retarget the animated scroll offset and arm the platform tick while the
@@ -97,9 +97,31 @@ fn snapScroll(v: f32) void {
     g_app.scroll_y = g_smooth.current;
 }
 
-const MAX_CHECKPOINTS = 2048;
+/// Async image natural sizes landed (platform completion): recompute metrics
+/// with live sizes (stale checkpoints would misplace content), then absorb
+/// the above-viewport height delta so content below stays put instead of
+/// jumping. The platform computes the delta from its last drawn rect
+/// (same laidOutImageHeight/above-viewport math, pinned by contract tests
+/// in controls_test.zig — see the scrollbar mirror precedent). Cold path:
+/// one metrics walk; zero allocations. No animation — snapScroll lands it
+/// synchronously and clamps to the fresh max.
+fn onImagesChanged(delta_above: f32) callconv(.c) void {
+    updateDocumentMetrics();
+    if (delta_above != 0.0) {
+        snapScroll(g_app.scroll_y + delta_above);
+    }
+}
+
+// 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
+// previous 2048 x 128-line coverage exactly (~98 KB static, zero heap).
+const MAX_CHECKPOINTS = 8192;
 var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
 var g_checkpoint_count: usize = 0;
+
+// Per-line exact layout cache: warmed by updateDocumentMetrics, hit by every
+// onDraw. Geometry/parse-input changes auto-invalidate; document reloads
+// re-key by content hash (stale entries simply miss and re-measure).
+var g_line_cache: layout.LineLayoutCache = .{};
 
 // Tiny hand-rolled atof: ship builds must not link std.fmt.parseFloat,
 // whose float tables cost kilobytes of __TEXT. Handles optional sign,
@@ -150,20 +172,38 @@ var g_sweep_step: f32 = 0.0;
 // Two-phase drag-back residue test state (read-test binary only): selection A
 // then shrink to B, painted incrementally on one bitmap. See --select-drag.
 var g_drag_active: bool = false;
+// First-paint gate for deferred image decodes (see platform_arm_images):
+// image records park until the first frame is committed, then decode.
+// Headless one-shot screenshots never arm (deterministic placeholders).
+var g_first_paint_done: bool = false;
+var g_headless_oneshot: bool = false;
 var g_drag_vals: [8]f32 = [_]f32{0.0} ** 8;
 
 fn onScrollTo(scroll_y: f32) callconv(.c) void {
     // Scrollbar drag target from the platform layer. Already clamped there
     // against the synced max, but clamp again: metrics may have moved.
-    g_app.scroll_y = std.math.clamp(scroll_y, 0.0, g_app.max_scroll_y);
+    // Syncs the easing state too so the next tick cannot yank back.
+    snapScroll(scroll_y);
 }
 
-fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void {
+fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void {
     const now_ms = getTimestampMs();
     const locked = g_scroll_lock.processScroll(delta_x, delta_y, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
-        retargetScroll(g_smooth.target - locked.dy);
+        // Routing (precise 1:1 vs eased wheel) lives in
+        // SmoothScroll.applyScrollDelta, pinned by strict tests; the full
+        // rationale is documented there. Sync the displayed offset, then arm
+        // the tick while unsettled (snaps settle synchronously, no timer).
+        g_smooth = layout.SmoothScroll.applyScrollDelta(
+            g_smooth.target,
+            g_smooth.current,
+            locked.dy,
+            precise != 0,
+            g_app.max_scroll_y,
+        );
+        g_app.scroll_y = g_smooth.current;
+        if (!g_smooth.settled()) bridge.platform_smooth_kick();
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);
@@ -175,13 +215,18 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) vo
     }
 }
 
-/// Display-link tick (dt in ms): ease the displayed offset toward the
-/// target. Returns 1 while more frames are needed, 0 when settled (the
-/// platform parks its timer on 0, so a static screen costs zero wakeups).
+/// Display tick (dt in ms) at the hosting screen's frame rate: ease the
+/// displayed offset toward the target. Returns 1 while more frames are
+/// needed, 0 when settled (the platform parks its timer on 0, so a static
+/// screen costs zero wakeups).
 fn onTick(dt_ms: f32) callconv(.c) c_int {
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
     g_app.scroll_y = g_smooth.current;
+    // Tick-fresh platform offset: the timer's scroll-copy measures this
+    // tick's movement against the last drawn offset (kept whole-point by
+    // SmoothScroll so the copy stays exact).
+    bridge.platform_sync_scroll(g_app.scroll_y);
     return if (settled) 0 else 1;
 }
 
@@ -194,6 +239,7 @@ fn updateDocumentMetrics() void {
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
+        .line_cache = &g_line_cache,
     };
     const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
@@ -328,6 +374,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
+        .line_cache = &g_line_cache,
     };
 
     var t_layout_ns: u64 = 0;
@@ -543,6 +590,14 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         bridge.platform_end_clip();
     }
 
+    // First frame committed: image decodes may start now, off the startup
+    // critical path. Headless one-shots skip this (placeholders are the
+    // deterministic expected output there); settle runs arm explicitly.
+    if (!g_first_paint_done) {
+        g_first_paint_done = true;
+        if (!g_headless_oneshot) bridge.platform_arm_images();
+    }
+
     // Scroll-sweep profiler row (read-test binary only): per-offset phase
     // timings plus workload counters. Compiled out of ship builds.
     if (build_options.test_hooks and g_sweep_active) {
@@ -607,6 +662,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     g_app.scroll_y = parseF32(sc_str);
                     g_smooth.snapTo(g_app.scroll_y, std.math.inf(f32));
                 }
+            } else if (std.mem.eql(u8, arg, "--scroll-x-end")) {
+                // Screenshot affordance (mirrors --scroll): park every
+                // horizontal block at its end so end-state shadows (left
+                // edge) can be captured. Layout clamps each to its max.
+                for (&g_app.block_scroll_x) |*s| s.* = std.math.inf(f32);
             } else {
             // Document paths land in file_path from any position; hook
             // flags (and their consumed values, taken above) never do, so
@@ -710,6 +770,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
+    // The mapping just swapped: drop borrowed platform text/code aliases
+    // before any draw rebuilds them (cold path only, zero hot-path cost).
+    bridge.platform_invalidate_text_records();
 
     // Index lines with SIMD scanner
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
@@ -730,6 +793,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Let async image decodes finish, then relayout with real sizes.
         // TEST_HOOKS only; ship screenshots render immediately.
         if (build_options.test_hooks and settle_images_ms > 0) {
+            // Settle runs want images: arm the parked decodes first, then
+            // wait for them to drain as before.
+            bridge.platform_arm_images();
             const t0 = getTimestampMs();
             const req = std.posix.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
             while (bridge.platform_images_pending() > 0 and
@@ -749,6 +815,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // of A-then-B on one bitmap, compared by the caller against a fresh
         // full render of B. Any byte difference is leftover highlight.
         if (build_options.test_hooks and g_drag_active) {
+            // Multi-phase determinism: like plain one-shots, the drag
+            // residue test compares incremental vs fresh renders pixel-wise,
+            // so decodes must not land mid-test. Placeholders throughout.
+            g_headless_oneshot = true;
             const v = g_drag_vals;
             const r = bridge.platform_render_select_drag_png(sc_path, 1200, 900, onDraw,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
@@ -781,6 +851,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             std.c.exit(0);
         }
+        // Plain one-shot: placeholders are the expected output (decodes
+        // never win the race today either); suppress the first-paint arm
+        // so no decode CPU lands in the startup window at all.
+        g_headless_oneshot = true;
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});
@@ -807,6 +881,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_link = onLink,
         .on_tick = onTick,
         .on_scroll_to = onScrollTo,
+        .on_images_changed = onImagesChanged,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);

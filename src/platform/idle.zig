@@ -184,3 +184,27 @@ test "idle: platform run loop is strictly event-driven (source audit)" {
         try std.testing.expect(std.mem.indexOf(u8, src, token) != null);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test: smoothing cadence follows the hosting screen (source audit).
+// The easing timer must derive its interval from the current screen's frame
+// rate and re-cadence on screen/backing changes — never a fixed constant —
+// while staying strictly on-demand (created on kick, parked on settle).
+// ---------------------------------------------------------------------------
+
+test "idle: smoothing cadence follows hosting screen (source audit)" {
+    var mapped = try mmap.MappedFile.open("src/platform/macos.m");
+    defer mapped.close();
+    const src = mapped.bytes;
+
+    const required = [_][]const u8{
+        "maximumFramesPerSecond",
+        "windowDidChangeScreen",
+        "smooth_interval_for_screen",
+        "smooth_rearm_for_screen",
+        "CFRunLoopTimerSetTolerance",
+    };
+    for (required) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, src, token) != null);
+    }
+}

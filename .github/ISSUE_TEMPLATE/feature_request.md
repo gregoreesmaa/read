@@ -19,5 +19,5 @@ Markdown features need discussion BEFORE implementation. -->
 ## Benchmark impact
 
 <!-- Which strict targets (scan GB/s, 450 µs/50k, 20 µs mmap, 12 µs viewport,
-12 µs deep-scroll, 0 allocations, 8-byte Line, < 500 KB) could move, and why
+11 µs deep-scroll, 0 allocations, 8-byte Line, < 180 KiB) could move, and why
 they will still pass. -->

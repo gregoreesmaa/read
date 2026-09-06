@@ -378,6 +378,50 @@ test "controls: smooth scroll clamps target and snaps scrollbar drags" {
     try std.testing.expectEqual(@as(f32, 250.0), s.target);
 }
 
+test "controls: smooth scroll steps on whole points and settles exactly" {
+    // Mid-flight positions must be whole points: the platform scroll-copies
+    // backing store by whole points, so fractional offsets would shimmer.
+    var s = layout.SmoothScroll{};
+    s.setTarget(40.0, 1000.0);
+    var frames: usize = 0;
+    while (!s.settled() and frames < 240) : (frames += 1) {
+        _ = s.tick(1.0 / 120.0);
+        if (!s.settled()) {
+            try std.testing.expectEqual(@round(s.current), s.current);
+        }
+    }
+    try std.testing.expect(s.settled());
+    try std.testing.expectEqual(@as(f32, 40.0), s.current);
+
+    // Fractional targets (momentum deltas accumulate there) still settle
+    // exactly via the final snap and never stall on a rounded zero-step.
+    var f = layout.SmoothScroll{};
+    f.setTarget(40.3, 1000.0);
+    frames = 0;
+    while (!f.settled() and frames < 240) : (frames += 1) {
+        _ = f.tick(1.0 / 120.0);
+    }
+    try std.testing.expect(f.settled());
+    try std.testing.expectEqual(@as(f32, 40.3), f.current);
+}
+
+test "controls: smooth scroll whole-point steps hold at 60Hz cadence" {
+    // The platform now ticks at the hosting screen's rate (60Hz panels stop
+    // paying 120 wakeups/s): mid-flight positions must be whole points at
+    // 60Hz too, with exact settle and no stall.
+    var s = layout.SmoothScroll{};
+    s.setTarget(40.0, 1000.0);
+    var frames: usize = 0;
+    while (!s.settled() and frames < 240) : (frames += 1) {
+        _ = s.tick(1.0 / 60.0);
+        if (!s.settled()) {
+            try std.testing.expectEqual(@round(s.current), s.current);
+        }
+    }
+    try std.testing.expect(s.settled());
+    try std.testing.expectEqual(@as(f32, 40.0), s.current);
+}
+
 test "controls: smooth scroll converges across frame rates" {
     var slow = layout.SmoothScroll{};
     slow.setTarget(480.0, 4000.0);
@@ -444,4 +488,173 @@ test "controls: draggable scrollbar drag maps pointer y back to scroll offset" {
 
     // Nothing to scroll -> drag is a no-op.
     try std.testing.expectEqual(@as(f32, 0.0), layout.scrollbarScrollFromY(300.0, 0.0, 0.0, view_h));
+}
+
+// Image size stubs: async load pending (0,0 -> 240px fallback box) vs a
+// resolved 400x400 animated GIF (e.g. assets/images/sample_animated.gif).
+fn gifSizeLoading(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void {
+    _ = url;
+    _ = url_len;
+    out_w.* = 0.0;
+    out_h.* = 0.0;
+}
+
+fn gifSizeLoaded(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void {
+    _ = url;
+    _ = url_len;
+    out_w.* = 400.0;
+    out_h.* = 400.0;
+}
+
+fn trailingY(doc: []const u8, size_fn: *const fn ([*]const u8, c_int, *f32, *f32) callconv(.c) void) !f32 {
+    var lines_buf: [32]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(doc, &lines_buf, &in_fence);
+    var commands_buf: [256]layout.DrawCommand = undefined;
+    const count = layout.layoutViewport(
+        doc,
+        lines_buf[0..n],
+        .{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = 0.0,
+            .image_size_fn = size_fn,
+        },
+        &commands_buf,
+    );
+    for (commands_buf[0..count]) |cmd| {
+        if (cmd.kind == .text_run and std.mem.indexOf(u8, cmd.text, "Trailing") != null) {
+            return cmd.rect.y;
+        }
+    }
+    return error.TrailingNotFound;
+}
+
+test "controls: async gif arrival shifts content below under fixed scroll" {
+    // Reproduces the live jump: while the GIF decodes, layout reserves the
+    // 240px fallback; when natural size (400x400) lands, everything below
+    // moves down under a stationary scroll offset.
+    const doc =
+        \\# Title
+        \\![Earth](assets/images/sample_animated.gif)
+        \\Trailing below the image.
+    ;
+    const y_loading = try trailingY(doc, gifSizeLoading);
+    const y_loaded = try trailingY(doc, gifSizeLoaded);
+    try std.testing.expectEqual(@as(f32, 160.0), y_loaded - y_loading);
+}
+
+test "controls: image arrival anchors scroll by above-viewport deltas" {
+    // Fix for the live jump: when async natural sizes land, the scroll
+    // offset must absorb the height deltas of images fully above the
+    // viewport top so on-screen content stays pixel-locked.
+    const boxes = [_]layout.ImageBox{
+        .{ .doc_y = 100.0, .h = 240.0 }, // fully above: 240 -> 400
+        .{ .doc_y = 400.0, .h = 240.0 }, // straddles top: contributes nothing
+        .{ .doc_y = 900.0, .h = 240.0 }, // below: contributes nothing
+    };
+    const new_h = [_]f32{ 400.0, 400.0, 400.0 };
+    try std.testing.expectEqual(@as(f32, 160.0), layout.imageArrivalShift(500.0, &boxes, &new_h));
+
+    // Stacked arrivals compose: each box is tested against the running shift.
+    const stacked = [_]layout.ImageBox{
+        .{ .doc_y = 100.0, .h = 240.0 },
+        .{ .doc_y = 300.0, .h = 240.0 }, // 300+160+240 = 700 <= 700: above
+    };
+    const stacked_h = [_]f32{ 400.0, 300.0 };
+    try std.testing.expectEqual(@as(f32, 220.0), layout.imageArrivalShift(700.0, &stacked, &stacked_h));
+
+    // Still loading (new == old) contributes nothing.
+    const pending_h = [_]f32{240.0};
+    try std.testing.expectEqual(@as(f32, 0.0), layout.imageArrivalShift(500.0, boxes[0..1], &pending_h));
+}
+
+fn layoutAt(doc: []const u8, scroll: f32, size_fn: *const fn ([*]const u8, c_int, *f32, *f32) callconv(.c) void, out: []layout.DrawCommand) usize {
+    var lines_buf: [32]simd.Line = undefined;
+    var in_fence = false;
+    const n = simd.scanLines(doc, &lines_buf, &in_fence);
+    return layout.layoutViewport(
+        doc,
+        lines_buf[0..n],
+        .{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = scroll,
+            .image_size_fn = size_fn,
+        },
+        out,
+    );
+}
+
+test "controls: anchored arrival keeps below-content pixel-locked" {
+    // End-to-end: the shift computed from laid-out boxes exactly cancels
+    // the content movement measured across the loading->loaded transition,
+    // so the live handler (shift + snap) leaves the viewport stable.
+    const doc =
+        \\# Title
+        \\![Earth](assets/images/sample_animated.gif)
+        \\Filler one for document height.
+        \\Filler two for document height.
+        \\Filler three for document height.
+        \\Filler four for document height.
+        \\Filler five for document height.
+        \\Filler six for document height.
+        \\Filler seven for document height.
+        \\Filler eight for document height.
+        \\Filler nine for document height.
+        \\Filler ten for document height.
+        \\Trailing below the image.
+    ;
+    // Image box in document coords (scroll 0: view == document).
+    var cmds0: [256]layout.DrawCommand = undefined;
+    const n0 = layoutAt(doc, 0.0, gifSizeLoading, &cmds0);
+    var img_y: f32 = -1.0;
+    var img_h: f32 = -1.0;
+    for (cmds0[0..n0]) |cmd| {
+        if (cmd.kind == .image) {
+            img_y = cmd.rect.y;
+            img_h = cmd.rect.h;
+        }
+    }
+    try std.testing.expect(img_y >= 0.0);
+
+    const scroll: f32 = 600.0;
+    try std.testing.expect(img_y + img_h <= scroll); // image fully above
+    var cmds_before: [256]layout.DrawCommand = undefined;
+    const n_before = layoutAt(doc, scroll, gifSizeLoading, &cmds_before);
+    var view_before: f32 = -1.0;
+    for (cmds_before[0..n_before]) |cmd| {
+        if (cmd.kind == .text_run and std.mem.indexOf(u8, cmd.text, "Trailing") != null) {
+            view_before = cmd.rect.y;
+        }
+    }
+    try std.testing.expect(view_before >= 0.0);
+
+    var cmds_loaded: [256]layout.DrawCommand = undefined;
+    const n_loaded = layoutAt(doc, 0.0, gifSizeLoaded, &cmds_loaded);
+    var new_h: f32 = -1.0;
+    for (cmds_loaded[0..n_loaded]) |cmd| {
+        if (cmd.kind == .image) new_h = cmd.rect.h;
+    }
+    try std.testing.expect(new_h > 0.0);
+
+    const boxes = [_]layout.ImageBox{.{ .doc_y = img_y, .h = img_h }};
+    const heights = [_]f32{new_h};
+    const shift = layout.imageArrivalShift(scroll, &boxes, &heights);
+    try std.testing.expect(shift > 0.0);
+
+    var cmds_after: [256]layout.DrawCommand = undefined;
+    const n_after = layoutAt(doc, scroll + shift, gifSizeLoaded, &cmds_after);
+    var view_after: f32 = -1.0;
+    for (cmds_after[0..n_after]) |cmd| {
+        if (cmd.kind == .text_run and std.mem.indexOf(u8, cmd.text, "Trailing") != null) {
+            view_after = cmd.rect.y;
+        }
+    }
+    try std.testing.expect(view_after >= 0.0);
+    // Exact f32 equality is too strict: shifting document math by +160 then
+    // re-subtracting the scroll rounds 1 ulp differently (~6e-5px at these
+    // magnitudes). 0.01px tolerance is 1/100th of a pixel — invisible —
+    // while a real anchoring miss would read ~160px.
+    try std.testing.expect(@abs(view_before - view_after) < 0.01);
 }

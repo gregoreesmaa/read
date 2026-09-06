@@ -7,6 +7,10 @@ static NSWindow* g_window = nil;
 static NSView*   g_main_view = nil;   // set in platform_init for async image → setNeedsDisplay
 static CGContextRef g_current_cg_context = NULL;
 static float g_scroll_y = 0.0f;
+// Platform scroll offset at the last completed drawRect. The smoothing
+// timer measures each tick's movement against this to scroll-copy backing
+// store instead of full-invalidating.
+static float g_last_drawn_scroll = 0.0f;
 static NSPoint g_mouse_pos = {-9999.0f, -9999.0f};
 
 // Ambient scrollbar drag model (mirrors scrollbarThumbY/scrollbarScrollFromY
@@ -23,6 +27,9 @@ static float g_scrollbar_grab_delta = 0.0f;
 static float scrollbar_thumb_y(void);
 static BOOL scrollbar_hit(NSPoint view_pt, float view_w);
 static void scrollbar_drag_to(float y);
+// Smoothing-cadence re-arm, defined with the timer below but triggered by
+// the window delegate above. Re-arms only a live timer; parked stays parked.
+static void smooth_rearm_for_screen(void);
 
 // Idle policy (mirrors src/platform/idle.zig): mouse motion alone never
 // redraws. Only a hover-state transition re-arms a draw. The last hover
@@ -47,7 +54,17 @@ typedef struct {
     int is_italic;
     int is_mono;
     int is_heading;
-    char text[512];
+    // BORROWED text, not owned: points into the Zig command slice (mmap
+    // document bytes or frame-lived BSS scratch in main.zig). No inline
+    // copy: the old text[512] dominated BSS and duplicated mmap bytes.
+    // Lifetime: records rebuild on every draw (drawRect resets the count
+    // first, single-threaded, so no consumer can observe a stale entry
+    // mid-rebuild); the document mapping lives for the whole process and
+    // the frame scratch outlives the frame it was filled in. Cleared on
+    // document load via platform_invalidate_text_records. len keeps the
+    // old 511-byte truncation so every index compare sees byte-identical
+    // prefixes; consumers must use explicit lengths (never NUL).
+    const char* text_ptr;
     int len;
     char link_url[256];
     int line_index;
@@ -58,14 +75,21 @@ typedef struct {
     int has_clip;
 } QuadTextRecord;
 
-#define MAX_QUAD_RECORDS 16384
+// Capped at the real emit ceiling: one text_run command yields exactly one
+// record and the command buffer holds MAX_COMMANDS 2048 (src/main.zig).
+// Was 16384 x ~832 B ~= 13.6 MiB BSS; now 2048 x ~80 B ~= 160 KiB.
+#define MAX_QUAD_RECORDS 2048
 static QuadTextRecord g_text_records[MAX_QUAD_RECORDS];
 static int g_text_record_count = 0;
 
 #define MAX_CODE_BLOCKS 64
 typedef struct {
     float x, y, w, h;
-    char text[8192];
+    // BORROWED code bytes (same lifetime story as QuadTextRecord.text_ptr).
+    // The only consumer needing bytes is the copy-button clipboard path,
+    // which reads them with an explicit length between draws. len keeps
+    // the old 8191-byte truncation.
+    const char* text_ptr;
     int len;
 } CodeBlockRecord;
 
@@ -244,6 +268,13 @@ static void register_app_fonts(void) {
     if (registered) return;
     registered = YES;
 
+    // Fast path (2026-09: parsing the 5 bundled TTFs costs ~20 ms on the
+    // first-paint critical path): if the families already resolve — user
+    // installed fonts, managed lab image — skip file registration entirely.
+    // One sentinel probe per process; a miss falls through to the file
+    // loop below exactly as before.
+    if ([NSFont fontWithName:@"IBMPlexSerif-Regular" size:12.0]) return;
+
     NSArray* paths = @[
         @"assets/fonts/IBMPlexSerif-Regular.ttf",
         @"assets/fonts/IBMPlexSerif-Bold.ttf",
@@ -327,13 +358,23 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
 // once ~500 runs were resident, evicting shaped lines mid-scroll and forcing
 // re-shape + re-raster churn on every frame (2026-09 scroll-storm hunt).
 #define SHAPE_CACHE_CAP 4096
-// 4096px = 16 MiB coverage cache, malloc-once on the cold path (BSS/file
-// size unaffected). A 2048px atlas thrashed on ordinary files at 2x
-// (flush + full re-raster storm every ~60 scroll frames, 2026-09 blackout
-// hunt); the live working set fits comfortably here.
-#define ATLAS_PX 4096
+// Two-tier coverage cache, malloc-once per tier on the cold path (BSS/file
+// size unaffected). The 2048px primary tier (4 MiB) holds the steady-state
+// working set; the 4096px tier (16 MiB) is entered only when RASTER_SCALE==2
+// AND the flush counter proves thrash (2026-09: a bare 2048px atlas flushed
+// + re-rastered every ~60 scroll frames at 2x). Growth is one-way: once the
+// working set proves it needs 4096px, shrinking back would just re-thrash.
+// A single run wider than the base tier also promotes (measured: the
+// direct-draw fallback renders visibly different pixels than the atlas
+// path, so oversize runs must take the 4096px path to stay identical).
+#define ATLAS_PX_BASE 2048
+#define ATLAS_PX_LARGE 4096
 #define RASTER_SCALE 2
-
+// Thrash proof: this many flushes inside the trailing draw window promotes
+// the atlas to the large tier. Conservative on purpose: one stray overflow
+// (a single giant run) must not cost 12 MiB forever.
+#define ATLAS_THRASH_FLUSHES 3
+#define ATLAS_THRASH_WINDOW_DRAWS 180
 typedef struct {
     uint64_t key;      // FNV-1a(text bytes, style, font size bits)
     int len;           // byte length (exact-match guard)
@@ -347,7 +388,10 @@ typedef struct {
 } ShapedEntry;
 
 static ShapedEntry g_shape_cache[SHAPE_CACHE_CAP]; // BSS: no binary cost
-static unsigned char* g_atlas_px = NULL;  // one 16 MiB buffer, malloc-once
+static unsigned char* g_atlas_px = NULL;  // one buffer per tier, malloc-once
+static int g_atlas_dim = ATLAS_PX_BASE;   // live tier dimension (px)
+static unsigned long g_atlas_window_draw = 0; // draw seq at thrash-window start
+static int g_atlas_window_flushes = 0;        // flushes inside the window
 static CGContextRef g_atlas_ctx = NULL;
 // Single persistent atlas image: provider-backed LIVE view of g_atlas_px,
 // created once — never copied, never rebuilt (verified live via probe:
@@ -386,13 +430,14 @@ static uint64_t shape_key(const char* text, int len, float font_size,
 
 // Shelf-pack `pw x ph` device px into the atlas. Returns 1 on success.
 static int atlas_alloc(int pw, int ph, short* out_x, short* out_y) {
-    if (pw <= 0 || ph <= 0 || pw > ATLAS_PX || ph > ATLAS_PX) return 0;
-    if (g_atlas_x + pw > ATLAS_PX) {
+    int dim = g_atlas_dim;
+    if (pw <= 0 || ph <= 0 || pw > dim || ph > dim) return 0;
+    if (g_atlas_x + pw > dim) {
         g_atlas_y += g_atlas_shelf_h;
         g_atlas_x = 0;
         g_atlas_shelf_h = 0;
     }
-    if (g_atlas_y + ph > ATLAS_PX) return 0;
+    if (g_atlas_y + ph > dim) return 0;
     *out_x = (short)g_atlas_x;
     *out_y = (short)g_atlas_y;
     g_atlas_x += pw;
@@ -410,25 +455,52 @@ static void shape_drop_raster(ShapedEntry* e) {
     e->ah = 0;
 }
 
-// Generational flush: wipe pixels, reset cursor, keep shaped lines cached
-// (they re-rasterize lazily via the aw==0 sentinel).
+static void atlas_grow(void); // defined after atlas_ensure (needs teardown)
+
+// Flush-time clear with base-identical semantics: the whole live tier is
+// zeroed, so every reused row reads exactly what a fresh calloc would give.
+// A MADV_DONTNEED-reclaim + zero-on-alloc variant was measured pixel-diver-
+// gent vs the 4096px renderer (fringe pixels on rare 2x runs), so the flush
+// keeps the explicit wipe; at 4 MiB it dirties a quarter of what the old
+// 16 MiB wipe did, flushes stay rare, and the steady-state win (4 MiB
+// resident vs 16 MiB) is untouched.
+static void atlas_reclaim(void) {
+    size_t n = (size_t)g_atlas_dim * (size_t)g_atlas_dim;
+    if (!g_atlas_px) return;
+    memset(g_atlas_px, 0, n);
+}
+
+// Generational flush: reclaim pixels, reset cursor, keep shaped lines cached
+// (they re-rasterize lazily via the aw==0 sentinel). Promotes to the large
+// tier when the flush counter proves thrash at 2x.
 static void atlas_flush(void) {
-    if (g_atlas_px) memset(g_atlas_px, 0, (size_t)ATLAS_PX * ATLAS_PX);
+    atlas_reclaim();
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
     for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
     g_atlas_flushes++;
+    // Thrash window: roll the window when it ages out, then count.
+    if (g_draw_seq - g_atlas_window_draw > ATLAS_THRASH_WINDOW_DRAWS) {
+        g_atlas_window_draw = g_draw_seq;
+        g_atlas_window_flushes = 0;
+    }
+    g_atlas_window_flushes++;
+    if (g_atlas_dim == ATLAS_PX_BASE && RASTER_SCALE == 2 &&
+        g_atlas_window_flushes >= ATLAS_THRASH_FLUSHES)
+        atlas_grow();
 #ifdef TEST_HOOKS
-    DBGLOG("EV atlas_flush t=%llu n=%llu", dbg_t_ms(), (unsigned long long)g_atlas_flushes);
+    DBGLOG("EV atlas_flush t=%llu n=%llu dim=%d", dbg_t_ms(),
+        (unsigned long long)g_atlas_flushes, g_atlas_dim);
 #endif
 }
 
 static void atlas_ensure(void) {
     if (g_atlas_ctx) return;
-    g_atlas_px = (unsigned char*)calloc((size_t)ATLAS_PX * ATLAS_PX, 1);
+    g_atlas_px = (unsigned char*)calloc((size_t)g_atlas_dim * (size_t)g_atlas_dim, 1);
     if (!g_atlas_px) return;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-    g_atlas_ctx = CGBitmapContextCreate(g_atlas_px, ATLAS_PX, ATLAS_PX, 8,
-                                        ATLAS_PX, cs,
+    size_t dim = (size_t)g_atlas_dim;
+    g_atlas_ctx = CGBitmapContextCreate(g_atlas_px, dim, dim, 8,
+                                        dim, cs,
                                         (CGBitmapInfo)kCGImageAlphaNone);
     // Crisp masks: the coverage edges baked here are the sharpest the blit
     // path can ever show, so rasterize with full hinted smoothing on.
@@ -438,18 +510,38 @@ static void atlas_ensure(void) {
     CGContextSetShouldSmoothFonts(g_atlas_ctx, true);
     CGContextSetAllowsFontSmoothing(g_atlas_ctx, true);
     // Y-down so drawing uses the same orientation as the flipped view.
-    CGContextTranslateCTM(g_atlas_ctx, 0, ATLAS_PX);
+    CGContextTranslateCTM(g_atlas_ctx, 0, (CGFloat)dim);
     CGContextScaleCTM(g_atlas_ctx, 1.0f, -1.0f);
     // Persistent live image over the same pixels: zero copies, ever.
     CGDataProviderRef prov = CGDataProviderCreateWithData(
-        NULL, g_atlas_px, (size_t)ATLAS_PX * ATLAS_PX, NULL);
+        NULL, g_atlas_px, dim * dim, NULL);
     if (prov) {
-        g_atlas_img = CGImageCreate(ATLAS_PX, ATLAS_PX, 8, 8, ATLAS_PX, cs,
+        g_atlas_img = CGImageCreate(dim, dim, 8, 8, dim, cs,
                                     (CGBitmapInfo)kCGImageAlphaNone, prov, NULL, false,
                                     kCGRenderingIntentDefault);
         CGDataProviderRelease(prov);
     }
     CGColorSpaceRelease(cs);
+}
+
+// One-way promotion to the large tier: tear down the base buffer, context,
+// and image, then re-create at 4096px. Slices reference the old image, so
+// every entry's raster state is dropped first (shaped lines survive and
+// re-rasterize lazily). Cold path only: zero hot-path allocations.
+static void atlas_grow(void) {
+    if (g_atlas_dim >= ATLAS_PX_LARGE) return;
+    for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
+    if (g_atlas_img) { CGImageRelease(g_atlas_img); g_atlas_img = NULL; }
+    if (g_atlas_ctx) { CGContextRelease(g_atlas_ctx); g_atlas_ctx = NULL; }
+    if (g_atlas_px) { free(g_atlas_px); g_atlas_px = NULL; }
+    g_atlas_dim = ATLAS_PX_LARGE;
+    g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
+    g_atlas_window_flushes = 0;
+    g_atlas_window_draw = g_draw_seq;
+    atlas_ensure();
+#ifdef TEST_HOOKS
+    DBGLOG("EV atlas_grow t=%llu dim=%d", dbg_t_ms(), g_atlas_dim);
+#endif
 }
 
 static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str);
@@ -536,8 +628,19 @@ static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str)
     if (pw <= 0 || ph <= 0) return;
     short ax = 0, ay = 0;
     if (!atlas_alloc(pw, ph, &ax, &ay)) {
-        atlas_flush();
-        if (!atlas_alloc(pw, ph, &ax, &ay)) return; // larger than atlas: caller draws direct
+        // Oversize for the tier (not fragmentation): a run wider than the
+        // 2048px tier rasterized fine at 4096px, and the direct-draw fallback
+        // renders visibly different pixels — so promote one tier and retry
+        // (cold path, one-way). Runs beyond even 4096px still draw direct,
+        // exactly as before.
+        if (g_atlas_dim == ATLAS_PX_BASE && RASTER_SCALE == 2 &&
+            (pw > g_atlas_dim || ph > g_atlas_dim)) {
+            atlas_grow();
+            if (!atlas_alloc(pw, ph, &ax, &ay)) return;
+        } else {
+            atlas_flush();
+            if (!atlas_alloc(pw, ph, &ax, &ay)) return; // larger than atlas: caller draws direct
+        }
     }
 
     // White coverage mask, 2x supersampled for Retina-crisp blits.
@@ -598,7 +701,7 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     if (x_offset >= rec->w) return rec->len;
 
     // Shaping-economy fast path: hit-test on the cached run, no new CTLine.
-    CTLineRef cached = shape_cached_line(rec->text, rec->len, rec->font_size,
+    CTLineRef cached = shape_cached_line(rec->text_ptr, rec->len, rec->font_size,
                                          rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
     if (cached) {
         CFIndex idx = CTLineGetStringIndexForPosition(cached, CGPointMake(x_offset, 0));
@@ -612,7 +715,7 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
         return (int)idx;
     }
 
-    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:rec->len encoding:NSUTF8StringEncoding freeWhenDone:NO];
+    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text_ptr length:rec->len encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (int)roundf((x_offset / rec->w) * rec->len);
 
     NSFont* nsFont = get_font_for_style(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
@@ -634,14 +737,14 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     if (char_idx >= rec->len) return rec->w;
 
     // Shaping-economy fast path: measure the prefix on the cached run.
-    CTLineRef cached = shape_cached_line(rec->text, rec->len, rec->font_size,
+    CTLineRef cached = shape_cached_line(rec->text_ptr, rec->len, rec->font_size,
                                          rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
     if (cached) {
         CGFloat off = CTLineGetOffsetForStringIndex(cached, char_idx, NULL);
         return (float)off;
     }
 
-    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text length:char_idx encoding:NSUTF8StringEncoding freeWhenDone:NO];
+    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)rec->text_ptr length:char_idx encoding:NSUTF8StringEncoding freeWhenDone:NO];
     if (!str) return (float)char_idx / rec->len * rec->w;
 
     NSFont* nsFont = get_font_for_style(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
@@ -787,7 +890,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (r_bot < min_y - 4.0f || r_top > max_y + 4.0f) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+                    DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.*s", q, rec->doc_y, rec->h, min_y, max_y, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                 continue;
             }
@@ -806,7 +909,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (!in_min_row && !in_max_row && (min_y > r_bot || max_y < r_top)) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+                    DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.*s", q, rec->doc_y, rec->h, min_y, max_y, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                 continue;
             }
@@ -851,7 +954,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->x + rec->w < left_x || rec->x > right_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
-                        DBGLOG("EV hlskip xrow q=%d x=%.1f w=%.1f l=%.1f r=%.1f txt=%.12s", q, rec->x, rec->w, left_x, right_x, rec->text);
+                        DBGLOG("EV hlskip xrow q=%d x=%.1f w=%.1f l=%.1f r=%.1f txt=%.*s", q, rec->x, rec->w, left_x, right_x, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                     continue;
                 }
@@ -862,7 +965,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->x + rec->w < start_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
-                        DBGLOG("EV hlskip xfirst q=%d x=%.1f w=%.1f s=%.1f txt=%.12s", q, rec->x, rec->w, start_x, rec->text);
+                        DBGLOG("EV hlskip xfirst q=%d x=%.1f w=%.1f s=%.1f txt=%.*s", q, rec->x, rec->w, start_x, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                     continue;
                 }
@@ -873,7 +976,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (rec->x > end_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
-                        DBGLOG("EV hlskip xlast q=%d x=%.1f w=%.1f e=%.1f txt=%.12s", q, rec->x, rec->w, end_x, rec->text);
+                        DBGLOG("EV hlskip xlast q=%d x=%.1f w=%.1f e=%.1f txt=%.*s", q, rec->x, rec->w, end_x, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                     continue;
                 }
@@ -887,7 +990,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (c_end <= c_start) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f miny=%.2f maxy=%.2f sx=%.2f sy=%.2f ex=%.2f ey=%.2f txt=%.12s", q, c_start, c_end, rec->len, rec->x, rec->w, min_y, max_y, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, rec->text);
+                    DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f miny=%.2f maxy=%.2f sx=%.2f sy=%.2f ex=%.2f ey=%.2f txt=%.*s", q, c_start, c_end, rec->len, rec->x, rec->w, min_y, max_y, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
             }
             if (c_end > c_start) {
@@ -895,7 +998,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 float x2 = rec->x + get_x_for_char_index(rec, c_end);
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
+                    DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.*s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, (rec->len < 12 ? rec->len : 12), rec->text_ptr);
 #endif
                 fill_highlight_clipped(ctx, rec, x1, view_y, x2 - x1, rec->h);
             }
@@ -986,6 +1089,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
 
     g_current_cg_context = NULL;
+    g_last_drawn_scroll = g_scroll_y;
     g_pending_dirty_valid = NO;
 }
 
@@ -1106,7 +1210,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             view_pt.y >= btn.origin.y && view_pt.y <= btn.origin.y + btn.size.height) {
             NSPasteboard* pb = [NSPasteboard generalPasteboard];
             [pb clearContents];
-            NSString* s = [[NSString alloc] initWithBytes:b->text length:b->len encoding:NSUTF8StringEncoding];
+            NSString* s = [[NSString alloc] initWithBytes:b->text_ptr length:b->len encoding:NSUTF8StringEncoding];
             if (s) [pb setString:s forType:NSPasteboardTypeString];
             g_copied_block_idx = b_idx;
             g_copied_timestamp = [NSDate timeIntervalSinceReferenceDate];
@@ -1348,7 +1452,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         float last_doc_y = -9999.0f;
         for (int q = 0; q < g_text_record_count; q++) {
             QuadTextRecord* rec = &g_text_records[q];
-            NSString* s = [[NSString alloc] initWithBytes:rec->text length:rec->len encoding:NSUTF8StringEncoding];
+            NSString* s = [[NSString alloc] initWithBytes:rec->text_ptr length:rec->len encoding:NSUTF8StringEncoding];
             if (s) {
                 if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 10.0f) {
                     if (fabs(rec->doc_y - last_doc_y) > 35.0f) {
@@ -1410,7 +1514,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
 
             if (c_end > c_start && c_start >= 0 && c_end <= rec->len) {
-                NSString* s = [[NSString alloc] initWithBytes:&rec->text[c_start] length:(c_end - c_start) encoding:NSUTF8StringEncoding];
+                NSString* s = [[NSString alloc] initWithBytes:&rec->text_ptr[c_start] length:(c_end - c_start) encoding:NSUTF8StringEncoding];
                 if (s) {
                     if (last_doc_y > -9000.0f && fabs(rec->doc_y - last_doc_y) > 10.0f) {
                         if (fabs(rec->doc_y - last_doc_y) > 35.0f) {
@@ -1436,6 +1540,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 }
 
 - (void)scrollWheel:(NSEvent *)event {
+    CGFloat dx = 0.0, dy = 0.0;
+    int hovered_block_id = -1;
     if (g_callbacks.on_scroll) {
         // Both the finger phase and the kinetic momentum phase are honored
         // (mirrors idle.zig isGestureEnd). Momentum delivers its own event
@@ -1445,7 +1551,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         NSEventPhase momentum = [event momentumPhase];
         if (phase == NSEventPhaseEnded || phase == NSEventPhaseCancelled ||
             momentum == NSEventPhaseEnded || momentum == NSEventPhaseCancelled) {
-            g_callbacks.on_scroll(0.0f, 0.0f, -1);
+            g_callbacks.on_scroll(0.0f, 0.0f, -1, 1);
             // Damage: scroll-lock reset changes no pixels, so no repaint.
 #ifdef TEST_HOOKS
             DBGLOG("EV scroll_end");
@@ -1453,15 +1559,15 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             return;
         }
 
-        CGFloat dx = [event scrollingDeltaX];
-        CGFloat dy = [event scrollingDeltaY];
+        dx = [event scrollingDeltaX];
+        dy = [event scrollingDeltaY];
         if (![event hasPreciseScrollingDeltas]) {
             dx *= 20.0;
             dy *= 20.0;
         }
         NSPoint win_pt = [event locationInWindow];
         NSPoint view_pt = [self convertPoint:win_pt fromView:nil];
-        int hovered_block_id = -1;
+        hovered_block_id = -1;
         for (int i = 0; i < g_scrollable_block_count; i++) {
             ScrollableBlockRecord* b = &g_scrollable_blocks[i];
             if (view_pt.x >= b->x && view_pt.x <= b->x + b->w &&
@@ -1470,13 +1576,32 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 break;
             }
         }
-        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id);
+        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id, (int)[event hasPreciseScrollingDeltas]);
 #ifdef TEST_HOOKS
         DBGLOG("EV scroll t=%llu dx=%.1f dy=%.1f hover=%d phase=%lu mom=%lu", dbg_t_ms(), dx, dy, hovered_block_id,
             (unsigned long)phase, (unsigned long)momentum);
 #endif
     }
-    [self setNeedsDisplay:YES];
+    // Damage: pure vertical motion is repainted by the smoothing timer as a
+    // scroll-copy plus the exposed strip, so no immediate work happens here
+    // (the Zig side kicks the timer exactly when the target moved). A
+    // dx-only pan over a hovered block repaints just that block's box,
+    // mirroring the h/l key path and respecting the Zig-side max_scroll_x
+    // clamp (an over-clamp pan repaints the same card, harmlessly).
+    // Diagonal deltas fall back to full: the axis lock resolves in Zig and
+    // the platform cannot know which axis survived. A dx-only event away
+    // from any block is zeroed by the Zig lock, so it repaints nothing.
+    if (dx != 0.0 && dy == 0.0 && hovered_block_id >= 0) {
+        for (int i = 0; i < g_scrollable_block_count; i++) {
+            ScrollableBlockRecord* b = &g_scrollable_blocks[i];
+            if (b->id == hovered_block_id) {
+                invalidate_rect(NSInsetRect(NSMakeRect(b->x, b->y, b->w, b->h), -2.0f, -2.0f));
+                break;
+            }
+        }
+    } else if (dx != 0.0 && dy != 0.0) {
+        [self setNeedsDisplay:YES];
+    }
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -1512,7 +1637,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         DBGLOG("EV key c=%c scroll=%.0f", (char)c, g_scroll_y);
 #endif
         // Damage: h/l nudge one hovered block -> its exact box only.
-        // j/k/Space scroll and t theme-toggle repaint every pixel -> full.
+        // j/k/Space retarget the smoother, whose timer repaints as a
+        // scroll-copy plus the exposed strip (a press at the clamp edge
+        // moves nothing, so skipping here is exact). t theme-toggle and
+        // anything else repaint every pixel -> full.
         if ((c == 'h' || c == 'l') && hovered_block_id >= 0) {
             for (int i = 0; i < g_scrollable_block_count; i++) {
                 ScrollableBlockRecord* b = &g_scrollable_blocks[i];
@@ -1523,6 +1651,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
         } else if (c == 'h' || c == 'l') {
             // No hovered block: scroll offsets unchanged, no repaint.
+        } else if (c == 'j' || c == 'k' || c == ' ') {
+            // Smoothing timer owns the repaint (see above).
         } else {
             [self setNeedsDisplay:YES];
         }
@@ -1542,7 +1672,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
 @end
 
-@interface ReadAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+// SIZE NOTE: no formal <NSApplicationDelegate>/<NSWindowDelegate> adoption.
+// AppKit delivers delegate callbacks via respondsToSelector:, so the formal
+// conformance only cost ~3.7 KB of protocol metadata. Behaviorally identical;
+// zero new compiler warnings (verified).
+@interface ReadAppDelegate : NSObject
 @end
 
 @implementation ReadAppDelegate
@@ -1588,6 +1722,18 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         (([g_window occlusionState] & NSWindowOcclusionStateVisible) != 0);
     if (vis) [g_main_view setNeedsDisplay:YES];
 #endif
+}
+
+// The hosting screen changed (space move, plug/unplug, promotion shift):
+// re-cadence the smoothing timer to the new panel's frame rate.
+- (void)windowDidChangeScreen:(NSNotification *)notification {
+    (void)notification;
+    smooth_rearm_for_screen();
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification *)notification {
+    (void)notification;
+    smooth_rearm_for_screen();
 }
 
 @end
@@ -1651,14 +1797,107 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
 }
 
 // ---------------------------------------------------------------------------
-// Scroll smoothing driver: a 120Hz runloop timer (CoreFoundation only — no
-// new framework) that eases the displayed offset toward the Zig-side
-// target. The timer exists only while unsettled: platform_smooth_kick
-// creates it, and each fire parks it when on_tick reports settled, so a
-// static screen keeps zero wakeups (0% CPU), same as before.
+// Scroll smoothing driver: a runloop timer (CoreFoundation only — no new
+// framework) at the hosting screen's frame rate that eases the displayed
+// offset toward the Zig-side target. The timer exists only while unsettled:
+// platform_smooth_kick creates it, and each fire parks it when on_tick
+// reports settled, so a static screen keeps zero wakeups (0% CPU).
+// Each fire scroll-copies backing store by the tick's whole-point delta
+// and repaints only the exposed strip (plus the ambient scrollbar thumb's
+// and Copy pill's old/new boxes); anything the copy cannot cover falls
+// back to full.
 // ---------------------------------------------------------------------------
 static CFRunLoopTimerRef g_smooth_timer = NULL;
 static CFAbsoluteTime g_smooth_last = 0;
+
+// Hosting screen's frame rate, 60 when unknown, clamped to 30..240, so a
+// 60Hz panel stops paying 120 wakeups/s while ProMotion keeps its 120.
+static double smooth_interval_for_screen(void) {
+    double fps = 0.0;
+    if (g_window) {
+        NSScreen* screen = [g_window screen];
+        if (screen && [screen respondsToSelector:@selector(maximumFramesPerSecond)])
+            fps = (double)[screen maximumFramesPerSecond];
+    }
+    if (fps <= 0.0) fps = 60.0;
+    if (fps < 30.0) fps = 30.0;
+    if (fps > 240.0) fps = 240.0;
+    return 1.0 / fps;
+}
+
+static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info);
+
+// (Re)create the on-demand easing timer at the current screen's cadence
+// with a small coalescing tolerance (~10% of the interval).
+static void smooth_timer_create(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    g_smooth_last = now;
+    double interval = smooth_interval_for_screen();
+    CFRunLoopTimerContext ctx = {0, NULL, NULL, NULL, NULL};
+    g_smooth_timer = CFRunLoopTimerCreate(NULL, now + interval, interval,
+                                          0, 0, smooth_timer_fire, &ctx);
+    if (g_smooth_timer) {
+        CFRunLoopTimerSetTolerance(g_smooth_timer, interval * 0.1);
+        CFRunLoopAddTimer(CFRunLoopGetMain(), g_smooth_timer, kCFRunLoopCommonModes);
+    }
+}
+
+static void smooth_rearm_for_screen(void) {
+    if (!g_smooth_timer) return; // parked loop stays parked: zero wakeups
+    CFRunLoopTimerInvalidate(g_smooth_timer);
+    CFRelease(g_smooth_timer);
+    g_smooth_timer = NULL;
+    smooth_timer_create();
+}
+
+// Thumb geometry for an arbitrary scroll offset (scrollbar_thumb_y covers
+// the live one; this one covers the last-drawn offset for damage).
+static float thumb_y_for_scroll(float scroll) {
+    if (g_max_scroll_y <= 0.0f) return 0.0f;
+    float p = scroll / g_max_scroll_y;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    return p * (g_view_h - SCROLLBAR_THUMB_H);
+}
+
+// Copy-pill damage for the scroll-copy path, same old/new-box pattern as the
+// thumb below. The pill rides with its block (document-space), so the copy
+// lands it exactly; invalidating its old box (vacated area repaints clean,
+// covering expiry and blocks sliding out) and its new box (idempotent
+// repaint, covering blocks sliding under a stationary cursor) keeps pixels
+// identical with no full-repaint fallback. Unconditional on the 1.5s
+// "Copied!" timer: a stale index only ever over-invalidates two small boxes.
+static void smooth_pill_damage(float dy) {
+    for (int i = 0; i < g_code_block_count; i++) {
+        CodeBlockRecord* b = &g_code_blocks[i];
+        if (i != g_hovered_code_btn && i != g_copied_block_idx &&
+            !(g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
+              g_mouse_pos.y + dy >= b->y && g_mouse_pos.y + dy <= b->y + b->h))
+            continue;
+        NSRect pr = copy_button_damage_rect_for_block(b);
+        invalidate_rect(pr);
+        pr.origin.y -= dy;
+        invalidate_rect(pr);
+    }
+}
+
+// Shift backing store by -dy points and repaint the window-space thumb.
+// scrollRect:by: moves the pixels and auto-invalidates the exposed strip;
+// the two thumb boxes union into that strip's band, never a full view.
+// All document-space content (text, highlight, images, Copy pill) rides the
+// copy exactly; text records are still rebuilt unconditionally in drawRect.
+static void smooth_scroll_copy(NSView* v, float dy) {
+    NSRect bounds = [v bounds];
+    [v scrollRect:bounds by:NSMakeSize(0.0, (CGFloat)-dy)];
+    smooth_pill_damage(dy);
+    if (g_max_scroll_y > 0.0f) {
+        float w = (float)bounds.size.width;
+        float old_t = thumb_y_for_scroll(g_last_drawn_scroll);
+        float new_t = scrollbar_thumb_y();
+        invalidate_rect(NSMakeRect(w - 4.0f, old_t - 1.0f, 5.0f, SCROLLBAR_THUMB_H + 2.0f));
+        invalidate_rect(NSMakeRect(w - 4.0f, new_t - 1.0f, 5.0f, SCROLLBAR_THUMB_H + 2.0f));
+    }
+}
 
 static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
     (void)timer; (void)info;
@@ -1674,18 +1913,26 @@ static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
         CFRelease(g_smooth_timer);
         g_smooth_timer = NULL;
     }
+    // on_tick syncs g_scroll_y, so this is the tick's movement since the
+    // last draw. Settled with no movement: parked above and nothing moved,
+    // so skip setNeedsDisplay entirely.
+    float dy = g_scroll_y - g_last_drawn_scroll;
+    if (dy == 0.0f) return;
     NSView* v = damage_target_view();
-    if (v) [v setNeedsDisplay:YES];
+    if (!v) return;
+    float h = (float)[v bounds].size.height;
+    if (dy == roundf(dy) && fabsf(dy) < h) {
+        smooth_scroll_copy(v, dy);
+    } else {
+        // Fallback: fractional snap landings and full-height jumps repaint
+        // every pixel (the Copy pill rides the copy with old/new invalidation).
+        [v setNeedsDisplay:YES];
+    }
 }
 
 void platform_smooth_kick(void) {
     if (g_smooth_timer || !g_callbacks.on_tick) return; // already easing
-    g_smooth_last = CFAbsoluteTimeGetCurrent();
-    CFRunLoopTimerContext ctx = {0, NULL, NULL, NULL, NULL};
-    g_smooth_timer = CFRunLoopTimerCreate(NULL, g_smooth_last + 1.0 / 120.0, 1.0 / 120.0,
-                                          0, 0, smooth_timer_fire, &ctx);
-    if (g_smooth_timer)
-        CFRunLoopAddTimer(CFRunLoopGetMain(), g_smooth_timer, kCFRunLoopCommonModes);
+    smooth_timer_create();
 }
 
 #ifdef TEST_HOOKS
@@ -1748,11 +1995,7 @@ void platform_set_scroll_info(float scroll_y, float max_scroll_y, float view_h) 
 
 // Thumb top for the current scroll offset; 0 when nothing scrolls.
 static float scrollbar_thumb_y(void) {
-    if (g_max_scroll_y <= 0.0f) return 0.0f;
-    float p = g_scroll_y / g_max_scroll_y;
-    if (p < 0.0f) p = 0.0f;
-    if (p > 1.0f) p = 1.0f;
-    return p * (g_view_h - SCROLLBAR_THUMB_H);
+    return thumb_y_for_scroll(g_scroll_y);
 }
 
 static BOOL scrollbar_hit(NSPoint view_pt, float view_w) {
@@ -1786,15 +2029,25 @@ void platform_register_code_block(float x, float y, float w, float h, const char
     b->y = y;
     b->w = w;
     b->h = h;
-    int copy_len = (code_text && code_len > 0) ? (code_len < 8191 ? code_len : 8191) : 0;
-    if (copy_len > 0) {
-        memcpy(b->text, code_text, copy_len);
-        b->text[copy_len] = '\0';
-        b->len = copy_len;
+    // Alias, not copy: the caller-owned slice (mmap document bytes) lives
+    // for the whole process and records rebuild every draw. Same 8191-byte
+    // truncation the old inline copy applied, so the clipboard path sees
+    // byte-identical prefixes.
+    if (code_text && code_len > 0) {
+        b->text_ptr = code_text;
+        b->len = code_len < 8191 ? code_len : 8191;
     } else {
-        b->text[0] = '\0';
+        b->text_ptr = "";
         b->len = 0;
     }
+}
+
+// Document-load fence: drop every borrowed alias the moment the mapping is
+// swapped, so selection/copy/hit-test between load and the next draw can
+// never read the old buffer. Called from the Zig load path (cold only).
+void platform_invalidate_text_records(void) {
+    g_text_record_count = 0;
+    g_code_block_count = 0;
 }
 
 void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x) {
@@ -1823,8 +2076,8 @@ void platform_end_clip(void) {
 }
 
 // Record quad for mouse text selection & copying (anchored to document Y).
-// noinline: called from 4 sites (register/draw/legacy); one shared copy keeps
-// __TEXT off the next page boundary (binary budget < 180 KiB).
+// noinline: called from 4 sites (register/draw/legacy); one shared alias
+// keeps __TEXT off the next page boundary (binary budget < 180 KiB).
 static __attribute__((noinline)) void record_text_quad(const char* text, int len, float x, float y, float w, float h,
                              float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
                              const char* link_url, int link_url_len) {
@@ -1839,10 +2092,11 @@ static __attribute__((noinline)) void record_text_quad(const char* text, int len
     rec->is_italic = is_italic;
     rec->is_mono = is_mono;
     rec->is_heading = is_heading;
-    int copy_len = len < 511 ? len : 511;
-    memcpy(rec->text, text, copy_len);
-    rec->text[copy_len] = '\0';
-    rec->len = copy_len;
+    // Alias, not copy (see text_ptr contract on the struct). The 511-byte
+    // truncation matches the old inline copy exactly, so hit-test, shaping
+    // fast paths, and clipboard slices see byte-identical prefixes.
+    rec->text_ptr = text ? text : "";
+    rec->len = len < 511 ? len : 511;
 
     int copy_url = (link_url && link_url_len > 0) ? (link_url_len < 255 ? link_url_len : 255) : 0;
     if (copy_url > 0) {
@@ -1991,6 +2245,7 @@ typedef struct {
     float       natural_h;
     BOOL        loading;        // async load in flight
     BOOL        failed;
+    BOOL        kick_pending;   // resolved but decode not yet dispatched (pre-first-paint)
     BOOL        parked;         // animation chain parked: no timer scheduled
     unsigned long last_draw_seq; // g_draw_seq of the pass that last painted this image
     // Last drawn rect in DOCUMENT coordinates for exact GIF-tick damage.
@@ -2218,7 +2473,83 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
     rec->natural_h = (float)pts.height;
 }
 
-// Returns existing or initiates async load; returns NULL if not yet ready
+// Startup economy: image decodes are dispatched only once g_images_armed
+// is set (after first paint, or explicitly for headless settle runs).
+// Before that, records resolve synchronously — fast-fail pixels are
+// identical — but park with kick_pending instead of spawning 9 contending
+// GCD decodes into the first-frame window (profiled 2026-09: +40 ms real,
+// +100 ms user on showcase.md). Call only from the main thread.
+static BOOL g_images_armed = NO;
+
+static void kick_image_load(CachedImageRecord* rec, NSString* resolved);
+
+void platform_arm_images(void) {
+    if (g_images_armed) return;
+    g_images_armed = YES;
+    for (int i = 0; i < g_image_cache_count; i++) {
+        CachedImageRecord* rec = &g_image_cache[i];
+        if (!rec->kick_pending || rec->failed) continue;
+        rec->kick_pending = NO;
+        NSString* pathStr = [[NSString alloc] initWithBytes:rec->url
+                                                     length:strlen(rec->url)
+                                                   encoding:NSUTF8StringEncoding];
+        NSString* resolved = resolve_image_path(pathStr);
+        if (!resolved) { rec->failed = YES; rec->loading = NO; continue; }
+        kick_image_load(rec, resolved);
+    }
+}
+
+static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
+    // Capture for block
+    NSString* resolvedCopy = [resolved copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        load_image_sync(rec, resolvedCopy);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Sizes just went live: recompute metrics and anchor scroll
+            // BEFORE the repaint below, so the draw uses fresh geometry
+            // and content below doesn't jump. Failures keep the fallback
+            // box (no geometry change), so only successes notify, with the
+            // above-viewport height delta: laid-out new height (same
+            // aspect-fit math as laidOutImageHeight in viewport.zig,
+            // pinned by contract tests) minus the last drawn height, when
+            // the drawn box sits fully above the viewport top — else 0.
+            // last_h advances to the new height so a repeat arrival for
+            // the same image reports zero instead of shifting twice (the
+            // next genuine draw re-stamps the rect anyway).
+            float delta_above = 0.0f;
+            if (!rec->failed && rec->frame_count > 0 && rec->has_rect) {
+                __unsafe_unretained NSView* av = damage_target_view();
+                float vw = av ? (float)[av bounds].size.width : 0.0f;
+                float cw = vw > 600.0f ? 600.0f : fmaxf(vw - 64.0f, 100.0f);
+                float new_h = (rec->natural_w > 0.0f && rec->natural_h > 0.0f)
+                    ? rec->natural_h * (fminf(rec->natural_w, cw) / rec->natural_w)
+                    : 240.0f;
+                if (rec->last_doc_y + rec->last_h <= g_scroll_y) {
+                    delta_above = new_h - rec->last_h;
+                }
+                rec->last_h = new_h;
+            }
+            if (g_callbacks.on_images_changed) {
+                g_callbacks.on_images_changed(delta_above);
+            }
+            [g_main_view setNeedsDisplay:YES];
+#ifdef TEST_HOOKS
+            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
+                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
+                rec->natural_w, rec->natural_h);
+#endif
+#ifdef READ_ANIMATED_GIF
+            // Kick off GIF animation if multi-frame
+            if (!rec->failed && rec->frame_count > 1) {
+                gif_schedule_next_frame(rec);
+            }
+#endif
+        });
+    });
+}
+
+// Returns existing or allocates a record; dispatches the async decode only
+// when armed (see above) — otherwise parks it for platform_arm_images.
 static CachedImageRecord* get_or_load_image_record(const char* url, int url_len) {
     if (!url || url_len <= 0 || url_len >= 512) return NULL;
 
@@ -2243,25 +2574,11 @@ static CachedImageRecord* get_or_load_image_record(const char* url, int url_len)
     NSString* resolved = resolve_image_path(pathStr);
     if (!resolved) { rec->failed = YES; rec->loading = NO; return rec; }
 
-    // Capture for block
-    NSString* resolvedCopy = [resolved copy];
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        load_image_sync(rec, resolvedCopy);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [g_main_view setNeedsDisplay:YES];
-#ifdef TEST_HOOKS
-            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
-                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
-                rec->natural_w, rec->natural_h);
-#endif
-#ifdef READ_ANIMATED_GIF
-            // Kick off GIF animation if multi-frame
-            if (!rec->failed && rec->frame_count > 1) {
-                gif_schedule_next_frame(rec);
-            }
-#endif
-        });
-    });
+    if (!g_images_armed) {
+        rec->kick_pending = YES;
+        return rec;
+    }
+    kick_image_load(rec, resolved);
 
     return rec;
 }
@@ -2377,41 +2694,6 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
     CGContextScaleCTM(ctx, 1.0f, -1.0f);
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), frame);
     CGContextRestoreGState(ctx);
-}
-
-float platform_measure_text(const char* text, int len, float font_size, int is_bold, int is_mono) {
-    if (!text || len <= 0) return 0.0f;
-
-    // Shaping-economy fast path: shape-only (no atlas raster yet; the first
-    // draw rasterizes lazily). Shares entries with the draw path wherever
-    // the style bits coincide (plain body/mono runs, i.e. the hot case).
-    ShapedEntry* e = shape_run(text, len, font_size, is_bold, 0, is_mono, 0, 0);
-    if (e) return e->w;
-    // Uncacheable run: fall through to direct measure below.
-
-    NSString* str = [[NSString alloc] initWithBytesNoCopy:(void*)text length:len encoding:NSUTF8StringEncoding freeWhenDone:NO];
-    if (!str) {
-        str = [[NSString alloc] initWithBytes:text length:len encoding:NSISOLatin1StringEncoding];
-    }
-    if (!str) return (float)len * font_size * 0.60f;
-
-    NSFont* nsFont = get_font_for_style(font_size, is_bold, 0, is_mono, 0);
-    CTFontRef font = (__bridge CTFontRef)nsFont;
-
-    NSDictionary* attributes = @{
-        (id)kCTFontAttributeName: (__bridge id)font,
-    };
-
-    NSAttributedString* attrStr = [[NSAttributedString alloc] initWithString:str attributes:attributes];
-    CTLineRef ctLine = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)attrStr);
-    if (!ctLine) return (float)len * font_size * 0.60f;
-
-    CGFloat ascent, descent, leading;
-    double measuredWidth = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading);
-    double trailing = CTLineGetTrailingWhitespaceWidth(ctLine);
-    CFRelease(ctLine);
-
-    return (float)(measuredWidth + trailing);
 }
 
 // Headless screenshot engine: renders directly to a PNG image file
