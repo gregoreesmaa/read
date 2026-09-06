@@ -1538,3 +1538,101 @@ test "regression: multi-line quoted indented code renders mono with bars" {
     try std.testing.expect(hasRun(cmds[0..m], "Example:"));
 }
 
+fn runX(cmds: []layout.DrawCommand, text: []const u8) ?f32 {
+    for (cmds) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, text)) return c.rect.x;
+    }
+    return null;
+}
+
+fn countKind(cmds: []layout.DrawCommand, kind: @TypeOf(@as(layout.DrawCommand, undefined).kind)) usize {
+    var k: usize = 0;
+    for (cmds) |c| {
+        if (c.kind == kind) k += 1;
+    }
+    return k;
+}
+
+test "spec compliance: GFM tables align columns per delimiter" {
+    // Same content under left, center, and right delimiters: the body
+    // cell must step right as alignment tightens to the column edge.
+    const rows = [_][]const u8{ "| --- |\n", "| :--: |\n", "| ---: |\n" };
+    var xs: [3]f32 = undefined;
+    for (rows, 0..) |delim, k| {
+        var doc_buf: [64]u8 = undefined;
+        const doc = try std.fmt.bufPrint(&doc_buf, "| H |\n{s}| ab |\n", .{delim});
+        var lines: [8]simd.Line = undefined;
+        var fence: simd.FenceState = .{};
+        const n = simd.scanLines(doc, &lines, &fence);
+        try std.testing.expectEqual(simd.BlockType.table_row, lines[0].block_type);
+        var cmds: [128]layout.DrawCommand = undefined;
+        var st = FullStore{};
+        const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+        xs[k] = runX(cmds[0..m], "ab") orelse return error.MissingCell;
+        // Header keeps its bold accent run; the delimiter draws a rule.
+        try std.testing.expect(hasRun(cmds[0..m], "H"));
+        try std.testing.expect(countKind(cmds[0..m], .line) >= 1);
+    }
+    try std.testing.expect(xs[0] < xs[1]);
+    try std.testing.expect(xs[1] < xs[2]);
+}
+
+test "spec compliance: GFM table rows pad and truncate to header count" {
+    const doc =
+        \\| A | B |
+        \\| --- | --- |
+        \\| only |
+        \\| x | y | ZZZ |
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    for (lines[0..n]) |ln| try std.testing.expectEqual(simd.BlockType.table_row, ln.block_type);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    // Short row renders its one cell; the over-wide row drops its third.
+    try std.testing.expect(hasRun(cmds[0..m], "only"));
+    try std.testing.expect(hasRun(cmds[0..m], "x"));
+    try std.testing.expect(hasRun(cmds[0..m], "y"));
+    try std.testing.expect(!hasRun(cmds[0..m], "ZZZ"));
+}
+
+test "spec compliance: GFM tables honor escaped pipes, reject bad delimiters" {
+    // `\|` stays inside its cell and renders as a literal pipe run.
+    const esc_doc =
+        \\| A |
+        \\| --- |
+        \\| p \| q |
+    ;
+    var elines: [8]simd.Line = undefined;
+    var efence: simd.FenceState = .{};
+    const en = simd.scanLines(esc_doc, &elines, &efence);
+    try std.testing.expectEqual(simd.BlockType.table_row, elines[2].block_type);
+    var eCmds: [128]layout.DrawCommand = undefined;
+    var est = FullStore{};
+    const em = renderFull(esc_doc, elines[0..en], en, &eCmds, &est);
+    try std.testing.expect(hasRun(eCmds[0..em], "|"));
+
+    // An invalid delimiter row is not a table: plain paragraph text, and
+    // no table rule lines are emitted.
+    const bad_doc =
+        \\| A |
+        \\| oops |
+    ;
+    var blines: [8]simd.Line = undefined;
+    var bfence: simd.FenceState = .{};
+    const bn = simd.scanLines(bad_doc, &blines, &bfence);
+    try std.testing.expectEqual(simd.BlockType.paragraph, blines[0].block_type);
+    try std.testing.expectEqual(simd.BlockType.paragraph, blines[1].block_type);
+    var bCmds: [128]layout.DrawCommand = undefined;
+    var bst = FullStore{};
+    const bm = renderFull(bad_doc, blines[0..bn], bn, &bCmds, &bst);
+    // Word flow emits each pipe as its own run; no table rule lines appear.
+    try std.testing.expect(hasRun(bCmds[0..bm], "|"));
+    try std.testing.expect(hasRun(bCmds[0..bm], "A"));
+    try std.testing.expect(hasRun(bCmds[0..bm], "oops"));
+    try std.testing.expectEqual(@as(usize, 0), countKind(bCmds[0..bm], .line));
+}
+
