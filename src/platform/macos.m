@@ -9,6 +9,21 @@ static CGContextRef g_current_cg_context = NULL;
 static float g_scroll_y = 0.0f;
 static NSPoint g_mouse_pos = {-9999.0f, -9999.0f};
 
+// Ambient scrollbar drag model (mirrors scrollbarThumbY/scrollbarScrollFromY
+// in src/layout/viewport.zig: same 40px thumb, same travel mapping).
+// The visual stays a 2px filament; the grab strip is 12px wide.
+#define SCROLLBAR_THUMB_H 40.0f
+#define SCROLLBAR_HIT_W 12.0f
+static float g_max_scroll_y = 0.0f;
+static float g_view_h = 0.0f;
+static BOOL g_scrollbar_dragging = NO;
+static float g_scrollbar_grab_delta = 0.0f;
+
+// Forward declarations: used by ReadView mouse methods above their definitions.
+static float scrollbar_thumb_y(void);
+static BOOL scrollbar_hit(NSPoint view_pt, float view_w);
+static void scrollbar_drag_to(float y);
+
 // Idle policy (mirrors src/platform/idle.zig): mouse motion alone never
 // redraws. Only a hover-state transition re-arms a draw. The last hover
 // state is cached here so mouseMoved can compare instead of redrawing.
@@ -377,6 +392,13 @@ static void atlas_ensure(void) {
     g_atlas_ctx = CGBitmapContextCreate(g_atlas_px, ATLAS_PX, ATLAS_PX, 8,
                                         ATLAS_PX, cs,
                                         (CGBitmapInfo)kCGImageAlphaNone);
+    // Crisp masks: the coverage edges baked here are the sharpest the blit
+    // path can ever show, so rasterize with full hinted smoothing on.
+    // (Probed explicit subpixel-positioning flags here: byte-identical
+    // output, they are already the default. Keep this minimal.)
+    CGContextSetShouldAntialias(g_atlas_ctx, true);
+    CGContextSetShouldSmoothFonts(g_atlas_ctx, true);
+    CGContextSetAllowsFontSmoothing(g_atlas_ctx, true);
     // Y-down so drawing uses the same orientation as the flipped view.
     CGContextTranslateCTM(g_atlas_ctx, 0, ATLAS_PX);
     CGContextScaleCTM(g_atlas_ctx, 1.0f, -1.0f);
@@ -487,8 +509,11 @@ static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str)
     // NOTE: stored vertically mirrored: the per-frame ClipToMask blit in the
     // flipped view context maps image rows bottom-up, so a mirrored mask
     // blits upright (verified visually via /tmp/shape_probe renders).
+    // Crisp masks: the baseline lands on an integer device row. A fractional
+    // ascent leaves every coverage edge straddling two device rows, and that
+    // softness is baked into the mask on every blit thereafter.
     CGContextSaveGState(g_atlas_ctx);
-    CGContextTranslateCTM(g_atlas_ctx, ax, ay + (float)ph - e->ascent * RASTER_SCALE);
+    CGContextTranslateCTM(g_atlas_ctx, ax, roundf(ay + (float)ph - e->ascent * RASTER_SCALE));
     CGContextScaleCTM(g_atlas_ctx, (float)RASTER_SCALE, (float)RASTER_SCALE);
     CGContextSetTextPosition(g_atlas_ctx, 0, 0);
     CTLineDraw(wline, g_atlas_ctx);
@@ -521,11 +546,14 @@ static CTLineRef shape_cached_line(const char* text, int len, float font_size,
     return NULL;
 }
 
+#ifdef TEST_HOOKS
+// Scroll-sweep profiler counters: read-test only.
 void platform_glyph_cache_stats(uint64_t* hits, uint64_t* misses, uint64_t* flushes) {
     if (hits) *hits = g_shape_hits;
     if (misses) *misses = g_shape_misses;
     if (flushes) *flushes = g_atlas_flushes;
 }
+#endif
 
 static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     if (x_offset <= 0) return 0;
@@ -536,6 +564,11 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
                                          rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
     if (cached) {
         CFIndex idx = CTLineGetStringIndexForPosition(cached, CGPointMake(x_offset, 0));
+        // Past the trailing edge (rec->w includes trailing space the CTLine
+        // does not shape): CoreText returns kCFNotFound, which must clamp to
+        // the END of the string, not the start — otherwise the last record
+        // of a selection paints empty and leaves a word-shaped hole.
+        if (idx == kCFNotFound) idx = rec->len;
         if (idx < 0) idx = 0;
         if (idx > rec->len) idx = rec->len;
         return (int)idx;
@@ -552,6 +585,7 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
 
     CFIndex idx = CTLineGetStringIndexForPosition(line, CGPointMake(x_offset, 0));
     CFRelease(line);
+    if (idx == kCFNotFound) idx = rec->len;
     if (idx < 0) idx = 0;
     if (idx > rec->len) idx = rec->len;
     return (int)idx;
@@ -636,7 +670,55 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         float min_y = top_pt.y;
         float max_y = bot_pt.y;
 
-        int last_selected_idx = -1;
+        // Snap endpoints that land in an inter-line gap to the nearest
+        // record edge — but ONLY within the same 4px slop the band check
+        // below tolerates. The record mirror is virtualized (visible rows
+        // only), so an unbounded snap teleports off-viewport endpoints to
+        // whatever edge is visible, collapsing big scrolled selections into
+        // slivers (2026-09: scroll un-painted correct lines and painted
+        // stray slivers). Beyond 4px the raw value stands and the strict
+        // edge-skip below resolves it (middle lines still span correctly).
+        {
+            BOOL min_in = NO, max_in = NO;
+            float min_edge = min_y, max_edge = max_y;
+            float min_d = 1e30f, max_d = 1e30f;
+            for (int s = 0; s < g_text_record_count; s++) {
+                QuadTextRecord* sr = &g_text_records[s];
+                float st = sr->doc_y, sb = sr->doc_y + sr->h;
+                if (min_y >= st && min_y <= sb) min_in = YES;
+                else {
+                    float d = fminf(fabsf(min_y - st), fabsf(min_y - sb));
+                    if (d < min_d) { min_d = d; min_edge = (fabsf(min_y - st) < fabsf(min_y - sb)) ? st : sb; }
+                }
+                if (max_y >= st && max_y <= sb) max_in = YES;
+                else {
+                    float d = fminf(fabsf(max_y - st), fabsf(max_y - sb));
+                    if (d < max_d) { max_d = d; max_edge = (fabsf(max_y - st) < fabsf(max_y - sb)) ? st : sb; }
+                }
+                if (min_in && max_in) break;
+            }
+            if (!min_in && min_d <= 4.0f) min_y = min_edge;
+            if (!max_in && max_d <= 4.0f) max_y = max_edge;
+        }
+
+        // Endpoint rows at row granularity: runs on one visual row share
+        // first/last status by doc_y, not by per-record band. Mixed-height
+        // runs (serif text 22.10px vs mono code span 22.44px) otherwise
+        // orphan the shorter run when the snapped endpoint sits in the
+        // taller run's overhang, punching a glyph-shaped hole (2026-09:
+        // words around inline `>` went dark on endpoint rows).
+        float min_row_y = 0.0f, max_row_y = 0.0f;
+        BOOL min_row_found = NO, max_row_found = NO;
+        for (int s = 0; s < g_text_record_count; s++) {
+            QuadTextRecord* sr = &g_text_records[s];
+            if (!min_row_found && min_y >= sr->doc_y && min_y <= sr->doc_y + sr->h) {
+                min_row_y = sr->doc_y; min_row_found = YES;
+            }
+            if (!max_row_found && max_y >= sr->doc_y && max_y <= sr->doc_y + sr->h) {
+                max_row_y = sr->doc_y; max_row_found = YES;
+            }
+            if (min_row_found && max_row_found) break;
+        }
 
         for (int q = 0; q < g_text_record_count; q++) {
             QuadTextRecord* rec = &g_text_records[q];
@@ -652,11 +734,58 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 continue;
             }
 
+            // Strict edge resolution: an endpoint in the +-4px inclusion
+            // slop but strictly outside the record band belongs to the gap,
+            // not the line. Falling through to the middle branch here paints
+            // the whole record for collapsed/micro selections whose tiny
+            // damage then never clears it (residue + holes). Skip instead;
+            // genuine middle lines (selection strictly spanning the band)
+            // still take the full branch below. Members of an endpoint row
+            // (row lookup above) are exempt: the endpoint is inside their
+            // row even when outside their own shorter band.
+            BOOL in_min_row = min_row_found && fabsf(rec->doc_y - min_row_y) < 1.0f;
+            BOOL in_max_row = max_row_found && fabsf(rec->doc_y - max_row_y) < 1.0f;
+            if (!in_min_row && !in_max_row && (min_y > r_bot || max_y < r_top)) {
+#ifdef TEST_HOOKS
+                if (g_text_record_count < 400)
+                    DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+#endif
+                continue;
+            }
+
             int c_start = 0;
             int c_end = rec->len;
 
-            BOOL is_first_line = (min_y >= r_top && min_y <= r_bot);
-            BOOL is_last_line = (max_y >= r_top && max_y <= r_bot);
+            BOOL is_first_line = in_min_row;
+            BOOL is_last_line = in_max_row;
+
+            // X span covered by the selection on this record's row. The
+            // inter-word gap below paints exactly where this span covers
+            // it, whether or not either adjacent run paints: an endpoint
+            // landing in a run's first pixels maps to an empty char range
+            // (CoreText leading-edge bias), and culled runs `continue`
+            // before painting. The old consecutive-painted bridge left the
+            // covered gap dark (2026-09: holes around 1-char code spans).
+            float span_lo, span_hi;
+            if (is_first_line && is_last_line) {
+                span_lo = fminf(top_pt.x, bot_pt.x);
+                span_hi = fmaxf(top_pt.x, bot_pt.x);
+            } else if (is_first_line) {
+                span_lo = top_pt.x; span_hi = 1e30f;
+            } else if (is_last_line) {
+                span_lo = -1e30f; span_hi = bot_pt.x;
+            } else {
+                span_lo = -1e30f; span_hi = 1e30f;
+            }
+            if (q > 0) {
+                QuadTextRecord* prev = &g_text_records[q - 1];
+                if (fabsf(prev->doc_y - rec->doc_y) < 6.0f) {
+                    float glo = fmaxf(prev->x + prev->w, span_lo);
+                    float ghi = fminf(rec->x, span_hi);
+                    if (ghi > glo)
+                        CGContextFillRect(ctx, CGRectMake(glo, view_y, ghi - glo, rec->h));
+                }
+            }
 
             if (is_first_line && is_last_line) {
                 float left_x = fminf(top_pt.x, bot_pt.x);
@@ -700,26 +829,17 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (c_end <= c_start) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
-                    DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d txt=%.12s", q, c_start, c_end, rec->len, rec->text);
+                    DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f miny=%.2f maxy=%.2f sx=%.2f sy=%.2f ex=%.2f ey=%.2f txt=%.12s", q, c_start, c_end, rec->len, rec->x, rec->w, min_y, max_y, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, rec->text);
 #endif
             }
             if (c_end > c_start) {
                 float x1 = rec->x + get_x_for_char_index(rec, c_start);
                 float x2 = rec->x + get_x_for_char_index(rec, c_end);
+#ifdef TEST_HOOKS
+                if (g_text_record_count < 400)
+                    DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
+#endif
                 CGContextFillRect(ctx, CGRectMake(x1, view_y, x2 - x1, rec->h));
-
-                // Highlight space between adjacent selected words on the same line
-                if (last_selected_idx >= 0 && last_selected_idx == q - 1) {
-                    QuadTextRecord* prev = &g_text_records[last_selected_idx];
-                    if (fabs(prev->doc_y - rec->doc_y) < 6.0f) {
-                        float gap_x = prev->x + prev->w;
-                        float gap_w = rec->x - gap_x;
-                        if (gap_w > 0) {
-                            CGContextFillRect(ctx, CGRectMake(gap_x, view_y, gap_w, rec->h));
-                        }
-                    }
-                }
-                last_selected_idx = q;
             }
         }
     }
@@ -733,6 +853,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     g_pending_dirty_valid = YES;
     CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
     if (!ctx) return;
+    // Crisp text: never let a default or inherited graphics state leave the
+    // window rendering glyphs without hinted smoothing.
+    CGContextSetShouldAntialias(ctx, true);
+    CGContextSetShouldSmoothFonts(ctx, true);
+    CGContextSetAllowsFontSmoothing(ctx, true);
     g_draw_seq++;
 #ifdef TEST_HOOKS
     uint64_t draw_t0 = dbg_now_ns();
@@ -835,7 +960,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         }
     }
 
-    if (over_link || over_code_btn) {
+    if (scrollbar_hit(g_mouse_pos, self.bounds.size.width) || g_scrollbar_dragging) {
+        [[NSCursor arrowCursor] set];
+    } else if (over_link || over_code_btn) {
         [[NSCursor pointingHandCursor] set];
     } else {
         [[NSCursor IBeamCursor] set];
@@ -897,6 +1024,21 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 }
 - (void)mouseDown:(NSEvent *)event {
     NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
+
+    // Scrollbar drag starts here: the right-edge strip belongs to the
+    // ambient scrollbar, never to text selection or Copy buttons.
+    if (!g_scrollbar_dragging && scrollbar_hit(view_pt, self.bounds.size.width)) {
+        float thumb = scrollbar_thumb_y();
+        if (view_pt.y >= thumb && view_pt.y <= thumb + SCROLLBAR_THUMB_H) {
+            g_scrollbar_grab_delta = view_pt.y - thumb;
+        } else {
+            g_scrollbar_grab_delta = SCROLLBAR_THUMB_H * 0.5f;
+        }
+        g_scrollbar_dragging = YES;
+        scrollbar_drag_to(view_pt.y);
+        [self setNeedsDisplay:YES];
+        return;
+    }
 
     // Check if clicked Copy button on a code block
     for (int b_idx = 0; b_idx < g_code_block_count; b_idx++) {
@@ -969,6 +1111,13 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 }
 
 - (void)mouseDragged:(NSEvent *)event {
+    if (g_scrollbar_dragging) {
+        NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
+        scrollbar_drag_to(view_pt.y);
+        // Damage: the scroll offset changed, so every pixel may have moved.
+        [self setNeedsDisplay:YES];
+        return;
+    }
     if (g_selection_mode <= 1) {
         // Damage: the selection spans start->end across full line widths, not
         // just the cursor path, so invalidate old + new full bounds.
@@ -998,6 +1147,12 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 }
 
 - (void)mouseUp:(NSEvent *)event {
+    if (g_scrollbar_dragging) {
+        // Scrollbar release changes no selection; the drag frames already
+        // repainted. Never fall through to selection handling.
+        g_scrollbar_dragging = NO;
+        return;
+    }
     if (g_selection_mode >= 2) {
         // Prohibit mouseUp from moving g_select_end on double or triple click.
         // Damage: selection did not change, so no repaint is needed.
@@ -1337,6 +1492,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     [NSApp activateIgnoringOtherApps:YES];
+#ifdef TEST_HOOKS
+    // Instrumented-build tag: bump on every hooks rebuild so log forensics
+    // can prove which binary wrote which launch. Keep in sync manually.
+    DBGLOG("EV build tag=B6-row-span-gap");
+#endif
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -1432,6 +1592,44 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
     invalidate_rect(NSMakeRect(x, y, w, h));
 }
 
+// ---------------------------------------------------------------------------
+// Scroll smoothing driver: a 120Hz runloop timer (CoreFoundation only — no
+// new framework) that eases the displayed offset toward the Zig-side
+// target. The timer exists only while unsettled: platform_smooth_kick
+// creates it, and each fire parks it when on_tick reports settled, so a
+// static screen keeps zero wakeups (0% CPU), same as before.
+// ---------------------------------------------------------------------------
+static CFRunLoopTimerRef g_smooth_timer = NULL;
+static CFAbsoluteTime g_smooth_last = 0;
+
+static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
+    (void)timer; (void)info;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    double dt_ms = (now - g_smooth_last) * 1000.0;
+    g_smooth_last = now;
+    if (dt_ms < 0.0) dt_ms = 0.0;
+    if (dt_ms > 50.0) dt_ms = 50.0; // clamped: menu-drag stalls must not teleport
+    int more = 0;
+    if (g_callbacks.on_tick) more = g_callbacks.on_tick((float)dt_ms);
+    if (!more && g_smooth_timer) {
+        CFRunLoopTimerInvalidate(g_smooth_timer);
+        CFRelease(g_smooth_timer);
+        g_smooth_timer = NULL;
+    }
+    NSView* v = damage_target_view();
+    if (v) [v setNeedsDisplay:YES];
+}
+
+void platform_smooth_kick(void) {
+    if (g_smooth_timer || !g_callbacks.on_tick) return; // already easing
+    g_smooth_last = CFAbsoluteTimeGetCurrent();
+    CFRunLoopTimerContext ctx = {0, NULL, NULL, NULL, NULL};
+    g_smooth_timer = CFRunLoopTimerCreate(NULL, g_smooth_last + 1.0 / 120.0, 1.0 / 120.0,
+                                          0, 0, smooth_timer_fire, &ctx);
+    if (g_smooth_timer)
+        CFRunLoopAddTimer(CFRunLoopGetMain(), g_smooth_timer, kCFRunLoopCommonModes);
+}
+
 #ifdef TEST_HOOKS
 // Headless test hooks (damage/selection parity tests): inject a synthetic
 // pending-damage rect and read back the rebuilt text-record count.
@@ -1482,6 +1680,37 @@ int platform_get_pending_damage(float* x, float* y, float* w, float* h) {
 
 void platform_sync_scroll(float scroll_y) {
     g_scroll_y = scroll_y;
+}
+
+void platform_set_scroll_info(float scroll_y, float max_scroll_y, float view_h) {
+    g_scroll_y = scroll_y;
+    g_max_scroll_y = max_scroll_y;
+    g_view_h = view_h;
+}
+
+// Thumb top for the current scroll offset; 0 when nothing scrolls.
+static float scrollbar_thumb_y(void) {
+    if (g_max_scroll_y <= 0.0f) return 0.0f;
+    float p = g_scroll_y / g_max_scroll_y;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    return p * (g_view_h - SCROLLBAR_THUMB_H);
+}
+
+static BOOL scrollbar_hit(NSPoint view_pt, float view_w) {
+    return g_max_scroll_y > 0.0f && view_pt.x >= view_w - SCROLLBAR_HIT_W;
+}
+
+// Map a drag pointer at view height y to an absolute scroll target and
+// hand it to Zig (which clamps and owns scroll_y). Track clicks center
+// the thumb on the cursor; thumb grabs keep the grab offset (no jump).
+static void scrollbar_drag_to(float y) {
+    float travel = g_view_h - SCROLLBAR_THUMB_H;
+    if (travel <= 0.0f || !g_callbacks.on_scroll_to) return;
+    float p = (y - g_scrollbar_grab_delta) / travel;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    g_callbacks.on_scroll_to(p * g_max_scroll_y);
 }
 
 void platform_draw_rect(float x, float y, float w, float h, unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
@@ -1535,7 +1764,7 @@ void platform_end_clip(void) {
 
 // Record quad for mouse text selection & copying (anchored to document Y).
 // noinline: called from 4 sites (register/draw/legacy); one shared copy keeps
-// __TEXT off the next page boundary (binary budget < 350 KiB).
+// __TEXT off the next page boundary (binary budget < 180 KiB).
 static __attribute__((noinline)) void record_text_quad(const char* text, int len, float x, float y, float w, float h,
                              float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
                              const char* link_url, int link_url_len) {
@@ -1636,11 +1865,19 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         // no allocation, no CPU compositing. Only when the destination scale
         // matches the 2x raster, otherwise the downsample softens edges.
         if (e->aw != 0 && e->slice && g_output_scale > 1.5f) {
-            // Destination: same geometry as the old CTLineDraw baseline
-            // (y + size*0.85, ascent above) so layout is pixel-identical.
-            float dest_y = y + font_size * 0.85f - e->ascent;
-            CGRect dest = CGRectMake(x, dest_y, e->w, e->h);
+            // Destination: same baseline as the old CTLineDraw geometry
+            // (y + size*0.85, ascent above), snapped to the output device
+            // grid. A fractional origin resamples the 2x mask on every blit
+            // (soft edges); a snapped origin blits mask pixels 1:1 (crisp).
+            // Dest size is the mask size exactly, not the shaped advance, so
+            // there is no sub-pixel stretch either (differs by < 1 device px
+            // of trailing whitespace; runs never drift, origins are absolute).
+            float dest_x = roundf(x * g_output_scale) / g_output_scale;
+            float dest_y = roundf((y + font_size * 0.85f - e->ascent) * g_output_scale) / g_output_scale;
+            CGRect dest = CGRectMake(dest_x, dest_y,
+                (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
             CGContextSaveGState(ctx);
+            CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
             CGContextClipToMask(ctx, dest, e->slice);
             CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
             CGContextFillRect(ctx, dest);
@@ -2027,6 +2264,7 @@ void platform_test_image_primed(unsigned long* total_frames, unsigned long* prim
 }
 #endif
 
+#ifdef TEST_HOOKS
 // Number of image records still decoding (for headless settle waits).
 int platform_images_pending(void) {
     int n = 0;
@@ -2034,6 +2272,7 @@ int platform_images_pending(void) {
         if (g_image_cache[i].loading) n++;
     return n;
 }
+#endif
 
 void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h) {
     if (!g_current_cg_context || w <= 0 || h <= 0) return;
@@ -2148,7 +2387,7 @@ float platform_measure_text(const char* text, int len, float font_size, int is_b
 // Returns 1 when the frame decoded.
 //
 // SIZE NOTE: this definition lives at end-of-file deliberately. __TEXT sits
-// ~12 bytes under a 16 KiB page boundary of the 350 KiB budget; a mid-file
+// ~12 bytes under a 16 KiB page boundary of the 180 KiB budget; a mid-file
 // function here shifts every function after it (branch ranges, literal pools
 // and alignment NOPs cascade ~3x the function's own bytes). At EOF nothing
 // follows it, so its bytes cost only themselves. Keep it tiny; check
@@ -2167,6 +2406,8 @@ static int prime_frame_decode(CGImageRef img) {
     return 1;
 }
 
+#ifdef TEST_HOOKS
+// Headless screenshot engine: read-test only, never ships.
 int platform_render_to_png(const char* output_path, int width, int height, void (*render_fn)(int width, int height)) {
     if (!output_path || width <= 0 || height <= 0 || !render_fn) return -1;
 
@@ -2208,9 +2449,13 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     render_fn(width, height);
 
+    // Headless selection captures paint the same highlight as live draws.
+    if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
+
 #ifdef TEST_HOOKS
     // Headless pixel probe: print bitmap values at requested image coords
     // (top-down) so scripts can assert content without external tools.
+    // Reads AFTER the highlight pass so probes observe selected pixels.
     if (g_probe_count > 0) {
         unsigned char* bytes = CGBitmapContextGetData(ctx);
         size_t bpr = CGBitmapContextGetBytesPerRow(ctx);
@@ -2232,9 +2477,6 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     }
 #endif
 
-    // Headless selection captures paint the same highlight as live draws.
-    if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
-
     g_current_cg_context = NULL;
 
     CGImageRef image = CGBitmapContextCreateImage(ctx);
@@ -2253,6 +2495,7 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     return success ? 0 : -5;
 }
+#endif // platform_render_to_png
 
 #ifdef TEST_HOOKS
 // Two-phase incremental repaint simulation for the drag-back residue test.

@@ -7,16 +7,16 @@
 #
 # Usage: scripts/damage_parity.sh [binary] [markdown-file]
 #
-# The --damage/--select/--dump-records probes only exist in -Dtest-hooks=true
-# builds (ship builds compile them out for size). When BIN lacks hooks, build
-# a throwaway hooks binary automatically; the draw/record code under test is
+# The --damage/--select/--dump-records probes only exist in the read-test
+# binary (ship builds compile them out for size). When BIN lacks hooks, build
+# a fresh binary automatically; the draw/record code under test is
 # identical in both (TEST_HOOKS only adds setters plus the pending-damage
 # override and the record-count getter).
 set -eu
 
 cd "$(dirname "$0")/.."
 
-BIN="${1:-zig-out/bin/read}"
+BIN="${1:-zig-out/bin/read-test}"
 DOC="${2:-showcase.md}"
 
 probe_hooks() {
@@ -26,11 +26,11 @@ probe_hooks() {
 }
 
 if ! probe_hooks "$BIN"; then
-    echo "note: $BIN lacks test hooks; building a throwaway -Dtest-hooks=true binary"
+    echo "note: $BIN lacks test hooks; building a fresh binary (read-test carries the hooks)"
     : "${ZIG_GLOBAL_CACHE_DIR:=$PWD/.zig-cache-global}"
     export ZIG_GLOBAL_CACHE_DIR
-    HOOKS_BIN="${TMPDIR:-/tmp}/read-hooks-$$/bin/read"
-    zig build -Doptimize=ReleaseFast -Dtest-hooks=true --prefix "${TMPDIR:-/tmp}/read-hooks-$$" >&2
+    HOOKS_BIN="${TMPDIR:-/tmp}/read-hooks-$$/bin/read-test"
+    zig build -Doptimize=ReleaseFast --prefix "${TMPDIR:-/tmp}/read-hooks-$$" >&2
     BIN="$HOOKS_BIN"
     probe_hooks "$BIN" || { echo "FAIL: hooks binary still reports no record count"; exit 2; }
 fi
