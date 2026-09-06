@@ -24,6 +24,13 @@ fn isAsciiPunct(ch: u8) bool {
     };
 }
 
+/// Email half of `<...>` autolink detection, shared by both inline passes
+/// (parseInlines / parseInlinesWithDefs): `user@domain` with no spaces.
+/// One non-inline copy; the two scans inside stay `inline` via findByte.
+fn isEmailAutolink(inner: []const u8) bool {
+    return simd.findByte(inner, 0, '@') != null and simd.findByte(inner, 0, ' ') == null;
+}
+
 /// Closing run for a code span opened with `run_len` backticks starting at
 /// `from` (index just past the opener). Only a run of exactly `run_len`
 /// closes; shorter/longer runs are content (so `` \ `` yields "`").
@@ -78,7 +85,7 @@ fn parseLinkTail(line: []const u8, paren_open: usize) ?LinkTail {
     var dest_start: usize = pos;
     var dest_end: usize = pos;
     if (line[pos] == '<') {
-        const gt = std.mem.indexOfScalarPos(u8, line, pos + 1, '>');
+        const gt = simd.findByte(line, pos + 1, '>');
         const end = gt orelse return null;
         dest_start = pos + 1;
         dest_end = end;
@@ -415,7 +422,7 @@ pub fn parseInlinesWithDefs(
                 const is_url = std.mem.startsWith(u8, inner, "http://") or
                     std.mem.startsWith(u8, inner, "https://") or
                     std.mem.startsWith(u8, inner, "mailto:") or
-                    (std.mem.indexOfScalar(u8, inner, '@') != null and std.mem.indexOfScalar(u8, inner, ' ') == null);
+                    isEmailAutolink(inner);
 
                 if (is_url) {
                     if (i > span_start) {
@@ -698,7 +705,7 @@ pub fn parseInlinesStream(
                 const is_url = std.mem.startsWith(u8, inner, "http://") or
                     std.mem.startsWith(u8, inner, "https://") or
                     std.mem.startsWith(u8, inner, "mailto:") or
-                    (std.mem.indexOfScalar(u8, inner, '@') != null and std.mem.indexOfScalar(u8, inner, ' ') == null);
+                    isEmailAutolink(inner);
 
                 if (is_url) {
                     em.flushText(span_start, i);
@@ -828,7 +835,7 @@ test "pass2: parseLineStream slices one mmap line with zero copies" {
 /// table: `amp lt gt quot apos nbsp` plus decimal/hex numeric references
 /// (which can address every scalar, e.g. `&#39;` `&#x2F;`).
 pub fn decodeEntityAfterAmp(rest: []const u8, out: []u8) usize {
-    const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return 0;
+    const semi = simd.findByte(rest, 0, ';') orelse return 0;
     if (semi == 0 or semi > 10) return 0;
     const body = rest[0..semi];
     const named: ?[]const u8 = if (std.mem.eql(u8, body, "amp"))
@@ -892,7 +899,7 @@ pub fn decodeEntityAfterAmp(rest: []const u8, out: []u8) usize {
 /// "is there an entity" question for measurement pre-scans.
 pub fn entityLengthAt(line: []const u8, i: usize) usize {
     if (i >= line.len or line[i] != '&') return 0;
-    const semi = std.mem.indexOfScalarPos(u8, line, i + 1, ';') orelse return 0;
+    const semi = simd.findByte(line, i + 1, ';') orelse return 0;
     if (semi - (i + 1) == 0 or semi - (i + 1) > 10) return 0;
     var tmp: [4]u8 = undefined;
     const n = decodeEntityAfterAmp(line[i + 1 ..], tmp[0..]);
