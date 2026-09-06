@@ -3404,6 +3404,93 @@ test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
     }
 }
 
+test "checkpoints: sparse grid density, kilobyte RAM, deterministic deep seek (issue #12)" {
+    // Pins the #12 contract on a 50k-line document: sparse checkpoints give
+    // O(1)-ish random access (bounded stride from any deep target back to a
+    // seek origin) with kilobytes of RAM, and checkpoint seeks are pure
+    // (identical output run to run — no retained scroll state). Latency gates
+    // (layout <= 8 us, deep scroll <= 11 us, 0 allocs) live in
+    // strict_benchmarks.zig, untouched here. Test setup allocates (cold);
+    // the layout calls below take only caller-owned fixed buffers.
+    const allocator = std.testing.allocator;
+
+    const chunk =
+        \\# Section Document Heading
+        \\Here is regular reading content for benchmarking layout latency.
+        \\> Simplicity is prerequisite for reliability.
+        \\- Bullet list item alpha
+        \\- Bullet list item beta
+        \\
+    ;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var rep: usize = 0;
+    while (rep < 10_000) : (rep += 1) {
+        try buffer.appendSlice(allocator, chunk);
+    }
+    const mem = buffer.items;
+
+    const line_entries = try allocator.alloc(simd.Line, 50_100);
+    defer allocator.free(line_entries);
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(mem, line_entries, &in_fence);
+    try std.testing.expect(line_count >= 50_000);
+
+    var checkpoints: [2048]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    const base_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 800.0,
+        .scroll_y = 0.0,
+    };
+    const doc_h = computeDocumentHeightEx(
+        mem,
+        line_entries[0..line_count],
+        base_cfg,
+        &checkpoints,
+        &cp_count,
+    );
+    try std.testing.expect(doc_h > 0);
+
+    // Sparse but present: roughly one checkpoint per grid cell.
+    try std.testing.expect(cp_count >= line_count / (4 * checkpoint_grid_lines));
+    try std.testing.expect(cp_count <= line_count / 8 + 2);
+    // Stride bounded: from any line, the seek origin is at most a few cells
+    // back (cells split only at clean block boundaries, so a straddling
+    // multi-line unit can push one gap wider).
+    try std.testing.expectEqual(@as(u32, 0), checkpoints[0].line_idx);
+    var c: usize = 1;
+    while (c < cp_count) : (c += 1) {
+        try std.testing.expect(checkpoints[c].line_idx > checkpoints[c - 1].line_idx);
+        try std.testing.expect(checkpoints[c].line_idx - checkpoints[c - 1].line_idx <= 4 * checkpoint_grid_lines);
+        try std.testing.expect(checkpoints[c].y >= checkpoints[c - 1].y);
+    }
+    // Kilobytes of RAM for the whole 50k-line grid.
+    try std.testing.expect(@sizeOf(Checkpoint) <= 12);
+    try std.testing.expect(cp_count * @sizeOf(Checkpoint) <= 64 * 1024);
+
+    // Deterministic deep seek: same 45k+ scroll twice, bit-identical output.
+    const deep_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 800.0,
+        .scroll_y = doc_h * 0.90,
+        .checkpoints = checkpoints[0..cp_count],
+    };
+    var cmds_a: [1024]DrawCommand = undefined;
+    var cmds_b: [1024]DrawCommand = undefined;
+    const n_a = layoutViewport(mem, line_entries[0..line_count], deep_cfg, &cmds_a);
+    const n_b = layoutViewport(mem, line_entries[0..line_count], deep_cfg, &cmds_b);
+    try std.testing.expect(n_a > 0);
+    try std.testing.expectEqual(n_a, n_b);
+    for (cmds_a[0..n_a], 0..) |cmd_a, idx| {
+        const cmd_b = cmds_b[idx];
+        try std.testing.expectEqual(cmd_a.kind, cmd_b.kind);
+        try std.testing.expectEqual(cmd_a.rect.x, cmd_b.rect.x);
+        try std.testing.expectEqual(cmd_a.rect.y, cmd_b.rect.y);
+        try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+    }
+}
+
 // ============================================================================
 // Virtualized lazy layout: time-sliced amortized layout + Goldilocks buffer
 // + estimated heights with just-in-time refinement.
