@@ -187,6 +187,53 @@ test "spec compliance: blockquotes and nested quotes" {
     try std.testing.expectEqual(@as(usize, 5), bar_count);
 }
 
+test "design #24: blank-separated quote bars connect with no seam" {
+    const doc =
+        \\> First paragraph here.
+        \\
+        \\> Second paragraph here.
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    try std.testing.expectEqual(@as(usize, 3), n);
+
+    var cmds: [64]layout.DrawCommand = undefined;
+    const vp_cfg = layout.ViewportConfig{
+        .window_width = 800,
+        .window_height = 600,
+        .scroll_y = 0,
+        .content_max_width = 600,
+    };
+    const cmd_count = layout.layoutViewport(doc, lines[0..n], vp_cfg, &cmds);
+
+    // content_x = (800 - 600) / 2 = 100; depth-1 bar at 100 + 16 - 12 - 3.
+    var bars: [4]layout.Rect = undefined;
+    var nb: usize = 0;
+    var first_x: f32 = -1;
+    for (cmds[0..cmd_count]) |cmd| {
+        if (cmd.kind == .fill_rect and cmd.rect.w == 3.0 and
+            cmd.rect.x == 100.0 + 16.0 - 12.0 - 3.0 and nb < bars.len)
+        {
+            bars[nb] = cmd.rect;
+            nb += 1;
+        }
+        if (cmd.kind == .text_run and std.mem.eql(u8, cmd.text, "First")) {
+            first_x = cmd.rect.x;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), nb);
+    // No seam: the first bar runs through the blank line, landing exactly
+    // on the second bar's top (run continues, so no spacing yet).
+    try std.testing.expectApproxEqAbs(bars[0].y + bars[0].h, bars[1].y, 0.01);
+    // 12px of air between bar and text.
+    try std.testing.expectApproxEqAbs(first_x, 100.0 + 16.0, 0.01);
+    try std.testing.expectApproxEqAbs(first_x - (bars[0].x + 3.0), 12.0, 0.01);
+    // 8px paragraph spacing after the run: the last bar covers its single
+    // 29.75px text row plus the spacing.
+    try std.testing.expectApproxEqAbs(bars[1].h, 29.75 + 8.0, 0.01);
+}
+
 test "spec compliance: unordered lists (*, -, +) and ordered lists (1., 1))" {
     const doc =
         \\* Star bullet
@@ -676,7 +723,9 @@ test "regression: lazy blockquote continuation keeps quote styling and bar" {
     try std.testing.expectEqual(@as(usize, 2), nb);
     try std.testing.expectApproxEqAbs(@as(f32, 50.0), bars[0].rect.y, 0.01);
     try std.testing.expect(bars[0].rect.y + bars[0].rect.h >= vest_y + 29.75 - 0.5);
-    try std.testing.expect(bars[1].rect.y > bars[0].rect.y + bars[0].rect.h);
+    // No seam (#24): the first bar runs through the blank line and lands
+    // exactly on the second bar's top (run continues, so no spacing yet).
+    try std.testing.expectApproxEqAbs(bars[0].rect.y + bars[0].rect.h, bars[1].rect.y, 0.01);
 
     // Height parity with the fully-marked form.
     const explicit_doc =
@@ -944,7 +993,8 @@ test "regression: quotes and code indent inside list items" {
         if (c.kind == .fill_rect and c.rect.w == 3.0) bar_x = c.rect.x;
         if (c.kind == .text_run and std.mem.eql(u8, c.text, "This")) quote_x = c.rect.x;
     }
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 18.0 + 16.0 - 12.0), bar_x, 0.5);
+    // Bar hugs the text with a 12px gap (single source; see #24).
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 18.0 + 16.0) - layout.quote_bar_gap - layout.quote_bar_w, bar_x, 0.5);
     try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 18.0 + 16.0), quote_x, 0.5);
 
     // Code card sits at the item column with mono rows.

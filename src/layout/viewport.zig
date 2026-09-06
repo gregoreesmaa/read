@@ -1099,6 +1099,43 @@ fn softSpace(pen: *FlowPen, tx: f32, font_size: f32) void {
     if (pen.x > tx) flowSpace(pen, measureCharEx(' ', font_size, false, false, false, false));
 }
 
+/// Quote bar design tokens (issue #24): 2–3px accent bar with 12–16px
+/// of air between the bar and the quoted text (text sits one 16px nesting
+/// step in; the bar hugs its left so the gap lands at 12px).
+pub const quote_bar_w: f32 = 3.0;
+pub const quote_bar_gap: f32 = 12.0;
+/// Paragraph spacing after a quote unit. The bar runs through it so
+/// blank-separated quote units connect with no multiline seam.
+pub const quote_para_spacing: f32 = 8.0;
+
+/// WCAG 2.x relative luminance of an sRGB color (contrast-test helper).
+fn relLuminance(c: Color) f32 {
+    const ch = struct {
+        fn lin(v: u8) f32 {
+            const s = @as(f32, @floatFromInt(v)) / 255.0;
+            return if (s <= 0.03928) s / 12.92 else std.math.pow(f32, (s + 0.055) / 1.055, 2.4);
+        }
+    }.lin;
+    return 0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b);
+}
+
+/// WCAG 2.x contrast ratio between two colors (contrast-test helper).
+fn contrastRatio(fg: Color, bg: Color) f32 {
+    const hi = @max(relLuminance(fg), relLuminance(bg));
+    const lo = @min(relLuminance(fg), relLuminance(bg));
+    return (hi + 0.05) / (lo + 0.05);
+}
+
+test "design #24: quote contrast >= 4.5:1, bar + spacing tokens" {
+    // Bar 2–3px, 12–16px of air to the text, 8px paragraph spacing.
+    try std.testing.expect(quote_bar_w >= 2.0 and quote_bar_w <= 3.0);
+    try std.testing.expect(quote_bar_gap >= 12.0 and quote_bar_gap <= 16.0);
+    try std.testing.expectApproxEqAbs(quote_para_spacing, 8.0, 0.001);
+    // Quote body (muted) clears WCAG AA against its background, both themes.
+    try std.testing.expect(contrastRatio(Theme.dark.muted, Theme.dark.bg) >= 4.5);
+    try std.testing.expect(contrastRatio(Theme.light.muted, Theme.light.bg) >= 4.5);
+}
+
 /// Quote bars for one quote line: one bar per depth level spanning the whole
 /// unit (leader line plus absorbed lazy tail).
 fn quoteBars(ux: *UnitCx, base_x: f32, depth: usize, start_y: f32, end_y: f32) void {
@@ -1108,9 +1145,9 @@ fn quoteBars(ux: *UnitCx, base_x: f32, depth: usize, start_y: f32, end_y: f32) v
         emitCmd(ux, .{
             .kind = .fill_rect,
             .rect = .{
-                .x = base_x + @as(f32, @floatFromInt(d)) * 16.0 - 12.0,
+                .x = base_x + @as(f32, @floatFromInt(d)) * 16.0 - quote_bar_gap - quote_bar_w,
                 .y = start_y,
-                .w = 3.0,
+                .w = quote_bar_w,
                 .h = end_y - start_y,
             },
             .color = ux.theme.quote_bar,
@@ -1502,8 +1539,24 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
         },
     }
 
-    quoteBars(ux, base_x, sq.depth, start_y, y);
-    return .{ .y = y, .consumed = consumed };
+    // 8px paragraph spacing after the quote run — never between its lines,
+    // so lazy and explicit marking of the same words measure identically.
+    // The bar runs through the spacing, and through any blank lines when
+    // another quote unit follows, so the whole blockquote reads as one
+    // continuous bar with no multiline seam (issue #24). Spacing is
+    // geometry (both passes); the blank-spanning tail only stretches the
+    // emitted bar rect, never the pen.
+    var run_continues = false;
+    var k = i + consumed;
+    while (k < ux.lines.len and ux.lines[k].block_type == .blank) k += 1;
+    if (k < ux.lines.len and ux.lines[k].block_type == .quote) run_continues = true;
+    const end_y = y + if (run_continues) 0.0 else quote_para_spacing;
+    var bar_end = end_y;
+    if (run_continues) {
+        bar_end += @as(f32, @floatFromInt(k - (i + consumed))) * ux.config.line_height * 0.75;
+    }
+    quoteBars(ux, base_x, sq.depth, start_y, bar_end);
+    return .{ .y = end_y, .consumed = consumed };
 }
 
 /// Lays out a top-level list item: marker adornment, flowed first paragraph
