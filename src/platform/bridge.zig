@@ -12,6 +12,9 @@ pub const PlatformCallbacks = extern struct {
     /// more frames are needed, 0 when settled. Appended last for the same
     /// FFI stability reason.
     on_tick: ?*const fn (dt_ms: f32) callconv(.c) c_int = null,
+    /// Scrollbar drag target (absolute scroll_y, clamped by the Zig side).
+    /// Appended last for the same FFI stability reason.
+    on_scroll_to: ?*const fn (scroll_y: f32) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_init(
@@ -32,6 +35,10 @@ pub extern "c" fn platform_sync_scroll(scroll_y: f32) void;
 /// timer parks itself when on_tick reports settled, so a static screen
 /// costs zero wakeups.
 pub extern "c" fn platform_smooth_kick() void;
+/// Scrollbar drag model: absolute offset plus the clamp range and view
+/// height, so the platform can map pointer y to a scroll target with the
+/// same geometry the Zig filament draws. Called every draw.
+pub extern "c" fn platform_set_scroll_info(scroll_y: f32, max_scroll_y: f32, view_h: f32) void;
 
 pub extern "c" fn platform_draw_rect(
     x: f32,

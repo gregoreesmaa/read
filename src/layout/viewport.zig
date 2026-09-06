@@ -216,6 +216,29 @@ pub const Theme = struct {
 
 pub const MAX_SCROLLABLE_BLOCKS = 128;
 
+/// Ambient scrollbar geometry shared by the Zig filament and the platform
+/// drag handling (macos.m mirrors this formula; tests pin it here).
+/// Visual stays a 2px filament; the grab strip is wider for usability.
+pub const SCROLLBAR_THUMB_H: f32 = 40.0;
+pub const SCROLLBAR_HIT_W: f32 = 12.0;
+
+/// Thumb top for a scroll offset. Returns 0 when there is nothing to scroll.
+pub fn scrollbarThumbY(scroll_y: f32, max_scroll_y: f32, view_h: f32) f32 {
+    if (max_scroll_y <= 0.0) return 0.0;
+    const progress = std.math.clamp(scroll_y / max_scroll_y, 0.0, 1.0);
+    return progress * (view_h - SCROLLBAR_THUMB_H);
+}
+
+/// Scroll offset for a drag pointer at view height `y` grabbed at `grab_delta`
+/// below the thumb top (track clicks pass THUMB_H/2 to center the thumb).
+pub fn scrollbarScrollFromY(y: f32, grab_delta: f32, max_scroll_y: f32, view_h: f32) f32 {
+    if (max_scroll_y <= 0.0) return 0.0;
+    const travel = view_h - SCROLLBAR_THUMB_H;
+    if (travel <= 0.0) return 0.0;
+    const progress = std.math.clamp((y - grab_delta) / travel, 0.0, 1.0);
+    return progress * max_scroll_y;
+}
+
 pub const Checkpoint = struct {
     line_idx: u32,
     y: f32,
@@ -240,7 +263,22 @@ pub const ViewportConfig = struct {
     /// (or full), markers echo the source text; otherwise sequential numbers
     /// ("1.", "2.", ...) per CommonMark. Geometry never depends on it.
     ordered_markers: ?*OrderedMarkerStore = null,
+    /// Reference definitions scanned once per document (cold path). Empty
+    /// disables `[t][l]` / `[t][]` / `[t]` resolution (spans stay literal).
+    ref_defs: []const simd.RefDef = &.{},
+    /// Caller-owned scratch for decoded `&entity;` text. When null, spans
+    /// keep raw source text; measurement and rendering stay consistent
+    /// either way because both flow the same slices.
+    entities: ?*EntityStore = null,
+    /// Caller-owned scratch for cross-line reference joints (`Foo [bar]` +
+    /// `[1].` flows exactly like `Foo [bar] [1].`, Markdown 1.0). Null
+    /// disables the joint (lines flow separately). Render and measurement
+    /// share the config, so both always agree.
+    join_buf: ?*[JOIN_BUF_LEN]u8 = null,
 };
+
+/// Cross-line reference joint scratch length: two source lines plus a space.
+pub const JOIN_BUF_LEN: usize = 4096;
 
 pub const ScrollAxisLock = enum {
     none,
@@ -417,6 +455,8 @@ pub const FlowCtx = struct {
     vp_bottom: f32,
     commands_out: []DrawCommand,
     cmd_count: *usize,
+    defs: []const simd.RefDef = &.{},
+    entities: ?*EntityStore = null,
 };
 
 /// Lays out one word at the pen: wraps to the next visual row on overflow,
@@ -515,7 +555,7 @@ pub fn flowSourceLine(
     while (text.len > 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) : (text = text[0 .. text.len - 1]) {}
     if (text.len == 0) return;
     var span_buf: [32]parser.InlineSpan = undefined;
-    const n = parser.parseInlines(text, &span_buf);
+    const n = parser.parseInlinesWithDefs(text, &span_buf, ctx.defs);
     for (span_buf[0..n]) |span| {
         if (ctx.commands_out.len >= 4 and ctx.cmd_count.* >= ctx.commands_out.len - 4) break;
         var style = span.style;
@@ -524,9 +564,70 @@ pub fn flowSourceLine(
             style.bold = true;
             style.heading = true;
         }
-        flowSpans(span.text, style, span.link_target, pen, ctx);
+        var txt = span.text;
+        var tgt = span.link_target;
+        // Entities decode in rendered text (never in code spans, whose
+        // `&amp;` is literal). Measurement flows the same decoded slices,
+        // so wrap geometry always matches the draw.
+        if (!style.code and ctx.entities != null) {
+            if (std.mem.indexOfScalar(u8, txt, '&') != null) {
+                if (ctx.entities.?.decodeInto(txt)) |d| txt = d;
+            }
+            if (tgt != null and std.mem.indexOfScalar(u8, tgt.?, '&') != null) {
+                if (ctx.entities.?.decodeInto(tgt.?)) |d| tgt = d;
+            }
+        }
+        flowSpans(txt, style, tgt, pen, ctx);
     }
 }
+
+/// Caller-owned scratch for decoded `&entity;` text (see `EntityStore` on
+/// `ViewportConfig`). Slots are frame-lived like ordered-marker slots, so
+/// draw commands and measurement pens can borrow them safely.
+pub const MAX_ENTITY_SLOTS: usize = 32;
+pub const MAX_ENTITY_BYTES: usize = 512;
+pub const EntityStore = struct {
+    buf: [MAX_ENTITY_SLOTS][MAX_ENTITY_BYTES]u8 = undefined,
+    len: [MAX_ENTITY_SLOTS]u16 = undefined,
+    count: usize = 0,
+
+    pub fn reset(self: *EntityStore) void {
+        self.count = 0;
+    }
+
+    /// Copies `text` with every valid `&...;` reference replaced by its
+    /// UTF-8 decoding. Null when slots are exhausted or the decoded text
+    /// overflows (caller keeps the raw slice; geometry stays consistent
+    /// because both passes take the same fallback).
+    pub fn decodeInto(self: *EntityStore, text: []const u8) ?[]const u8 {
+        if (self.count >= MAX_ENTITY_SLOTS) return null;
+        const out = &self.buf[self.count];
+        var o: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] == '&') {
+                const el = parser.entityLengthAt(text, i);
+                if (el > 0) {
+                    var tmp: [8]u8 = undefined;
+                    const n = parser.decodeEntityAfterAmp(text[i + 1 ..], &tmp);
+                    if (n > 0 and o + n <= out.len) {
+                        @memcpy(out[o..][0..n], tmp[0..n]);
+                        o += n;
+                        i += el;
+                        continue;
+                    }
+                }
+            }
+            if (o >= out.len) return null;
+            out[o] = text[i];
+            o += 1;
+            i += 1;
+        }
+        self.len[self.count] = @intCast(o);
+        self.count += 1;
+        return out[0..o];
+    }
+};
 
 /// Caller-owned scratch for corrected ordered-list markers ("1." .. "N.").
 /// `DrawCommand.text` must borrow long-lived memory, so formatted numbers go
@@ -641,6 +742,28 @@ fn skipSpaces(s: []const u8) usize {
     return n;
 }
 
+/// Parses heading text with reference-link resolution, forces heading style,
+/// and decodes entities through the frame store. Shared by render, height,
+/// and refine so all three agree bit-for-bit.
+fn resolveHeadingSpans(config: ViewportConfig, h_text: []const u8, span_buf: []parser.InlineSpan) usize {
+    const n = parser.parseInlinesWithDefs(h_text, span_buf, config.ref_defs);
+    for (span_buf[0..n]) |*s| {
+        s.style.bold = true;
+        s.style.heading = true;
+    }
+    const ents = config.entities orelse return n;
+    for (span_buf[0..n]) |*s| {
+        if (s.style.code) continue;
+        if (std.mem.indexOfScalar(u8, s.text, '&') != null) {
+            if (ents.decodeInto(s.text)) |d| s.text = d;
+        }
+        if (s.link_target != null and std.mem.indexOfScalar(u8, s.link_target.?, '&') != null) {
+            if (ents.decodeInto(s.link_target.?)) |d| s.link_target = d;
+        }
+    }
+    return n;
+}
+
 /// Content kind of a quote body (after marker stripping).
 const QuoteBodyKind = enum { text, heading, bullet, ordered, task, code };
 
@@ -687,12 +810,12 @@ fn classifyQuoteBody(body: []const u8) QuoteBody {
         return .{ .kind = .text };
     }
     if (t[0] == '-' or t[0] == '*' or t[0] == '+') {
-        if (t.len >= 5 and t[1] == ' ' and t[2] == '[' and
+        if (t.len >= 5 and (t[1] == ' ' or t[1] == '\t') and t[2] == '[' and
             (t[3] == ' ' or t[3] == 'x' or t[3] == 'X') and t[4] == ']')
         {
             return .{ .kind = .task, .prefix_len = @intCast((body.len - t.len) + 5), .checked = (t[3] == 'x' or t[3] == 'X') };
         }
-        if (t.len >= 2 and t[1] == ' ') {
+        if (t.len >= 2 and (t[1] == ' ' or t[1] == '\t')) {
             return .{ .kind = .bullet, .prefix_len = @intCast((body.len - t.len) + 2) };
         }
         return .{ .kind = .text };
@@ -700,7 +823,7 @@ fn classifyQuoteBody(body: []const u8) QuoteBody {
     if (t[0] >= '0' and t[0] <= '9') {
         var d: usize = 1;
         while (d < t.len and t[d] >= '0' and t[d] <= '9') : (d += 1) {}
-        if (d + 1 < t.len and (t[d] == '.' or t[d] == ')') and t[d + 1] == ' ') {
+        if (d + 1 < t.len and (t[d] == '.' or t[d] == ')') and (t[d + 1] == ' ' or t[d + 1] == '\t')) {
             return .{
                 .kind = .ordered,
                 .prefix_len = @intCast((body.len - t.len) + d + 2),
@@ -777,10 +900,12 @@ fn quoteLeader(bytes: []const u8, lines: []const simd.Line, j: usize) ?usize {
 }
 
 /// Line types an indented code block can claim (post-blank, indent >= 4).
-/// Fences, tables, and blanks keep their own units.
+/// Fences, tables, blanks, reference definitions, and comments keep their
+/// own units. (Tab/4-space-indented defs and comments classify as plain
+/// paragraphs, so they still flow to code through this path.)
 fn isCodeClaimable(bt: simd.BlockType) bool {
     return switch (bt) {
-        .blank, .code_fence_start, .code_fence_end, .code_line, .table_row => false,
+        .blank, .code_fence_start, .code_fence_end, .code_line, .table_row, .link_def, .html_comment => false,
         else => true,
     };
 }
@@ -927,6 +1052,8 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .vp_bottom = ux.vp_bottom,
         .commands_out = ux.commands_out,
         .cmd_count = ux.cmd_count,
+        .defs = ux.config.ref_defs,
+        .entities = ux.config.entities,
     };
 }
 
@@ -1410,7 +1537,7 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         if (indent_level > 32) indent_level = 32;
         bullet_x = ux.content_x + indent_level * 10.0;
         var prefix_len: usize = 0;
-        while (prefix_len < text_slice.len and text_slice[prefix_len] != ' ') : (prefix_len += 1) {}
+        while (prefix_len < text_slice.len and text_slice[prefix_len] != ' ' and text_slice[prefix_len] != '\t') : (prefix_len += 1) {}
         if (prefix_len < text_slice.len) prefix_len += 1;
         const op_start = @min(prefix_len, text_slice.len);
         item_text = text_slice[op_start + skipSpaces(text_slice[op_start..]) ..];
@@ -1438,6 +1565,106 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
     return .{ .y = sub.y, .consumed = sub.next - i };
 }
 
+/// Own start number of an ordered-list line, or null when not ordered.
+fn orderedOwnNumber(bytes: []const u8, line: simd.Line) ?u32 {
+    if (line.block_type != .ordered_list) return null;
+    var t = bytes[line.offset..][0..line.len];
+    while (t.len > 0 and (t[0] == ' ' or t[0] == '\t')) : (t = t[1..]) {}
+    var d: usize = 0;
+    while (d < t.len and t[d] >= '0' and t[d] <= '9') : (d += 1) {}
+    if (d == 0 or d + 1 >= t.len) return null;
+    if (t[d] != '.' and t[d] != ')') return null;
+    if (t[d + 1] != ' ' and t[d + 1] != '\t') return null;
+    return parseListNumber(t[0..d]);
+}
+
+/// Start of the top-level paragraph run owning list line `j` as lazy
+/// continuation text. Two marker kinds never interrupt a paragraph (Markdown
+/// 1.0 reference: `Version\n8. x` and `bullet.\n* y` both stay one paragraph):
+/// ordered markers numbered != 1, and `*` bullets (`-`/`+` keep interrupting,
+/// matching the auto-links reference where the paragraph line is absorbed).
+/// Null when the line starts its own list (blank/doc-start/non-paragraph
+/// boundary, an intervening interrupting marker) or when the owning paragraph
+/// belongs to a list or quote (those followers absorb paragraph lines only,
+/// keeping every path that consumes this line in exact agreement).
+/// Iterative: no recursion risk on adversarial input.
+/// True for markers that never interrupt a paragraph: ordered numbers != 1
+/// and `*` bullets (`-`/`+` keep interrupting).
+fn isNonInterruptingMarker(bytes: []const u8, lines: []const simd.Line, m: usize) bool {
+    if (m >= lines.len) return false;
+    const b = lines[m].block_type;
+    if (b == .ordered_list) return (orderedOwnNumber(bytes, lines[m]) orelse 1) != 1;
+    if (b == .bullet_list) {
+        const raw = bytes[lines[m].offset..][0..lines[m].len];
+        var t = raw;
+        while (t.len > 0 and (t[0] == ' ' or t[0] == '\t')) : (t = t[1..]) {}
+        return t.len > 0 and t[0] == '*';
+    }
+    return false;
+}
+
+fn listContinuationStart(bytes: []const u8, lines: []const simd.Line, j: usize) ?usize {
+    if (!isNonInterruptingMarker(bytes, lines, j)) return null;
+    var k = j;
+    while (k > 0) {
+        const pb = lines[k - 1].block_type;
+        if (pb == .blank) return null;
+        if (pb == .paragraph) {
+            if (enclosingListMarker(bytes, lines, k - 1) != null) return null;
+            if (quoteLeader(bytes, lines, k - 1) != null) return null;
+            return unitStartAt(bytes, lines, k - 1);
+        }
+        if (pb == .ordered_list or pb == .bullet_list) {
+            if (isNonInterruptingMarker(bytes, lines, k - 1)) {
+                k -= 1;
+                continue;
+            }
+            return null;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Flows paragraph line `k` (leading-stripped per `strip`), joining it with
+/// `k+1` when the pair forms a cross-line reference (`Foo [bar]` + `[1].`
+/// flows exactly like `Foo [bar] [1].`, Markdown 1.0). The next line must be
+/// a lazy continuation so setext pairs and foreign units never merge.
+/// Returns the next unflowed index (`k+1` normally, `k+2` after a joint).
+fn flowParaLineJoint(ux: *UnitCx, pen: *FlowPen, tx: f32, ctx: FlowCtx, k: usize, strip: bool) usize {
+    const raw = ux.bytes[ux.lines[k].offset..][0..ux.lines[k].len];
+    var lb = raw;
+    if (strip) {
+        while (lb.len > 0 and (lb[0] == ' ' or lb[0] == '\t')) : (lb = lb[1..]) {}
+    }
+    if (ux.config.join_buf) |jb| {
+        const nk = k + 1;
+        if (nk < ux.lines.len and isLazyContinuation(ux.bytes, ux.lines, nk) and
+            setextLevel(ux.bytes, ux.lines, nk) == null)
+        {
+            var a = lb;
+            while (a.len > 0 and (a[a.len - 1] == ' ' or a[a.len - 1] == '\t')) : (a = a[0 .. a.len - 1]) {}
+            var b = ux.bytes[ux.lines[nk].offset..][0..ux.lines[nk].len];
+            while (b.len > 0 and (b[0] == ' ' or b[0] == '\t')) : (b = b[1..]) {}
+            if (a.len > 0 and a[a.len - 1] == ']' and b.len > 0 and b[0] == '[' and
+                a.len + 1 + b.len <= jb.len)
+            {
+                @memcpy(jb[0..a.len], a);
+                jb[a.len] = ' ';
+                @memcpy(jb[a.len + 1 ..][0..b.len], b);
+                // Head lines flow without a leading soft space; followers
+                // take one exactly like the non-joint path.
+                if (strip) softSpace(pen, tx, ux.config.base_font_size);
+                flowSourceLine(jb[0 .. a.len + 1 + b.len], false, false, false, pen, ctx);
+                return nk + 1;
+            }
+        }
+    }
+    if (strip) softSpace(pen, tx, ux.config.base_font_size);
+    flowSourceLine(lb, strip, false, false, pen, ctx);
+    return k + 1;
+}
+
 /// Lays out a paragraph unit: setext pair (consumes 2) or a flowed run of
 /// soft-break-joined lines with a single trailing gap.
 /// `base_x` is content_x, or the item column for list-owned runs past
@@ -1458,16 +1685,37 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
     }
     var pen = FlowPen{ .x = base_x, .y = start_y };
     const ctx = flowCtxFor(ux, base_x, bw, ux.config.base_font_size, ux.config.line_height, ux.theme.text);
-    const first = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
-    flowSourceLine(first, false, false, false, &pen, ctx);
+    // Cross-line reference joints only in top-level runs (list/quote-owned
+    // followers absorb paragraph lines only, and unitStartAt agrees).
+    const allow_joint = ux.config.join_buf != null and
+        enclosingListMarker(ux.bytes, ux.lines, i) == null and
+        quoteLeader(ux.bytes, ux.lines, i) == null;
     var j = i + 1;
-    while (j < ux.lines.len and ux.lines[j].block_type == .paragraph and
-        setextLevel(ux.bytes, ux.lines, j) == null)
+    if (allow_joint) {
+        j = flowParaLineJoint(ux, &pen, base_x, ctx, i, false);
+    } else {
+        const first = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
+        flowSourceLine(first, false, false, false, &pen, ctx);
+    }
+    while (j < ux.lines.len and
+        ((ux.lines[j].block_type == .paragraph and
+            setextLevel(ux.bytes, ux.lines, j) == null) or
+            ((listContinuationStart(ux.bytes, ux.lines, j) orelse (j + 1)) == i)))
     {
-        softSpace(&pen, base_x, ux.config.base_font_size);
-        const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
-        flowSourceLine(lb, true, false, false, &pen, ctx);
-        j += 1;
+        if (allow_joint) {
+            const strip = true;
+            const before = j;
+            j = flowParaLineJoint(ux, &pen, base_x, ctx, j, strip);
+            if (j == before) {
+                // Defensive: helper always advances; never spin.
+                j += 1;
+            }
+        } else {
+            softSpace(&pen, base_x, ux.config.base_font_size);
+            const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
+            flowSourceLine(lb, true, false, false, &pen, ctx);
+            j += 1;
+        }
     }
     return .{ .y = pen.y + ux.config.line_height + 4.0, .consumed = j - i };
 }
@@ -2004,11 +2252,7 @@ pub fn renderViewportCore(
             cur_y += margin_top;
 
             const h_text = line_bytes[h_offset..];
-            const span_count = parser.parseInlines(h_text, &span_buf);
-            for (span_buf[0..span_count]) |*s| {
-                s.style.bold = true;
-                s.style.heading = true;
-            }
+            const span_count = resolveHeadingSpans(config, h_text, &span_buf);
 
             const end_y = layoutWrappedSpans(
                 span_buf[0..span_count],
@@ -2054,6 +2298,13 @@ pub fn renderViewportCore(
         // ----------------------------------------------------
         if (line_info.block_type == .blank) {
             cur_y += config.line_height * 0.75;
+            continue;
+        }
+
+        // ----------------------------------------------------
+        // Reference definitions and HTML comments never render.
+        // ----------------------------------------------------
+        if (line_info.block_type == .link_def or line_info.block_type == .html_comment) {
             continue;
         }
 
@@ -2379,11 +2630,7 @@ pub fn computeDocumentHeightEx(
             cur_y += margin_top;
 
             const h_text = line_bytes[h_offset..];
-            const span_count = parser.parseInlines(h_text, &span_buf);
-            for (span_buf[0..span_count]) |*s| {
-                s.style.bold = true;
-                s.style.heading = true;
-            }
+            const span_count = resolveHeadingSpans(config, h_text, &span_buf);
 
             const end_y = layoutWrappedSpans(
                 span_buf[0..span_count],
@@ -2412,6 +2659,11 @@ pub fn computeDocumentHeightEx(
         // 5. Blank Line
         if (line_info.block_type == .blank) {
             cur_y += config.line_height * 0.75;
+            continue;
+        }
+
+        // Reference definitions and HTML comments take no space.
+        if (line_info.block_type == .link_def or line_info.block_type == .html_comment) {
             continue;
         }
 
@@ -2913,6 +3165,7 @@ pub fn estimateBlockHeight(line: simd.Line, config: ViewportConfig, content_widt
     const lh = config.line_height;
     const bt = line.block_type;
     if (bt == .blank) return lh * 0.75;
+    if (bt == .link_def or bt == .html_comment) return 0.0;
     if (bt == .hr) return 24.0;
     if (bt == .code_fence_start or bt == .code_fence_end) return 20.0;
     if (bt == .code_line) return lh * 0.88;
@@ -3011,6 +3264,10 @@ pub fn refineLineHeight(
 
     switch (info.block_type) {
         .blank => return .{ .height = lh * 0.75, .consumed = 1 },
+        // Reference definitions and HTML comments never render: their
+        // block types exist so no paragraph, list, quote, or code unit can
+        // absorb them (hiding is structural, not per-call).
+        .link_def, .html_comment => return .{ .height = 0.0, .consumed = 1 },
         .hr => return .{ .height = 24.0, .consumed = 1 },
         .code_line => return .{ .height = lh * 0.88, .consumed = 1 },
         .code_fence_end => return .{ .height = 0.0, .consumed = 1 },
@@ -3072,11 +3329,7 @@ pub fn refineLineHeight(
             var h_offset: usize = 0;
             while (h_offset < line_bytes.len and line_bytes[h_offset] == '#') : (h_offset += 1) {}
             while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
-            const span_count = parser.parseInlines(line_bytes[h_offset..], &span_buf);
-            for (span_buf[0..span_count]) |*s| {
-                s.style.bold = true;
-                s.style.heading = true;
-            }
+            const span_count = resolveHeadingSpans(config, line_bytes[h_offset..], &span_buf);
             var mux_h = measureCx(bytes, lines, config, content_width, content_x, &dummy);
             const hx = if (lineIndentWidth(bytes, info) >= 4)
                 listContentBase(&mux_h, idx, 4) orelse content_x
@@ -3092,6 +3345,12 @@ pub fn refineLineHeight(
             return .{ .height = r.y, .consumed = r.consumed };
         },
         .task_list, .bullet_list, .ordered_list => {
+            // Absorbed as paragraph-run text: the owning unit measures it.
+            if ((info.block_type == .ordered_list or info.block_type == .bullet_list) and
+                listContinuationStart(bytes, lines, idx) != null)
+            {
+                return .{ .height = 0.0, .consumed = 1 };
+            }
             var mux = measureCx(bytes, lines, config, content_width, content_x, &dummy);
             const r = layoutListUnit(&mux, idx, 0);
             return .{ .height = r.y, .consumed = r.consumed };
@@ -3222,6 +3481,10 @@ pub fn unitStartAt(bytes: []const u8, lines: []const simd.Line, j: usize) usize 
         return s;
     }
     if (setextLevel(bytes, lines, j - 1) != null) return j - 1;
+    // Non-interrupting markers flow as text inside the owning paragraph run.
+    if (bt == .ordered_list or bt == .bullet_list) {
+        if (listContinuationStart(bytes, lines, j)) |s| return s;
+    }
     if (bt == .blank) {
         if (blankInsideListUnit(bytes, lines, j) or blankInsideCodeUnit(bytes, lines, j)) {
             var k = j;
@@ -3593,6 +3856,10 @@ fn unitContinuesAt(bytes: []const u8, lines: []const simd.Line, j: usize) bool {
     if (bt == .table_row and j > 0 and lines[j - 1].block_type == .table_row) return true;
     // Setext underline continues the heading unit started above it.
     if (j > 0 and setextLevel(bytes, lines, j - 1) != null) return true;
+    // Non-interrupting markers absorbed as paragraph-run text continue it.
+    if (bt == .ordered_list or bt == .bullet_list) {
+        if (listContinuationStart(bytes, lines, j)) |s| return s < j;
+    }
     // Blanks inside list/code units.
     if (bt == .blank) {
         return blankInsideListUnit(bytes, lines, j) or blankInsideCodeUnit(bytes, lines, j);

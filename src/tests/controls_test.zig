@@ -395,3 +395,53 @@ test "controls: smooth scroll converges across frame rates" {
     try std.testing.expectEqual(@as(f32, 480.0), fast.current);
 }
 
+test "controls: draggable scrollbar thumb maps scroll offset to view geometry" {
+    const view_h: f32 = 750.0;
+    const max_scroll: f32 = 2000.0;
+
+    // Top of document -> thumb at top; bottom -> thumb at bottom of travel.
+    try std.testing.expectEqual(@as(f32, 0.0), layout.scrollbarThumbY(0.0, max_scroll, view_h));
+    try std.testing.expectEqual(view_h - layout.SCROLLBAR_THUMB_H, layout.scrollbarThumbY(max_scroll, max_scroll, view_h));
+
+    // Midpoint maps to mid-travel.
+    try std.testing.expectEqual(
+        (view_h - layout.SCROLLBAR_THUMB_H) * 0.5,
+        layout.scrollbarThumbY(max_scroll * 0.5, max_scroll, view_h),
+    );
+
+    // Out-of-range offsets clamp instead of running off the track.
+    try std.testing.expectEqual(@as(f32, 0.0), layout.scrollbarThumbY(-100.0, max_scroll, view_h));
+    try std.testing.expectEqual(view_h - layout.SCROLLBAR_THUMB_H, layout.scrollbarThumbY(max_scroll + 500.0, max_scroll, view_h));
+
+    // Nothing to scroll -> no thumb.
+    try std.testing.expectEqual(@as(f32, 0.0), layout.scrollbarThumbY(0.0, 0.0, view_h));
+}
+
+test "controls: draggable scrollbar drag maps pointer y back to scroll offset" {
+    const view_h: f32 = 750.0;
+    const max_scroll: f32 = 2000.0;
+    const travel = view_h - layout.SCROLLBAR_THUMB_H;
+
+    // Thumb grab keeps its offset: dragging the grabbed point back to where
+    // the thumb was returns the original scroll (no jump on grab).
+    const start_scroll: f32 = 500.0;
+    const thumb = layout.scrollbarThumbY(start_scroll, max_scroll, view_h);
+    const grab: f32 = 10.0;
+    try std.testing.expectEqual(
+        start_scroll,
+        layout.scrollbarScrollFromY(thumb + grab, grab, max_scroll, view_h),
+    );
+
+    // Track click centers the thumb: pointer at mid-track scrolls to middle.
+    try std.testing.expectEqual(
+        max_scroll * 0.5,
+        layout.scrollbarScrollFromY(travel * 0.5 + layout.SCROLLBAR_THUMB_H * 0.5, layout.SCROLLBAR_THUMB_H * 0.5, max_scroll, view_h),
+    );
+
+    // Dragging past either end clamps to the document bounds.
+    try std.testing.expectEqual(@as(f32, 0.0), layout.scrollbarScrollFromY(-1000.0, 0.0, max_scroll, view_h));
+    try std.testing.expectEqual(max_scroll, layout.scrollbarScrollFromY(view_h + 1000.0, 0.0, max_scroll, view_h));
+
+    // Nothing to scroll -> drag is a no-op.
+    try std.testing.expectEqual(@as(f32, 0.0), layout.scrollbarScrollFromY(300.0, 0.0, 0.0, view_h));
+}
