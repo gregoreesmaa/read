@@ -2447,7 +2447,9 @@ pub fn renderViewportCore(
                         else
                             "";
                         if (cell_text.len > 0 and cmd_count < commands_out.len) {
-                            const cell_spans = parser.parseInlines(cell_text, &span_buf);
+                            // Reference links resolve in cells like
+                            // every other flow context ([#16]).
+                            const cell_spans = parser.parseInlinesWithDefs(cell_text, &span_buf, config.ref_defs);
                             const cell_color = if (is_header) theme.accent else theme.text;
                             const cell_fs = config.base_font_size * 0.90;
                             const space_w = measureCharEx(' ', cell_fs, false, false, false, false);
