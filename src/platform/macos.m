@@ -1425,6 +1425,44 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
     invalidate_rect(NSMakeRect(x, y, w, h));
 }
 
+// ---------------------------------------------------------------------------
+// Scroll smoothing driver: a 120Hz runloop timer (CoreFoundation only — no
+// new framework) that eases the displayed offset toward the Zig-side
+// target. The timer exists only while unsettled: platform_smooth_kick
+// creates it, and each fire parks it when on_tick reports settled, so a
+// static screen keeps zero wakeups (0% CPU), same as before.
+// ---------------------------------------------------------------------------
+static CFRunLoopTimerRef g_smooth_timer = NULL;
+static CFAbsoluteTime g_smooth_last = 0;
+
+static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
+    (void)timer; (void)info;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    double dt_ms = (now - g_smooth_last) * 1000.0;
+    g_smooth_last = now;
+    if (dt_ms < 0.0) dt_ms = 0.0;
+    if (dt_ms > 50.0) dt_ms = 50.0; // clamped: menu-drag stalls must not teleport
+    int more = 0;
+    if (g_callbacks.on_tick) more = g_callbacks.on_tick((float)dt_ms);
+    if (!more && g_smooth_timer) {
+        CFRunLoopTimerInvalidate(g_smooth_timer);
+        CFRelease(g_smooth_timer);
+        g_smooth_timer = NULL;
+    }
+    NSView* v = damage_target_view();
+    if (v) [v setNeedsDisplay:YES];
+}
+
+void platform_smooth_kick(void) {
+    if (g_smooth_timer || !g_callbacks.on_tick) return; // already easing
+    g_smooth_last = CFAbsoluteTimeGetCurrent();
+    CFRunLoopTimerContext ctx = {0, NULL, NULL, NULL, NULL};
+    g_smooth_timer = CFRunLoopTimerCreate(NULL, g_smooth_last + 1.0 / 120.0, 1.0 / 120.0,
+                                          0, 0, smooth_timer_fire, &ctx);
+    if (g_smooth_timer)
+        CFRunLoopAddTimer(CFRunLoopGetMain(), g_smooth_timer, kCFRunLoopCommonModes);
+}
+
 #ifdef TEST_HOOKS
 // Headless test hooks (damage/selection parity tests): inject a synthetic
 // pending-damage rect and read back the rebuilt text-record count.

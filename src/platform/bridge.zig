@@ -8,6 +8,10 @@ pub const PlatformCallbacks = extern struct {
     /// Section-link clicks (`#fragment` URLs). Appended last so existing
     /// field offsets never shift across the FFI boundary.
     on_link: ?*const fn (url: [*]const u8, url_len: c_int) callconv(.c) void = null,
+    /// Display-link tick for scroll smoothing (dt in ms). Returns 1 while
+    /// more frames are needed, 0 when settled. Appended last for the same
+    /// FFI stability reason.
+    on_tick: ?*const fn (dt_ms: f32) callconv(.c) c_int = null,
 };
 
 pub extern "c" fn platform_init(
@@ -24,6 +28,10 @@ pub extern "c" fn platform_request_redraw_rect(x: f32, y: f32, w: f32, h: f32) v
 /// or 0 when there is no pending damage (headless render, first draw).
 pub extern "c" fn platform_get_pending_damage(x: *f32, y: *f32, w: *f32, h: *f32) c_int;
 pub extern "c" fn platform_sync_scroll(scroll_y: f32) void;
+/// Arm the 120Hz smoothing timer. No-op while it is already running; the
+/// timer parks itself when on_tick reports settled, so a static screen
+/// costs zero wakeups.
+pub extern "c" fn platform_smooth_kick() void;
 
 pub extern "c" fn platform_draw_rect(
     x: f32,

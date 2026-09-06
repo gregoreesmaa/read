@@ -71,6 +71,24 @@ var g_dump_commands: bool = false;
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
+// Smooth-scroll animation state: inputs retarget, a 120Hz platform tick
+// eases g_app.scroll_y (displayed) toward the target. Anchor jumps and
+// resizes snap both so they stay 1:1.
+var g_smooth: layout.SmoothScroll = .{};
+
+/// Retarget the animated scroll offset and arm the platform tick while the
+/// displayed offset is still settling. No-op when already settled.
+fn retargetScroll(target: f32) void {
+    g_smooth.setTarget(target, g_app.max_scroll_y);
+    if (!g_smooth.settled()) bridge.platform_smooth_kick();
+}
+
+/// Snap displayed and target offsets together (anchor jumps, resizes,
+/// startup offsets): no animation, never diverged.
+fn snapScroll(v: f32) void {
+    g_smooth.snapTo(v, g_app.max_scroll_y);
+    g_app.scroll_y = g_smooth.current;
+}
 
 const MAX_CHECKPOINTS = 2048;
 var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
@@ -132,7 +150,7 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) vo
     const locked = g_scroll_lock.processScroll(delta_x, delta_y, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
-        g_app.scroll_y = std.math.clamp(g_app.scroll_y - locked.dy, 0.0, g_app.max_scroll_y);
+        retargetScroll(g_smooth.target - locked.dy);
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);
@@ -142,6 +160,16 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) vo
             g_app.block_max_scroll_x[id],
         );
     }
+}
+
+/// Display-link tick (dt in ms): ease the displayed offset toward the
+/// target. Returns 1 while more frames are needed, 0 when settled (the
+/// platform parks its timer on 0, so a static screen costs zero wakeups).
+fn onTick(dt_ms: f32) callconv(.c) c_int {
+    g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
+    const settled = g_smooth.tick(dt_ms / 1000.0);
+    g_app.scroll_y = g_smooth.current;
+    return if (settled) 0 else 1;
 }
 
 fn updateDocumentMetrics() void {
@@ -165,7 +193,7 @@ fn onResize(w: c_int, h: c_int) callconv(.c) void {
     g_app.window_width = @floatFromInt(w);
     g_app.window_height = @floatFromInt(h);
     updateDocumentMetrics();
-    g_app.scroll_y = std.math.clamp(g_app.scroll_y, 0.0, g_app.max_scroll_y);
+    snapScroll(g_app.scroll_y);
 }
 
 fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
@@ -187,17 +215,17 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
         vp_config,
         frag,
     ) orelse return;
-    g_app.scroll_y = std.math.clamp(target, 0.0, g_app.max_scroll_y);
+    snapScroll(target);
     bridge.platform_request_redraw();
 }
 
 fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
     switch (key_code) {
         'j' => {
-            g_app.scroll_y = std.math.clamp(g_app.scroll_y + 40.0, 0.0, g_app.max_scroll_y);
+            retargetScroll(g_smooth.target + 40.0);
         },
         'k' => {
-            g_app.scroll_y = std.math.clamp(g_app.scroll_y - 40.0, 0.0, g_app.max_scroll_y);
+            retargetScroll(g_smooth.target - 40.0);
         },
         'h' => {
             if (hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
@@ -220,7 +248,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
             }
         },
         ' ' => {
-            g_app.scroll_y = std.math.clamp(g_app.scroll_y + g_app.window_height * 0.8, 0.0, g_app.max_scroll_y);
+            retargetScroll(g_smooth.target + g_app.window_height * 0.8);
         },
         't' => {
             g_app.is_dark_theme = !g_app.is_dark_theme;
@@ -532,6 +560,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else if (std.mem.eql(u8, arg, "--scroll")) {
             if (args_it.next()) |sc_str| {
                 g_app.scroll_y = parseF32(sc_str);
+                g_smooth.snapTo(g_app.scroll_y, std.math.inf(f32));
             }
         } else {
             // Document paths land in file_path from any position; hook
@@ -725,6 +754,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_key = onKey,
         .on_draw = onDraw,
         .on_link = onLink,
+        .on_tick = onTick,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);

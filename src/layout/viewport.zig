@@ -314,6 +314,52 @@ pub const ScrollLockState = struct {
     }
 };
 
+/// Display-synced scroll smoothing: input handlers retarget, a 120Hz platform
+/// tick eases `current` toward `target`. Exponential approach (frame-rate
+/// independent via dt), monotonic, no overshoot, exact snap under 0.5px.
+/// Zero allocations; two f32 of state.
+pub const SmoothScroll = struct {
+    current: f32 = 0.0,
+    target: f32 = 0.0,
+
+    pub const RATE: f32 = 16.0;
+    pub const SNAP_PX: f32 = 0.5;
+
+    pub fn setTarget(self: *SmoothScroll, v: f32, max: f32) void {
+        self.target = std.math.clamp(v, 0.0, @max(0.0, max));
+    }
+
+    /// Scrollbar drags stay 1:1 — the displayed offset jumps with the target.
+    pub fn snapTo(self: *SmoothScroll, v: f32, max: f32) void {
+        const c = std.math.clamp(v, 0.0, @max(0.0, max));
+        self.target = c;
+        self.current = c;
+    }
+
+    pub fn settled(self: *const SmoothScroll) bool {
+        return self.current == self.target;
+    }
+
+    /// Advance toward the target by dt seconds. Returns true when settled.
+    pub fn tick(self: *SmoothScroll, dt_s: f32) bool {
+        const diff = self.target - self.current;
+        if (diff == 0.0) return true;
+        const dt = @max(0.0, dt_s);
+        // 1 - e^(-RATE*dt): frame-rate independent exponential approach.
+        const t = 1.0 - @exp(-RATE * dt);
+        const next = self.current + diff * t;
+        // Snap, then pin to the segment so float error can never overshoot.
+        if (@abs(self.target - next) < SNAP_PX) {
+            self.current = self.target;
+        } else if (diff > 0.0) {
+            self.current = @min(next, self.target);
+        } else {
+            self.current = @max(next, self.target);
+        }
+        return self.current == self.target;
+    }
+};
+
 /// Renders a series of inline spans with automatic word wrapping and exact typography.
 pub fn layoutWrappedSpans(
     spans: []const parser.InlineSpan,
