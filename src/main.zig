@@ -125,6 +125,11 @@ var g_sweep_step: f32 = 0.0;
 // Two-phase drag-back residue test state (needs -Dtest-hooks): selection A
 // then shrink to B, painted incrementally on one bitmap. See --select-drag.
 var g_drag_active: bool = false;
+// First-paint gate for deferred image decodes (see platform_arm_images):
+// image records park until the first frame is committed, then decode.
+// Headless one-shot screenshots never arm (deterministic placeholders).
+var g_first_paint_done: bool = false;
+var g_headless_oneshot: bool = false;
 var g_drag_vals: [8]f32 = [_]f32{0.0} ** 8;
 
 fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void {
@@ -492,6 +497,14 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         bridge.platform_end_clip();
     }
 
+    // First frame committed: image decodes may start now, off the startup
+    // critical path. Headless one-shots skip this (placeholders are the
+    // deterministic expected output there); settle runs arm explicitly.
+    if (!g_first_paint_done) {
+        g_first_paint_done = true;
+        if (!g_headless_oneshot) bridge.platform_arm_images();
+    }
+
     // Scroll-sweep profiler row (needs -Dtest-hooks): per-offset phase
     // timings plus workload counters. Compiled out of ship builds.
     if (build_options.test_hooks and g_sweep_active) {
@@ -651,6 +664,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Let async image decodes finish, then relayout with real sizes.
         // TEST_HOOKS only; ship screenshots render immediately.
         if (build_options.test_hooks and settle_images_ms > 0) {
+            // Settle runs want images: arm the parked decodes first, then
+            // wait for them to drain as before.
+            bridge.platform_arm_images();
             const t0 = getTimestampMs();
             const req = std.posix.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
             while (bridge.platform_images_pending() > 0 and
@@ -670,6 +686,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // of A-then-B on one bitmap, compared by the caller against a fresh
         // full render of B. Any byte difference is leftover highlight.
         if (build_options.test_hooks and g_drag_active) {
+            // Multi-phase determinism: like plain one-shots, the drag
+            // residue test compares incremental vs fresh renders pixel-wise,
+            // so decodes must not land mid-test. Placeholders throughout.
+            g_headless_oneshot = true;
             const v = g_drag_vals;
             const r = bridge.platform_render_select_drag_png(sc_path, 1200, 900, onDraw,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
@@ -702,6 +722,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             std.c.exit(0);
         }
+        // Plain one-shot: placeholders are the expected output (decodes
+        // never win the race today either); suppress the first-paint arm
+        // so no decode CPU lands in the startup window at all.
+        g_headless_oneshot = true;
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});

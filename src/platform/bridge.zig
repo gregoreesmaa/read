@@ -74,6 +74,7 @@ pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;
 pub extern "c" fn platform_images_pending() c_int;
+pub extern "c" fn platform_arm_images() void;
 pub extern "c" fn platform_probe_px_add(x: c_int, y: c_int) void;
 
 pub extern "c" fn platform_register_text_run(
