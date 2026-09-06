@@ -6,6 +6,7 @@ const simd = @import("core/simd.zig");
 const parser = @import("core/parser.zig");
 const layout = @import("layout/viewport.zig");
 const damage = @import("layout/damage.zig");
+const help_overlay = @import("layout/help_overlay.zig");
 const bridge = @import("platform/bridge.zig");
 
 const DEFAULT_DOC =
@@ -273,15 +274,24 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
     bridge.platform_request_redraw();
 }
 
+// Cheat-sheet overlay visibility (issue #54), toggled by `?`.
+var g_show_help: bool = false;
+
+// Key dispatch goes through the shared binding table in
+// layout/help_overlay.zig: the overlay lists exactly these rows, and the
+// switch below is exhaustive over Action (no else), so a new table row
+// fails to compile until it is handled here — handler and sheet cannot
+// drift apart. Unknown keys are a no-op, as before.
 fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
-    switch (key_code) {
-        'j' => {
+    const binding = help_overlay.actionFor(key_code) orelse return;
+    switch (binding.action) {
+        .scroll_down => {
             retargetScroll(g_smooth.target + 40.0);
         },
-        'k' => {
+        .scroll_up => {
             retargetScroll(g_smooth.target - 40.0);
         },
-        'h' => {
+        .block_left => {
             if (hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
                 const id: usize = @intCast(hovered_block_id);
                 g_app.block_scroll_x[id] = std.math.clamp(
@@ -291,7 +301,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
                 );
             }
         },
-        'l' => {
+        .block_right => {
             if (hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
                 const id: usize = @intCast(hovered_block_id);
                 g_app.block_scroll_x[id] = std.math.clamp(
@@ -301,16 +311,70 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
                 );
             }
         },
-        ' ' => {
+        .page_down => {
             retargetScroll(g_smooth.target + g_app.window_height * 0.8);
         },
-        't' => {
+        .toggle_theme => {
             g_app.is_dark_theme = !g_app.is_dark_theme;
         },
-        'q' => {
+        .toggle_help => {
+            g_show_help = !g_show_help;
+        },
+        .dismiss_help => {
+            g_show_help = false;
+        },
+        .quit => {
             std.c.exit(0);
         },
-        else => {},
+        .native => {},
+    }
+}
+
+// Centered cheat-sheet overlay (issue #54): geometry comes from the same
+// table as the key handler (see help_overlay.emitOverlay). Painted after
+// the damage clip closes so the modal card is never partially culled;
+// pixels reuse platform_draw_text, which also records the runs in the
+// text model (selection now, VoiceOver via #29 later).
+fn drawHelpOverlay() void {
+    const theme = if (g_app.is_dark_theme) layout.Theme.dark else layout.Theme.light;
+    var cmds: [32]layout.DrawCommand = undefined;
+    const n = help_overlay.emitOverlay(&cmds, g_app.window_width, g_app.window_height, theme);
+    for (cmds[0..n]) |cmd| {
+        switch (cmd.kind) {
+            .fill_rect => {
+                bridge.platform_draw_rect(
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.rect.w,
+                    cmd.rect.h,
+                    cmd.color.r,
+                    cmd.color.g,
+                    cmd.color.b,
+                    cmd.color.a,
+                );
+            },
+            .text_run => {
+                const is_bold: c_int = if (cmd.style.bold) 1 else 0;
+                bridge.platform_draw_text(
+                    cmd.text.ptr,
+                    @intCast(cmd.text.len),
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.font_size,
+                    is_bold,
+                    0,
+                    0,
+                    0,
+                    cmd.color.r,
+                    cmd.color.g,
+                    cmd.color.b,
+                    cmd.color.a,
+                    null,
+                    0,
+                );
+            },
+            else => {},
+        }
     }
 }
 
@@ -577,6 +641,10 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     if (clipped_pass) {
         bridge.platform_end_clip();
     }
+
+    // Modal cheat sheet paints above everything, unclipped (see
+    // drawHelpOverlay: never culled by partial damage).
+    if (g_show_help) drawHelpOverlay();
 
     // First frame committed: image decodes may start now, off the startup
     // critical path. Headless one-shots skip this (placeholders are the
@@ -1069,4 +1137,27 @@ test "retina atlas text stays crisp (no-blur regression)" {
         try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
     }
+}
+
+test "cheatsheet overlay: ? toggles, Esc dismisses, unknown keys no-op" {
+    // Drives the real onKey dispatch (same table the overlay lists), but
+    // only through side-effect-free actions: no scroll (needs the platform
+    // timer), no theme flip, no quit. Runs in the exe test binaries.
+    const prev = g_show_help;
+    defer g_show_help = prev;
+    g_show_help = false;
+    onKey('?', -1);
+    try std.testing.expect(g_show_help);
+    onKey('?', -1);
+    try std.testing.expect(!g_show_help);
+    onKey('?', -1);
+    onKey(27, -1);
+    try std.testing.expect(!g_show_help);
+    onKey('z', -1);
+    try std.testing.expect(!g_show_help);
+    // Overlay paint path runs headless without crashing (platform draws
+    // early-return with no live context; geometry is pinned in
+    // help_overlay.zig tests).
+    g_show_help = true;
+    drawHelpOverlay();
 }
