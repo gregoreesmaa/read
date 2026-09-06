@@ -542,6 +542,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
                 const url_ptr = if (cmd.link_target) |t| t.ptr else null;
                 const url_len: c_int = if (cmd.link_target) |t| @intCast(t.len) else 0;
+                // Alt text rides along for the muted placeholder box (#45);
+                // loaded images ignore it.
                 bridge.platform_draw_image(
                     url_ptr,
                     url_len,
@@ -549,6 +551,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.rect.y,
                     cmd.rect.w,
                     cmd.rect.h,
+                    cmd.text.ptr,
+                    @intCast(cmd.text.len),
                 );
             },
         }
@@ -755,6 +759,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         g_app.mapped_file = mapped;
         g_app.bytes = mapped.bytes;
+        // Document directory for relative image paths (#45). The platform
+        // takes the full path and keeps the dirname; empty clears it.
+        bridge.platform_set_document_dir(path.ptr, @intCast(path.len));
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
@@ -1068,5 +1075,25 @@ test "retina atlas text stays crisp (no-blur regression)" {
         std.debug.print("\n[CRISP] acutance={d:.1} edge_frac={d:.4}\n", .{ m.acutance, m.edge_frac });
         try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
+    }
+}
+
+test "image completeness contracts: doc-dir resolve + URL session (#45)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the crisp test). Only the read-test binary executes it.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        // Doc-dir join: ("/","tmp") exists on any macOS; nonsense does not.
+        try t.expectEqual(
+            @as(c_int, 1),
+            bridge.platform_test_image_resolve("/", 1, "tmp", 3),
+        );
+        try t.expectEqual(
+            @as(c_int, 0),
+            bridge.platform_test_image_resolve("/", 1, "read-definitely-missing-zzz", 25),
+        );
+        try t.expectEqual(@as(c_int, -1), bridge.platform_test_image_resolve("", 0, "tmp", 3));
+        // Session: shared, ephemeral, no shared cache, bounded timeouts.
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_image_session());
     }
 }
