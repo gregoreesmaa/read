@@ -42,12 +42,13 @@ paragraph, so GitHub search matches both topics and README text.
 
 ## 4. Social preview (About → Social preview → Upload)
 
-- Recommended: 1280×640 PNG, e.g. a side-by-side of `screenshots/text_wrapping.png` and
-  the benchmark table, with the one-line pitch from §1 as the headline.
-- Suggested headline text on the image:
+- Use the README hero so the card matches the repo front page: `screenshots/text_wrapping.png`
+  (1280×640 PNG; GitHub's recommended social-image size) with the one-line pitch from §1 as the headline.
+- Suggested headline text on the image (no numbers here — the README comparison table is the
+  single claims surface; never copy figures into discovery copy):
 
 ```text
-Read — microsecond-grade Markdown in pure Zig. <180 KiB. Zero dependencies.
+Read — microsecond-grade Markdown in pure Zig.
 ```
 
 ## 5. After applying (verify)
