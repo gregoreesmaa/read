@@ -64,9 +64,26 @@ pub const MappedFile = struct {
             );
             errdefer _ = std.c.close(fd);
 
-            var stat: std.c.Stat = undefined;
-            if (std.c.fstat(fd, &stat) != 0) return error.StatFailed;
-            const size: usize = @intCast(stat.size);
+            // File size without a trailing dependency on libc::fstat, which
+            // Zig 0.16 leaves void on Linux. The Linux arm uses the same
+            // statx(AT_EMPTY_PATH) query as std.Io.Threaded.fileLength.
+            const size: usize = if (builtin.os.tag == .linux) blk: {
+                const linux = std.os.linux;
+                var sx = std.mem.zeroes(linux.Statx);
+                const err = linux.errno(linux.statx(
+                    fd,
+                    "",
+                    linux.AT.EMPTY_PATH,
+                    .{ .SIZE = true },
+                    &sx,
+                ));
+                if (err != .SUCCESS or !sx.mask.SIZE) return error.StatFailed;
+                break :blk @intCast(sx.size);
+            } else blk: {
+                var stat: std.c.Stat = undefined;
+                if (std.c.fstat(fd, &stat) != 0) return error.StatFailed;
+                break :blk @intCast(stat.size);
+            };
 
             if (size == 0) {
                 return MappedFile{

@@ -6,7 +6,7 @@
 
 > **Read** — an ultra-minimalist, zero-dependency, microsecond-grade Markdown reader in pure Zig with a native macOS Cocoa/CoreText layer.
 
-A **zig markdown reader** with **zero-dependency** binaries under 500 KB: zero-copy file access via
+A **zig markdown reader** with **zero-dependency** binaries under 180 KiB: zero-copy file access via
 **mmap**, branchless **SIMD** line scanning at gigabytes per second, a virtualized viewport with
 **microsecond** layout latency, and native **Core Text** typography on **macOS**. No Electron, no
 WebKit, no UI toolkit, no package dependencies — just Zig and OS headers.
@@ -22,6 +22,15 @@ WebKit, no UI toolkit, no package dependencies — just Zig and OS headers.
 
 `Read` is designed for one thing: opening and rendering Markdown files faster than the human eye can perceive, using the absolute minimum computer resources possible. Zero heap allocations on the hot path, SIMD vector scanning, and native sub-pixel typography.
 
+> **New here?** Build and open the demo in one step (macOS, Zig 0.16):
+>
+> ```bash
+> zig build -Doptimize=ReleaseFast && ./zig-out/bin/read showcase.md
+> ```
+>
+> `j`/`k` scroll · `Space` page down · `t` toggle theme · `q` quit. The one-page
+> reason this exists: [VISION.md](VISION.md).
+
 ---
 
 ## ⚡ Performance & Strict Benchmarks
@@ -30,7 +39,7 @@ All metrics are codified in `src/core/strict_benchmarks.zig` and verified on App
 
 | Metric | Typical Markdown App (Electron / WebTech) | Standard Native Reader | **Read** (Zig 0.16) | Target Guaranteed |
 | :--- | :--- | :--- | :--- | :--- |
-| **Binary Size** | ~180 MB | ~15 – 35 MB | **< 500 KB** (`ReleaseFast`) | **< 500 KB** |
+| **Binary Size** | ~180 MB | ~15 – 35 MB | **< 180 KiB** (`ReleaseFast`) | **< 180 KiB** |
 | **Document Open Time** | 350 – 1,200 ms | 20 – 60 ms | **≤ 18 µs** (Zero-copy `mmap`) | **≤ 18 µs** |
 | **SIMD Line Scanning** | ~100 ms | 15 – 25 ms | **≤ 400 µs for 50,000 lines** (**≥ 5.5 GB/s**) | **≥ 5.5 GB/s, ≤ 400 µs** |
 | **Viewport Layout Latency** | 8 – 16 ms | 1 – 3 ms | **≤ 8 µs** | **≤ 8 µs** |
@@ -70,7 +79,7 @@ All metrics are codified in `src/core/strict_benchmarks.zig` and verified on App
 
 2. **Branchless SIMD Line Scanner (`src/core/simd.zig`)**
    - Scans 32 bytes per iteration using hardware vector registers (`@Vector(32, u8)`).
-   - High-speed classification identifies headings, code fences, blockquotes, lists, task checkboxes, tables, and horizontal rules at > 7.0 GB/s.
+   - High-speed classification identifies headings, code fences, blockquotes, lists, task checkboxes, tables, and horizontal rules at ≥ 5.5 GB/s.
    - Outputs a compact 8-byte packed `Line` index array.
 
 3. **Virtualized Viewport Layout (`src/layout/viewport.zig`)**
@@ -173,7 +182,7 @@ Visual regression captures (regenerated via `./scripts/screenshot_suite.sh scree
 # Run 100% of unit tests and strict microsecond benchmarks (required gate)
 zig build test -Doptimize=ReleaseFast --summary all
 
-# Build optimized ReleaseFast executable (< 500 KB)
+# Build optimized ReleaseFast executable (< 180 KiB ship binary)
 zig build -Doptimize=ReleaseFast
 
 # Open a Markdown document (try the full demo)

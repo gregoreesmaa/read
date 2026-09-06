@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const PlatformCallbacks = extern struct {
-    on_scroll: ?*const fn (delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void,
+    on_scroll: ?*const fn (delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void,
     on_resize: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
     on_key: ?*const fn (key_code: c_int, hovered_block_id: c_int) callconv(.c) void,
     on_draw: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
@@ -15,6 +15,10 @@ pub const PlatformCallbacks = extern struct {
     /// Scrollbar drag target (absolute scroll_y, clamped by the Zig side).
     /// Appended last for the same FFI stability reason.
     on_scroll_to: ?*const fn (scroll_y: f32) callconv(.c) void = null,
+    /// Async image natural sizes landed, with the above-viewport height
+    /// delta (0 when the image is at/below the viewport top: nothing above
+    /// moved). Appended last for the same FFI stability reason.
+    on_images_changed: ?*const fn (delta_above: f32) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_init(
@@ -89,6 +93,7 @@ pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;
 pub extern "c" fn platform_images_pending() c_int;
+pub extern "c" fn platform_arm_images() void;
 pub extern "c" fn platform_probe_px_add(x: c_int, y: c_int) void;
 
 pub extern "c" fn platform_register_text_run(
@@ -136,14 +141,6 @@ pub extern "c" fn platform_begin_clip(
 ) void;
 
 pub extern "c" fn platform_end_clip() void;
-
-pub extern "c" fn platform_measure_text(
-    text: [*]const u8,
-    len: c_int,
-    font_size: f32,
-    is_bold: c_int,
-    is_mono: c_int,
-) f32;
 
 pub extern "c" fn platform_glyph_cache_stats(
     hits: *u64,
