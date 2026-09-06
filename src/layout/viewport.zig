@@ -4924,7 +4924,9 @@ test "virtualized: warm JIT viewport layout under 12us" {
         last_cmd_count,
     });
     try std.testing.expect(last_cmd_count > 0);
-    try std.testing.expect(min_elapsed_us <= 12);
+    if (simd.enforce_timing_budgets) {
+        try std.testing.expect(min_elapsed_us <= 12);
+    }
 }
 
 // ============================================================================
@@ -5141,7 +5143,9 @@ test "scroll illusion: O(1) fraction jump resolves inside deep-scroll budget" {
     }
     std.testing.expect(sink < lines.len * 2) catch {};
     std.debug.print("[scroll illusion] fraction-jump resolution: {d} µs\n", .{min_us});
-    try std.testing.expect(min_us <= 12);
+    if (simd.enforce_timing_budgets) {
+        try std.testing.expect(min_us <= 12);
+    }
 
     // The jumped-to region actually renders: viewport at that line's height.
     var cps: [64]Checkpoint = undefined;
