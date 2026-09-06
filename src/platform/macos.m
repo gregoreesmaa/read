@@ -7,6 +7,10 @@ static NSWindow* g_window = nil;
 static NSView*   g_main_view = nil;   // set in platform_init for async image → setNeedsDisplay
 static CGContextRef g_current_cg_context = NULL;
 static float g_scroll_y = 0.0f;
+// Platform scroll offset at the last completed drawRect. The smoothing
+// timer measures each tick's movement against this to scroll-copy backing
+// store instead of full-invalidating.
+static float g_last_drawn_scroll = 0.0f;
 static NSPoint g_mouse_pos = {-9999.0f, -9999.0f};
 
 // Ambient scrollbar drag model (mirrors scrollbarThumbY/scrollbarScrollFromY
@@ -23,6 +27,9 @@ static float g_scrollbar_grab_delta = 0.0f;
 static float scrollbar_thumb_y(void);
 static BOOL scrollbar_hit(NSPoint view_pt, float view_w);
 static void scrollbar_drag_to(float y);
+// Smoothing-cadence re-arm, defined with the timer below but triggered by
+// the window delegate above. Re-arms only a live timer; parked stays parked.
+static void smooth_rearm_for_screen(void);
 
 // Idle policy (mirrors src/platform/idle.zig): mouse motion alone never
 // redraws. Only a hover-state transition re-arms a draw. The last hover
@@ -986,6 +993,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
 
     g_current_cg_context = NULL;
+    g_last_drawn_scroll = g_scroll_y;
     g_pending_dirty_valid = NO;
 }
 
@@ -1436,6 +1444,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 }
 
 - (void)scrollWheel:(NSEvent *)event {
+    CGFloat dx = 0.0, dy = 0.0;
+    int hovered_block_id = -1;
     if (g_callbacks.on_scroll) {
         // Both the finger phase and the kinetic momentum phase are honored
         // (mirrors idle.zig isGestureEnd). Momentum delivers its own event
@@ -1453,15 +1463,15 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             return;
         }
 
-        CGFloat dx = [event scrollingDeltaX];
-        CGFloat dy = [event scrollingDeltaY];
+        dx = [event scrollingDeltaX];
+        dy = [event scrollingDeltaY];
         if (![event hasPreciseScrollingDeltas]) {
             dx *= 20.0;
             dy *= 20.0;
         }
         NSPoint win_pt = [event locationInWindow];
         NSPoint view_pt = [self convertPoint:win_pt fromView:nil];
-        int hovered_block_id = -1;
+        hovered_block_id = -1;
         for (int i = 0; i < g_scrollable_block_count; i++) {
             ScrollableBlockRecord* b = &g_scrollable_blocks[i];
             if (view_pt.x >= b->x && view_pt.x <= b->x + b->w &&
@@ -1476,7 +1486,26 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             (unsigned long)phase, (unsigned long)momentum);
 #endif
     }
-    [self setNeedsDisplay:YES];
+    // Damage: pure vertical motion is repainted by the smoothing timer as a
+    // scroll-copy plus the exposed strip, so no immediate work happens here
+    // (the Zig side kicks the timer exactly when the target moved). A
+    // dx-only pan over a hovered block repaints just that block's box,
+    // mirroring the h/l key path and respecting the Zig-side max_scroll_x
+    // clamp (an over-clamp pan repaints the same card, harmlessly).
+    // Diagonal deltas fall back to full: the axis lock resolves in Zig and
+    // the platform cannot know which axis survived. A dx-only event away
+    // from any block is zeroed by the Zig lock, so it repaints nothing.
+    if (dx != 0.0 && dy == 0.0 && hovered_block_id >= 0) {
+        for (int i = 0; i < g_scrollable_block_count; i++) {
+            ScrollableBlockRecord* b = &g_scrollable_blocks[i];
+            if (b->id == hovered_block_id) {
+                invalidate_rect(NSInsetRect(NSMakeRect(b->x, b->y, b->w, b->h), -2.0f, -2.0f));
+                break;
+            }
+        }
+    } else if (dx != 0.0 && dy != 0.0) {
+        [self setNeedsDisplay:YES];
+    }
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -1512,7 +1541,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         DBGLOG("EV key c=%c scroll=%.0f", (char)c, g_scroll_y);
 #endif
         // Damage: h/l nudge one hovered block -> its exact box only.
-        // j/k/Space scroll and t theme-toggle repaint every pixel -> full.
+        // j/k/Space retarget the smoother, whose timer repaints as a
+        // scroll-copy plus the exposed strip (a press at the clamp edge
+        // moves nothing, so skipping here is exact). t theme-toggle and
+        // anything else repaint every pixel -> full.
         if ((c == 'h' || c == 'l') && hovered_block_id >= 0) {
             for (int i = 0; i < g_scrollable_block_count; i++) {
                 ScrollableBlockRecord* b = &g_scrollable_blocks[i];
@@ -1523,6 +1555,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
         } else if (c == 'h' || c == 'l') {
             // No hovered block: scroll offsets unchanged, no repaint.
+        } else if (c == 'j' || c == 'k' || c == ' ') {
+            // Smoothing timer owns the repaint (see above).
         } else {
             [self setNeedsDisplay:YES];
         }
@@ -1590,6 +1624,18 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #endif
 }
 
+// The hosting screen changed (space move, plug/unplug, promotion shift):
+// re-cadence the smoothing timer to the new panel's frame rate.
+- (void)windowDidChangeScreen:(NSNotification *)notification {
+    (void)notification;
+    smooth_rearm_for_screen();
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification *)notification {
+    (void)notification;
+    smooth_rearm_for_screen();
+}
+
 @end
 
 int platform_init(const char* title, int width, int height, PlatformCallbacks callbacks) {
@@ -1651,14 +1697,94 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
 }
 
 // ---------------------------------------------------------------------------
-// Scroll smoothing driver: a 120Hz runloop timer (CoreFoundation only — no
-// new framework) that eases the displayed offset toward the Zig-side
-// target. The timer exists only while unsettled: platform_smooth_kick
-// creates it, and each fire parks it when on_tick reports settled, so a
-// static screen keeps zero wakeups (0% CPU), same as before.
+// Scroll smoothing driver: a runloop timer (CoreFoundation only — no new
+// framework) at the hosting screen's frame rate that eases the displayed
+// offset toward the Zig-side target. The timer exists only while unsettled:
+// platform_smooth_kick creates it, and each fire parks it when on_tick
+// reports settled, so a static screen keeps zero wakeups (0% CPU).
+// Each fire scroll-copies backing store by the tick's whole-point delta
+// and repaints only the exposed strip (plus the ambient scrollbar thumb's
+// old/new boxes); anything the copy cannot cover falls back to full.
 // ---------------------------------------------------------------------------
 static CFRunLoopTimerRef g_smooth_timer = NULL;
 static CFAbsoluteTime g_smooth_last = 0;
+
+// Hosting screen's frame rate, 60 when unknown, clamped to 30..240, so a
+// 60Hz panel stops paying 120 wakeups/s while ProMotion keeps its 120.
+static double smooth_interval_for_screen(void) {
+    double fps = 0.0;
+    if (g_window) {
+        NSScreen* screen = [g_window screen];
+        if (screen && [screen respondsToSelector:@selector(maximumFramesPerSecond)])
+            fps = (double)[screen maximumFramesPerSecond];
+    }
+    if (fps <= 0.0) fps = 60.0;
+    if (fps < 30.0) fps = 30.0;
+    if (fps > 240.0) fps = 240.0;
+    return 1.0 / fps;
+}
+
+static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info);
+
+// (Re)create the on-demand easing timer at the current screen's cadence
+// with a small coalescing tolerance (~10% of the interval).
+static void smooth_timer_create(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    g_smooth_last = now;
+    double interval = smooth_interval_for_screen();
+    CFRunLoopTimerContext ctx = {0, NULL, NULL, NULL, NULL};
+    g_smooth_timer = CFRunLoopTimerCreate(NULL, now + interval, interval,
+                                          0, 0, smooth_timer_fire, &ctx);
+    if (g_smooth_timer) {
+        CFRunLoopTimerSetTolerance(g_smooth_timer, interval * 0.1);
+        CFRunLoopAddTimer(CFRunLoopGetMain(), g_smooth_timer, kCFRunLoopCommonModes);
+    }
+}
+
+static void smooth_rearm_for_screen(void) {
+    if (!g_smooth_timer) return; // parked loop stays parked: zero wakeups
+    CFRunLoopTimerInvalidate(g_smooth_timer);
+    CFRelease(g_smooth_timer);
+    g_smooth_timer = NULL;
+    smooth_timer_create();
+}
+
+// Thumb geometry for an arbitrary scroll offset (scrollbar_thumb_y covers
+// the live one; this one covers the last-drawn offset for damage).
+static float thumb_y_for_scroll(float scroll) {
+    if (g_max_scroll_y <= 0.0f) return 0.0f;
+    float p = scroll / g_max_scroll_y;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    return p * (g_view_h - SCROLLBAR_THUMB_H);
+}
+
+// The hover Copy pill is a window-space overlay: while it is up, a copy
+// would smear it, so those frames fall back to a full repaint.
+static BOOL copy_pill_visible(void) {
+    if (g_hovered_code_btn >= 0) return YES;
+    if (g_copied_block_idx >= 0 &&
+        ([NSDate timeIntervalSinceReferenceDate] - g_copied_timestamp < 1.5))
+        return YES;
+    return NO;
+}
+
+// Shift backing store by -dy points and repaint the window-space thumb.
+// scrollRect:by: moves the pixels and auto-invalidates the exposed strip;
+// the two thumb boxes union into that strip's band, never a full view.
+// All document-space content (text, highlight, images) rides the copy
+// exactly; text records are still rebuilt unconditionally in drawRect.
+static void smooth_scroll_copy(NSView* v, float dy) {
+    NSRect bounds = [v bounds];
+    [v scrollRect:bounds by:NSMakeSize(0.0, (CGFloat)-dy)];
+    if (g_max_scroll_y > 0.0f) {
+        float w = (float)bounds.size.width;
+        float old_t = thumb_y_for_scroll(g_last_drawn_scroll);
+        float new_t = scrollbar_thumb_y();
+        invalidate_rect(NSMakeRect(w - 4.0f, old_t - 1.0f, 5.0f, SCROLLBAR_THUMB_H + 2.0f));
+        invalidate_rect(NSMakeRect(w - 4.0f, new_t - 1.0f, 5.0f, SCROLLBAR_THUMB_H + 2.0f));
+    }
+}
 
 static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
     (void)timer; (void)info;
@@ -1674,18 +1800,26 @@ static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
         CFRelease(g_smooth_timer);
         g_smooth_timer = NULL;
     }
+    // on_tick syncs g_scroll_y, so this is the tick's movement since the
+    // last draw. Settled with no movement: parked above and nothing moved,
+    // so skip setNeedsDisplay entirely.
+    float dy = g_scroll_y - g_last_drawn_scroll;
+    if (dy == 0.0f) return;
     NSView* v = damage_target_view();
-    if (v) [v setNeedsDisplay:YES];
+    if (!v) return;
+    float h = (float)[v bounds].size.height;
+    if (dy == roundf(dy) && fabsf(dy) < h && !copy_pill_visible()) {
+        smooth_scroll_copy(v, dy);
+    } else {
+        // Fallback: fractional snap landings, full-height jumps, and
+        // visible overlays repaint every pixel.
+        [v setNeedsDisplay:YES];
+    }
 }
 
 void platform_smooth_kick(void) {
     if (g_smooth_timer || !g_callbacks.on_tick) return; // already easing
-    g_smooth_last = CFAbsoluteTimeGetCurrent();
-    CFRunLoopTimerContext ctx = {0, NULL, NULL, NULL, NULL};
-    g_smooth_timer = CFRunLoopTimerCreate(NULL, g_smooth_last + 1.0 / 120.0, 1.0 / 120.0,
-                                          0, 0, smooth_timer_fire, &ctx);
-    if (g_smooth_timer)
-        CFRunLoopAddTimer(CFRunLoopGetMain(), g_smooth_timer, kCFRunLoopCommonModes);
+    smooth_timer_create();
 }
 
 #ifdef TEST_HOOKS
@@ -1748,11 +1882,7 @@ void platform_set_scroll_info(float scroll_y, float max_scroll_y, float view_h) 
 
 // Thumb top for the current scroll offset; 0 when nothing scrolls.
 static float scrollbar_thumb_y(void) {
-    if (g_max_scroll_y <= 0.0f) return 0.0f;
-    float p = g_scroll_y / g_max_scroll_y;
-    if (p < 0.0f) p = 0.0f;
-    if (p > 1.0f) p = 1.0f;
-    return p * (g_view_h - SCROLLBAR_THUMB_H);
+    return thumb_y_for_scroll(g_scroll_y);
 }
 
 static BOOL scrollbar_hit(NSPoint view_pt, float view_w) {

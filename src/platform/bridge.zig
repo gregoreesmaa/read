@@ -31,9 +31,9 @@ pub extern "c" fn platform_request_redraw_rect(x: f32, y: f32, w: f32, h: f32) v
 /// or 0 when there is no pending damage (headless render, first draw).
 pub extern "c" fn platform_get_pending_damage(x: *f32, y: *f32, w: *f32, h: *f32) c_int;
 pub extern "c" fn platform_sync_scroll(scroll_y: f32) void;
-/// Arm the 120Hz smoothing timer. No-op while it is already running; the
-/// timer parks itself when on_tick reports settled, so a static screen
-/// costs zero wakeups.
+/// Arm the smoothing timer at the hosting screen's frame rate. No-op
+/// while it is already running; the timer parks itself when on_tick
+/// reports settled, so a static screen costs zero wakeups.
 pub extern "c" fn platform_smooth_kick() void;
 /// Scrollbar drag model: absolute offset plus the clamp range and view
 /// height, so the platform can map pointer y to a scroll target with the

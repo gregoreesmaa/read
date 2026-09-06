@@ -78,9 +78,9 @@ var g_dump_commands: bool = false;
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
-// Smooth-scroll animation state: inputs retarget, a 120Hz platform tick
-// eases g_app.scroll_y (displayed) toward the target. Anchor jumps and
-// resizes snap both so they stay 1:1.
+// Smooth-scroll animation state: inputs retarget, a platform tick at the
+// hosting screen's frame rate eases g_app.scroll_y (displayed) toward the
+// target. Anchor jumps and resizes snap both so they stay 1:1.
 var g_smooth: layout.SmoothScroll = .{};
 
 /// Retarget the animated scroll offset and arm the platform tick while the
@@ -175,13 +175,18 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) vo
     }
 }
 
-/// Display-link tick (dt in ms): ease the displayed offset toward the
-/// target. Returns 1 while more frames are needed, 0 when settled (the
-/// platform parks its timer on 0, so a static screen costs zero wakeups).
+/// Display tick (dt in ms) at the hosting screen's frame rate: ease the
+/// displayed offset toward the target. Returns 1 while more frames are
+/// needed, 0 when settled (the platform parks its timer on 0, so a static
+/// screen costs zero wakeups).
 fn onTick(dt_ms: f32) callconv(.c) c_int {
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
     g_app.scroll_y = g_smooth.current;
+    // Tick-fresh platform offset: the timer's scroll-copy measures this
+    // tick's movement against the last drawn offset (kept whole-point by
+    // SmoothScroll so the copy stays exact).
+    bridge.platform_sync_scroll(g_app.scroll_y);
     return if (settled) 0 else 1;
 }
 

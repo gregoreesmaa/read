@@ -352,10 +352,15 @@ pub const ScrollLockState = struct {
     }
 };
 
-/// Display-synced scroll smoothing: input handlers retarget, a 120Hz platform
-/// tick eases `current` toward `target`. Exponential approach (frame-rate
-/// independent via dt), monotonic, no overshoot, exact snap under 0.5px.
-/// Zero allocations; two f32 of state.
+/// Display-synced scroll smoothing: input handlers retarget, a platform tick
+/// at the hosting screen's frame rate eases `current` toward `target`.
+/// Exponential approach (frame-rate independent via dt), monotonic, no
+/// overshoot, exact snap under 0.5px. Zero allocations; two f32 of state.
+///
+/// Displayed positions stay on whole points between the final snap: the
+/// platform scroll-copies backing store by whole points, so fractional
+/// offsets would shimmer. The fractional target is kept (momentum deltas
+/// accumulate there) and the settle snap lands exactly.
 pub const SmoothScroll = struct {
     current: f32 = 0.0,
     target: f32 = 0.0,
@@ -379,6 +384,8 @@ pub const SmoothScroll = struct {
     }
 
     /// Advance toward the target by dt seconds. Returns true when settled.
+    /// Mid-flight positions are whole points (see the struct docs); the
+    /// settle snap lands on the exact target, fractional or not.
     pub fn tick(self: *SmoothScroll, dt_s: f32) bool {
         const diff = self.target - self.current;
         if (diff == 0.0) return true;
@@ -389,10 +396,18 @@ pub const SmoothScroll = struct {
         // Snap, then pin to the segment so float error can never overshoot.
         if (@abs(self.target - next) < SNAP_PX) {
             self.current = self.target;
-        } else if (diff > 0.0) {
-            self.current = @min(next, self.target);
+            return true;
+        }
+        // Whole-point display step with at least 1pt of progress so a
+        // rounded step can never stall short of the snap band; the min/max
+        // pin keeps the step from crossing the target.
+        var q = @round(next);
+        if (diff > 0.0) {
+            if (q <= self.current) q = self.current + 1.0;
+            self.current = @min(q, self.target);
         } else {
-            self.current = @max(next, self.target);
+            if (q >= self.current) q = self.current - 1.0;
+            self.current = @max(q, self.target);
         }
         return self.current == self.target;
     }
