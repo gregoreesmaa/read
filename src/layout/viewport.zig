@@ -3449,6 +3449,17 @@ pub fn laidOutImageHeight(nat_w: f32, nat_h: f32, content_width: f32) f32 {
     return 240.0;
 }
 
+test "images clamp to the content column preserving aspect (#45)" {
+    const t = std.testing;
+    // Oversized 800x400 in a 600px column -> 600x300 (aspect kept).
+    try t.expectEqual(@as(f32, 300.0), laidOutImageHeight(800.0, 400.0, 600.0));
+    // Small images never upscale.
+    try t.expectEqual(@as(f32, 100.0), laidOutImageHeight(200.0, 100.0, 600.0));
+    // Unknown size (still loading / failed): fixed fallback box.
+    try t.expectEqual(@as(f32, 240.0), laidOutImageHeight(0.0, 0.0, 600.0));
+    try t.expectEqual(@as(f32, 240.0), laidOutImageHeight(800.0, 0.0, 600.0));
+}
+
 pub fn contentWidthOf(config: ViewportConfig) f32 {
     return if (config.window_width > config.content_max_width)
         config.content_max_width

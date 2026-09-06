@@ -80,7 +80,13 @@ pub extern "c" fn platform_draw_image(
     y: f32,
     w: f32,
     h: f32,
+    alt: ?[*]const u8,
+    alt_len: c_int,
 ) void;
+
+pub extern "c" fn platform_set_document_dir(path: [*]const u8, path_len: c_int) void;
+pub extern "c" fn platform_test_image_resolve(dir: [*]const u8, dirlen: c_int, rel: [*]const u8, rellen: c_int) c_int;
+pub extern "c" fn platform_test_image_session() c_int;
 
 pub extern "c" fn platform_get_image_size(
     url: ?[*]const u8,

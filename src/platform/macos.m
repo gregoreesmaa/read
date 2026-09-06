@@ -36,6 +36,9 @@ static unsigned long g_draw_seq = 0;
 #ifdef READ_ANIMATED_GIF
 static BOOL gif_window_visible(void); // defined with the image cache below
 #endif
+static int image_url_is_remote(NSString* s); // defined at end-of-file
+static NSURLSession* image_session(void); // defined at end-of-file
+static int image_path_exists_joined(const char* dir, NSString* rel); // ditto
 
 typedef struct {
     float x;
@@ -2013,13 +2016,26 @@ static void gif_schedule_next_frame(CachedImageRecord* rec) {
 }
 #endif // READ_ANIMATED_GIF
 
-// Resolve relative path to absolute
+// Document directory for relative image paths (#45), set once per document
+// via platform_set_document_dir (absolute, or empty = unset). Cold path only.
+static char g_doc_dir[1024] = {0};
+
+// Resolve relative path to absolute (#45: document-dir first).
+// Remote URLs pass through untouched (fetched via NSURLSession, never
+// resolved as files). Absolute/CWD hits win (back-compat), then the
+// document directory set by platform_set_document_dir, then CWD join.
 static NSString* resolve_image_path(NSString* pathStr) {
-    if ([pathStr hasPrefix:@"http://"] || [pathStr hasPrefix:@"https://"]) return pathStr;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:pathStr]) return pathStr;
-    NSString* cwd = [[NSFileManager defaultManager] currentDirectoryPath];
+    if (image_url_is_remote(pathStr)) return pathStr;
+    NSFileManager* fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:pathStr]) return pathStr;
+    if (g_doc_dir[0] != '\0') {
+        NSString* docDir = [[NSString alloc] initWithUTF8String:g_doc_dir];
+        NSString* full = [docDir stringByAppendingPathComponent:pathStr];
+        if ([fm fileExistsAtPath:full]) return full;
+    }
+    NSString* cwd = [fm currentDirectoryPath];
     NSString* full = [cwd stringByAppendingPathComponent:pathStr];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:full]) return full;
+    if ([fm fileExistsAtPath:full]) return full;
     return nil;
 }
 
@@ -2081,19 +2097,13 @@ static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecor
 #endif
 }
 
-// Synchronously populate a cache slot from a URL/path string
+// Synchronously populate a cache slot from a local file path. Remote URLs
+// never reach here: kick_image_load routes them to the async URL session,
+// so no synchronous network fetch exists anywhere on any path (#45).
 static void load_image_sync(CachedImageRecord* rec, NSString* pathStr) {
     CGImageSourceRef src = nil;
-    if ([pathStr hasPrefix:@"http://"] || [pathStr hasPrefix:@"https://"]) {
-        NSURL* u = [NSURL URLWithString:pathStr];
-        if (u) {
-            NSData* data = [NSData dataWithContentsOfURL:u];
-            if (data) src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
-        }
-    } else {
-        NSURL* fu = [NSURL fileURLWithPath:pathStr];
-        if (fu) src = CGImageSourceCreateWithURL((__bridge CFURLRef)fu, NULL);
-    }
+    NSURL* fu = [NSURL fileURLWithPath:pathStr];
+    if (fu) src = CGImageSourceCreateWithURL((__bridge CFURLRef)fu, NULL);
 
     if (src) {
         load_image_source_into_record(src, rec);
@@ -2175,51 +2185,84 @@ void platform_arm_images(void) {
     }
 }
 
+// Shared main-thread arrival for local (GCD) and remote (URL session)
+// decodes, success or failure: metrics resync + repaint. See the notes
+// that used to live inline in kick_image_load below.
+static void image_load_completed(CachedImageRecord* rec) {
+    // Sizes just went live: recompute metrics and anchor scroll
+    // BEFORE the repaint below, so the draw uses fresh geometry
+    // and content below doesn't jump. Failures keep the fallback
+    // box (no geometry change), so only successes notify, with the
+    // above-viewport height delta: laid-out new height (same
+    // aspect-fit math as laidOutImageHeight in viewport.zig,
+    // pinned by contract tests) minus the last drawn height, when
+    // the drawn box sits fully above the viewport top — else 0.
+    // last_h advances to the new height so a repeat arrival for
+    // the same image reports zero instead of shifting twice (the
+    // next genuine draw re-stamps the rect anyway).
+    float delta_above = 0.0f;
+    if (!rec->failed && rec->frame_count > 0 && rec->has_rect) {
+        __unsafe_unretained NSView* av = damage_target_view();
+        float vw = av ? (float)[av bounds].size.width : 0.0f;
+        float cw = vw > 600.0f ? 600.0f : fmaxf(vw - 64.0f, 100.0f);
+        float new_h = (rec->natural_w > 0.0f && rec->natural_h > 0.0f)
+            ? rec->natural_h * (fminf(rec->natural_w, cw) / rec->natural_w)
+            : 240.0f;
+        if (rec->last_doc_y + rec->last_h <= g_scroll_y) {
+            delta_above = new_h - rec->last_h;
+        }
+        rec->last_h = new_h;
+    }
+    if (g_callbacks.on_images_changed) {
+        g_callbacks.on_images_changed(delta_above);
+    }
+    [g_main_view setNeedsDisplay:YES];
+#ifdef TEST_HOOKS
+    DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
+        rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
+        rec->natural_w, rec->natural_h);
+#endif
+#ifdef READ_ANIMATED_GIF
+    // Kick off GIF animation if multi-frame
+    if (!rec->failed && rec->frame_count > 1) {
+        gif_schedule_next_frame(rec);
+    }
+#endif
+}
+
 static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
+    // Remote images (#45): async system URL session — never blocks first
+    // paint, scroll, or layout. The completion decodes off-main and lands
+    // through the same image_load_completed arrival as local files, so a
+    // broken/blocked load degrades to the identical muted placeholder.
+    if (image_url_is_remote(resolved)) {
+        NSURL* u = [NSURL URLWithString:resolved];
+        if (!u) { rec->failed = YES; rec->loading = NO; image_load_completed(rec); return; }
+        [[image_session() dataTaskWithURL:u completionHandler:^(NSData* data, NSURLResponse* resp, NSError* err) {
+            (void)resp;
+            if (data && !err) {
+                CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+                if (src) {
+                    load_image_source_into_record(src, rec);
+                    CFRelease(src);
+                }
+            }
+            // No vector fallback for remote bytes (AppKit needs a file for
+            // SVG/PDF): undecodable remotes fail into the placeholder.
+            if (rec->frame_count == 0) rec->failed = YES;
+            rec->loading = NO;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                image_load_completed(rec);
+            });
+        }] resume];
+        return;
+    }
     // Capture for block
     NSString* resolvedCopy = [resolved copy];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         load_image_sync(rec, resolvedCopy);
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Sizes just went live: recompute metrics and anchor scroll
-            // BEFORE the repaint below, so the draw uses fresh geometry
-            // and content below doesn't jump. Failures keep the fallback
-            // box (no geometry change), so only successes notify, with the
-            // above-viewport height delta: laid-out new height (same
-            // aspect-fit math as laidOutImageHeight in viewport.zig,
-            // pinned by contract tests) minus the last drawn height, when
-            // the drawn box sits fully above the viewport top — else 0.
-            // last_h advances to the new height so a repeat arrival for
-            // the same image reports zero instead of shifting twice (the
-            // next genuine draw re-stamps the rect anyway).
-            float delta_above = 0.0f;
-            if (!rec->failed && rec->frame_count > 0 && rec->has_rect) {
-                __unsafe_unretained NSView* av = damage_target_view();
-                float vw = av ? (float)[av bounds].size.width : 0.0f;
-                float cw = vw > 600.0f ? 600.0f : fmaxf(vw - 64.0f, 100.0f);
-                float new_h = (rec->natural_w > 0.0f && rec->natural_h > 0.0f)
-                    ? rec->natural_h * (fminf(rec->natural_w, cw) / rec->natural_w)
-                    : 240.0f;
-                if (rec->last_doc_y + rec->last_h <= g_scroll_y) {
-                    delta_above = new_h - rec->last_h;
-                }
-                rec->last_h = new_h;
-            }
-            if (g_callbacks.on_images_changed) {
-                g_callbacks.on_images_changed(delta_above);
-            }
-            [g_main_view setNeedsDisplay:YES];
-#ifdef TEST_HOOKS
-            DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
-                rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
-                rec->natural_w, rec->natural_h);
-#endif
-#ifdef READ_ANIMATED_GIF
-            // Kick off GIF animation if multi-frame
-            if (!rec->failed && rec->frame_count > 1) {
-                gif_schedule_next_frame(rec);
-            }
-#endif
+            image_load_completed(rec);
         });
     });
 }
@@ -2305,7 +2348,11 @@ int platform_images_pending(void) {
 }
 #endif
 
-void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h) {
+static void draw_placeholder_alt(CGContextRef ctx, const char* alt, int alt_len,
+    float x, float y, float w, float h); // defined at end-of-file
+
+void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h,
+        const char* alt, int alt_len) {
     if (!g_current_cg_context || w <= 0 || h <= 0) return;
     CGContextRef ctx = g_current_cg_context;
 #ifdef TEST_HOOKS
@@ -2331,7 +2378,7 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
         rec->has_rect = YES;
     }
 
-    // Still loading — draw subtle placeholder outline
+    // Still loading — muted placeholder box with alt text (#45).
     if (!rec || rec->loading) {
         CGContextSaveGState(ctx);
         CGContextSetRGBFillColor(ctx, 28.0f/255, 28.0f/255, 32.0f/255, 0.5f);
@@ -2339,8 +2386,11 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
         CGContextSetRGBStrokeColor(ctx, 60.0f/255, 60.0f/255, 70.0f/255, 0.6f);
         CGContextStrokeRect(ctx, CGRectMake(x, y, w, h));
         CGContextRestoreGState(ctx);
+        draw_placeholder_alt(ctx, alt, alt_len, x, y, w, h);
         return;
     }
+    // Broken/offline/undecodable: the same box (solid, red-tinged border)
+    // with alt text — never a hole, never a hang (#45).
     if (rec->failed || rec->frame_count == 0) {
         CGContextSaveGState(ctx);
         CGContextSetRGBFillColor(ctx, 28.0f/255, 28.0f/255, 32.0f/255, 1.0f);
@@ -2348,6 +2398,7 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
         CGContextSetRGBStrokeColor(ctx, 80.0f/255, 40.0f/255, 40.0f/255, 1.0f);
         CGContextStrokeRect(ctx, CGRectMake(x, y, w, h));
         CGContextRestoreGState(ctx);
+        draw_placeholder_alt(ctx, alt, alt_len, x, y, w, h);
         return;
     }
 
@@ -2636,5 +2687,100 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
                                 error:NULL];
 
     return success ? 0 : -5;
+}
+#endif
+
+// Image completeness (#45): helpers kept at end-of-file per the SIZE NOTE
+// (see prime_frame_decode above).
+static int image_url_is_remote(NSString* s) {
+    return ([s hasPrefix:@"http://"] || [s hasPrefix:@"https://"]) ? 1 : 0;
+}
+
+// Shared remote-fetch session: ephemeral (no disk persistence), NO shared
+// URLCache (the 64-slot image cache above is the bound — an unbounded
+// NSURLCache would violate it), bounded timeouts so blocked hosts fail
+// into the placeholder instead of dangling.
+static NSURLSession* image_session(void) {
+    static NSURLSession* s = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSURLSessionConfiguration* cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        cfg.URLCache = nil;
+        cfg.timeoutIntervalForRequest = 20.0;
+        cfg.timeoutIntervalForResource = 30.0;
+        s = [NSURLSession sessionWithConfiguration:cfg];
+    });
+    return s;
+}
+
+// Document directory for relative image paths: dirname of the open file,
+// stored verbatim (the process never chdirs, so relative stays valid).
+// Empty/absent path clears it (built-in default doc).
+void platform_set_document_dir(const char* path, int path_len) {
+    g_doc_dir[0] = '\0';
+    if (!path || path_len <= 0) return;
+    int end = path_len;
+    while (end > 0 && path[end - 1] != '/') end--;
+    if (end > 0) end--; // drop the '/'
+    if (end <= 0) return; // bare filename: CWD resolution already covers it
+    if (end > (int)sizeof(g_doc_dir) - 1) end = (int)sizeof(g_doc_dir) - 1;
+    memcpy(g_doc_dir, path, end);
+    g_doc_dir[end] = '\0';
+}
+
+// Join helper shared by resolve_image_path and the contract probe below.
+static int image_path_exists_joined(const char* dir, NSString* rel) {
+    if (!dir || !dir[0] || !rel) return 0;
+    NSString* docDir = [[NSString alloc] initWithUTF8String:dir];
+    if (!docDir) return 0;
+    NSString* full = [docDir stringByAppendingPathComponent:rel];
+    return [[NSFileManager defaultManager] fileExistsAtPath:full] ? 1 : 0;
+}
+
+// Muted alt text inside loading/failed placeholder boxes. Truncates at a
+// UTF-8 boundary to fit ~7px/char at 12px; drawn UNRECORDED — the box
+// interior has no layout text_run counterpart (only the caption below is a
+// run), so recording it would ghost the selection/hit-test record model
+// that damage-parity tests pin via platform_text_record_count. Skipped for
+// tiny boxes and empty alt (decorative images stay a plain box).
+static void draw_placeholder_alt(CGContextRef ctx, const char* alt, int alt_len,
+        float x, float y, float w, float h) {
+    if (!alt || alt_len <= 0 || w < 60.0f || h < 26.0f) return;
+    int cap = (int)((w - 16.0f) / 7.0f);
+    if (cap > 96) cap = 96;
+    if (cap <= 0) return;
+    int n = alt_len < cap ? alt_len : cap;
+    while (n > 0 && ((unsigned char)alt[n] & 0xC0) == 0x80) n--;
+    if (n <= 0) return;
+    draw_text_legacy(ctx, alt, n, x + 8.0f, y + h * 0.5f - 7.0f, 12.0f,
+        0, 0, 0, 0, 140, 140, 145, 255, 0, NULL, 0);
+}
+
+#ifdef TEST_HOOKS
+// Doc-dir resolution contract: existence through the exact join
+// resolve_image_path uses. Deterministic on any macOS: ("/","tmp") exists,
+// a nonsense name does not. -1 = bad input (never 1/0 confusion).
+int platform_test_image_resolve(const char* dir, int dirlen, const char* rel, int rellen) {
+    if (!dir || dirlen <= 0 || !rel || rellen <= 0) return -1;
+    char d[1024];
+    char r[1024];
+    if (dirlen >= (int)sizeof(d) || rellen >= (int)sizeof(r)) return -1;
+    memcpy(d, dir, dirlen); d[dirlen] = '\0';
+    memcpy(r, rel, rellen); r[rellen] = '\0';
+    NSString* relStr = [[NSString alloc] initWithUTF8String:r];
+    if (!relStr) return -1;
+    return image_path_exists_joined(d, relStr);
+}
+
+// URL session contract: session exists, no shared cache, bounded timeouts.
+int platform_test_image_session(void) {
+    NSURLSession* s = image_session();
+    if (!s) return 0;
+    NSURLSessionConfiguration* c = s.configuration;
+    if (!c) return 0;
+    if (c.URLCache != nil) return 0;
+    if (c.timeoutIntervalForRequest <= 0.0 || c.timeoutIntervalForRequest > 30.0) return 0;
+    if (c.timeoutIntervalForResource <= 0.0 || c.timeoutIntervalForResource > 60.0) return 0;
+    return 1;
 }
 #endif

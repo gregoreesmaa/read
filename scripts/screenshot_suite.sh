@@ -39,6 +39,16 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
 
+# Case 6: Image completeness — local (doc-dir relative), missing, and remote
+# URLs. Plain one-shot renders deterministic placeholders for all three;
+# --settle-images lets the local file decode so reviewers see the 600px
+# clamp, while missing/remote (offline) keep the muted alt-text placeholder.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/images.png" test_cases/images.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/images_settled.png" --settle-images test_cases/images.md
+# Same-file scrolled frame (mdtest precedent: no new test case) so reviewers
+# see the remote-URL placeholder state below the fold.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/images_scrolled.png" --scroll 450 test_cases/images.md
+
 # Cases 6+: Original MarkdownTest 1.0 suite (.text sources copied verbatim to
 # test_cases/mdtest_*.md). scrollable_doc.md remains the single
 # scrolled-viewport *test case*; the per-file scroll steps below capture the
