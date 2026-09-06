@@ -10,6 +10,17 @@ pub const SpanStyle = packed struct {
     heading: bool = false,
     image: bool = false,
     autolink: bool = false,
+    // Issue #40 inline HTML subset: style toggles carried line-scoped in
+    // cur_style like strikethrough (`sub`/`sup`/`mark`, `code` for kbd).
+    sub: bool = false,
+    sup: bool = false,
+    mark: bool = false,
+    // Endpoint styles, never inherited: `line_break` (<br>) and `html_tag`
+    // (muted-mono fallback for out-of-subset tags) are set only on the
+    // span that carries them.
+    line_break: bool = false,
+    html_tag: bool = false,
+    _pad: u3 = 0,
 };
 
 pub const InlineSpan = struct {
@@ -206,8 +217,20 @@ fn parseLinkTail(line: []const u8, paren_open: usize) ?LinkTail {
 /// Pending-segment style: positional emphasis union plus threaded strike.
 fn segStyle(runs: []const DelimRun, pairs: []const EmPair, pos: usize, strike_holder: SpanStyle) SpanStyle {
     var st = activeStyle(runs, pairs, pos);
-    st.strikethrough = strike_holder.strikethrough;
+    inheritTagBits(&st, strike_holder);
     return st;
+}
+
+/// Threads line-scoped HTML subset state (issue #40) plus strike from the
+/// holder into a freshly computed positional style. Endpoint bits
+/// (`line_break`, `html_tag`) never inherit: their spans carry them
+/// explicitly and the holder never sets them.
+fn inheritTagBits(st: *SpanStyle, holder: SpanStyle) void {
+    st.strikethrough = holder.strikethrough;
+    st.code = st.code or holder.code;
+    st.sub = holder.sub;
+    st.sup = holder.sup;
+    st.mark = holder.mark;
 }
 
 /// High-speed inline parser for viewport lines.
@@ -874,6 +897,96 @@ fn matchAutolink(line: []const u8, lt: usize) ?usize {
     return p + 1;
 }
 
+/// Issue #40 inline HTML tag scan. Caller guarantees `line[lt] == '<'` and
+/// the position is not an autolink (the link-match block runs first).
+/// Single-line only, quote-aware, bounded: malformed input returns null and
+/// stays literal text. Never allocates; fuzz-crash-proof by construction
+/// (every advance is bounds-checked, no backtracking).
+const HtmlTagKind = enum {
+    comment,
+    br,
+    styled_open,
+    styled_close,
+    strip,
+    other,
+};
+
+const HtmlTag = struct {
+    kind: HtmlTagKind,
+    /// Subset style id for styled_open/styled_close: 0=kbd, 1=sub, 2=sup,
+    /// 3=del/s, 4=mark.
+    style_id: u8 = 255,
+    /// Index past the closing `>`.
+    end: usize = 0,
+};
+
+fn parseHtmlTag(line: []const u8, lt: usize) ?HtmlTag {
+    var p = lt + 1;
+    if (p >= line.len) return null;
+    // Comments and declarations (`<!-- -->`, `<!DOCTYPE>`, `<?..?>`,
+    // `<![CDATA[..]]>`): scan to `>`, quote-aware; comments strip,
+    // everything else is fallback.
+    if (line[p] == '!') {
+        if (p + 2 < line.len and line[p + 1] == '-' and line[p + 2] == '-') {
+            const close = std.mem.indexOf(u8, line[p + 3 ..], "-->") orelse return null;
+            return .{ .kind = .comment, .end = p + 3 + close + 3 };
+        }
+        const decl_end = scanTagTail(line, p) orelse return null;
+        return .{ .kind = .other, .end = decl_end };
+    }
+    if (line[p] == '?') {
+        const pi_end = scanTagTail(line, p) orelse return null;
+        return .{ .kind = .other, .end = pi_end };
+    }
+    var close = false;
+    if (line[p] == '/') {
+        close = true;
+        p += 1;
+        if (p >= line.len) return null;
+    }
+    if (!((line[p] >= 'a' and line[p] <= 'z') or (line[p] >= 'A' and line[p] <= 'Z'))) return null;
+    const name_start = p;
+    while (p < line.len and ((line[p] >= 'a' and line[p] <= 'z') or
+        (line[p] >= 'A' and line[p] <= 'Z') or
+        (line[p] >= '0' and line[p] <= '9'))) : (p += 1)
+    {}
+    const name = line[name_start..p];
+    // The name must end at a delimiter (spec ex 606: `<m:abc>` is literal
+    // text, not a tag). Autolinks never reach here (matched earlier), so
+    // `:`/`@` also mean literal.
+    if (p >= line.len or (line[p] != ' ' and line[p] != '\t' and line[p] != '/' and line[p] != '>')) return null;
+    // Shared subset dispatch (one copy in the ship binary, via simd):
+    // 1=br, 2=kbd, 3=sub, 4=sup, 5=del, 6=s, 7=mark, 8=details, 9=summary.
+    const style_map = [_]u8{ 255, 255, 0, 1, 2, 3, 3, 4, 255, 255 };
+    const sid = simd.htmlSubsetId(name);
+    const kind: HtmlTagKind = switch (sid) {
+        1 => .br,
+        2, 3, 4, 5, 6, 7 => if (close) .styled_close else .styled_open,
+        8, 9 => .strip,
+        else => .other,
+    };
+    const end = scanTagTail(line, p) orelse return null;
+    return .{ .kind = kind, .style_id = style_map[sid], .end = end };
+}
+
+/// Shared attribute/`>` tail scanner: from `p` (just past the tag name, or
+/// at `!`/`?` for declarations) to the index past `>`. Quote-aware, rejects
+/// `<` and end-of-line (single-line tags only); null means malformed.
+fn scanTagTail(line: []const u8, p: usize) ?usize {
+    var q = p;
+    while (q < line.len) {
+        const c = line[q];
+        if (c == '>') return q + 1;
+        if (c == '<') return null;
+        if (c == '"' or c == '\'') {
+            q = simd.skipHtmlQuoted(line, q) orelse return null;
+            continue;
+        }
+        q += 1;
+    }
+    return null;
+}
+
 const Opener = struct {
     pos: usize,
     image: bool,
@@ -1251,7 +1364,7 @@ pub fn parseInlinesWithDefs(
                     // Flush text before the run.
                     if (i > span_start) {
                         var st = activeStyle(run_buf[0..n_runs], pairs, span_start);
-                        st.strikethrough = cur_style.strikethrough;
+                        inheritTagBits(&st, cur_style);
                         spans_out[span_count] = .{ .text = line[span_start..i], .style = st };
                         span_count += 1;
                         if (span_count >= spans_out.len) {
@@ -1262,7 +1375,7 @@ pub fn parseInlinesWithDefs(
                     // Gap literals under the mid-run style.
                     if (open_start > close_end and span_count < spans_out.len) {
                         var st = activeStyle(run_buf[0..n_runs], pairs, i + close_end);
-                        st.strikethrough = cur_style.strikethrough;
+                        inheritTagBits(&st, cur_style);
                         spans_out[span_count] = .{
                             .text = line[i + close_end .. i + open_start],
                             .style = st,
@@ -1332,6 +1445,66 @@ pub fn parseInlinesWithDefs(
             i = m.end;
             span_start = i;
             continue;
+        }
+
+        // Issue #40 inline HTML: blessed subset renders typographically
+        // (br/kbd/sub/sup/del/s/mark, comments and details/summary
+        // stripped); everything else keeps the muted-mono fallback span,
+        // never silently absorbed. Runs after the link-match block so
+        // autolinks (`<https://…>`, `<a@b.c>`) keep precedence. Malformed
+        // `<` stays literal text.
+        if (c == '<') {
+            if (parseHtmlTag(line, i)) |tag| {
+                if (tag.kind == .styled_open or tag.kind == .styled_close) {
+                    if (i > span_start) {
+                        spans_out[span_count] = .{
+                            .text = line[span_start..i],
+                            .style = segStyle(run_buf[0..n_runs], pairs, span_start, cur_style),
+                        };
+                        span_count += 1;
+                        if (span_count >= spans_out.len) break;
+                    }
+                    const on = tag.kind == .styled_open;
+                    switch (tag.style_id) {
+                        0 => cur_style.code = on,
+                        1 => cur_style.sub = on,
+                        2 => cur_style.sup = on,
+                        3 => cur_style.strikethrough = on,
+                        4 => cur_style.mark = on,
+                        else => {},
+                    }
+                    i = tag.end;
+                    span_start = i;
+                    continue;
+                }
+                if (i > span_start) {
+                    spans_out[span_count] = .{
+                        .text = line[span_start..i],
+                        .style = segStyle(run_buf[0..n_runs], pairs, span_start, cur_style),
+                    };
+                    span_count += 1;
+                    if (span_count >= spans_out.len) break;
+                }
+                switch (tag.kind) {
+                    .comment, .strip => {},
+                    .br => {
+                        spans_out[span_count] = .{ .text = "", .style = .{ .line_break = true } };
+                        span_count += 1;
+                    },
+                    .other => {
+                        spans_out[span_count] = .{
+                            .text = line[i..tag.end],
+                            .style = .{ .code = true, .html_tag = true },
+                        };
+                        span_count += 1;
+                    },
+                    .styled_open, .styled_close => unreachable,
+                }
+                if (span_count >= spans_out.len) break;
+                i = tag.end;
+                span_start = i;
+                continue;
+            }
         }
 
         i += 1;
@@ -1936,6 +2109,69 @@ test "code spans: matched closers and padding strip" {
     for (s4[0..n4]) |s| {
         try std.testing.expect(!s.style.code);
     }
+}
+
+test "html subset: kbd/del/mark/sub/sup spans, br breaks, comments strip" {
+    // kbd toggles mono; del toggles strike like ~~; mark/sub/sup set bits.
+    var spans: [16]InlineSpan = undefined;
+    const n = parseInlines("Press <kbd>Enter</kbd> and <del>gone</del> plus <mark>hi</mark> x<sup>2</sup> H<sub>2</sub>O", &spans);
+    var saw_kbd = false;
+    var saw_del = false;
+    var saw_mark = false;
+    var saw_sup = false;
+    var saw_sub = false;
+    for (spans[0..n]) |s| {
+        if (std.mem.eql(u8, s.text, "Enter")) saw_kbd = s.style.code and !s.style.html_tag;
+        if (std.mem.eql(u8, s.text, "gone")) saw_del = s.style.strikethrough;
+        if (std.mem.eql(u8, s.text, "hi")) saw_mark = s.style.mark;
+        if (std.mem.eql(u8, s.text, "2") and s.style.sup) saw_sup = true;
+        if (std.mem.eql(u8, s.text, "2") and s.style.sub) saw_sub = true;
+        // No span may leak tag source for subset tags.
+        try std.testing.expect(std.mem.indexOf(u8, s.text, "<kbd>") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s.text, "</del>") == null);
+    }
+    try std.testing.expect(saw_kbd and saw_del and saw_mark and saw_sup and saw_sub);
+
+    // <br> variants emit a break span; comments and details/summary strip.
+    var b: [8]InlineSpan = undefined;
+    const nb = parseInlines("a<br>b<BR/>c<br />d", &b);
+    var breaks: usize = 0;
+    for (b[0..nb]) |s| {
+        if (s.style.line_break) breaks += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), breaks);
+
+    var c: [8]InlineSpan = undefined;
+    const nc = parseInlines("a<!-- hush -->b<summary>T</summary>c", &c);
+    var joined_len: usize = 0;
+    for (c[0..nc]) |s| {
+        try std.testing.expect(std.mem.indexOf(u8, s.text, "<!--") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s.text, "summary") == null);
+        try std.testing.expect(!s.style.line_break);
+        joined_len += s.text.len;
+    }
+    // "a" + "b" + "T" + "c": tags stripped, text kept.
+    try std.testing.expectEqual(@as(usize, 4), joined_len);
+
+    // Out-of-subset tags keep the muted-mono fallback span, never absorbed.
+    var f: [8]InlineSpan = undefined;
+    const nf = parseInlines("x <span class=\"a>b\">y</span> z", &f);
+    var saw_open = false;
+    var saw_close = false;
+    for (f[0..nf]) |s| {
+        if (std.mem.eql(u8, s.text, "<span class=\"a>b\">")) saw_open = s.style.code and s.style.html_tag;
+        if (std.mem.eql(u8, s.text, "</span>")) saw_close = s.style.code and s.style.html_tag;
+    }
+    try std.testing.expect(saw_open and saw_close);
+
+    // Malformed and non-tag `<` stay literal (spec ex 606); autolinks win.
+    var m: [8]InlineSpan = undefined;
+    const nm = parseInlines("<m:abc> a < b <3", &m);
+    try std.testing.expectEqual(@as(usize, 1), nm);
+    try std.testing.expect(!m[0].style.code and !m[0].style.html_tag);
+    var a: [8]InlineSpan = undefined;
+    const na = parseInlines("<https://example.com/>", &a);
+    try std.testing.expect(na == 1 and a[0].style.autolink);
 }
 
 test "entities: named and numeric references decode" {

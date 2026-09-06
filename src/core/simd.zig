@@ -30,6 +30,10 @@ pub const BlockType = enum(u5) {
     image = 17,
     link_def = 18,
     html_comment = 19,
+    // Issue #40: raw HTML block fallback (muted mono) and hidden
+    // details/summary tag lines (zero-height, content flows as plain).
+    html_block = 20,
+    html_hidden = 21,
 };
 
 pub const Line = packed struct(u64) {
@@ -508,6 +512,132 @@ pub fn findRefDef(defs: []const RefDef, label: []const u8) ?RefDef {
     return null;
 }
 
+fn foldByte(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+/// Issue #40 shared subset dispatch (parser.zig reuses this so the ship
+/// binary holds one copy). Length-gated single dispatch, ASCII
+/// case-insensitive. Returns 1=br, 2=kbd, 3=sub, 4=sup, 5=del, 6=s,
+/// 7=mark, 8=details, 9=summary, 0 = not a subset name.
+pub fn htmlSubsetId(name: []const u8) u8 {
+    if (name.len == 0 or name.len > 7) return 0;
+    const a = foldByte(name[0]);
+    switch (name.len) {
+        1 => return if (a == 's') 6 else 0,
+        2 => {
+            if (a == 'b' and foldByte(name[1]) == 'r') return 1;
+            return 0;
+        },
+        3 => {
+            const b = foldByte(name[1]);
+            const c = foldByte(name[2]);
+            if (a == 'k' and b == 'b' and c == 'd') return 2;
+            if (a == 's' and b == 'u' and c == 'b') return 3;
+            if (a == 's' and b == 'u' and c == 'p') return 4;
+            if (a == 'd' and b == 'e' and c == 'l') return 5;
+            return 0;
+        },
+        4 => {
+            if (a == 'm' and foldByte(name[1]) == 'a' and
+                foldByte(name[2]) == 'r' and foldByte(name[3]) == 'k') return 7;
+            return 0;
+        },
+        7 => {
+            var md = true;
+            var ms = true;
+            const det = "details";
+            const sum = "summary";
+            var i: usize = 0;
+            while (i < 7) : (i += 1) {
+                const f = foldByte(name[i]);
+                if (f != det[i]) md = false;
+                if (f != sum[i]) ms = false;
+            }
+            if (md) return 8;
+            if (ms) return 9;
+            return 0;
+        },
+        else => return 0,
+    }
+}
+
+/// Skip one quoted span (`"` or `'`) from `p` (at the quote); index past
+/// the closer, or null when unclosed. Shared by the block classifier and
+/// the inline tag scanner (via parser.zig).
+pub fn skipHtmlQuoted(line: []const u8, p: usize) ?usize {
+    const q = line[p];
+    var r = p + 1;
+    while (r < line.len and line[r] != q) : (r += 1) {}
+    if (r >= line.len) return null;
+    return r + 1;
+}
+
+/// True when the line holds one bare tag and nothing else: from just past
+/// the tag name, a quote-aware scan reaches `>` with only trailing
+/// whitespace after it. Attributes and self-closes are fine (`<details
+/// open>`, `<hr/>`); a second tag or trailing text is not.
+fn isBareTagEnd(trimmed: []const u8, p: usize) bool {
+    var q = p;
+    while (q < trimmed.len) {
+        const c = trimmed[q];
+        if (c == '>') {
+            q += 1;
+            while (q < trimmed.len) : (q += 1) {
+                const d = trimmed[q];
+                if (d != ' ' and d != '\t' and d != '\r' and d != '\n') return false;
+            }
+            return true;
+        }
+        if (c == '<') return false;
+        if (c == '"' or c == '\'') {
+            q = skipHtmlQuoted(trimmed, q) orelse return false;
+            continue;
+        }
+        q += 1;
+    }
+    return false;
+}
+
+/// Issue #40 block-level HTML dispatch for a trimmed line opening with
+/// `<`. Null means "not an HTML block line" (paragraph as before).
+/// Bounded single pass, no allocation; every index is bounds-checked.
+fn classifyHtmlLine(trimmed: []const u8) ?BlockType {
+    var p: usize = 1;
+    if (p < trimmed.len and trimmed[p] == '/') p += 1;
+    if (p >= trimmed.len) return null;
+    // Declarations (`<!DOCTYPE>`, `<?…?>`, `<![CDATA[..]]>`; comments are
+    // classified earlier): fallback when closed on the line.
+    if (trimmed[p] == '!' or trimmed[p] == '?') {
+        return if (findByte(trimmed, p, '>') != null) .html_block else null;
+    }
+    if (!((trimmed[p] >= 'a' and trimmed[p] <= 'z') or
+        (trimmed[p] >= 'A' and trimmed[p] <= 'Z'))) return null;
+    const name_start = p;
+    while (p < trimmed.len and ((trimmed[p] >= 'a' and trimmed[p] <= 'z') or
+        (trimmed[p] >= 'A' and trimmed[p] <= 'Z') or
+        (trimmed[p] >= '0' and trimmed[p] <= '9'))) : (p += 1)
+    {}
+    const name = trimmed[name_start..p];
+    // Autolink/email shapes (`<scheme:…>`, `<a@b.c>`) are not tags.
+    if (p < trimmed.len and (trimmed[p] == ':' or trimmed[p] == '@')) return null;
+    const bare = isBareTagEnd(trimmed, p);
+    const sid = htmlSubsetId(name);
+    if (bare) {
+        // Bare `<br>` stays a paragraph so the break renders; bare
+        // details/summary tags take no space; any other bare tag shows as
+        // muted fallback (never silently absorbed).
+        if (sid == 1) return null;
+        if (sid == 8 or sid == 9) return .html_hidden;
+        return .html_block;
+    }
+    // Tag-led lines with inline content: subset-led lines (`<kbd>x</kbd>`,
+    // `<summary>T</summary>`) stay paragraphs for inline handling;
+    // everything else with a `>` on the line is fallback.
+    if (sid != 0) return null;
+    return if (findByte(trimmed, p, '>') != null) .html_block else null;
+}
+
 /// Fast single-dispatch classifier for a single line of markdown.
 /// Inlined into the scan loop; the switch on the first content byte compiles
 /// to a jump table, so the common paragraph case costs one indirect jump.
@@ -570,6 +700,29 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *FenceS
                 .block_type = .html_comment,
                 .indent = indent,
             };
+        }
+    }
+
+    // Issue #40 raw-HTML block lines: a trimmed line opening with `<` and a
+    // tag/declaration shape becomes `.html_block` (muted-mono fallback,
+    // never serif spill) or `.html_hidden` (bare details/summary tags take
+    // no space; their content flows as plain paragraphs). Indent >= 4 stays
+    // indented code; autolinks (`<scheme:…>`, `<a@b.c>`) and bare `<br>`
+    // stay paragraphs; malformed `<` stays a paragraph.
+    if (first == '<') {
+        var hiw: usize = 0;
+        for (line[0..idx]) |c| {
+            hiw += if (c == '\t') 4 else 1;
+        }
+        if (hiw < 4) {
+            if (classifyHtmlLine(trimmed)) |bt| {
+                return Line{
+                    .offset = offset,
+                    .len = raw_len,
+                    .block_type = bt,
+                    .indent = indent,
+                };
+            }
         }
     }
 
@@ -1251,9 +1404,41 @@ test "classify: link definitions and HTML comments" {
     try std.testing.expectEqual(BlockType.html_comment, lines[3].block_type);
     try std.testing.expectEqual(BlockType.html_comment, lines[4].block_type);
     try std.testing.expectEqual(BlockType.paragraph, lines[5].block_type);
-    // Other inline HTML is literal text, never a comment.
-    try std.testing.expectEqual(BlockType.paragraph, lines[6].block_type);
+    // Issue #40: other block HTML is the muted-mono fallback, never a
+    // comment and never a serif paragraph.
+    try std.testing.expectEqual(BlockType.html_block, lines[6].block_type);
     try std.testing.expect(!fence.open);
+}
+
+test "classify: issue 40 html blocks, hidden tags, and paragraph keeps" {
+    // Raw tag lines fall back to muted mono.
+    try std.testing.expectEqual(BlockType.html_block, classifyOne("<div>"));
+    try std.testing.expectEqual(BlockType.html_block, classifyOne("</div>"));
+    try std.testing.expectEqual(BlockType.html_block, classifyOne("<hr class=\"foo\" />"));
+    try std.testing.expectEqual(BlockType.html_block, classifyOne("<!DOCTYPE html>"));
+    try std.testing.expectEqual(BlockType.html_block, classifyOne("<div><br></div>"));
+    try std.testing.expectEqual(BlockType.html_block, classifyOne("  <table>"));
+    // Bare details/summary tags take no space.
+    try std.testing.expectEqual(BlockType.html_hidden, classifyOne("<details>"));
+    try std.testing.expectEqual(BlockType.html_hidden, classifyOne("</details>"));
+    try std.testing.expectEqual(BlockType.html_hidden, classifyOne("<details open>"));
+    try std.testing.expectEqual(BlockType.html_hidden, classifyOne("<SUMMARY>"));
+    // Bare <br> stays a paragraph so the break renders; subset-led lines
+    // with content stay paragraphs for inline handling.
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<br>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<br/>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<kbd>x</kbd>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<summary>Title</summary>"));
+    // Autolinks, malformed tags, deep indent, and unclosed tags stay
+    // paragraphs exactly as before.
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<https://example.com/>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<a@b.c>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<m:abc>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<3"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("a < b"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("    <div>"));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("<div"));
 }
 
 fn recordBlockRun(bytes_inner: []const u8, nl_pos: usize, out: []u32, n: *usize) void {
