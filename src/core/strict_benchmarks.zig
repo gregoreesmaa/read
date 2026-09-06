@@ -291,7 +291,8 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
     var in_fence: bool = false;
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
-    var checkpoints: [512]layout.Checkpoint = undefined;
+    // Sized for the 32-line checkpoint grid over 50,000 lines.
+    var checkpoints: [2048]layout.Checkpoint = undefined;
     var cp_count: usize = 0;
 
     const base_cfg = layout.ViewportConfig{

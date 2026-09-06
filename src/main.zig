@@ -72,7 +72,9 @@ var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
 
-const MAX_CHECKPOINTS = 2048;
+// 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
+// previous 2048 x 128-line coverage exactly (~98 KB static, zero heap).
+const MAX_CHECKPOINTS = 8192;
 var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
 var g_checkpoint_count: usize = 0;
 

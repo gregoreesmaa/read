@@ -222,6 +222,14 @@ pub const Checkpoint = struct {
     next_block_id: u16,
 };
 
+/// Checkpoint grid density (lines between checkpoints). A deep seek lands on
+/// the last checkpoint at/below target, then re-walks forward to the
+/// viewport: worst-case walk ≈ 600px overscan + one grid cell. At 32 lines
+/// (≈1.8k px) the walk stays under ~45 units, keeping deep-scroll layout
+/// inside the strict microsecond budget even on slow shared CI cores.
+/// Tightening the grid costs ~12 bytes per checkpoint (caller-owned).
+pub const checkpoint_grid_lines: usize = 32;
+
 pub const ViewportConfig = struct {
     window_width: f32,
     window_height: f32,
@@ -2239,7 +2247,7 @@ pub fn computeDocumentHeightEx(
     while (i < lines.len) : (i += 1) {
         // Record sparse checkpoint at clean block boundary
         if (checkpoints_out) |cps| {
-            if ((i == 0 or i >= last_cp_line + 128) and cp_count < cps.len) {
+            if ((i == 0 or i >= last_cp_line + checkpoint_grid_lines) and cp_count < cps.len) {
                 cps[cp_count] = .{
                     .line_idx = @intCast(i),
                     .y = cur_y,
