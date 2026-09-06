@@ -20,15 +20,22 @@ pub fn build(b: *std.Build) void {
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
-    const test_hooks = b.option(
-        bool,
-        "test-hooks",
-        "Include headless test hooks (--damage/--select/--dump-records) for damage parity tests (adds bytes; ship builds leave it off)",
-    ) orelse false;
+    // Two binaries from one source tree:
+    //   read      = production ship binary. test_hooks is hardcoded OFF, so
+    //               no headless test CLI (--screenshot, --scroll, --damage,
+    //               --select, --dump-*, --settle-images, --probe-px,
+    //               --force-scale, --scroll-sweep, --select-drag) is compiled
+    //               in. The Zig/ObjC comptime gates strip it; trust the
+    //               compiler, no runtime probe needed.
+    //   read-test = headless testing binary with all hooks on. Used by
+    //               scripts/screenshot_suite.sh, damage_parity.sh,
+    //               scroll_profile.sh, fuzz_render.sh, select_holes.sh.
     // Animated GIF frame cycling is required reader behavior: always on in
     // every build (ship included). No build option disables it.
-    const build_options = b.addOptions();
-    build_options.addOption(bool, "test_hooks", test_hooks);
+    const ship_options = b.addOptions();
+    ship_options.addOption(bool, "test_hooks", false);
+    const hooks_options = b.addOptions();
+    hooks_options.addOption(bool, "test_hooks", true);
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -89,38 +96,52 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "read", .module = mod },
-                .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "build_options", .module = ship_options.createModule() },
+            },
+        }),
+    });
+
+    // Headless testing binary: same sources, hooks on. Never shipped.
+    const exe_test = b.addExecutable(.{
+        .name = "read-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "read", .module = mod },
+                .{ .name = "build_options", .module = hooks_options.createModule() },
             },
         }),
     });
 
     if (target.result.os.tag.isDarwin()) {
-        // Headless test hooks (__damage/--select/--dump-records backing) only
-        // exist in -Dtest-hooks=true builds; ship builds skip them for size.
         // -Os for the platform glue TU only: its cost is dominated by
         // CoreText/CG/UIColor calls, while the microsecond hot paths (scan,
         // layout, viewport) live in the Zig TU pinned by strict benchmarks.
-        // Keeps the ship binary under the 350 KiB budget (page-alignment
+        // Keeps the ship binary under the 180 KiB budget (page-alignment
         // padding makes even small __TEXT growth disproportionate).
-        const cflags: []const []const u8 = if (test_hooks)
-            &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1", "-DREAD_ANIMATED_GIF=1"}
-        else
-            &.{"-fobjc-arc", "-Os", "-DREAD_ANIMATED_GIF=1"};
-        // Binary diet (AGENTS.md §1: < 350 KiB): behavior-neutral linker
+        // Binary diet (AGENTS.md §1: < 180 KiB): behavior-neutral linker
         // trims only — no codegen, API, or optimization-level change.
         // --gc-sections dead-strips unreachable sections, -dead_strip_dylibs
         // drops unused dylib edges, -fstrip drops the symbol table (kept for
-        // Debug and test-hooks builds, which need their symbols).
-        exe.link_gc_sections = true;
-        exe.dead_strip_dylibs = true;
-        if (!test_hooks and optimize != .Debug) exe.root_module.strip = true;
+        // Debug and the read-test binary, which need their symbols).
+        for ([_]*std.Build.Step.Compile{ exe, exe_test }) |e| {
+            e.link_gc_sections = true;
+            e.dead_strip_dylibs = true;
+            e.root_module.linkFramework("Cocoa", .{});
+            e.root_module.linkFramework("CoreText", .{});
+            e.root_module.linkFramework("CoreGraphics", .{});
+        }
+        if (optimize != .Debug) exe.root_module.strip = true;
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = cflags,
+            .flags = &.{"-fobjc-arc", "-Os", "-DREAD_ANIMATED_GIF=1"},
         });
-        exe.root_module.linkFramework("Cocoa", .{});
-        exe.root_module.linkFramework("CoreText", .{});
-        exe.root_module.linkFramework("CoreGraphics", .{});
+        exe_test.root_module.addCSourceFile(.{
+            .file = b.path("src/platform/macos.m"),
+            .flags = &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1", "-DREAD_ANIMATED_GIF=1"},
+        });
     }
 
     // This declares intent for the executable to be installed into the
@@ -128,6 +149,7 @@ pub fn build(b: *std.Build) void {
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
+    b.installArtifact(exe_test);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
@@ -175,12 +197,20 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // The read-test binary shares main.zig with hooks on: it must keep
+    // compiling (its test CLI lives behind the same comptime gate).
+    const exe_hooks_tests = b.addTest(.{
+        .root_module = exe_test.root_module,
+    });
+    const run_exe_hooks_tests = b.addRunArtifact(exe_hooks_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_exe_hooks_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

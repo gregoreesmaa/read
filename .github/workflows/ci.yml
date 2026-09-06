@@ -19,12 +19,12 @@ jobs:
         run: zig build test -Doptimize=ReleaseFast --summary all
       - name: Release build
         run: zig build -Doptimize=ReleaseFast
-      - name: Binary size budget (strictly under 500 KiB = 512000 bytes)
-        run: test $(stat -f%z zig-out/bin/read) -lt 512000
-      - name: Screenshot smoke test
-        run: ./zig-out/bin/read --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
+      - name: Binary size budget (ship binary, see AGENTS.md §1)
+        run: ./scripts/size_gate.sh zig-out/bin/read
+      - name: Screenshot smoke test (testing binary carries the headless CLI)
+        run: ./zig-out/bin/read-test --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
       - name: Damage parity (selection records under partial redraws)
-        run: sh scripts/damage_parity.sh ./zig-out/bin/read showcase.md
+        run: sh scripts/damage_parity.sh ./zig-out/bin/read-test showcase.md
 
   # Portability check: core tests + build must also pass on Linux.
   # (Cocoa frameworks link only on Darwin; see build.zig.)

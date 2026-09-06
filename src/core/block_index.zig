@@ -33,7 +33,7 @@ pub const Block = struct {
 /// never produce blocks.
 fn isStandalone(tag: simd.BlockType) bool {
     return switch (tag) {
-        .heading1, .heading2, .heading3, .heading4, .heading5, .heading6, .hr, .image, .code_fence_start, .code_fence_end => true,
+        .heading1, .heading2, .heading3, .heading4, .heading5, .heading6, .hr, .image, .code_fence_start, .code_fence_end, .link_def, .html_comment => true,
         else => false,
     };
 }

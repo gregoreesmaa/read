@@ -14,7 +14,11 @@ Every agent working on this repository MUST strictly follow these principles.
   - Virtualized viewport: Only tokens visibly intersecting the screen are parsed and rendered.
   - Memory-mapped files: Zero-copy virtual address space mapping.
 - **Zero Dependencies**: No Electron, no WebKit, no heavy UI toolkits, no external package manager dependencies.
-- **Binary Footprint**: Executable size must remain strictly under 350 KiB.
+- **Binary Footprint**: Executable size must remain strictly under 180 KiB.
+- **Lean Production Build**: The ship binary contains only what reading needs — nothing test-only ever ships.
+  - Testing, debugging, and observability tooling lives in a separate binary behind compile-time gates, never behind runtime flags. The separation is structural: no build option may re-enable test code in production.
+  - Production surfaces a minimal interface; anything outside it is rejected, never silently absorbed.
+  - Trust the compiler to strip gated code; enforce leanness through the binary size budget, not runtime self-checks.
 
 ---
 
