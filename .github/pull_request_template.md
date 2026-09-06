@@ -8,7 +8,7 @@
 - [ ] No benchmark target was loosened (`src/core/strict_benchmarks.zig` untouched or tightened only)
 - [ ] Screenshots regenerated via `./scripts/screenshot_suite.sh screenshots` and staged (if rendering changed)
 - [ ] `test_cases/` discipline kept: no new scrollable doc beyond the single `scrollable_doc.md`
-- [ ] Binary footprint still < 500 KB, zero new dependencies
+- [ ] Binary footprint still < 180 KiB (`./scripts/size_gate.sh`), zero new dependencies
 
 ## Screenshots
 

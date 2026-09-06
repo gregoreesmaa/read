@@ -47,7 +47,7 @@ paragraph, so GitHub search matches both topics and README text.
 - Suggested headline text on the image:
 
 ```text
-Read — microsecond-grade Markdown in pure Zig. <500 KB. Zero dependencies.
+Read — microsecond-grade Markdown in pure Zig. <180 KiB. Zero dependencies.
 ```
 
 ## 5. After applying (verify)
