@@ -1416,3 +1416,117 @@ test "regression: quoted titles keep link and referral def resolves" {
     try std.testing.expect(hasLink(cmds[0..m], "bar"));
 }
 
+test "regression: autolinks stay literal in code spans and indented code" {
+    // Backtick span must be code, never a link (mdtest_auto_links).
+    const line = "Auto-links should not occur here: `<http://example.com/>`";
+    var spans: [16]parser.InlineSpan = undefined;
+    const count = parser.parseInlines(line, &spans);
+    var found_code = false;
+    for (spans[0..count]) |s| {
+        if (std.mem.eql(u8, s.text, "<http://example.com/>")) {
+            try std.testing.expect(s.style.code);
+            try std.testing.expect(!s.style.link);
+            found_code = true;
+        }
+    }
+    try std.testing.expect(found_code);
+
+    // Tab-indented autolink line is an indented code block, not a link.
+    const doc = "Para.\n\n\tor here: <http://example.com/>\n";
+    var lines: [8]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    // `indent` counts whitespace characters (a tab is 1), so assert the
+    // renderer treatment instead: the tab-indented line becomes a code card.
+    try std.testing.expectEqual(@as(u7, 1), lines[2].indent);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    var saw_bg = false;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .code_block_bg) saw_bg = true;
+        if (c.kind == .text_run and c.style.link) {
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "example.com") == null);
+        }
+    }
+    try std.testing.expect(saw_bg);
+}
+
+test "regression: empty urls, tab titles, and bracketed reference text" {
+    // `[Empty]()` links with an empty target; tab between URL and title
+    // still resolves (mdtest_links_inline_style).
+    const empty_line = "[Empty]().";
+    var spans: [8]parser.InlineSpan = undefined;
+    const en = parser.parseInlines(empty_line, &spans);
+    var found_empty = false;
+    for (spans[0..en]) |s| {
+        if (s.style.link and std.mem.eql(u8, s.text, "Empty")) {
+            found_empty = true;
+            try std.testing.expectEqualStrings("", s.link_target.?);
+        }
+    }
+    try std.testing.expect(found_empty);
+
+    const tab_title = "[URL and title](/url/\t\"title preceded by a tab\").";
+    var tspans: [8]parser.InlineSpan = undefined;
+    const tn = parser.parseInlines(tab_title, &tspans);
+    var found_tabbed = false;
+    for (tspans[0..tn]) |s| {
+        if (s.style.link and std.mem.eql(u8, s.text, "URL and title")) found_tabbed = true;
+    }
+    try std.testing.expect(found_tabbed);
+
+    // Embedded brackets stay inside the link text (mdtest_links_reference_style).
+    const bline = "With [embedded [brackets]] [b].";
+    const defs = [_]simd.RefDef{.{ .label = "b", .url = "/url/", .line_idx = 0 }};
+    var bspans: [16]parser.InlineSpan = undefined;
+    const bn = parser.parseInlinesWithDefs(bline, &bspans, defs[0..]);
+    var found_brackets = false;
+    for (bspans[0..bn]) |s| {
+        if (s.style.link and std.mem.eql(u8, s.text, "embedded [brackets]")) found_brackets = true;
+    }
+    try std.testing.expect(found_brackets);
+}
+
+test "regression: amps in urls stay single and bare amps stay literal" {
+    const line = "Here's an inline [link](/script?foo=1&bar=2).";
+    var spans: [16]parser.InlineSpan = undefined;
+    const n = parser.parseInlines(line, &spans);
+    var found = false;
+    for (spans[0..n]) |s| {
+        if (s.style.link and std.mem.eql(u8, s.text, "link")) {
+            found = true;
+            try std.testing.expectEqualStrings("/script?foo=1&bar=2", s.link_target.?);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "regression: multi-line quoted indented code renders mono with bars" {
+    // mdtest_blockquotes_with_code_blocks: `> ` blank separators plus
+    // 4-space indented bodies inside quotes are code, keeping quote bars.
+    const doc =
+        \\> Example:
+        \\>
+        \\>     sub status {
+        \\>         print "working";
+        \\>     }
+    ;
+    var lines: [16]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, &lines, n, &cmds, &st);
+    var bars: usize = 0;
+    var mono: usize = 0;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .fill_rect and c.rect.w == 3.0) bars += 1;
+        if (c.kind == .text_run and c.style.code) mono += 1;
+    }
+    try std.testing.expect(bars >= 1);
+    try std.testing.expect(mono >= 1);
+    try std.testing.expect(hasRun(cmds[0..m], "Example:"));
+}
+
