@@ -1511,12 +1511,14 @@ fn layoutIndentedCodeUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) Unit
 /// tables: a short edge-fade strip painted inside the block's clip rect so
 /// readers can see the block scrolls. Right shadow while content still hides
 /// to the right; left shadow once scrolled right; none when the content fits.
-/// Rendered as plain `fill_rect` strips (translucent black over content, a
-/// universal overlay that reads on both themes): no new platform interface,
+/// The overlay contrasts with the surface (light in dark mode, dark in light
+/// mode): a dark-on-dark shadow has almost no headroom (card 26 -> 22 at
+/// full alpha), while a contrasting overlay swings ~32 levels in both
+/// themes. Rendered as plain `fill_rect` strips: no new platform interface,
 /// no allocation, identical live and headless output.
 const scroll_shadow_strips: u32 = 4;
 const scroll_shadow_strip_w: f32 = 3.0;
-/// Edge -> inward alphas (darkest at the clipped edge, fading to content).
+/// Edge -> inward alphas (strongest at the clipped edge, fading to content).
 const scroll_shadow_alphas = [_]u8{ 36, 22, 12, 5 };
 
 fn emitScrollShadows(
@@ -1528,8 +1530,11 @@ fn emitScrollShadows(
     bh: f32,
     cur_scroll_x: f32,
     max_scroll_x: f32,
+    is_dark_theme: bool,
 ) void {
     if (max_scroll_x <= 1.0) return;
+    // Contrasting overlay: light glow on dark surfaces, dark shade on light.
+    const sh: u8 = if (is_dark_theme) 255 else 0;
     const total_w = scroll_shadow_strip_w * @as(f32, @floatFromInt(scroll_shadow_strips));
     // Right edge: more content hides to the right.
     if (cur_scroll_x < max_scroll_x - 0.5) {
@@ -1544,7 +1549,7 @@ fn emitScrollShadows(
                     .w = scroll_shadow_strip_w,
                     .h = bh,
                 },
-                .color = .{ .r = 0, .g = 0, .b = 0, .a = scroll_shadow_alphas[scroll_shadow_strips - 1 - s] },
+                .color = .{ .r = sh, .g = sh, .b = sh, .a = scroll_shadow_alphas[scroll_shadow_strips - 1 - s] },
             };
             cmd_count.* += 1;
         }
@@ -1562,7 +1567,7 @@ fn emitScrollShadows(
                     .w = scroll_shadow_strip_w,
                     .h = bh,
                 },
-                .color = .{ .r = 0, .g = 0, .b = 0, .a = scroll_shadow_alphas[s] },
+                .color = .{ .r = sh, .g = sh, .b = sh, .a = scroll_shadow_alphas[s] },
             };
             cmd_count.* += 1;
         }
@@ -1779,6 +1784,7 @@ pub fn renderViewportCore(
                     code_block_h,
                     cur_scroll_x,
                     max_scroll_x,
+                    config.is_dark_theme,
                 );
 
                 // End clip
@@ -1995,6 +2001,7 @@ pub fn renderViewportCore(
                     table_h + 4.0,
                     cur_scroll_x,
                     max_scroll_x,
+                    config.is_dark_theme,
                 );
 
                 // End clip
@@ -2818,13 +2825,14 @@ test "strict cross-element copying across headings, paragraphs, lists, tables, a
     try std.testing.expect(std.mem.indexOf(u8, sel3, "Ultra high throughput\n• Precise") != null);
 }
 
-/// Counts scroll-shadow strips (black `fill_rect`s of shadow-strip width)
-/// hugging the left (`at_left = true`) or right edge of a block rect.
-fn countShadowStrips(cmds: []const DrawCommand, edge_x: f32, at_left: bool) usize {
+/// Counts scroll-shadow strips (`fill_rect`s of shadow-strip width in the
+/// theme's overlay shade `sh`: 255 dark mode, 0 light mode) hugging the
+/// left (`at_left = true`) or right edge of a block rect.
+fn countShadowStrips(cmds: []const DrawCommand, edge_x: f32, at_left: bool, sh: u8) usize {
     var n: usize = 0;
     for (cmds) |c| {
         if (c.kind != .fill_rect) continue;
-        if (c.color.r != 0 or c.color.g != 0 or c.color.b != 0 or c.color.a == 0) continue;
+        if (c.color.r != sh or c.color.g != sh or c.color.b != sh or c.color.a == 0) continue;
         if (@abs(c.rect.w - scroll_shadow_strip_w) > 0.01) continue;
         const anchor = if (at_left) c.rect.x else c.rect.x + c.rect.w;
         if (@abs(anchor - edge_x) <= scroll_shadow_strip_w * @as(f32, @floatFromInt(scroll_shadow_strips)) + 0.01) n += 1;
@@ -2858,8 +2866,9 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
     try std.testing.expect(max_scroll > 1.0);
 
     // Block card: content_x=100, content_width=600 -> x=88, right edge=712.
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 712.0, false));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true));
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 712.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 0));
 }
 
 test "scroll shadows: scrolled-right code block shows left-edge fade, no right fade" {
@@ -2882,8 +2891,9 @@ test "scroll shadows: scrolled-right code block shows left-edge fade, no right f
     config.block_scroll_x[0] = 1e9; // clamped to max inside layout
     const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
 
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 88.0, true));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false));
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 88.0, true, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 0));
 }
 
 test "scroll shadows: fitting code block shows no fade" {
@@ -2909,7 +2919,7 @@ test "scroll shadows: fitting code block shows no fade" {
     var strips: usize = 0;
     for (cmds[0..count]) |c| {
         if (c.kind == .register_scrollable_block) max_scroll = c.max_scroll_x;
-        if (c.kind == .fill_rect and c.color.r == 0 and c.color.g == 0 and c.color.b == 0 and c.color.a != 0) strips += 1;
+        if (c.kind == .fill_rect and c.color.r == 255 and c.color.g == 255 and c.color.b == 255 and c.color.a != 0) strips += 1;
     }
     try std.testing.expectEqual(@as(f32, 0.0), max_scroll);
     try std.testing.expectEqual(@as(usize, 0), strips);
@@ -2943,8 +2953,34 @@ test "scroll shadows: overflowing table shows right-edge fade" {
     try std.testing.expect(max_scroll > 1.0);
 
     // Table clip: content_x=100 -> x=96, w=608, right edge=704.
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 704.0, false));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 96.0, true));
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 704.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 96.0, true, 255));
+}
+
+test "scroll shadows: light theme uses a dark overlay" {
+    const test_doc =
+        \\```zig
+        \\this_is_a_very_long_code_line_that_far_exceeds_the_content_width_and_must_overflow_the_visible_card_area_abcdefghij
+        \\```
+    ;
+
+    var lines_buf: [64]simd.Line = undefined;
+    var fence = false;
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .is_dark_theme = false,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    // Dark strips at the right edge, no light strips anywhere near the block.
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 712.0, false, 0));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 0));
 }
 
 test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
