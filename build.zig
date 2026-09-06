@@ -79,34 +79,43 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+    // App root module factory: the exe test binaries and the ship binary
+    // share sources but differ in unwind tables (see the diet note in the
+    // Darwin block: ship drops unwind metadata, tests keep it for crash
+    // backtraces). One module object per consumer so flags never leak.
+    const makeAppModule = struct {
+        fn make(
+            b2: *std.Build,
+            target2: std.Build.ResolvedTarget,
+            optimize2: std.builtin.OptimizeMode,
+            mod2: *std.Build.Module,
+            opts2: *std.Build.Step.Options,
+            unwind: ?std.builtin.UnwindTables,
+        ) *std.Build.Module {
+            return b2.createModule(.{
+                .root_source_file = b2.path("src/main.zig"),
+                .target = target2,
+                .optimize = optimize2,
+                .unwind_tables = unwind,
+                // main.zig uses std.c (write/exit/nanosleep): same explicit
+                // libc edge as the read module, required for the Linux CI build.
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "read", .module = mod2 },
+                    .{ .name = "build_options", .module = opts2.createModule() },
+                },
+            });
+        }
+    }.make;
+    const exe_mod = makeAppModule(b, target, optimize, mod, ship_options, null);
+    // Ship module: identical sources, unwind tables off. Unwind data is
+    // metadata only — no instruction changes — so screenshots, benchmarks,
+    // and scroll behavior are unaffected; only crash-report backtraces
+    // degrade (already address-only post-strip).
+    const ship_mod = makeAppModule(b, target, optimize, mod, ship_options, .none);
     const exe = b.addExecutable(.{
         .name = "read",
-        .root_module = b.createModule(.{
-            // b.createModule defines a new module just like b.addModule but,
-            // unlike b.addModule, it does not expose the module to consumers of
-            // this package, which is why in this case we don't have to give it a name.
-            .root_source_file = b.path("src/main.zig"),
-            // Target and optimization levels must be explicitly wired in when
-            // defining an executable or library (in the root module), and you
-            // can also hardcode a specific target for an executable or library
-            // definition if desireable (e.g. firmware for embedded devices).
-            .target = target,
-            .optimize = optimize,
-            // main.zig uses std.c (write/exit/nanosleep): same explicit
-            // libc edge as the read module, required for the Linux CI build.
-            .link_libc = true,
-            // List of modules available for import in source files part of the
-            // root module.
-            .imports = &.{
-                // Here "read" is the name you will use in your source code to
-                // import this module (e.g. `@import("read")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
-                .{ .name = "read", .module = mod },
-                .{ .name = "build_options", .module = ship_options.createModule() },
-            },
-        }),
+        .root_module = ship_mod,
     });
 
     // Headless testing binary: same sources, hooks on. Never shipped.
@@ -145,6 +154,11 @@ pub fn build(b: *std.Build) void {
         // --gc-sections dead-strips unreachable sections, -dead_strip_dylibs
         // drops unused dylib edges, -fstrip drops the symbol table (kept for
         // Debug and the read-test binary, which need their symbols).
+        // Unwind tables off in the ship module + ship glue TU: __eh_frame /
+        // __unwind_info are pure metadata (never read on the happy path),
+        // so dropping them changes no instruction and keeps screenshots,
+        // benchmarks, and scroll behavior identical. The exe test modules
+        // keep unwind tables for crash backtraces.
         for ([_]*std.Build.Step.Compile{ exe, exe_test }) |e| {
             e.link_gc_sections = true;
             e.dead_strip_dylibs = true;
@@ -152,6 +166,12 @@ pub fn build(b: *std.Build) void {
             e.root_module.linkFramework("CoreText", .{});
             e.root_module.linkFramework("CoreGraphics", .{});
         }
+        // exe_tests is its own Compile step inheriting link edges from its
+        // root module: give exe_mod the same frameworks (it is otherwise
+        // identical to the pre-split exe root module).
+        exe_mod.linkFramework("Cocoa", .{});
+        exe_mod.linkFramework("CoreText", .{});
+        exe_mod.linkFramework("CoreGraphics", .{});
         if (optimize != .Debug) exe.root_module.strip = true;
         // Binary diet: post-link `strip -x` on the ship binary only. The
         // linker's own strip leaves ~238 local symbols (OUTLINED_FUNCTION_*,
@@ -165,7 +185,16 @@ pub fn build(b: *std.Build) void {
             s.step.dependOn(&exe.step);
             strip_ship = s;
         }
-        exe.root_module.addCSourceFile(.{
+        // Ship glue TU: -fno-unwind-tables drops its __eh_frame share
+        // (no ObjC exceptions in-tree; crash backtraces stay intact in the
+        // test TU below, which keeps these flags off).
+        ship_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos.m"),
+            .flags = &.{"-fobjc-arc", "-Oz", "-fno-unwind-tables", "-DREAD_ANIMATED_GIF=1"},
+        });
+        // Exe-test glue TU: same -Oz codegen as ship (pixel-identical
+        // headless screenshots) with unwind tables kept for backtraces.
+        exe_mod.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
             .flags = &.{"-fobjc-arc", "-Oz", "-DREAD_ANIMATED_GIF=1"},
         });
@@ -261,7 +290,8 @@ pub fn build(b: *std.Build) void {
         // root module. Note that test executables only test one module at a time,
         // hence why we have to create two separate ones.
         const exe_tests = b.addTest(.{
-            .root_module = exe.root_module,
+            // exe_mod, not the ship module: crash backtraces stay on here.
+            .root_module = exe_mod,
         });
 
         // A run step that will run the second test executable.
