@@ -544,6 +544,22 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool, 
                     .indent = indent,
                 };
             }
+            // Fast path: bullet-shaped with an ordinary byte third. A task
+            // needs '[' there and an hr needs only marker/space bytes, so
+            // both remaining checks provably fail and `- foo` returns here
+            // without the full-line hr scan. (`- - -`, `- --`, `- [ ]` and
+            // tab shapes fall through to the exact original sequence.)
+            if (trimmed.len >= 3 and
+                (trimmed[1] == ' ' or trimmed[1] == '\t') and
+                trimmed[2] != first and trimmed[2] != ' ' and trimmed[2] != '\t')
+            {
+                return Line{
+                    .offset = offset,
+                    .len = raw_len,
+                    .block_type = .bullet_list,
+                    .indent = indent,
+                };
+            }
             // Horizontal rule: ---, ***, and spaced forms (- - -, * * *).
             // (___ and _ _ _ are handled under '_'.)
             if ((first == '-' or first == '*') and isSpacedHr(trimmed, first)) {
