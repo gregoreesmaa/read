@@ -1538,3 +1538,63 @@ test "regression: multi-line quoted indented code renders mono with bars" {
     try std.testing.expect(hasRun(cmds[0..m], "Example:"));
 }
 
+fn hasEmRun(cmds: []layout.DrawCommand, text: []const u8, bold: bool, italic: bool) bool {
+    for (cmds) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, text) and
+            c.style.bold == bold and c.style.italic == italic) return true;
+    }
+    return false;
+}
+
+test "spec compliance: intra-word underscore stays literal, star emphasizes" {
+    // `_` cannot open/close inside a word (CommonMark rule 12); `*` can
+    // (rules 8-9). The `_` line must survive as one unstyled span.
+    var spans: [8]parser.InlineSpan = undefined;
+    const n = parser.parseInlines("foo_bar_baz", &spans);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(!spans[0].style.italic);
+    try std.testing.expect(!spans[0].style.bold);
+
+    const doc = "foo_bar_baz and foo*bar*baz";
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const ln = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..ln], ln, &cmds, &st);
+    try std.testing.expect(hasEmRun(cmds[0..m], "foo_bar_baz", false, false));
+    try std.testing.expect(hasEmRun(cmds[0..m], "bar", false, true));
+}
+
+test "spec compliance: triple emphasis nests bold inside italic" {
+    const doc = "Text with ***triple*** plus ___under___ here.";
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    try std.testing.expect(hasEmRun(cmds[0..m], "triple", true, true));
+    try std.testing.expect(hasEmRun(cmds[0..m], "under", true, true));
+}
+
+test "spec compliance: unmatched emphasis delimiters stay literal" {
+    const doc = "A *a plus **b plus _c stays.";
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    // No bold/italic runs anywhere; every delimiter renders as text.
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) {
+            try std.testing.expect(!c.style.bold);
+            try std.testing.expect(!c.style.italic);
+        }
+    }
+    try std.testing.expect(hasRun(cmds[0..m], "*a"));
+    try std.testing.expect(hasRun(cmds[0..m], "**b"));
+    try std.testing.expect(hasRun(cmds[0..m], "_c"));
+}
+
