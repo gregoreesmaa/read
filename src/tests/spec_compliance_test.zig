@@ -187,6 +187,67 @@ test "spec compliance: blockquotes and nested quotes" {
     try std.testing.expectEqual(@as(usize, 5), bar_count);
 }
 
+test "design #26: hr is a full-column 1px rule on a 2em rhythm" {
+    const doc = "Top\n\n---\n\nBottom\n";
+    var lines: [8]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    try std.testing.expectEqual(@as(usize, 5), n);
+
+    var cmds: [64]layout.DrawCommand = undefined;
+    const count = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    var y_top: f32 = -1;
+    var y_bot: f32 = -1;
+    var hr_y: f32 = -1;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Top")) y_top = c.rect.y;
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Bottom")) y_bot = c.rect.y;
+        if (c.kind == .line) {
+            try std.testing.expectApproxEqAbs(c.rect.h, 1.0, 0.001);
+            try std.testing.expectApproxEqAbs(c.rect.x, 100.0, 0.01);
+            try std.testing.expectApproxEqAbs(c.rect.w, 600.0, 0.01);
+            try std.testing.expectEqual(layout.Theme.dark.hr, c.color);
+            hr_y = c.rect.y;
+        }
+    }
+    try std.testing.expect(y_top >= 0 and y_bot >= 0 and hr_y >= 0);
+    // Top half: paragraph row + 4px trailing + blank + 1em pad.
+    try std.testing.expectApproxEqAbs(hr_y - y_top, 29.75 + 4.0 + 29.75 * 0.75 + 17.0, 0.01);
+    // Bottom half: 1em pad + blank. Both halves make the 2em rhythm.
+    try std.testing.expectApproxEqAbs(y_bot - hr_y, 17.0 + 29.75 * 0.75, 0.01);
+}
+
+test "design #26: raw html lines render muted mono, never serif" {
+    const doc = "<div>\n</div>\n";
+    var lines: [8]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    var cmds: [64]layout.DrawCommand = undefined;
+    const count = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    var runs: usize = 0;
+    for (cmds[0..count]) |c| {
+        if (c.kind != .text_run) continue;
+        runs += 1;
+        try std.testing.expect(c.style.code);
+        try std.testing.expectEqual(layout.Theme.dark.muted, c.color);
+    }
+    try std.testing.expect(runs > 0);
+}
+
+test "design #26: autolink lines keep link rendering" {
+    const doc = "<https://example.com>\n";
+    var lines: [8]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    var cmds: [64]layout.DrawCommand = undefined;
+    const count = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    var linked: usize = 0;
+    for (cmds[0..count]) |c| {
+        if (c.kind != .text_run or c.link_target == null) continue;
+        linked += 1;
+        try std.testing.expect(!c.style.code);
+        try std.testing.expectEqual(layout.Theme.dark.accent, c.color);
+    }
+    try std.testing.expect(linked > 0);
+}
+
 test "spec compliance: unordered lists (*, -, +) and ordered lists (1., 1))" {
     const doc =
         \\* Star bullet

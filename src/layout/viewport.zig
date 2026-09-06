@@ -126,6 +126,29 @@ pub const DrawCommandKind = enum {
     image,
 };
 
+/// Horizontal-rule vertical rhythm (issue #26): 2em total (1em each side
+/// of the 1px rule), base-relative so estimate/measure/refine/render agree.
+pub const hr_rhythm_em: f32 = 2.0;
+
+test "design #26: hr is 12-15% fg with 2em rhythm" {
+    try std.testing.expectApproxEqAbs(hr_rhythm_em, 2.0, 0.001);
+    // Per-channel mix of fg over bg lands inside 12–15% for both themes.
+    const Mix = struct { hr: u8, bg: u8, fg: u8 };
+    const mixes = [_]Mix{
+        .{ .hr = Color.hr_dark.r, .bg = Color.bg_dark.r, .fg = Color.text_dark.r },
+        .{ .hr = Color.hr_dark.g, .bg = Color.bg_dark.g, .fg = Color.text_dark.g },
+        .{ .hr = Color.hr_dark.b, .bg = Color.bg_dark.b, .fg = Color.text_dark.b },
+        .{ .hr = Color.hr_light.r, .bg = Color.bg_light.r, .fg = Color.text_light.r },
+        .{ .hr = Color.hr_light.g, .bg = Color.bg_light.g, .fg = Color.text_light.g },
+        .{ .hr = Color.hr_light.b, .bg = Color.bg_light.b, .fg = Color.text_light.b },
+    };
+    for (mixes) |m| {
+        const t = (@as(f32, @floatFromInt(m.hr)) - @as(f32, @floatFromInt(m.bg))) /
+            (@as(f32, @floatFromInt(m.fg)) - @as(f32, @floatFromInt(m.bg)));
+        try std.testing.expect(t >= 0.12 and t <= 0.15);
+    }
+}
+
 pub const Color = struct {
     r: u8,
     g: u8,
@@ -143,7 +166,7 @@ pub const Color = struct {
     pub const accent_dark = Color{ .r = 96, .g = 165, .b = 250, .a = 255 };
     pub const code_bg_dark = Color{ .r = 26, .g = 26, .b = 28, .a = 255 };
     pub const quote_bar_dark = Color{ .r = 70, .g = 70, .b = 80, .a = 255 };
-    pub const hr_dark = Color{ .r = 40, .g = 40, .b = 45, .a = 255 };
+    pub const hr_dark = Color{ .r = 46, .g = 46, .b = 46, .a = 255 };
     pub const table_border_dark = Color{ .r = 45, .g = 45, .b = 52, .a = 255 };
     pub const table_header_bg_dark = Color{ .r = 28, .g = 28, .b = 32, .a = 255 };
 
@@ -154,7 +177,7 @@ pub const Color = struct {
     pub const accent_light = Color{ .r = 37, .g = 99, .b = 235, .a = 255 };
     pub const code_bg_light = Color{ .r = 240, .g = 241, .b = 243, .a = 255 };
     pub const quote_bar_light = Color{ .r = 203, .g = 213, .b = 225, .a = 255 };
-    pub const hr_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
+    pub const hr_light = Color{ .r = 220, .g = 221, .b = 221, .a = 255 };
     pub const table_border_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
     pub const table_header_bg_light = Color{ .r = 244, .g = 245, .b = 247, .a = 255 };
 };
@@ -432,6 +455,7 @@ pub fn layoutWrappedSpans(
     line_h: f32,
     default_color: Color,
     accent_color: Color,
+    muted: Color,
     vp_bottom: f32,
     commands_out: []DrawCommand,
     cmd_count: *usize,
@@ -442,6 +466,7 @@ pub fn layoutWrappedSpans(
         .line_h = line_h,
         .default_color = default_color,
         .accent_color = accent_color,
+        .muted = muted,
         .start_x = start_x,
         .max_w = max_w,
         .vp_bottom = vp_bottom,
@@ -474,6 +499,7 @@ pub const FlowCtx = struct {
     line_h: f32,
     default_color: Color,
     accent_color: Color,
+    muted: Color,
     start_x: f32,
     max_w: f32,
     vp_bottom: f32,
@@ -482,6 +508,35 @@ pub const FlowCtx = struct {
     defs: []const simd.RefDef = &.{},
     entities: ?*EntityStore = null,
 };
+
+/// Raw-HTML fallback line start (issue #26): offset of `<` when a paragraph
+/// line opens with an HTML tag/close/declaration/PI (`<div>`, `</div>`,
+/// `<!…>`, `<?…>`; up to 3 leading spaces, the CommonMark HTML-block
+/// start condition) — but never an autolink (`<https://…>`, `<a@b.c>`),
+/// which keeps its link rendering. Null otherwise.
+fn rawHtmlStart(text: []const u8) ?usize {
+    var p: usize = 0;
+    while (p < text.len and text[p] == ' ') : (p += 1) {}
+    if (p > 3) return null;
+    if (p + 1 >= text.len or text[p] != '<') return null;
+    if (parser.isAutolinkAt(text, p)) return null;
+    const c = text[p + 1];
+    if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '/' or c == '!' or c == '?') return p;
+    return null;
+}
+
+test "design #26: raw html start detection" {
+    try std.testing.expect(rawHtmlStart("<div>") != null);
+    try std.testing.expect(rawHtmlStart("  </div>") != null);
+    try std.testing.expect(rawHtmlStart("<?pi?>") != null);
+    try std.testing.expect(rawHtmlStart("<!DOCTYPE html>") != null);
+    try std.testing.expect(rawHtmlStart("    <div>") == null);
+    try std.testing.expect(rawHtmlStart("<https://example.com>") == null);
+    try std.testing.expect(rawHtmlStart("<a@b.com>") == null);
+    try std.testing.expect(rawHtmlStart("a < b") == null);
+    try std.testing.expect(rawHtmlStart("<3 hearts") == null);
+    try std.testing.expect(rawHtmlStart("<") == null);
+}
 
 /// Lays out one word at the pen: wraps to the next visual row on overflow,
 /// emits a text_run when visible, and advances past the word. Conditions are
@@ -578,12 +633,22 @@ pub fn flowSourceLine(
     }
     while (text.len > 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) : (text = text[0 .. text.len - 1]) {}
     if (text.len == 0) return;
+    // Raw HTML fallback (issue #26): source lines opening with a tag render
+    // as a muted monospace block, never body serif. Links inside keep link
+    // rendering; everything else flows mono through the forced-code path
+    // (block code: wraps by word, never takes the inline-code pill).
+    var line_ctx = ctx;
+    var line_force_code = force_code;
+    if (!force_code and !force_heading and rawHtmlStart(text) != null) {
+        line_force_code = true;
+        line_ctx.default_color = ctx.muted;
+    }
     var span_buf: [32]parser.InlineSpan = undefined;
-    const n = parser.parseInlinesWithDefs(text, &span_buf, ctx.defs);
+    const n = parser.parseInlinesWithDefs(text, &span_buf, line_ctx.defs);
     for (span_buf[0..n]) |span| {
-        if (ctx.commands_out.len >= 4 and ctx.cmd_count.* >= ctx.commands_out.len - 4) break;
+        if (line_ctx.commands_out.len >= 4 and line_ctx.cmd_count.* >= line_ctx.commands_out.len - 4) break;
         var style = span.style;
-        if (force_code) style.code = true;
+        if (line_force_code) style.code = true;
         if (force_heading) {
             style.bold = true;
             style.heading = true;
@@ -593,15 +658,15 @@ pub fn flowSourceLine(
         // Entities decode in rendered text (never in code spans, whose
         // `&amp;` is literal). Measurement flows the same decoded slices,
         // so wrap geometry always matches the draw.
-        if (!style.code and ctx.entities != null) {
+        if (!style.code and line_ctx.entities != null) {
             if (simd.findByte(txt, 0, '&') != null) {
-                if (ctx.entities.?.decodeInto(txt)) |d| txt = d;
+                if (line_ctx.entities.?.decodeInto(txt)) |d| txt = d;
             }
             if (tgt != null and simd.findByte(tgt.?, 0, '&') != null) {
-                if (ctx.entities.?.decodeInto(tgt.?)) |d| tgt = d;
+                if (line_ctx.entities.?.decodeInto(tgt.?)) |d| tgt = d;
             }
         }
-        flowSpans(txt, style, tgt, pen, ctx);
+        flowSpans(txt, style, tgt, pen, line_ctx);
     }
 }
 
@@ -1071,6 +1136,7 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .line_h = line_h,
         .default_color = color,
         .accent_color = ux.theme.accent,
+        .muted = ux.theme.muted,
         .start_x = tx,
         .max_w = tw,
         .vp_bottom = ux.vp_bottom,
@@ -2395,6 +2461,7 @@ pub fn renderViewportCore(
                 heading_line_h,
                 theme.text,
                 theme.accent,
+                theme.muted,
                 vp_bottom,
                 commands_out,
                 &cmd_count,
@@ -2413,15 +2480,16 @@ pub fn renderViewportCore(
                 listContentBase(&unit_cx, i, 4) orelse content_x
             else
                 content_x;
+            const hr_pad = config.base_font_size * hr_rhythm_em * 0.5;
             if (cur_y + 20.0 >= 0 and cur_y <= vp_bottom) {
                 commands_out[cmd_count] = .{
                     .kind = .line,
-                    .rect = .{ .x = hx, .y = cur_y + 10.0, .w = content_x + content_width - hx, .h = 1.0 },
+                    .rect = .{ .x = hx, .y = cur_y + hr_pad, .w = content_x + content_width - hx, .h = 1.0 },
                     .color = theme.hr,
                 };
                 cmd_count += 1;
             }
-            cur_y += 24.0;
+            cur_y += config.base_font_size * hr_rhythm_em;
             continue;
         }
 
@@ -2770,6 +2838,7 @@ pub fn computeDocumentHeightEx(
                 heading_line_h,
                 Color.transparent,
                 Color.transparent,
+                Color.transparent,
                 std.math.inf(f32),
                 &.{},
                 &dummy_cmd_count,
@@ -2781,7 +2850,7 @@ pub fn computeDocumentHeightEx(
 
         // 4. Horizontal Rule
         if (line_info.block_type == .hr) {
-            cur_y += 24.0;
+            cur_y += config.base_font_size * hr_rhythm_em;
             continue;
         }
 
@@ -3474,7 +3543,7 @@ pub fn estimateBlockHeight(line: simd.Line, config: ViewportConfig, content_widt
     const bt = line.block_type;
     if (bt == .blank) return lh * 0.75;
     if (bt == .link_def or bt == .html_comment) return 0.0;
-    if (bt == .hr) return 24.0;
+    if (bt == .hr) return config.base_font_size * hr_rhythm_em;
     if (bt == .code_fence_start or bt == .code_fence_end) return 20.0;
     if (bt == .code_line) return lh * 0.88;
     if (bt == .table_row) return lh * 1.3;
@@ -3602,7 +3671,7 @@ pub fn refineLineHeight(
         // block types exist so no paragraph, list, quote, or code unit can
         // absorb them (hiding is structural, not per-call).
         .link_def, .html_comment => return .{ .height = 0.0, .consumed = 1 },
-        .hr => return .{ .height = 24.0, .consumed = 1 },
+        .hr => return .{ .height = config.base_font_size * hr_rhythm_em, .consumed = 1 },
         .code_line => return .{ .height = lh * 0.88, .consumed = 1 },
         .code_fence_end => return .{ .height = 0.0, .consumed = 1 },
         .code_fence_start => {
@@ -3668,7 +3737,7 @@ pub fn refineLineHeight(
                 listContentBase(&mux_h, idx, 4) orelse content_x
             else
                 content_x;
-            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy);
+            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy);
             return .{ .height = margin_top + end_y + margin_bottom, .consumed = 1 };
         },
         .quote => {
