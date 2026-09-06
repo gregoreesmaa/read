@@ -520,6 +520,21 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     continue;
                 }
 
+                // Visited-link state (issue #25): the platform owns the
+                // clicked-URL set; linked runs query it and take the theme
+                // visited color. Link runs are rare, so the FFI round-trip
+                // never touches the hot path.
+                var run_color = cmd.color;
+                if (cmd.link_target) |t| {
+                    if (t.len > 0 and
+                        bridge.platform_link_visited(t.ptr, @intCast(t.len)) != 0)
+                    {
+                        run_color = if (g_app.is_dark_theme)
+                            layout.Theme.dark.link_visited
+                        else
+                            layout.Theme.light.link_visited;
+                    }
+                }
                 bridge.platform_draw_text(
                     cmd.text.ptr,
                     @intCast(cmd.text.len),
@@ -530,10 +545,10 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     is_italic,
                     is_mono,
                     is_heading,
-                    cmd.color.r,
-                    cmd.color.g,
-                    cmd.color.b,
-                    cmd.color.a,
+                    run_color.r,
+                    run_color.g,
+                    run_color.b,
+                    run_color.a,
                     url_ptr,
                     url_len,
                 );

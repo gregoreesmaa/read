@@ -23,6 +23,7 @@ static float g_scrollbar_grab_delta = 0.0f;
 static float scrollbar_thumb_y(void);
 static BOOL scrollbar_hit(NSPoint view_pt, float view_w);
 static void scrollbar_drag_to(float y);
+static void mark_link_visited(const char* url);
 
 // Idle policy (mirrors src/platform/idle.zig): mouse motion alone never
 // redraws. Only a hover-state transition re-arms a draw. The last hover
@@ -1191,6 +1192,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                             [[NSWorkspace sharedWorkspace] openURL:url];
                         }
                     }
+                    mark_link_visited(rec->link_url);
                     break;
                 }
             }
@@ -1256,6 +1258,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     if (urlStr) {
         NSURL* url = [NSURL URLWithString:urlStr];
         if (url) [[NSWorkspace sharedWorkspace] openURL:url];
+        mark_link_visited([urlStr UTF8String]);
     }
 }
 
@@ -1816,6 +1819,57 @@ void platform_register_text_run(const char* text, int len, float x, float y, flo
     }
 }
 
+// Visited-link memory (issue #25): FNV-1a hashes of opened URLs in a small
+// BSS ring (no allocation, no ordering). A collision only mis-tints a link;
+// slots start zeroed and no non-empty URL hashes to zero in practice.
+#define VISITED_LINK_CAP 64
+static uint64_t g_visited_links[VISITED_LINK_CAP];
+static int g_visited_next = 0;
+
+static uint64_t link_url_hash(const char* url, int url_len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < url_len; i++) {
+        h ^= (unsigned char)url[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static void mark_link_visited(const char* url) {
+    if (!url || !url[0]) return;
+    g_visited_links[g_visited_next] = link_url_hash(url, (int)strlen(url));
+    g_visited_next = (g_visited_next + 1) % VISITED_LINK_CAP;
+}
+
+int platform_link_visited(const char* url, int url_len) {
+    if (!url || url_len <= 0) return 0;
+    uint64_t h = link_url_hash(url, url_len);
+    for (int i = 0; i < VISITED_LINK_CAP; i++) {
+        if (g_visited_links[i] == h) return 1;
+    }
+    return 0;
+}
+
+// Link hover at draw time (issue #25): the same box the mouseMoved record
+// scan uses, evaluated on view coords (draw-time x/y are already view
+// coords: record_text_quad re-anchors doc_y = y + g_scroll_y).
+static inline BOOL link_run_hovered(float x, float y, float w, float h) {
+    if (w <= 0.0f || h <= 0.0f) return NO;
+    return g_mouse_pos.x >= x && g_mouse_pos.x <= x + w &&
+           g_mouse_pos.y >= y && g_mouse_pos.y <= y + h;
+}
+
+// Link underline (issue #25): a rule just below the baseline in the run's
+// own color (visited substitution is already applied by the caller), 2px
+// while hovered. Font-size-relative geometry matches on 1x, 2x, and
+// headless captures without extra CoreText queries.
+static void draw_link_underline(CGContextRef ctx, float x, float y, float w, float font_size, BOOL hovered) {
+    if (w <= 0.0f || font_size <= 0.0f) return;
+    float uy = y + font_size * 0.85f + fmaxf(1.5f, font_size * 0.10f);
+    float th = hovered ? 2.0f : 1.0f;
+    CGContextFillRect(ctx, CGRectMake(x, uy, w, th));
+}
+
 // Legacy direct text draw with a fresh explicit-color line (pixel-identical
 // to the pre-atlas renderer). Records the run only when do_record is set, so
 // callers that already recorded with shaped dims never double-record.
@@ -1827,6 +1881,8 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
     CGFloat components[4] = { r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f };
     CGColorRef fontColor = CGColorCreate(colorSpace, components);
     CTLineRef ctLine = ctline_with_font(str, nsFont, fontColor);
+    float ul_w = -1.0f;
+    float ul_h = 0.0f;
     if (ctLine && do_record) {
         // Uncacheable run: measure for the record. The shaped call site
         // already recorded exact dims, so it passes do_record=0 and skips
@@ -1834,7 +1890,9 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
         CGFloat ascent, descent, leading;
         double measuredWidth = CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading);
         double trailing = CTLineGetTrailingWhitespaceWidth(ctLine);
-        record_text_quad(text, len, x, y, (float)(measuredWidth + trailing), (float)(ascent + descent),
+        ul_w = (float)(measuredWidth + trailing);
+        ul_h = (float)(ascent + descent);
+        record_text_quad(text, len, x, y, ul_w, ul_h,
                          font_size, is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
     }
     if (ctLine) {
@@ -1844,6 +1902,12 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
         CGContextSetTextPosition(ctx, 0, 0);
         CTLineDraw(ctLine, ctx);
         CGContextRestoreGState(ctx);
+        // Uncacheable link runs underline here (the shaped path's caller
+        // draws its own from cache dims, so do_record=0 stays quiet).
+        if (ul_w >= 0.0f && link_url && link_url_len > 0) {
+            CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+            draw_link_underline(ctx, x, y, ul_w, font_size, link_run_hovered(x, y, ul_w, ul_h));
+        }
         CFRelease(ctLine);
     }
     CGColorRelease(fontColor);
@@ -1886,6 +1950,12 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
             CGContextFillRect(ctx, dest);
             CGContextRestoreGState(ctx);
+            // Shaped link runs underline here (issue #25); the uncacheable
+            // path below is covered inside draw_text_legacy instead.
+            if (link_url && link_url_len > 0) {
+                CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+                draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h));
+            }
             return; // textured quad done: no shaping, no CPU compositing
         }
         // 1x destination (or missing slice): legacy pixels, no re-record.
@@ -1896,6 +1966,10 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         // still serves measure/hit-test paths with zero re-shape cost.
         draw_text_legacy(ctx, text, len, x, y, font_size, is_bold, is_italic, is_mono, is_heading,
                          r, g, b, a, 0, link_url, link_url_len);
+        if (link_url && link_url_len > 0) {
+            CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+            draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h));
+        }
         return;
     }
 

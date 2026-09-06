@@ -141,6 +141,7 @@ pub const Color = struct {
     pub const text_dark = Color{ .r = 224, .g = 224, .b = 224, .a = 255 };
     pub const text_muted_dark = Color{ .r = 140, .g = 140, .b = 145, .a = 255 };
     pub const accent_dark = Color{ .r = 96, .g = 165, .b = 250, .a = 255 };
+    pub const link_visited_dark = Color{ .r = 196, .g = 181, .b = 253, .a = 255 };
     pub const code_bg_dark = Color{ .r = 26, .g = 26, .b = 28, .a = 255 };
     pub const quote_bar_dark = Color{ .r = 70, .g = 70, .b = 80, .a = 255 };
     pub const hr_dark = Color{ .r = 40, .g = 40, .b = 45, .a = 255 };
@@ -152,6 +153,7 @@ pub const Color = struct {
     pub const text_light = Color{ .r = 30, .g = 32, .b = 34, .a = 255 };
     pub const text_muted_light = Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
     pub const accent_light = Color{ .r = 37, .g = 99, .b = 235, .a = 255 };
+    pub const link_visited_light = Color{ .r = 109, .g = 40, .b = 217, .a = 255 };
     pub const code_bg_light = Color{ .r = 240, .g = 241, .b = 243, .a = 255 };
     pub const quote_bar_light = Color{ .r = 203, .g = 213, .b = 225, .a = 255 };
     pub const hr_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
@@ -183,6 +185,7 @@ pub const Theme = struct {
     text: Color,
     muted: Color,
     accent: Color,
+    link_visited: Color,
     code_bg: Color,
     quote_bar: Color,
     hr: Color,
@@ -194,6 +197,7 @@ pub const Theme = struct {
         .text = Color.text_dark,
         .muted = Color.text_muted_dark,
         .accent = Color.accent_dark,
+        .link_visited = Color.link_visited_dark,
         .code_bg = Color.code_bg_dark,
         .quote_bar = Color.quote_bar_dark,
         .hr = Color.hr_dark,
@@ -206,6 +210,7 @@ pub const Theme = struct {
         .text = Color.text_light,
         .muted = Color.text_muted_light,
         .accent = Color.accent_light,
+        .link_visited = Color.link_visited_light,
         .code_bg = Color.code_bg_light,
         .quote_bar = Color.quote_bar_light,
         .hr = Color.hr_light,
@@ -1097,6 +1102,35 @@ fn emitCmd(ux: *UnitCx, cmd: DrawCommand) void {
 /// Single soft-break space between flowed lines (never wraps, like spaces).
 fn softSpace(pen: *FlowPen, tx: f32, font_size: f32) void {
     if (pen.x > tx) flowSpace(pen, measureCharEx(' ', font_size, false, false, false, false));
+}
+
+/// WCAG 2.x relative luminance of an sRGB color (contrast-test helper).
+fn relLuminance(c: Color) f32 {
+    const ch = struct {
+        fn lin(v: u8) f32 {
+            const s = @as(f32, @floatFromInt(v)) / 255.0;
+            return if (s <= 0.03928) s / 12.92 else std.math.pow(f32, (s + 0.055) / 1.055, 2.4);
+        }
+    }.lin;
+    return 0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b);
+}
+
+/// WCAG 2.x contrast ratio between two colors (contrast-test helper).
+fn contrastRatio(fg: Color, bg: Color) f32 {
+    const hi = @max(relLuminance(fg), relLuminance(bg));
+    const lo = @min(relLuminance(fg), relLuminance(bg));
+    return (hi + 0.05) / (lo + 0.05);
+}
+
+test "design #25: link accent + visited contrast >= 4.5:1" {
+    // Accent blues clear WCAG AA against their backgrounds, both themes.
+    try std.testing.expect(contrastRatio(Theme.dark.accent, Theme.dark.bg) >= 4.5);
+    try std.testing.expect(contrastRatio(Theme.light.accent, Theme.light.bg) >= 4.5);
+    // Visited states stay distinguishable from accents and AA-clear too.
+    try std.testing.expect(!std.meta.eql(Theme.dark.accent, Theme.dark.link_visited));
+    try std.testing.expect(!std.meta.eql(Theme.light.accent, Theme.light.link_visited));
+    try std.testing.expect(contrastRatio(Theme.dark.link_visited, Theme.dark.bg) >= 4.5);
+    try std.testing.expect(contrastRatio(Theme.light.link_visited, Theme.light.bg) >= 4.5);
 }
 
 /// Quote bars for one quote line: one bar per depth level spanning the whole

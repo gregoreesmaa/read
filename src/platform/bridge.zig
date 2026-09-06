@@ -73,6 +73,9 @@ pub extern "c" fn platform_draw_text(
     link_url_len: c_int,
 ) void;
 
+/// Visited-link probe (issue #25): 1 when this URL was opened before.
+pub extern "c" fn platform_link_visited(url: ?[*]const u8, url_len: c_int) c_int;
+
 pub extern "c" fn platform_draw_image(
     url: ?[*]const u8,
     url_len: c_int,
