@@ -101,6 +101,11 @@ const MAX_CHECKPOINTS = 2048;
 var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
 var g_checkpoint_count: usize = 0;
 
+// Per-line exact layout cache: warmed by updateDocumentMetrics, hit by every
+// onDraw. Geometry/parse-input changes auto-invalidate; document reloads
+// re-key by content hash (stale entries simply miss and re-measure).
+var g_line_cache: layout.LineLayoutCache = .{};
+
 // Tiny hand-rolled atof: ship builds must not link std.fmt.parseFloat,
 // whose float tables cost kilobytes of __TEXT. Handles optional sign,
 // integer digits, and an optional fraction; anything else parses as prefix.
@@ -199,6 +204,7 @@ fn updateDocumentMetrics() void {
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
+        .line_cache = &g_line_cache,
     };
     const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
@@ -333,6 +339,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
+        .line_cache = &g_line_cache,
     };
 
     var t_layout_ns: u64 = 0;

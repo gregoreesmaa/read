@@ -245,6 +245,189 @@ pub const Checkpoint = struct {
     next_block_id: u16,
 };
 
+/// Direct-mapped slots for the per-line exact layout cache. Sized like the
+/// Goldilocks window (`MAX_WINDOW_LINES`): a ~3-screen working set of units
+/// never exceeds this, so steady scrolling neither thrashes nor grows.
+pub const LINE_CACHE_SIZE: usize = 1024;
+pub const LINE_CACHE_MASK: usize = LINE_CACHE_SIZE - 1;
+
+/// Per-line exact layout cache (finding #1): memoizes the exact measured
+/// height of parse-heavy units (paragraph runs, quotes, lists, headings) so
+/// steady-state frames never re-parse or re-wrap units scrolled fully above
+/// the viewport, and the checkpoint-seek correction loop reuses heights
+/// instead of re-measuring. Caller-owned, zero heap allocations.
+///
+/// Soundness: entries are content-addressed (FNV-1a over the unit's line
+/// offsets/lengths/indents/block-types/bytes with the unit start mixed in)
+/// and versioned by a geometry + parse-input generation (content width, font
+/// sizes, ref-def/join/entity store identity). Any mismatch is a miss that
+/// re-measures exactly, so the cache can only skip work, never change
+/// pixels. Units whose heights depend on live async state (images via
+/// `image_size_fn`) are never cached. Fenced code, tables, and indented
+/// code are never cached either: their heights are branch-light arithmetic
+/// and their above-viewport emission is already block-culled.
+///
+/// Scratch replication: each entry records how many entity/marker scratch
+/// slots its unit consumed at measure time; a skipped unit reserves the same
+/// counts (saturating exactly like the real stores), so later units in the
+/// frame observe bit-identical scratch state, including exhaustion fallback.
+/// Cached heights additionally rely on the architecture-wide invariant that
+/// measurement is scroll-independent (the same assumption checkpoints and
+/// `VirtualCache` already make).
+pub const LineLayoutCache = struct {
+    valid: bool = false,
+    content_width_bits: u32 = 0,
+    base_font_size_bits: u32 = 0,
+    line_height_bits: u32 = 0,
+    ref_defs_ptr: usize = 0,
+    ref_defs_len: usize = 0,
+    join_ptr: usize = 0,
+    entities_ptr: usize = 0,
+    hash: [LINE_CACHE_SIZE]u64 = [_]u64{0} ** LINE_CACHE_SIZE,
+    height: [LINE_CACHE_SIZE]f32 = [_]f32{0} ** LINE_CACHE_SIZE,
+    consumed: [LINE_CACHE_SIZE]u32 = [_]u32{0} ** LINE_CACHE_SIZE,
+    marker_slots: [LINE_CACHE_SIZE]u8 = [_]u8{0} ** LINE_CACHE_SIZE,
+    entity_slots: [LINE_CACHE_SIZE]u8 = [_]u8{0} ** LINE_CACHE_SIZE,
+
+    pub fn reset(self: *LineLayoutCache) void {
+        self.valid = false;
+        self.consumed = [_]u32{0} ** LINE_CACHE_SIZE;
+    }
+
+    fn storeGeneration(self: *LineLayoutCache, config: ViewportConfig, content_width: f32) void {
+        self.content_width_bits = @bitCast(content_width);
+        self.base_font_size_bits = @bitCast(config.base_font_size);
+        self.line_height_bits = @bitCast(config.line_height);
+        if (config.ref_defs.len > 0) {
+            self.ref_defs_ptr = @intFromPtr(config.ref_defs.ptr);
+            self.ref_defs_len = config.ref_defs.len;
+        } else {
+            self.ref_defs_ptr = 0;
+            self.ref_defs_len = 0;
+        }
+        self.join_ptr = if (config.join_buf) |jb| @intFromPtr(jb) else 0;
+        self.entities_ptr = if (config.entities) |e| @intFromPtr(e) else 0;
+        self.valid = true;
+    }
+
+    fn generationMatches(self: *const LineLayoutCache, config: ViewportConfig, content_width: f32) bool {
+        if (!self.valid) return false;
+        if (self.content_width_bits != @as(u32, @bitCast(content_width))) return false;
+        if (self.base_font_size_bits != @as(u32, @bitCast(config.base_font_size))) return false;
+        if (self.line_height_bits != @as(u32, @bitCast(config.line_height))) return false;
+        const rd_ptr: usize = if (config.ref_defs.len > 0) @intFromPtr(config.ref_defs.ptr) else 0;
+        if (self.ref_defs_ptr != rd_ptr or self.ref_defs_len != config.ref_defs.len) return false;
+        const j_ptr: usize = if (config.join_buf) |jb| @intFromPtr(jb) else 0;
+        if (self.join_ptr != j_ptr) return false;
+        const e_ptr: usize = if (config.entities) |e| @intFromPtr(e) else 0;
+        if (self.entities_ptr != e_ptr) return false;
+        return true;
+    }
+
+    /// Exact cached measurement for the unit starting at `idx`, or null on
+    /// any generation/content mismatch (caller re-measures exactly).
+    pub fn lookup(
+        self: *LineLayoutCache,
+        bytes: []const u8,
+        lines: []const simd.Line,
+        idx: usize,
+        config: ViewportConfig,
+        content_width: f32,
+    ) ?LineCacheHit {
+        if (!self.generationMatches(config, content_width)) {
+            self.reset();
+            self.storeGeneration(config, content_width);
+            return null;
+        }
+        if (idx >= lines.len) return null;
+        const slot = idx & LINE_CACHE_MASK;
+        const c = self.consumed[slot];
+        if (c == 0 or @as(usize, c) > lines.len - idx) return null;
+        if (lineCacheHash(bytes, lines, idx, c) != self.hash[slot]) return null;
+        return .{
+            .height = self.height[slot],
+            .consumed = c,
+            .marker_slots = self.marker_slots[slot],
+            .entity_slots = self.entity_slots[slot],
+        };
+    }
+
+    pub fn store(
+        self: *LineLayoutCache,
+        bytes: []const u8,
+        lines: []const simd.Line,
+        idx: usize,
+        height: f32,
+        consumed: usize,
+        marker_slots: u8,
+        entity_slots: u8,
+        config: ViewportConfig,
+        content_width: f32,
+    ) void {
+        if (!self.generationMatches(config, content_width)) {
+            self.reset();
+            self.storeGeneration(config, content_width);
+        }
+        if (idx >= lines.len or consumed == 0) return;
+        if (consumed > lines.len - idx) return;
+        if (consumed > std.math.maxInt(u32)) return;
+        const c: u32 = @intCast(consumed);
+        const slot = idx & LINE_CACHE_MASK;
+        self.hash[slot] = lineCacheHash(bytes, lines, idx, c);
+        self.height[slot] = height;
+        self.consumed[slot] = c;
+        self.marker_slots[slot] = marker_slots;
+        self.entity_slots[slot] = entity_slots;
+    }
+};
+
+/// Exact cached measurement for one unit: height plus the source lines it
+/// consumed plus the scratch slots it used (for identical reservation).
+pub const LineCacheHit = struct {
+    height: f32,
+    consumed: u32,
+    marker_slots: u8,
+    entity_slots: u8,
+};
+
+fn lineCacheMix(h: *u64, v: u64) void {
+    h.* ^= v;
+    h.* *%= 0x100000001b3;
+}
+
+/// Content address of the unit `[idx, idx + consumed)`: start index, then
+/// per line the offset/length/indent/block-type plus raw bytes. Line bytes
+/// alone would miss stale classifications; geometry is versioned in the
+/// cache header instead (checked before this runs).
+fn lineCacheHash(bytes: []const u8, lines: []const simd.Line, idx: usize, consumed: u32) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    lineCacheMix(&h, @intCast(idx));
+    var k: usize = idx;
+    const end = idx + @as(usize, consumed);
+    while (k < end and k < lines.len) : (k += 1) {
+        const ln = lines[k];
+        lineCacheMix(&h, @intCast(ln.offset));
+        lineCacheMix(&h, @intCast(ln.len));
+        lineCacheMix(&h, @intCast(ln.indent));
+        lineCacheMix(&h, @intCast(@intFromEnum(ln.block_type)));
+        const lb = bytes[ln.offset..][0..ln.len];
+        for (lb) |c| lineCacheMix(&h, c);
+    }
+    return h;
+}
+
+/// Reserves skipped-unit scratch consumption so later units in the frame see
+/// the exact store state the legacy flow would have left, saturating exactly
+/// like the real pushes (exhaustion fallback timing is preserved).
+fn lineCacheReserve(config: ViewportConfig, marker_slots: u8, entity_slots: u8) void {
+    if (config.ordered_markers) |st| {
+        st.count = @min(st.count + @as(usize, marker_slots), MAX_ORDERED_MARKERS);
+    }
+    if (config.entities) |ents| {
+        ents.count = @min(ents.count + @as(usize, entity_slots), MAX_ENTITY_SLOTS);
+    }
+}
+
 pub const ViewportConfig = struct {
     window_width: f32,
     window_height: f32,
@@ -275,6 +458,12 @@ pub const ViewportConfig = struct {
     /// disables the joint (lines flow separately). Render and measurement
     /// share the config, so both always agree.
     join_buf: ?*[JOIN_BUF_LEN]u8 = null,
+    /// Optional per-line exact layout cache (finding #1). Null disables
+    /// caching: every pass re-measures exactly (legacy behavior, used by
+    /// tests and cold paths). Non-null enables memoized heights for
+    /// parse-heavy units with identical output. Caller-owned, zero heap
+    /// allocations; auto-invalidates on geometry/parse-input change.
+    line_cache: ?*LineLayoutCache = null,
 };
 
 /// Cross-line reference joint scratch length: two source lines plus a space.
@@ -1814,6 +2003,57 @@ fn layoutIndentedCodeUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) Unit
     return .{ .y = start_y + card_h + 16.0, .consumed = n };
 }
 
+/// Probes the per-line cache for the unit starting at line `i`. Null when
+/// caching is off or the entry missed validation (caller flows exactly and
+/// stores the fresh measurement).
+fn lineCacheProbe(ux: *UnitCx, i: usize) ?LineCacheHit {
+    const cache = ux.config.line_cache orelse return null;
+    return cache.lookup(ux.bytes, ux.lines, i, ux.config, ux.content_width);
+}
+
+/// Saturating scratch-slot delta between two store counts (reservation
+/// saturates identically, so clamping preserves exhaustion behavior).
+fn satSlotDelta(before: usize, after: usize) u8 {
+    return @intCast(@min(after -| before, 255));
+}
+
+/// True when the unit `[i, i + consumed)` holds only cacheable content: no
+/// fenced/indented code, table, or image lines. Those units own scrollable
+/// ids or async heights and always take the legacy path; the parse-heavy
+/// units (paragraph runs, quotes, lists, headings) never absorb them, so
+/// this guard only ever fires on hash-validated input as defense in depth.
+fn lineCacheSkippable(lines: []const simd.Line, i: usize, consumed: usize) bool {
+    var k: usize = i;
+    const end = i + consumed;
+    while (k < end and k < lines.len) : (k += 1) {
+        switch (lines[k].block_type) {
+            .code_fence_start, .code_fence_end, .code_line, .table_row, .image => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Applies a cache hit for a fully above-viewport unit: the caller advances
+/// `cur_y` by the hit height and jumps to the returned next line without
+/// parsing. Strict `< 0` matches every emission guard in the unit functions
+/// (a unit ending exactly at 0 still emits its bottom edge, so it flows).
+/// Reserves the unit's scratch consumption and resets ordered-numbering
+/// carry so following units re-seed deterministically by backward scan
+/// (marker text is geometry-independent). Null when the unit is visible or
+/// unskippable: the caller must flow it exactly.
+fn lineCacheSkip(ux: *UnitCx, i: usize, hit: LineCacheHit, cur_y: f32) ?usize {
+    if (cur_y + hit.height >= 0.0) return null;
+    if (i >= ux.lines.len) return null;
+    const consumed: usize = hit.consumed;
+    if (consumed == 0 or consumed > ux.lines.len - i) return null;
+    if (!lineCacheSkippable(ux.lines, i, consumed)) return null;
+    lineCacheReserve(ux.config, hit.marker_slots, hit.entity_slots);
+    ux.ord_active = false;
+    ux.qord_active = false;
+    return i + consumed;
+}
+
 /// Shared virtualized render core: emits draw commands for `lines[start_line..]`,
 /// positioned with `start_line` at viewport-relative `origin_y`, assigning
 /// scrollable block ids from `start_block_id`.
@@ -2264,6 +2504,18 @@ pub fn renderViewportCore(
                 content_x;
             const hw = content_x + content_width - hx;
 
+            const hit = lineCacheProbe(&unit_cx, i);
+            if (hit) |h| {
+                if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
+                    cur_y += h.height;
+                    next_block_id += countScrollableBlocks(lines, i, next);
+                    i = next - 1;
+                    continue;
+                }
+            }
+            const y0 = cur_y;
+            const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
+            const en0: usize = if (config.entities) |e| e.count else 0;
             cur_y += margin_top;
 
             const h_text = line_bytes[h_offset..];
@@ -2284,6 +2536,13 @@ pub fn renderViewportCore(
             );
 
             cur_y = end_y + margin_bottom;
+            if (config.line_cache) |cache| {
+                if (hit == null) {
+                    const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
+                    const en1: usize = if (config.entities) |e| e.count else 0;
+                    cache.store(bytes, lines, i, cur_y - y0, 1, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
+                }
+            }
             continue;
         }
 
@@ -2411,9 +2670,28 @@ pub fn renderViewportCore(
         // Blockquote (nested quotes, lazy tails, quoted blocks)
         // ----------------------------------------------------
         if (line_info.block_type == .quote) {
+            const hit = lineCacheProbe(&unit_cx, i);
+            if (hit) |h| {
+                if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
+                    cur_y += h.height;
+                    next_block_id += countScrollableBlocks(lines, i, next);
+                    i = next - 1;
+                    continue;
+                }
+            }
+            const y0 = cur_y;
+            const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
+            const en0: usize = if (config.entities) |e| e.count else 0;
             const base_x = listContentBase(&unit_cx, i, 4) orelse content_x;
             const r = layoutQuoteLine(&unit_cx, i, base_x, cur_y);
             cur_y = r.y;
+            if (config.line_cache) |cache| {
+                if (hit == null) {
+                    const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
+                    const en1: usize = if (config.entities) |e| e.count else 0;
+                    cache.store(bytes, lines, i, cur_y - y0, r.consumed, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
+                }
+            }
             i += r.consumed - 1;
             continue;
         }
@@ -2422,8 +2700,27 @@ pub fn renderViewportCore(
         // Lists (tasks, bullets, ordered with corrected numbers)
         // ----------------------------------------------------
         if (isListLeader(line_info.block_type)) {
+            const hit = lineCacheProbe(&unit_cx, i);
+            if (hit) |h| {
+                if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
+                    cur_y += h.height;
+                    next_block_id += countScrollableBlocks(lines, i, next);
+                    i = next - 1;
+                    continue;
+                }
+            }
+            const y0 = cur_y;
+            const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
+            const en0: usize = if (config.entities) |e| e.count else 0;
             const r = layoutListUnit(&unit_cx, i, cur_y);
             cur_y = r.y;
+            if (config.line_cache) |cache| {
+                if (hit == null) {
+                    const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
+                    const en1: usize = if (config.entities) |e| e.count else 0;
+                    cache.store(bytes, lines, i, cur_y - y0, r.consumed, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
+                }
+            }
             i += r.consumed - 1;
             continue;
         }
@@ -2432,16 +2729,65 @@ pub fn renderViewportCore(
         // List-owned runs past intervening quote/code blocks resolve
         // to the item column via backward context.
         // ----------------------------------------------------
+        const hit = lineCacheProbe(&unit_cx, i);
+        if (hit) |h| {
+            if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
+                cur_y += h.height;
+                next_block_id += countScrollableBlocks(lines, i, next);
+                i = next - 1;
+                continue;
+            }
+        }
+        const y0 = cur_y;
+        const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
+        const en0: usize = if (config.entities) |e| e.count else 0;
         const pbase = if (enclosingListMarker(bytes, lines, i)) |m|
             itemContentX(lines[m], content_x)
         else
             content_x;
         const r = layoutParagraphUnit(&unit_cx, i, pbase, cur_y);
         cur_y = r.y;
+        if (config.line_cache) |cache| {
+            if (hit == null) {
+                const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
+                const en1: usize = if (config.entities) |e| e.count else 0;
+                cache.store(bytes, lines, i, cur_y - y0, r.consumed, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
+            }
+        }
         i += r.consumed - 1;
     }
 
     return cmd_count;
+}
+
+/// `refineLineHeight` memoized through the per-line cache when present.
+/// Hits reuse the exact height and reserve the unit's entity scratch
+/// consumption (the legacy refine path consumes the live entity store but
+/// never marker slots: measurement uses a throwaway marker store, so none
+/// are reserved here). Misses measure exactly and populate the cache.
+fn cachedRefineLineHeight(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    k: usize,
+    config: ViewportConfig,
+    cw: f32,
+    cx: f32,
+) RefinedUnit {
+    const cache = config.line_cache orelse return refineLineHeight(bytes, lines, k, config, cw, cx);
+    if (cache.lookup(bytes, lines, k, config, cw)) |hit| {
+        if (config.entities) |ents| {
+            ents.count = @min(ents.count + @as(usize, hit.entity_slots), MAX_ENTITY_SLOTS);
+        }
+        return .{
+            .height = hit.height,
+            .consumed = @as(usize, hit.consumed),
+            .marker_slots = hit.marker_slots,
+            .entity_slots = hit.entity_slots,
+        };
+    }
+    const u = refineLineHeight(bytes, lines, k, config, cw, cx);
+    cache.store(bytes, lines, k, u.height, u.consumed, u.marker_slots, u.entity_slots, config, cw);
+    return u;
 }
 
 /// High-speed virtualized layout generator.
@@ -2488,7 +2834,7 @@ pub fn layoutViewport(
             var id_skip: usize = 0;
             var k = s0;
             while (k < cp.line_idx and k < lines.len) {
-                const u = refineLineHeight(bytes, lines, k, config, cw, cx);
+                const u = cachedRefineLineHeight(bytes, lines, k, config, cw, cx);
                 y_skip += u.height;
                 id_skip += countScrollableBlocks(lines, k, @min(k + @max(u.consumed, 1), lines.len));
                 k += @max(u.consumed, 1);
@@ -2548,14 +2894,57 @@ pub fn computeDocumentHeightEx(
         .markers = null,
     };
 
+    // Throwaway marker store for cache-warmup observation below: marker
+    // text is geometry-independent and unobservable here (the command
+    // buffer is empty), and the dummy keeps frame stores untouched. Only
+    // wired in when a line cache is present; otherwise this sweep is
+    // bit-for-bit the legacy one.
+    var warm_markers: OrderedMarkerStore = .{};
+
     while (i < lines.len) : (i += 1) {
-        // Record sparse checkpoint at clean block boundary
+        // Record sparse checkpoints snapped to unit starts (finding #4):
+        // the sweep advances unit-wise so `i` is usually already a unit
+        // start; when it is not (blank/setext edges owned by an earlier
+        // unit), back up with exact `refineLineHeight` steps on this cold
+        // path so the hot seek correction loop iterates zero times. The
+        // backup measures with throwaway scratch (no side effects on the
+        // sweep's stores) and falls back to the raw line on any boundary
+        // overshoot, so it can never mis-record.
         if (checkpoints_out) |cps| {
             if ((i == 0 or i >= last_cp_line + 128) and cp_count < cps.len) {
+                var rec_idx = i;
+                var rec_y = cur_y;
+                var rec_bid = next_block_id;
+                const s = snapWindowStart(bytes, lines, i);
+                if (s < i) {
+                    var backup_ents: EntityStore = .{};
+                    var backup_cfg = config;
+                    backup_cfg.entities = &backup_ents;
+                    var k = s;
+                    var back_h: f32 = 0.0;
+                    var back_b: usize = 0;
+                    var ok = true;
+                    while (k < i) {
+                        const u = refineLineHeight(bytes, lines, k, backup_cfg, content_width, content_x);
+                        const c = @max(u.consumed, 1);
+                        if (k + c > i) {
+                            ok = false;
+                            break;
+                        }
+                        back_h += u.height;
+                        back_b += countScrollableBlocks(lines, k, k + c);
+                        k += c;
+                    }
+                    if (ok and k == i) {
+                        rec_idx = s;
+                        rec_y = cur_y - back_h;
+                        rec_bid = next_block_id -| back_b;
+                    }
+                }
                 cps[cp_count] = .{
-                    .line_idx = @intCast(i),
-                    .y = cur_y,
-                    .next_block_id = @intCast(@min(next_block_id, 65535)),
+                    .line_idx = @intCast(rec_idx),
+                    .y = rec_y,
+                    .next_block_id = @intCast(@min(rec_bid, 65535)),
                 };
                 cp_count += 1;
                 last_cp_line = i;
@@ -2642,6 +3031,14 @@ pub fn computeDocumentHeightEx(
                 content_x;
             const hw = content_x + content_width - hx;
 
+            const warming = config.line_cache != null;
+            const y0 = cur_y;
+            var en0: usize = 0;
+            if (warming) {
+                en0 = if (config.entities) |e| e.count else 0;
+                warm_markers.count = 0;
+                unit_cx.markers = &warm_markers;
+            }
             cur_y += margin_top;
 
             const h_text = line_bytes[h_offset..];
@@ -2662,6 +3059,11 @@ pub fn computeDocumentHeightEx(
             );
 
             cur_y = end_y + margin_bottom;
+            if (config.line_cache) |cache| {
+                unit_cx.markers = null;
+                const en1: usize = if (config.entities) |e| e.count else 0;
+                cache.store(bytes, lines, i, cur_y - y0, 1, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
+            }
             continue;
         }
 
@@ -2720,28 +3122,67 @@ pub fn computeDocumentHeightEx(
 
         // 6. Blockquote (shared unit: nested, lazy tails, quoted blocks)
         if (line_info.block_type == .quote) {
+            const warming = config.line_cache != null;
+            const y0 = cur_y;
+            var en0: usize = 0;
+            if (warming) {
+                en0 = if (config.entities) |e| e.count else 0;
+                warm_markers.count = 0;
+                unit_cx.markers = &warm_markers;
+            }
             const base_x = listContentBase(&unit_cx, i, 4) orelse content_x;
             const r = layoutQuoteLine(&unit_cx, i, base_x, cur_y);
             cur_y = r.y;
+            if (config.line_cache) |cache| {
+                unit_cx.markers = null;
+                const en1: usize = if (config.entities) |e| e.count else 0;
+                cache.store(bytes, lines, i, cur_y - y0, r.consumed, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
+            }
             i += r.consumed - 1;
             continue;
         }
 
         // 7+8. Lists (shared unit: markers, continuations, sub-paragraphs)
         if (isListLeader(line_info.block_type)) {
+            const warming = config.line_cache != null;
+            const y0 = cur_y;
+            var en0: usize = 0;
+            if (warming) {
+                en0 = if (config.entities) |e| e.count else 0;
+                warm_markers.count = 0;
+                unit_cx.markers = &warm_markers;
+            }
             const r = layoutListUnit(&unit_cx, i, cur_y);
             cur_y = r.y;
+            if (config.line_cache) |cache| {
+                unit_cx.markers = null;
+                const en1: usize = if (config.entities) |e| e.count else 0;
+                cache.store(bytes, lines, i, cur_y - y0, r.consumed, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
+            }
             i += r.consumed - 1;
             continue;
         }
 
         // 9. Paragraph runs and setext headings (shared unit)
+        const warming = config.line_cache != null;
+        const y0 = cur_y;
+        var en0: usize = 0;
+        if (warming) {
+            en0 = if (config.entities) |e| e.count else 0;
+            warm_markers.count = 0;
+            unit_cx.markers = &warm_markers;
+        }
         const pbase = if (enclosingListMarker(bytes, lines, i)) |m|
             itemContentX(lines[m], content_x)
         else
             content_x;
         const r = layoutParagraphUnit(&unit_cx, i, pbase, cur_y);
         cur_y = r.y;
+        if (config.line_cache) |cache| {
+            unit_cx.markers = null;
+            const en1: usize = if (config.entities) |e| e.count else 0;
+            cache.store(bytes, lines, i, cur_y - y0, r.consumed, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
+        }
         i += r.consumed - 1;
     }
 
@@ -3122,6 +3563,374 @@ test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
 }
 
 // ============================================================================
+// Per-line exact layout cache (finding #1 + #4): differential and
+// invariance tests. The cache may only ever skip work, never change
+// pixels: every test below compares cached output bit-for-bit against the
+// legacy exact path.
+// ============================================================================
+
+/// Draw-command stream comparison between the cached and legacy paths.
+/// Discrete fields (kind, color, text, style, link, ids, font size) are
+/// bit-exact. Rect geometry uses the codebase's 0.01px bar (same bar the
+/// checkpoint seek-vs-linear equivalence test uses): skipped units advance
+/// `cur_y` by a stored height instead of a fresh pen computation, and float
+/// reassociation across the two paths wobbles positions — and values
+/// derived from them such as quote-bar heights — by ~1 ulp, far below any
+/// pixel. Real bugs (wrong spans, wrong units, wrong heights) move geometry
+/// by whole pixels and still fail loudly. `max_drift` tracks the worst
+/// observed rect delta so tests can bound systematic growth far below a
+/// pixel.
+fn expectCommandsIdentical(a: []const DrawCommand, b: []const DrawCommand, max_drift: *f32) !void {
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |ca, cb| {
+        try std.testing.expectEqual(ca.kind, cb.kind);
+        const dx = @abs(ca.rect.x - cb.rect.x);
+        const dy = @abs(ca.rect.y - cb.rect.y);
+        const dw = @abs(ca.rect.w - cb.rect.w);
+        const dh = @abs(ca.rect.h - cb.rect.h);
+        const worst = @max(@max(dx, dy), @max(dw, dh));
+        if (worst > max_drift.*) max_drift.* = worst;
+        try std.testing.expectApproxEqAbs(ca.rect.x, cb.rect.x, 0.01);
+        try std.testing.expectApproxEqAbs(ca.rect.y, cb.rect.y, 0.01);
+        try std.testing.expectApproxEqAbs(ca.rect.w, cb.rect.w, 0.01);
+        try std.testing.expectApproxEqAbs(ca.rect.h, cb.rect.h, 0.01);
+        try std.testing.expectEqual(ca.color, cb.color);
+        try std.testing.expect(std.mem.eql(u8, ca.text, cb.text));
+        try std.testing.expectEqual(@as(u32, @bitCast(ca.font_size)), @as(u32, @bitCast(cb.font_size)));
+        try std.testing.expectEqual(ca.style, cb.style);
+        if (ca.link_target) |ta| {
+            try std.testing.expect(cb.link_target != null);
+            try std.testing.expect(std.mem.eql(u8, ta, cb.link_target.?));
+        } else {
+            try std.testing.expect(cb.link_target == null);
+        }
+        try std.testing.expectEqual(ca.scrollable_id, cb.scrollable_id);
+        try std.testing.expectEqual(@as(u32, @bitCast(ca.max_scroll_x)), @as(u32, @bitCast(cb.max_scroll_x)));
+    }
+}
+
+const lean_cache_doc =
+    \\# Cache Identity Heading With Several Words To Force Wrapping Behavior
+    \\
+    \\A paragraph with enough words to wrap across multiple visual lines, plus *italic*, **bold**, `code`, and an &amp; entity for the decode path.
+    \\Second line of the same run joins with a soft break and more words here.
+    \\
+    \\> A blockquote with **bold** and a lazy tail
+    \\that continues without a marker and wraps onward with more text.
+    \\> > Nested quote line with [link text](https://example.com) inside.
+    \\
+    \\- Bullet item alpha with `inline code` attached
+    \\- Bullet item beta that is deliberately much longer so it wraps across multiple visual lines in the viewport
+    \\1. Ordered step one
+    \\2. Ordered step two with [ref link][lbl] inside
+    \\3. Ordered step three with trailing words to wrap the line further
+    \\- [x] Done task with &lt;entity&gt;
+    \\- [ ] Open task with more words to wrap across lines
+    \\
+    \\[lbl]: https://ziglang.org "title words here"
+    \\
+    \\Cross-line joint head ends with [t][l]
+    \\[1]. tail line starts with a bracket
+    \\
+    \\| Col A | Col B |
+    \\| :--- | :--- |
+    \\| Data 1 | Data 2 |
+    \\
+    \\```zig
+    \\pub fn main() void {}
+    \\```
+    \\
+    \\Setext Title Words
+    \\============
+    \\
+    \\![alt text](https://example.com/img.png)
+    \\
+    \\Trailing paragraph with ***triple*** and ~~struck~~ text and more words to wrap.
+;
+
+test "lean(cpu): cached render is bit-identical to uncached across scroll sweep" {
+    const allocator = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var r: usize = 0;
+    while (r < 12) : (r += 1) try buffer.appendSlice(allocator, lean_cache_doc);
+    const mem = buffer.items;
+
+    var lines_buf: [1024]simd.Line = undefined;
+    var fence = false;
+    const line_count = simd.scanLines(mem, &lines_buf, &fence);
+    const lines = lines_buf[0..line_count];
+
+    var refdefs: [simd.MAX_REF_DEFS]simd.RefDef = undefined;
+    const refdef_count = simd.scanRefDefs(mem, lines, &refdefs);
+
+    var checkpoints: [64]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    _ = computeDocumentHeightEx(
+        mem,
+        lines,
+        .{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 },
+        &checkpoints,
+        &cp_count,
+    );
+    try std.testing.expect(cp_count > 0);
+
+    var cache = LineLayoutCache{};
+    var join_a: [JOIN_BUF_LEN]u8 = undefined;
+    var join_b: [JOIN_BUF_LEN]u8 = undefined;
+    var cmds_plain: [1024]DrawCommand = undefined;
+    var cmds_cached: [1024]DrawCommand = undefined;
+
+    // Sweep from the top deep past the checkpoint threshold in fine steps
+    // (covers unit alignments, seek vs linear paths, and warm vs cold
+    // cache states). Each scroll renders twice cached: the first pass
+    // populates, the second must hit without changing output. Drift must
+    // stay orders of magnitude below a pixel (no systematic bias).
+    var max_drift: f32 = 0.0;
+    var s: f32 = 0.0;
+    while (s < 4000.0) : (s += 37.0) {
+        var markers_a = OrderedMarkerStore{};
+        var entities_a = EntityStore{};
+        const count_plain = layoutViewport(mem, lines, .{
+            .window_width = 800.0,
+            .window_height = 600.0,
+            .scroll_y = s,
+            .checkpoints = checkpoints[0..cp_count],
+            .ordered_markers = &markers_a,
+            .ref_defs = refdefs[0..refdef_count],
+            .entities = &entities_a,
+            .join_buf = &join_a,
+        }, &cmds_plain);
+
+        var markers_b = OrderedMarkerStore{};
+        var entities_b = EntityStore{};
+        const count_warm = layoutViewport(mem, lines, .{
+            .window_width = 800.0,
+            .window_height = 600.0,
+            .scroll_y = s,
+            .checkpoints = checkpoints[0..cp_count],
+            .ordered_markers = &markers_b,
+            .ref_defs = refdefs[0..refdef_count],
+            .entities = &entities_b,
+            .join_buf = &join_b,
+            .line_cache = &cache,
+        }, &cmds_cached);
+        try std.testing.expectEqual(count_plain, count_warm);
+        try expectCommandsIdentical(cmds_plain[0..count_plain], cmds_cached[0..count_warm], &max_drift);
+
+        markers_b = OrderedMarkerStore{};
+        entities_b = EntityStore{};
+        const count_warm2 = layoutViewport(mem, lines, .{
+            .window_width = 800.0,
+            .window_height = 600.0,
+            .scroll_y = s,
+            .checkpoints = checkpoints[0..cp_count],
+            .ordered_markers = &markers_b,
+            .ref_defs = refdefs[0..refdef_count],
+            .entities = &entities_b,
+            .join_buf = &join_b,
+            .line_cache = &cache,
+        }, &cmds_cached);
+        try std.testing.expectEqual(count_plain, count_warm2);
+        try expectCommandsIdentical(cmds_plain[0..count_plain], cmds_cached[0..count_warm2], &max_drift);
+    }
+    try std.testing.expect(max_drift < 0.05);
+}
+
+test "lean(cpu): line cache hits exact units, misses on content or geometry change" {
+    const doc = "# Head\n\nPara words here with enough text to wrap a little bit.\n";
+    var lines_buf: [16]simd.Line = undefined;
+    var fence = false;
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+
+    const cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
+    // 800px window centers 600px content: hard-coded here (contentWidthOf is private).
+    const cw: f32 = 600.0;
+    const cx: f32 = 100.0;
+
+    var cache = LineLayoutCache{};
+    // Cold: miss.
+    try std.testing.expect(cache.lookup(doc, lines, 2, cfg, cw) == null);
+    // Measure, store, hit back bit-exactly.
+    const u = refineLineHeight(doc, lines, 2, cfg, cw, cx);
+    try std.testing.expect(u.consumed >= 1);
+    cache.store(doc, lines, 2, u.height, u.consumed, u.marker_slots, u.entity_slots, cfg, cw);
+    const hit = cache.lookup(doc, lines, 2, cfg, cw).?;
+    try std.testing.expectEqual(@as(u32, @bitCast(hit.height)), @as(u32, @bitCast(u.height)));
+    try std.testing.expectEqual(@as(usize, hit.consumed), u.consumed);
+
+    // Same structure, one byte different: content miss.
+    var mut: [128]u8 = undefined;
+    @memcpy(mut[0..doc.len], doc);
+    const mdoc = mut[0..doc.len];
+    mdoc[mdoc.len - 3] = 'X';
+    var mlines_buf: [16]simd.Line = undefined;
+    var mfence = false;
+    const mn = simd.scanLines(mdoc, &mlines_buf, &mfence);
+    try std.testing.expectEqual(n, mn);
+    try std.testing.expect(cache.lookup(mdoc, mlines_buf[0..mn], 2, cfg, cw) == null);
+
+    // Same content, narrower width / bigger font: generation miss.
+    try std.testing.expect(cache.lookup(doc, lines, 2, cfg, 500.0) == null);
+    var cfg2 = cfg;
+    cfg2.base_font_size = 20.0;
+    try std.testing.expect(cache.lookup(doc, lines, 2, cfg2, cw) == null);
+}
+
+test "lean(cpu): recorded checkpoints start on unit boundaries" {
+    const doc =
+        \\# Title One
+        \\Paragraph run line one with words.
+        \\Paragraph run line two with words.
+        \\
+        \\- list item alpha
+        \\
+        \\    indented continuation text here
+        \\
+        \\- list item beta
+        \\Setext Head Words
+        \\================
+        \\
+        \\> quoted line one
+        \\lazy tail line two
+        \\
+        \\1. ordered one
+        \\2. ordered two
+    ;
+    const allocator = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var r: usize = 0;
+    while (r < 30) : (r += 1) try buffer.appendSlice(allocator, doc);
+    const mem = buffer.items;
+
+    var lines_buf: [2048]simd.Line = undefined;
+    var fence = false;
+    const line_count = simd.scanLines(mem, &lines_buf, &fence);
+    const lines = lines_buf[0..line_count];
+
+    var checkpoints: [64]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    _ = computeDocumentHeightEx(
+        mem,
+        lines,
+        .{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 },
+        &checkpoints,
+        &cp_count,
+    );
+    try std.testing.expect(cp_count > 1);
+    // Every recorded checkpoint must already sit on a unit start, so the
+    // seek correction loop has nothing to repair.
+    for (checkpoints[0..cp_count]) |cp| {
+        try std.testing.expectEqual(@as(usize, cp.line_idx), snapWindowStart(mem, lines, cp.line_idx));
+    }
+}
+
+test "lean(cpu): geometry and document change invalidates the line cache" {
+    const allocator = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var r: usize = 0;
+    while (r < 12) : (r += 1) try buffer.appendSlice(allocator, lean_cache_doc);
+    const mem = buffer.items;
+
+    var lines_buf: [1024]simd.Line = undefined;
+    var fence = false;
+    const line_count = simd.scanLines(mem, &lines_buf, &fence);
+    const lines = lines_buf[0..line_count];
+
+    var refdefs: [simd.MAX_REF_DEFS]simd.RefDef = undefined;
+    const refdef_count = simd.scanRefDefs(mem, lines, &refdefs);
+
+    var cache = LineLayoutCache{};
+    var join_a: [JOIN_BUF_LEN]u8 = undefined;
+    var join_b: [JOIN_BUF_LEN]u8 = undefined;
+    var cmds_plain: [1024]DrawCommand = undefined;
+    var cmds_cached: [1024]DrawCommand = undefined;
+
+    // Warm the cache at one geometry, then render at two new ones: stale
+    // entries must miss (never mis-apply) and match the legacy path.
+    const scrolls = [_]f32{ 0.0, 900.0, 2500.0 };
+    for (scrolls) |s| {
+        var ma = OrderedMarkerStore{};
+        var ea = EntityStore{};
+        _ = layoutViewport(mem, lines, .{
+            .window_width = 800.0,
+            .window_height = 600.0,
+            .scroll_y = s,
+            .ordered_markers = &ma,
+            .ref_defs = refdefs[0..refdef_count],
+            .entities = &ea,
+            .join_buf = &join_a,
+            .line_cache = &cache,
+        }, &cmds_cached);
+    }
+    const widths = [_]f32{ 500.0, 1200.0 };
+    var max_drift: f32 = 0.0;
+    for (widths) |w| {
+        for (scrolls) |s| {
+            var ma = OrderedMarkerStore{};
+            var ea = EntityStore{};
+            const count_plain = layoutViewport(mem, lines, .{
+                .window_width = w,
+                .window_height = 600.0,
+                .scroll_y = s,
+                .ordered_markers = &ma,
+                .ref_defs = refdefs[0..refdef_count],
+                .entities = &ea,
+                .join_buf = &join_a,
+            }, &cmds_plain);
+            var mb = OrderedMarkerStore{};
+            var eb = EntityStore{};
+            const count_cached = layoutViewport(mem, lines, .{
+                .window_width = w,
+                .window_height = 600.0,
+                .scroll_y = s,
+                .ordered_markers = &mb,
+                .ref_defs = refdefs[0..refdef_count],
+                .entities = &eb,
+                .join_buf = &join_b,
+                .line_cache = &cache,
+            }, &cmds_cached);
+            try std.testing.expectEqual(count_plain, count_cached);
+            try expectCommandsIdentical(cmds_plain[0..count_plain], cmds_cached[0..count_cached], &max_drift);
+        }
+    }
+    try std.testing.expect(max_drift < 0.05);
+
+    // A different document through the same cache instance must also match.
+    const other = "# Other doc\n\nShort paragraph here.\n\n- item one\n- item two\n";
+    var lines2_buf: [32]simd.Line = undefined;
+    var fence2 = false;
+    const n2 = simd.scanLines(other, &lines2_buf, &fence2);
+    var m2 = OrderedMarkerStore{};
+    var e2 = EntityStore{};
+    const c_plain = layoutViewport(other, lines2_buf[0..n2], .{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &m2,
+        .entities = &e2,
+        .join_buf = &join_a,
+    }, &cmds_plain);
+    var m3 = OrderedMarkerStore{};
+    var e3 = EntityStore{};
+    const c_cached = layoutViewport(other, lines2_buf[0..n2], .{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &m3,
+        .entities = &e3,
+        .join_buf = &join_b,
+        .line_cache = &cache,
+    }, &cmds_cached);
+    try std.testing.expectEqual(c_plain, c_cached);
+    try expectCommandsIdentical(cmds_plain[0..c_plain], cmds_cached[0..c_cached], &max_drift);
+    try std.testing.expect(max_drift < 0.05);
+}
+
+// ============================================================================
 // Virtualized lazy layout: time-sliced amortized layout + Goldilocks buffer
 // + estimated heights with just-in-time refinement.
 //
@@ -3243,7 +4052,24 @@ pub fn anchorScrollForDelta(scroll_y: f32, delta_above: f32) f32 {
 /// match on-screen rendering bit-for-bit. `consumed` is the number of source
 /// lines folded into this unit (multi-line fences, tables, setext pairs);
 /// follower lines refine to height 0. Zero heap allocations (stack spans).
-pub const RefinedUnit = struct { height: f32, consumed: usize };
+/// `marker_slots` / `entity_slots` report how many scratch slots the unit
+/// consumed (markers via a throwaway store so frame stores are untouched;
+/// entities via the live store delta), letting the per-line layout cache
+/// reserve identical state when it skips a unit.
+pub const RefinedUnit = struct { height: f32, consumed: usize, marker_slots: u8 = 0, entity_slots: u8 = 0 };
+
+/// Scratch-slot consumption observed by `refineLineHeight` for one unit:
+/// marker pushes into the throwaway store, entity decodes as a live delta
+/// since `e0`. Saturates (reservation saturates identically, so clamping the
+/// report preserves exhaustion behavior exactly).
+fn refineSlots(config: ViewportConfig, dummy_markers: *const OrderedMarkerStore, e0: usize) struct { m: u8, e: u8 } {
+    var e: usize = 0;
+    if (config.entities) |ents| e = ents.count -| e0;
+    return .{
+        .m = @intCast(@min(dummy_markers.count, 255)),
+        .e = @intCast(@min(e, 255)),
+    };
+}
 
 pub fn refineLineHeight(
     bytes: []const u8,
@@ -3258,6 +4084,12 @@ pub fn refineLineHeight(
     const line_bytes = bytes[info.offset..][0..info.len];
     var span_buf: [32]parser.InlineSpan = undefined;
     var dummy: usize = 0;
+    // Throwaway marker store: observes the true marker-slot consumption of
+    // the unit below without touching frame stores (marker text is
+    // geometry-independent and unobservable here: the command buffer is
+    // empty). Entity consumption is observed as a live-store delta.
+    var dummy_markers: OrderedMarkerStore = .{};
+    const e0: usize = if (config.entities) |e| e.count else 0;
 
     // Indented code units (top-level and in-list) before type dispatch,
     // mirroring renderViewportCore and computeDocumentHeightEx.
@@ -3346,18 +4178,22 @@ pub fn refineLineHeight(
             while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
             const span_count = resolveHeadingSpans(config, line_bytes[h_offset..], &span_buf);
             var mux_h = measureCx(bytes, lines, config, content_width, content_x, &dummy);
+            mux_h.markers = &dummy_markers;
             const hx = if (lineIndentWidth(bytes, info) >= 4)
                 listContentBase(&mux_h, idx, 4) orelse content_x
             else
                 content_x;
             const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy);
-            return .{ .height = margin_top + end_y + margin_bottom, .consumed = 1 };
+            const sl_h = refineSlots(config, &dummy_markers, e0);
+            return .{ .height = margin_top + end_y + margin_bottom, .consumed = 1, .marker_slots = sl_h.m, .entity_slots = sl_h.e };
         },
         .quote => {
             var mux = measureCx(bytes, lines, config, content_width, content_x, &dummy);
+            mux.markers = &dummy_markers;
             const base_x = listContentBase(&mux, idx, 4) orelse content_x;
             const r = layoutQuoteLine(&mux, idx, base_x, 0);
-            return .{ .height = r.y, .consumed = r.consumed };
+            const sl = refineSlots(config, &dummy_markers, e0);
+            return .{ .height = r.y, .consumed = r.consumed, .marker_slots = sl.m, .entity_slots = sl.e };
         },
         .task_list, .bullet_list, .ordered_list => {
             // Absorbed as paragraph-run text: the owning unit measures it.
@@ -3367,11 +4203,14 @@ pub fn refineLineHeight(
                 return .{ .height = 0.0, .consumed = 1 };
             }
             var mux = measureCx(bytes, lines, config, content_width, content_x, &dummy);
+            mux.markers = &dummy_markers;
             const r = layoutListUnit(&mux, idx, 0);
-            return .{ .height = r.y, .consumed = r.consumed };
+            const sl = refineSlots(config, &dummy_markers, e0);
+            return .{ .height = r.y, .consumed = r.consumed, .marker_slots = sl.m, .entity_slots = sl.e };
         },
         .paragraph => {
             var mux = measureCx(bytes, lines, config, content_width, content_x, &dummy);
+            mux.markers = &dummy_markers;
             // Paragraph lines claimed by quotes are measured as part of
             // those units (their own slots hold 0). Code lines are handled
             // by the pre-switch block above. List-owned runs measure at the
@@ -3382,7 +4221,8 @@ pub fn refineLineHeight(
             else
                 content_x;
             const r = layoutParagraphUnit(&mux, idx, pbase, 0);
-            return .{ .height = r.y, .consumed = r.consumed };
+            const sl = refineSlots(config, &dummy_markers, e0);
+            return .{ .height = r.y, .consumed = r.consumed, .marker_slots = sl.m, .entity_slots = sl.e };
         },
     }
 }
