@@ -386,6 +386,22 @@ pub const SmoothScroll = struct {
         return self.current == self.target;
     }
 
+    /// Input routing for vertical scroll deltas: the unit-testable core of
+    /// the platform onScroll handler. Precise devices (trackpad / Magic
+    /// Mouse) snap 1:1 from the DISPLAYED offset — the OS already sends the
+    /// physical momentum curve, and snapping from current (not target)
+    /// cancels in-flight glides with no teleport. Classic wheel notches
+    /// retarget the eased offset instead. Returns the new easing state,
+    /// clamped to [0, max]. Zero allocations; pure.
+    pub fn applyScrollDelta(target: f32, current: f32, dy: f32, precise: bool, max: f32) SmoothScroll {
+        const m = @max(0.0, max);
+        if (precise) {
+            const v = std.math.clamp(current - dy, 0.0, m);
+            return .{ .current = v, .target = v };
+        }
+        return .{ .current = current, .target = std.math.clamp(target - dy, 0.0, m) };
+    }
+
     /// Advance toward the target by dt seconds. Returns true when settled.
     pub fn tick(self: *SmoothScroll, dt_s: f32) bool {
         const diff = self.target - self.current;

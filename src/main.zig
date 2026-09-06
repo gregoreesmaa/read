@@ -186,23 +186,19 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
     const locked = g_scroll_lock.processScroll(delta_x, delta_y, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
-        if (precise != 0) {
-            // Precise devices (trackpad / Magic Mouse, finger + momentum):
-            // 1:1 passthrough from the DISPLAYED offset. AppKit already
-            // sends the physical momentum curve, so easing on top only
-            // adds lag. Advancing from current (not target) matters: if a
-            // keyboard/wheel glide is still in flight, the target is ahead
-            // of the screen — snapping from it would teleport the view
-            // (start-of-scroll jitter). Snapping from current cancels the
-            // glide into finger control with no jump, and needs no timer —
-            // scrollWheel already repaints directly.
-            snapScroll(g_smooth.current - locked.dy);
-        } else {
-            // Classic wheel notches: accumulate into the eased target so
-            // steps glide instead of jumping (~21% closure per 120Hz frame
-            // at RATE 28, converging on the 120Hz tick).
-            retargetScroll(g_smooth.target - locked.dy);
-        }
+        // Routing (precise 1:1 vs eased wheel) lives in
+        // SmoothScroll.applyScrollDelta, pinned by strict tests; the full
+        // rationale is documented there. Sync the displayed offset, then arm
+        // the tick while unsettled (snaps settle synchronously, no timer).
+        g_smooth = layout.SmoothScroll.applyScrollDelta(
+            g_smooth.target,
+            g_smooth.current,
+            locked.dy,
+            precise != 0,
+            g_app.max_scroll_y,
+        );
+        g_app.scroll_y = g_smooth.current;
+        if (!g_smooth.settled()) bridge.platform_smooth_kick();
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);

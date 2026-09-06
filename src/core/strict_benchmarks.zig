@@ -18,6 +18,11 @@ pub const TARGET_MAX_SUBSTRING_SEARCH_TIME_US: i128 = 50; // Max 50 µs to searc
 pub const TARGET_MAX_HOT_PATH_ALLOCATIONS: usize = 0;     // Zero allocations on hot render path
 pub const TARGET_MAX_LINE_STRUCT_BYTES: usize = 8;        // Strict 64-bit packed line structure
 pub const TARGET_MAX_DEEP_SCROLL_LAYOUT_TIME_US: i128 = 11;// Max 11 µs for deep scroll (line 45k+) with checkpoints (tightened from 20 µs -> 12 µs -> 11 µs)
+// Scroll-feel targets (immutable like the rest): the premium feel is the
+// product's defining trait, so its curve is pinned behaviorally, not by a
+// frozen RATE constant — any future curve must still clear these bounds.
+pub const TARGET_MIN_SCROLL_FIRST_FRAME_FRAC: f32 = 0.20; // Min fraction of remaining distance covered by the first 120Hz frame (RATE 28 covers ~0.208)
+pub const TARGET_MAX_SCROLL_SETTLE_FRAMES_40PX: u32 = 24; // Max 120Hz frames for a 40px key step to snap within 0.5px, no overshoot (~19 in theory)
 // ADDITIVE startup gate (2026-09 showcase probe): existing targets above are
 // immutable and untouched. End-to-end Zig-side startup for showcase.md
 // (mmap open + scanLines + full document metrics + first layoutViewport).
@@ -501,4 +506,60 @@ test "STRICT: SIMD Search Edge Situations (Needle at Start, End, and Not Found)"
     if (simd.enforce_timing_budgets) {
         try std.testing.expect(min_elapsed_us <= TARGET_MAX_SUBSTRING_SEARCH_TIME_US);
     }
+}
+
+test "STRICT SCROLL: first frame covers enough distance for instant response" {
+    // Premium feel starts on the input event, not one display period later:
+    // the opening 120Hz frame must cover a decisive fraction of a 40px key
+    // step. Pure math, no timing involved — deterministic on every machine.
+    var s = layout.SmoothScroll{};
+    s.setTarget(40.0, 1000.0);
+    _ = s.tick(1.0 / 120.0);
+    try std.testing.expect(s.current / 40.0 >= TARGET_MIN_SCROLL_FIRST_FRAME_FRAC);
+}
+
+test "STRICT SCROLL: 40px key step settles fast without overshoot" {
+    // A discrete key press must land crisply: monotonic approach, never past
+    // the target, snapped within the frame budget. Deterministic math.
+    var s = layout.SmoothScroll{};
+    s.setTarget(40.0, 1000.0);
+    var prev: f32 = 0.0;
+    var frames: u32 = 0;
+    while (!s.settled()) : (frames += 1) {
+        if (frames > 600) break; // must settle long before this
+        _ = s.tick(1.0 / 120.0);
+        try std.testing.expect(s.current >= prev);
+        try std.testing.expect(s.current <= 40.0);
+        prev = s.current;
+    }
+    try std.testing.expect(s.settled());
+    try std.testing.expect(frames <= TARGET_MAX_SCROLL_SETTLE_FRAMES_40PX);
+}
+
+test "STRICT SCROLL: precise input snaps 1:1, wheel retargets for glide" {
+    // Trackpad / Magic Mouse (finger + momentum): synchronous 1:1 from the
+    // displayed offset — no easing lag — and grabbing mid-glide cancels
+    // into finger control instead of teleporting to a stale target.
+    var s = layout.SmoothScroll.applyScrollDelta(140.0, 100.0, 2.0, true, 1000.0);
+    try std.testing.expectEqual(@as(f32, 98.0), s.current);
+    try std.testing.expectEqual(@as(f32, 98.0), s.target);
+    // Clamps at both ends, settling synchronously (no timer needed).
+    s = layout.SmoothScroll.applyScrollDelta(5.0, 5.0, 20.0, true, 1000.0);
+    try std.testing.expect(s.settled());
+    try std.testing.expectEqual(@as(f32, 0.0), s.current);
+    s = layout.SmoothScroll.applyScrollDelta(990.0, 990.0, -50.0, true, 1000.0);
+    try std.testing.expect(s.settled());
+    try std.testing.expectEqual(@as(f32, 1000.0), s.current);
+    // Classic wheel notch: the displayed offset does NOT move — the target
+    // advances and the 120Hz tick glides it there with no overshoot.
+    var w = layout.SmoothScroll.applyScrollDelta(100.0, 100.0, -40.0, false, 1000.0);
+    try std.testing.expectEqual(@as(f32, 100.0), w.current);
+    try std.testing.expectEqual(@as(f32, 140.0), w.target);
+    var n: u32 = 0;
+    while (!w.settled() and n < 600) : (n += 1) {
+        _ = w.tick(1.0 / 120.0);
+        try std.testing.expect(w.current <= 140.0);
+    }
+    try std.testing.expect(w.settled());
+    try std.testing.expectEqual(@as(f32, 140.0), w.current);
 }
