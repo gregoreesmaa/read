@@ -633,6 +633,105 @@ fn scanDoc(doc: []const u8, lines: []simd.Line) usize {
     return simd.scanLines(doc, lines, &fence);
 }
 
+fn countBars(cmds: []layout.DrawCommand) usize {
+    var bars: usize = 0;
+    for (cmds) |c| {
+        if (c.kind == .fill_rect and c.rect.w == 3.0) bars += 1;
+    }
+    return bars;
+}
+
+test "spec compliance: nested blockquote depths draw stacked bars" {
+    const doc =
+        \\> one
+        \\>> two
+        \\>>> three
+    ;
+    var lines: [8]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    var cmds: [128]layout.DrawCommand = undefined;
+    const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    // Depths 1 + 2 + 3 stack six bars; bodies stay literal text runs.
+    try std.testing.expectEqual(@as(usize, 6), countBars(cmds[0..m]));
+    try std.testing.expect(hasRun(cmds[0..m], "one"));
+    try std.testing.expect(hasRun(cmds[0..m], "two"));
+    try std.testing.expect(hasRun(cmds[0..m], "three"));
+}
+
+test "spec compliance: fenced code inside quotes stays literal" {
+    const doc =
+        \\> ```
+        \\> code
+        \\> ```
+        \\
+        \\after
+    ;
+    var lines: [16]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    for (lines[0..3]) |ln| try std.testing.expectEqual(simd.BlockType.quote, ln.block_type);
+    var cmds: [128]layout.DrawCommand = undefined;
+    const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    // Quote bars survive, fence ticks render as text, and no code card
+    // opens (the fence state never toggles inside a quote).
+    try std.testing.expect(countBars(cmds[0..m]) >= 1);
+    try std.testing.expect(hasRun(cmds[0..m], "```"));
+    try std.testing.expect(hasRun(cmds[0..m], "code"));
+    for (cmds[0..m]) |c| try std.testing.expect(c.kind != .code_block_bg);
+    try std.testing.expect(hasRun(cmds[0..m], "after"));
+}
+
+test "spec compliance: tab-nested sublists stay lists, not code" {
+    // A single tab is 4 columns: inside an ordered item it nests a bullet
+    // list (mdtest_ordered_and_unordered_lists), never an 8-column code row.
+    // (Regular string: the sublist indent is a real tab character.)
+    const doc = "1. First\n2. Second:\n\t* Fee\n\t* Fie\n3. Third\n";
+    var lines: [16]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    var cmds: [256]layout.DrawCommand = undefined;
+    const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+    try std.testing.expect(hasRun(cmds[0..m], "Fee"));
+    try std.testing.expect(hasRun(cmds[0..m], "Fie"));
+    for (cmds[0..m]) |c| try std.testing.expect(c.kind != .code_block_bg);
+}
+
+test "spec compliance: tabs expand to multiples of 4 before block detection" {
+    // One tab, or 1-3 spaces plus a tab reaching column 4, is indented
+    // code after a blank boundary (CommonMark tab stops).
+    const variants = [_][]const u8{
+        "Para.\n\n\tcode\n",
+        "Para.\n\n \tcode\n",
+        "Para.\n\n  \tcode\n",
+        "Para.\n\n   \tcode\n",
+    };
+    for (variants) |doc| {
+        var lines: [8]simd.Line = undefined;
+        const n = scanDoc(doc, &lines);
+        var cmds: [128]layout.DrawCommand = undefined;
+        const m = layout.layoutViewport(doc, lines[0..n], testCfg(), &cmds);
+        var saw_bg = false;
+        for (cmds[0..m]) |c| {
+            if (c.kind == .code_block_bg) saw_bg = true;
+        }
+        try std.testing.expect(saw_bg);
+        try std.testing.expect(hasRun(cmds[0..m], "code"));
+    }
+    // Inside quotes the same stops apply: mixed indent is quoted code.
+    // (Regular string: multiline `\\` literals keep `\t` unexpanded.)
+    const qdoc = ">   \tcode";
+    var qlines: [8]simd.Line = undefined;
+    const qn = scanDoc(qdoc, &qlines);
+    var qcmds: [128]layout.DrawCommand = undefined;
+    const qm = layout.layoutViewport(qdoc, qlines[0..qn], testCfg(), &qcmds);
+    try std.testing.expect(countBars(qcmds[0..qm]) >= 1);
+    var qmono = false;
+    for (qcmds[0..qm]) |c| {
+        if (c.kind == .text_run and c.style.code and std.mem.eql(u8, c.text, "code")) qmono = true;
+    }
+    try std.testing.expect(qmono);
+}
+
 test "regression: lazy blockquote continuation keeps quote styling and bar" {
     const doc =
         \\> This is a blockquote with two paragraphs. Lorem ipsum dolor sit amet,
