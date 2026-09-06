@@ -111,7 +111,7 @@ pub const Damage = struct {
         return .{ .rect = rect, .full = false, .cause = cause };
     }
 
-    /// Build frame damage from the dirty rect AppKit reported for this draw.
+    /// Build frame damage from the dirty rect the platform reported for this draw.
     /// No pending rect (headless render, first draw) means full redraw.
     /// A pending rect covering the whole view collapses to full.
     pub fn fromPending(has_pending: bool, x: f32, y: f32, w: f32, h: f32, view_w: f32, view_h: f32) Damage {
@@ -340,8 +340,8 @@ test "damage: fromPending collapses full-view and missing rects to full" {
     const full = Damage.fromPending(false, 0, 0, 0, 0, 800.0, 600.0);
     try std.testing.expect(full.full);
 
-    const appkit_full = Damage.fromPending(true, 0, 0, 800, 600, 800.0, 600.0);
-    try std.testing.expect(appkit_full.full);
+    const platform_full = Damage.fromPending(true, 0, 0, 800, 600, 800.0, 600.0);
+    try std.testing.expect(platform_full.full);
 
     const part = Damage.fromPending(true, 200, 300, 400, 240, 800.0, 600.0);
     try std.testing.expect(!part.full);
