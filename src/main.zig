@@ -6,6 +6,7 @@ const simd = @import("core/simd.zig");
 const parser = @import("core/parser.zig");
 const layout = @import("layout/viewport.zig");
 const damage = @import("layout/damage.zig");
+const remote_policy = @import("core/remote_policy.zig");
 const bridge = @import("platform/bridge.zig");
 
 const DEFAULT_DOC =
@@ -61,6 +62,9 @@ pub const AppState = struct {
     block_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
     block_max_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
     is_dark_theme: bool = true,
+    /// Remote-image privacy (issue #52): loads by default per #45, one-key
+    /// toggle (`i`) drops all remote content to placeholders.
+    remote_images: bool = remote_policy.RemoteEnabledDefault,
 };
 
 var g_app: AppState = .{};
@@ -75,6 +79,26 @@ var g_refdefs: [simd.MAX_REF_DEFS]simd.RefDef = undefined;
 var g_refdef_count: usize = 0;
 // Headless command-stream probe flag (set by --dump-commands under TEST_HOOKS).
 var g_dump_commands: bool = false;
+// Latched when any remote image is laid out (sticky per document, reset on
+// document load): drives the privacy indicator. Set inside gatedImageSize
+// so even the cold metrics pass latches it before first paint.
+var g_remote_seen: bool = false;
+
+/// Privacy-gated image sizing (issue #52): blocked URLs report 0x0 so
+/// layout takes the placeholder path AND — critically — the platform
+/// loader is never asked (`platform_get_image_size` is what kicks async
+/// loads, so gating here means no fetch is ever started for blocked
+/// content). Local content passes straight through.
+fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void {
+    out_w.* = 0;
+    out_h.* = 0;
+    if (url_len <= 0) return;
+    const slice = url[0..@as(usize, @intCast(url_len))];
+    if (remote_policy.isRemoteUrl(slice)) g_remote_seen = true;
+    if (remote_policy.blockedByPolicy(slice, g_app.remote_images)) return;
+    bridge.platform_get_image_size(url, url_len, out_w, out_h);
+}
+
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
@@ -225,7 +249,7 @@ fn updateDocumentMetrics() void {
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
-        .image_size_fn = bridge.platform_get_image_size,
+        .image_size_fn = gatedImageSize,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -258,7 +282,7 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
-        .image_size_fn = bridge.platform_get_image_size,
+        .image_size_fn = gatedImageSize,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -306,6 +330,15 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
         },
         't' => {
             g_app.is_dark_theme = !g_app.is_dark_theme;
+        },
+        // Remote-image privacy toggle (issue #52): dropping remote content
+        // changes laid-out image heights (real size <-> placeholder), so
+        // metrics are recomputed and the offset re-clamped, exactly like a
+        // resize. The platform repaints (full damage on key events).
+        'i' => {
+            g_app.remote_images = !g_app.remote_images;
+            updateDocumentMetrics();
+            snapScroll(g_app.scroll_y);
         },
         'q' => {
             std.c.exit(0);
@@ -358,7 +391,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .block_scroll_x = g_app.block_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
-        .image_size_fn = bridge.platform_get_image_size,
+        .image_size_fn = gatedImageSize,
         .ordered_markers = &g_markers,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
@@ -542,6 +575,17 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
                 const url_ptr = if (cmd.link_target) |t| t.ptr else null;
                 const url_len: c_int = if (cmd.link_target) |t| @intCast(t.len) else 0;
+                // Privacy gate (issue #52): blocked remote URLs never reach
+                // the platform loader (which is what would fetch them).
+                // They degrade to the same muted placeholder box the loader
+                // draws for failures — pixels only, no fetch, no hang.
+                if (cmd.link_target) |t| {
+                    if (remote_policy.blockedByPolicy(t, g_app.remote_images)) {
+                        bridge.platform_draw_rect(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h, 28, 28, 32, 255);
+                        bridge.platform_draw_rect(cmd.rect.x, cmd.rect.y, cmd.rect.w, 1.0, 80, 40, 40, 255);
+                        continue;
+                    }
+                }
                 bridge.platform_draw_image(
                     url_ptr,
                     url_len,
@@ -576,6 +620,38 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     }
     if (clipped_pass) {
         bridge.platform_end_clip();
+    }
+
+    // Remote-image privacy indicator (issue #52): visible whenever the
+    // document contains remote content. Painted last and unclipped so a
+    // partial damage pass can never leave it half-drawn.
+    if (g_remote_seen) {
+        const ind_on = g_app.remote_images;
+        const ind_text = if (ind_on) "remote images on (i to block)" else "remote images off (i to allow)";
+        const ind_fs: f32 = 12.0;
+        const ind_w = layout.measureTextEx(ind_text, ind_fs, false, false, false, false);
+        const ind_x = g_app.window_width - ind_w - 14.0;
+        const ind_color = if (g_app.is_dark_theme)
+            layout.Color{ .r = 140, .g = 140, .b = 145, .a = 255 }
+        else
+            layout.Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
+        bridge.platform_draw_text(
+            ind_text.ptr,
+            @intCast(ind_text.len),
+            ind_x,
+            8.0,
+            ind_fs,
+            0,
+            0,
+            0,
+            0,
+            ind_color.r,
+            ind_color.g,
+            ind_color.b,
+            ind_color.a,
+            null,
+            0,
+        );
     }
 
     // First frame committed: image decodes may start now, off the startup
@@ -758,6 +834,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
+    // Fresh document: privacy indicator latch re-arms (relatched by the
+    // metrics pass below when the doc actually contains remote images).
+    g_remote_seen = false;
 
     // Index lines with SIMD scanner
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
