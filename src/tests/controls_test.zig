@@ -286,7 +286,7 @@ test "controls: accurate document height computation ensures tables and end of d
     const showcase_doc = file.bytes;
 
     var lines_buf: [256]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(showcase_doc, &lines_buf, &in_fence);
 
     const vp_config = layout.ViewportConfig{

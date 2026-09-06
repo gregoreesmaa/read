@@ -367,7 +367,7 @@ test "damage: redraw-region verification against real layout output" {
         \\```
     ;
     var lines_buf: [32]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines_buf, &fence);
     try std.testing.expect(n > 0);
 

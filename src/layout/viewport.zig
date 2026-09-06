@@ -2776,7 +2776,7 @@ test "strict scroll smoothness across enumerations, lists, headings, and mixed b
     ;
 
     var lines_buf: [256]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
     const lines = lines_buf[0..line_count];
 
@@ -2960,7 +2960,7 @@ test "strict cross-element copying across headings, paragraphs, lists, tables, a
     ;
 
     var lines_buf: [64]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
@@ -3052,7 +3052,7 @@ test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
 
     const mem = buffer.items;
     var lines_buf: [3000]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
 
     var checkpoints: [64]Checkpoint = undefined;
@@ -4303,7 +4303,7 @@ const virtual_test_doc =
 
 test "virtualized: estimated heights track exact refined heights" {
     var lines_buf: [64]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(virtual_test_doc, &lines_buf, &fence);
     const lines = lines_buf[0..line_count];
 
@@ -4344,7 +4344,7 @@ test "virtualized: Goldilocks window spans viewport plus exactly one screen each
     const mem = buffer.items;
 
     var lines_buf: [8192]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, &lines_buf, &fence);
     const lines = lines_buf[0..line_count];
 
@@ -4378,7 +4378,7 @@ test "virtualized: incremental scroll parses in entering lines, frees evicted ed
     const mem = buffer.items;
 
     var lines_buf: [4096]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, &lines_buf, &fence);
     const lines = lines_buf[0..line_count];
 
@@ -4421,7 +4421,7 @@ test "virtualized: JIT output identical to exact layout after incremental scroll
     const mem = buffer.items;
 
     var lines_buf: [512]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, &lines_buf, &fence);
     const lines = lines_buf[0..line_count];
 
@@ -4461,7 +4461,7 @@ test "virtualized: jumped-to window anchors to exact layout" {
     const mem = buffer.items;
 
     var lines_buf: [4096]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, &lines_buf, &fence);
     const lines = lines_buf[0..line_count];
 
@@ -4535,7 +4535,7 @@ test "virtualized: time-sliced job yields on budget and converges to exact heigh
 
     const line_entries = try allocator.alloc(simd.Line, 50_100);
     defer allocator.free(line_entries);
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, line_entries, &fence);
     const lines = line_entries[0..line_count];
 
@@ -4602,7 +4602,7 @@ test "virtualized: warm JIT viewport layout under 12us" {
 
     const line_entries = try allocator.alloc(simd.Line, 50_100);
     defer allocator.free(line_entries);
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, line_entries, &fence);
     const lines = line_entries[0..line_count];
 
@@ -4759,7 +4759,7 @@ test "scroll illusion: estimate is O(1) sane vs accurate height" {
         \\- item two
     ;
     var lines_buf: [32]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const lc = simd.scanLines(doc, &lines_buf, &fence);
     const cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
     const nl = simd.countNewlines(doc);
@@ -4815,7 +4815,7 @@ test "scroll illusion: O(1) fraction jump resolves inside deep-scroll budget" {
     const mem = buffer.items;
 
     var lines_buf: [10000]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const lc = simd.scanLines(mem, &lines_buf, &fence);
     const lines = lines_buf[0..lc];
 

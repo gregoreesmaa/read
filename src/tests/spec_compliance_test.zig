@@ -54,7 +54,7 @@ test "spec compliance: ATX headings h1 through h6 and trailing hashes" {
     ;
 
     var lines: [16]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 6), n);
@@ -76,7 +76,7 @@ test "spec compliance: Setext headings h1 (===) and h2 (---)" {
     ;
 
     var lines: [16]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 5), n);
@@ -115,7 +115,7 @@ test "spec compliance: thematic breaks (horizontal rules ---, ***, ___)" {
     ;
 
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 3), n);
@@ -135,7 +135,7 @@ test "spec compliance: fenced code blocks (``` and ~~~)" {
     ;
 
     var lines: [16]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 6), n);
@@ -155,7 +155,7 @@ test "spec compliance: blockquotes and nested quotes" {
     ;
 
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 3), n);
@@ -197,7 +197,7 @@ test "spec compliance: unordered lists (*, -, +) and ordered lists (1., 1))" {
     ;
 
     var lines: [16]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 5), n);
@@ -216,7 +216,7 @@ test "spec compliance: task lists (- [ ], - [x], * [X])" {
     ;
 
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 3), n);
@@ -299,7 +299,7 @@ test "spec compliance: standalone image block parsing and viewport command gener
     ;
 
     var lines: [16]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(md, &lines, &fence);
 
     try std.testing.expectEqual(@as(usize, 10), line_count);
@@ -339,7 +339,7 @@ test "spec compliance: standalone image block parsing and viewport command gener
 test "situation: mixed CRLF, LF, and trailing bare line endings" {
     const doc = "Line 1 CRLF\r\nLine 2 LF\nLine 3 CRLF\r\nLine 4 EOF no newline";
     var lines: [8]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &in_fence);
 
     try std.testing.expectEqual(@as(usize, 4), n);
@@ -367,7 +367,7 @@ test "situation: extreme and pathological line lengths" {
     try long_line.append(allocator, '\n');
 
     var lines: [4]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(long_line.items, &lines, &in_fence);
 
     try std.testing.expectEqual(@as(usize, 1), n);
@@ -396,7 +396,7 @@ test "situation: deeply nested blockquotes (up to 8 levels)" {
     ;
 
     var lines: [16]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &in_fence);
 
     try std.testing.expectEqual(@as(usize, 8), n);
@@ -432,14 +432,14 @@ test "situation: unclosed code fence and malformed block elements" {
     ;
 
     var lines: [8]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &in_fence);
 
     try std.testing.expect(n >= 3);
     try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[0].block_type);
     try std.testing.expectEqual(simd.BlockType.code_line, lines[1].block_type);
     try std.testing.expectEqual(simd.BlockType.code_line, lines[2].block_type);
-    try std.testing.expect(in_fence);
+    try std.testing.expect(in_fence.open);
 
     var cmds: [64]layout.DrawCommand = undefined;
     const cfg = layout.ViewportConfig{
@@ -462,7 +462,7 @@ test "situation: Unicode UTF-8 multi-byte robustness across headings and inlines
     ;
 
     var lines: [16]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &in_fence);
 
     try std.testing.expectEqual(@as(usize, 6), n);
@@ -492,7 +492,7 @@ test "situation: extreme viewport dimensions and overscroll boundaries" {
     ;
 
     var lines: [8]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &in_fence);
 
     var cmds: [64]layout.DrawCommand = undefined;
@@ -563,7 +563,7 @@ test "situation: arbitrary scroll position checkpoint invariance across rich doc
     const lines = try allocator.alloc(simd.Line, 3000);
     defer allocator.free(lines);
 
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, lines, &in_fence);
 
     var checkpoints: [128]layout.Checkpoint = undefined;
@@ -629,7 +629,7 @@ fn testCfg() layout.ViewportConfig {
 }
 
 fn scanDoc(doc: []const u8, lines: []simd.Line) usize {
-    var fence = false;
+    var fence: simd.FenceState = .{};
     return simd.scanLines(doc, lines, &fence);
 }
 
@@ -1239,7 +1239,7 @@ test "regression: checkpoints agree on continuation-heavy documents" {
     const mem = buf.items;
     const lines = std.testing.allocator.alloc(simd.Line, 1200) catch unreachable;
     defer std.testing.allocator.free(lines);
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, lines, &fence);
 
     var checkpoints: [64]layout.Checkpoint = undefined;
@@ -1271,7 +1271,7 @@ test "regression: entities decode inline, bare amps stay literal" {
         \\AT&amp;T and fish & chips
     ;
     var lines: [4]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [64]layout.DrawCommand = undefined;
     var st = FullStore{};
@@ -1287,7 +1287,7 @@ test "regression: reference links resolve and defs are hidden" {
         \\[1]: /url/  "Title"
     ;
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [64]layout.DrawCommand = undefined;
     var st = FullStore{};
@@ -1298,7 +1298,10 @@ test "regression: reference links resolve and defs are hidden" {
     }
 }
 
-test "regression: cross-line reference joints stay links" {
+test "regression: cross-line reference joints follow CommonMark" {
+    // `[bar]` has no definition so it stays literal text; the next line's
+    // `[1]` resolves as its own shortcut link (CommonMark has no
+    // space/newline-separated `[text] [label]` form).
     const doc =
         \\Foo [bar]
         \\[1].
@@ -1306,12 +1309,13 @@ test "regression: cross-line reference joints stay links" {
         \\[1]: /url/
     ;
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [64]layout.DrawCommand = undefined;
     var st = FullStore{};
     const m = renderFull(doc, &lines, n, &cmds, &st);
-    try std.testing.expect(hasLink(cmds[0..m], "bar"));
+    try std.testing.expect(!hasLink(cmds[0..m], "bar"));
+    try std.testing.expect(hasLink(cmds[0..m], "1"));
 }
 
 test "regression: indented ref-like lines stay code, not defs" {
@@ -1319,7 +1323,7 @@ test "regression: indented ref-like lines stay code, not defs" {
         \\    [four]: /url
     ;
     var lines: [4]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [64]layout.DrawCommand = undefined;
     var st = FullStore{};
@@ -1342,7 +1346,7 @@ test "regression: html comments are hidden" {
         \\after
     ;
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [64]layout.DrawCommand = undefined;
     var st = FullStore{};
@@ -1363,7 +1367,7 @@ test "regression: hard wrap never starts a list" {
         \\2. stays text
     ;
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [64]layout.DrawCommand = undefined;
     var st = FullStore{};
@@ -1390,7 +1394,7 @@ test "regression: hard wrap never starts a list" {
 test "regression: spaced hr and tab bullets with ordered tabs" {
     const doc = "- - -\n\n*\ttabbed\n\n1.\ttabbed\n";
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [48]layout.DrawCommand = undefined;
     var st = FullStore{};
@@ -1401,14 +1405,17 @@ test "regression: spaced hr and tab bullets with ordered tabs" {
     try std.testing.expect(hasRun(cmds[0..m], "tabbed"));
 }
 
-test "regression: quoted titles keep link and referral def resolves" {
+test "regression: quoted titles fall back to referral def" {
+    // First-close titles (CommonMark): the inline tail is malformed, so the
+    // `[bar]` resolves as a shortcut reference instead and the tail stays
+    // literal text.
     const doc =
         \\Foo [bar](/url/ "Title with "quotes" inside").
         \\
         \\[bar]: /url/
     ;
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [64]layout.DrawCommand = undefined;
     var st = FullStore{};
@@ -1434,7 +1441,7 @@ test "regression: autolinks stay literal in code spans and indented code" {
     // Tab-indented autolink line is an indented code block, not a link.
     const doc = "Para.\n\n\tor here: <http://example.com/>\n";
     var lines: [8]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     try std.testing.expectEqual(@as(usize, 3), n);
     // `indent` counts whitespace characters (a tab is 1), so assert the
@@ -1477,14 +1484,15 @@ test "regression: empty urls, tab titles, and bracketed reference text" {
     }
     try std.testing.expect(found_tabbed);
 
-    // Embedded brackets stay inside the link text (mdtest_links_reference_style).
+    // A space before the label is not a full reference (CommonMark): the
+    // brackets stay literal and only the trailing `[b]` links.
     const bline = "With [embedded [brackets]] [b].";
     const defs = [_]simd.RefDef{.{ .label = "b", .url = "/url/", .line_idx = 0 }};
     var bspans: [16]parser.InlineSpan = undefined;
     const bn = parser.parseInlinesWithDefs(bline, &bspans, defs[0..]);
     var found_brackets = false;
     for (bspans[0..bn]) |s| {
-        if (s.style.link and std.mem.eql(u8, s.text, "embedded [brackets]")) found_brackets = true;
+        if (s.style.link and std.mem.eql(u8, s.text, "b")) found_brackets = true;
     }
     try std.testing.expect(found_brackets);
 }
@@ -1514,7 +1522,7 @@ test "regression: multi-line quoted indented code renders mono with bars" {
         \\>     }
     ;
     var lines: [16]simd.Line = undefined;
-    var fence = false;
+    var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines, &fence);
     var cmds: [128]layout.DrawCommand = undefined;
     var st = FullStore{};

@@ -52,7 +52,7 @@ test "STRICT: SIMD Line Scanner Throughput and Latency" {
     var last_mb: f64 = 0.0;
     var iter: usize = 0;
     while (iter < 3) : (iter += 1) {
-        var in_fence: bool = false;
+        var in_fence: simd.FenceState = .{};
 
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
@@ -155,7 +155,7 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
     const line_entries = try allocator.alloc(simd.Line, lines_target + 100);
     defer allocator.free(line_entries);
 
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
     var commands: [1024]layout.DrawCommand = undefined;
@@ -270,7 +270,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
     const line_entries = try allocator.alloc(simd.Line, lines_target + 100);
     defer allocator.free(line_entries);
 
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
     var checkpoints: [512]layout.Checkpoint = undefined;

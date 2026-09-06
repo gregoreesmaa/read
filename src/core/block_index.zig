@@ -196,7 +196,7 @@ test "block store: fold lines into flat SoA blocks with u32 links" {
         \\Trailing.
     ;
     var lines: [16]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n_lines = simd.scanLines(md, &lines, &in_fence);
 
     var buf: [16]Block = undefined;
@@ -229,7 +229,7 @@ test "block store: MultiArrayList owns SoA columns; binary search works" {
     const allocator = std.testing.allocator;
     const md = "# A\nBody line here.\nBody line two.\n> Quote.\n";
     var lines: [8]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n_lines = simd.scanLines(md, &lines, &in_fence);
 
     var store = try BlockStore.initFromLines(allocator, lines[0..n_lines]);
@@ -248,7 +248,7 @@ test "block store: MultiArrayList owns SoA columns; binary search works" {
 
 test "block store: resident byte range expands visible window" {
     var lines: [4]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const md = "l0\nl1\nl2\nl3\n";
     const n = simd.scanLines(md, &lines, &in_fence);
     const r = residentByteRange(lines[0..n], 1, 2, 1);
