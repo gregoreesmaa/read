@@ -551,6 +551,30 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.rect.h,
                 );
             },
+            .inline_code_bg => {
+                // Inline-code pill: rounded fill + 1px border. Culled like
+                // text runs; the partial-damage hard clip confines pixels.
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
+                const bd = if (g_app.is_dark_theme)
+                    layout.Theme.dark.code_border
+                else
+                    layout.Theme.light.code_border;
+                bridge.platform_draw_pill(
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.rect.w,
+                    cmd.rect.h,
+                    layout.inline_code_radius,
+                    cmd.color.r,
+                    cmd.color.g,
+                    cmd.color.b,
+                    cmd.color.a,
+                    bd.r,
+                    bd.g,
+                    bd.b,
+                    bd.a,
+                );
+            },
         }
     }
 
