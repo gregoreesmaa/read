@@ -4541,6 +4541,98 @@ fn appendInlinePlain(text: []const u8, out: []u8, used: usize) usize {
     return u;
 }
 
+/// Heading outline mark for the Cmd+J picker (#48). `text` borrows the
+/// caller's arena copy (plain inline text, markup stripped, truncated).
+pub const HeadingMark = struct {
+    level: u8,
+    y: f32,
+    text: []const u8 = "",
+};
+
+/// Plain-text + level of the heading unit starting at line `i` (ATX or
+/// setext). Shared extraction for the outline picker; the anchor path keeps
+/// its own inline copy (untouched, battle-tested).
+inline fn headingPlainLevel(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    i: usize,
+    bt: simd.BlockType,
+    text_buf: []u8,
+) struct { level: u8, used: usize } {
+    if (isHeadingType(bt)) {
+        const used = appendInlinePlain(
+            atxHeadingText(bytes[lines[i].offset..][0..lines[i].len]),
+            text_buf,
+            0,
+        );
+        return .{ .level = @intCast(@intFromEnum(bt)), .used = used };
+    }
+    // Setext content may span lines: same back-walk as the anchor path.
+    var k = i;
+    while (k > 0 and lines[k - 1].block_type == .paragraph and
+        quoteLeader(bytes, lines, k - 1) == null and
+        enclosingListMarker(bytes, lines, k - 1) == null and
+        indentedCodeLeader(bytes, lines, k - 1) == null)
+    {
+        if (k >= 2 and setextLevel(bytes, lines, k - 2) != null) break;
+        if (setextLevel(bytes, lines, k - 1) != null) break;
+        k -= 1;
+    }
+    var used: usize = 0;
+    var m = k;
+    while (m <= i) : (m += 1) {
+        used = appendInlinePlain(bytes[lines[m].offset..][0..lines[m].len], text_buf, used);
+    }
+    return .{ .level = setextLevel(bytes, lines, i) orelse 1, .used = used };
+}
+
+/// Caller-owned arena slice per outline item (cold path only).
+pub const OUTLINE_TEXT_MAX: usize = 160;
+
+/// Outline enumeration for the Cmd+J picker (#48): every ATX/setext heading
+/// top-to-bottom with level and document y — the same height walk as
+/// anchorScrollY, so picker jumps land exactly. Copies plain text into
+/// `arena` (fixed stride, UTF-8-safe truncation) and marks into `out`;
+/// stops when either fills. Returns the mark count. Cold path:zero heap.
+pub fn collectHeadings(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    config: ViewportConfig,
+    arena: []u8,
+    out: []HeadingMark,
+) usize {
+    const cw = contentWidthOf(config);
+    const cx = contentXOf(config);
+    var text_buf: [512]u8 = undefined;
+    var count: usize = 0;
+    var y: f32 = 50.0;
+    var i: usize = 0;
+    while (i < lines.len and count < out.len) {
+        const bt = lines[i].block_type;
+        const is_head = isHeadingType(bt) or
+            (bt == .paragraph and setextLevel(bytes, lines, i) != null);
+        if (is_head) {
+            const h = headingPlainLevel(bytes, lines, i, bt, &text_buf);
+            const room = count * OUTLINE_TEXT_MAX;
+            if (room + OUTLINE_TEXT_MAX <= arena.len) {
+                var take = @min(h.used, OUTLINE_TEXT_MAX);
+                while (take > 0 and take < h.used and (text_buf[take] & 0xC0) == 0x80) take -= 1;
+                @memcpy(arena[room..][0..take], text_buf[0..take]);
+                out[count] = .{
+                    .level = h.level,
+                    .y = y,
+                    .text = arena[room..][0..take],
+                };
+                count += 1;
+            }
+        }
+        const u = refineLineHeight(bytes, lines, i, config, cw, cx);
+        y += u.height;
+        i += @max(u.consumed, 1);
+    }
+    return count;
+}
+
 /// Document y (same basis as scroll offsets) of the heading unit targeted by
 /// `#fragment`, or null when no heading matches. ATX and setext headings
 /// both participate. Match tiers win globally: an exact slug anywhere beats
@@ -4608,6 +4700,54 @@ pub fn anchorScrollY(
         if (tier == 7) return null;
         tier += 1;
     }
+}
+
+test "outline picker: headings enumerate top-to-bottom with levels (#48)" {
+    const t = std.testing;
+    const doc_raw =
+        \\# Top
+        \\
+        \\## **Bold** Sub
+        \\
+        \\Body text.
+        \\
+        \\Setext Title
+        \\============
+        \\
+        \\### Deep
+        \\
+        \\# Top
+    ;
+    const doc = doc_raw ++ "\n";
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const cfg = ViewportConfig{ .window_width = 1200, .window_height = 900, .scroll_y = 0 };
+    var arena: [8 * OUTLINE_TEXT_MAX]u8 = undefined;
+    var marks: [8]HeadingMark = undefined;
+    const count = collectHeadings(doc, lines_buf[0..n], cfg, &arena, &marks);
+    try t.expectEqual(@as(usize, 5), count);
+    // Levels in document order (ATX 1/2/3, setext === is 1, dupe H1 again).
+    try t.expectEqual(@as(u8, 1), marks[0].level);
+    try t.expectEqual(@as(u8, 2), marks[1].level);
+    try t.expectEqual(@as(u8, 1), marks[2].level);
+    try t.expectEqual(@as(u8, 3), marks[3].level);
+    try t.expectEqual(@as(u8, 1), marks[4].level);
+    // Markup stripped from picker text (spans join with a space each — the
+    // same plain-text path anchors slugify, so picker and #links agree).
+    try t.expectEqualStrings("Top", marks[0].text);
+    try t.expectEqualStrings("Bold  Sub", marks[1].text);
+    try t.expectEqualStrings("Setext Title", marks[2].text);
+    // Positions strictly increase (jump targets distinct).
+    var k: usize = 1;
+    while (k < count) : (k += 1) {
+        try t.expect(marks[k].y > marks[k - 1].y);
+    }
+    // First heading sits at the walk origin.
+    try t.expectEqual(@as(f32, 50.0), marks[0].y);
+    // Small output caps enumeration (picker shows a prefix, never overflows).
+    var tiny: [2]HeadingMark = undefined;
+    try t.expectEqual(@as(usize, 2), collectHeadings(doc, lines_buf[0..n], cfg, &arena, &tiny));
 }
 
 const virtual_test_doc =

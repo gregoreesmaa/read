@@ -36,6 +36,15 @@ static unsigned long g_draw_seq = 0;
 #ifdef READ_ANIMATED_GIF
 static BOOL gif_window_visible(void); // defined with the image cache below
 #endif
+// Heading outline picker (#48): C core at end-of-file. Trivial wrappers
+// are inlined into the delegate methods below (a call costs more than the
+// body here); tentative definitions merge with the real ones at EOF.
+static int g_outline_row_count;
+static NSSearchField* g_outline_search;
+static NSTableView* g_outline_table;
+static NSString* outline_display_string(NSInteger row);
+static int outline_rebuild(NSString* filter);
+static void outline_jump(void);
 
 typedef struct {
     float x;
@@ -1426,6 +1435,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     NSString* chars = [event charactersIgnoringModifiers];
 
     if (flags == NSEventModifierFlagCommand) {
+        if ([chars isEqualToString:@"j"]) {
+            // Heading outline picker (#48): native filterable panel.
+            if (g_callbacks.on_outline_open) g_callbacks.on_outline_open();
+            return;
+        }
         if ([chars isEqualToString:@"c"]) {
             [self copySelectionToClipboard];
             return;
@@ -1489,6 +1503,13 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 // conformance only cost ~3.7 KB of protocol metadata. Behaviorally identical;
 // zero new compiler warnings (verified).
 @interface ReadAppDelegate : NSObject
+// Heading outline picker (#48) handlers. Informal declarations only, like
+// the window/app callbacks below — no protocol adoption per the SIZE NOTE.
+- (NSInteger)numberOfRowsInTableView:(NSTableView*)tv;
+- (id)tableView:(NSTableView*)tv objectValueForTableColumn:(NSTableColumn*)col row:(NSInteger)row;
+- (void)controlTextDidChange:(NSNotification*)note;
+- (BOOL)control:(NSControl*)control textView:(NSTextView*)tv doCommandBySelector:(SEL)cmd;
+- (void)outlineJump:(id)sender;
 @end
 
 @implementation ReadAppDelegate
@@ -1506,6 +1527,38 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
     (void)sender;
     return YES;
+}
+
+// Heading outline picker (#48): table + search drive. Thin wrappers over
+// the C implementation at end-of-file — logic lives there so the ObjC
+// method/metadata footprint stays at these five.
+- (NSInteger)numberOfRowsInTableView:(NSTableView*)tv {
+    (void)tv;
+    return g_outline_row_count;
+}
+
+- (id)tableView:(NSTableView*)tv objectValueForTableColumn:(NSTableColumn*)col row:(NSInteger)row {
+    (void)tv; (void)col;
+    return outline_display_string(row);
+}
+
+- (void)controlTextDidChange:(NSNotification*)note {
+    (void)note;
+    outline_rebuild([g_outline_search stringValue]);
+}
+
+- (BOOL)control:(NSControl*)control textView:(NSTextView*)tv doCommandBySelector:(SEL)cmd {
+    (void)tv;
+    // Enter jumps; arrows are intentionally unhandled here — Tab reaches
+    // the native list (full keyboard flow: type, Tab, arrows, Enter).
+    if (control != g_outline_search) return NO;
+    if (cmd == @selector(insertNewline:)) { outline_jump(); return YES; }
+    return NO;
+}
+
+- (void)outlineJump:(id)sender {
+    (void)sender;
+    outline_jump();
 }
 
 // Visibility changes are OS events, not wakeups: a single redraw on restore
@@ -2636,5 +2689,166 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
                                 error:NULL];
 
     return success ? 0 : -5;
+}
+#endif
+
+// Heading outline picker (#48): native NSPanel + NSSearchField + NSTableView
+// with zero custom drawing. Standard controls carry free VoiceOver roles
+// (AXWindow/AXSearchField/AXTable/AXRow — the #29 contract) and follow the
+// system appearance, so the picker works in both content themes. Jumps reuse
+// on_scroll_to with exact document y: duplicate headings land precisely with
+// no slug roundtrip. Logic lives in C functions (no per-method ObjC metadata
+// bloat — see the size-gate postmortem); only the five AppKit-mandated
+// delegate/action methods sit on ReadAppDelegate, plus a one-method panel
+// subclass so Esc dismisses. Kept at end-of-file per the SIZE NOTE.
+#define OUTLINE_MAX 512
+typedef struct { int level; float y; char text[160]; } OutlineItem;
+static OutlineItem g_outline_items[OUTLINE_MAX];
+static int g_outline_count = 0;
+// Filtered view: indices into g_outline_items (no per-show allocations).
+static int g_outline_rows[OUTLINE_MAX];
+static int g_outline_row_count = 0;
+static NSPanel* g_outline_panel = nil;
+static NSSearchField* g_outline_search = nil;
+static NSTableView* g_outline_table = nil;
+static id g_outline_delegate = nil; // ReadAppDelegate instance (id: no protocol adoption, per SIZE NOTE)
+
+void platform_outline_add(int level, float y, const char* text, int text_len) {
+    // Both callers send valid levels (Zig clamps 1-6, probe sends 1/3);
+    // empties are skipped (nothing to display or filter).
+    if (g_outline_count >= OUTLINE_MAX || !text || text_len <= 0) return;
+    OutlineItem* it = &g_outline_items[g_outline_count++];
+    it->level = level;
+    it->y = y;
+    int n = text_len < 159 ? text_len : 159;
+    memcpy(it->text, text, n);
+    it->text[n] = '\0';
+}
+
+// Plain-substring filter (case-insensitive): empty matches everything.
+// Text is never null (add skips empties, probe NUL-fills).
+static int outline_filter_matches(const char* text, NSString* filter) {
+    if (!filter || [filter length] == 0) return 1;
+    NSString* s = [[NSString alloc] initWithUTF8String:text];
+    if (!s) return 0;
+    return [s rangeOfString:filter options:NSCaseInsensitiveSearch].location != NSNotFound ? 1 : 0;
+}
+
+static NSString* outline_display_string(NSInteger row) {
+    // AppKit only queries 0..count-1 after reloadData.
+    OutlineItem* it = &g_outline_items[g_outline_rows[row]];
+    // Nesting as a spaces prefix (level-1 * 2); %*s keeps it one call.
+    return [NSString stringWithFormat:@"%*s%s", (it->level - 1) * 2, "", it->text];
+}
+
+static void outline_jump(void) {
+    // Only reachable from panel controls; reloadData always clears stale
+    // selections, so row is -1 (empty list, return) or valid.
+    NSInteger row = [g_outline_table selectedRow];
+    if (row < 0) {
+        if (g_outline_row_count == 0) return;
+        row = 0;
+    }
+    float y = g_outline_items[g_outline_rows[row]].y;
+    [g_outline_panel close];
+    if (g_callbacks.on_scroll_to) g_callbacks.on_scroll_to(y);
+}
+
+@interface OutlinePanel : NSPanel @end
+@implementation OutlinePanel
+- (void)cancelOperation:(id)sender { (void)sender; [self close]; } // Esc dismisses
+@end
+
+static void outline_ensure_built(void) {
+    if (g_outline_panel) return;
+    if (!g_outline_delegate) g_outline_delegate = [[ReadAppDelegate alloc] init];
+    NSRect frame = NSMakeRect(0, 0, 440, 380);
+    g_outline_panel = [[OutlinePanel alloc] initWithContentRect:frame
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
+        backing:NSBackingStoreBuffered defer:NO];
+    [g_outline_panel setTitle:@"Headings"];
+    [g_outline_panel center];
+    NSView* content = [g_outline_panel contentView];
+
+    g_outline_search = [[NSSearchField alloc] initWithFrame:NSMakeRect(12, 380 - 36, 440 - 24, 24)];
+    [g_outline_search setPlaceholderString:@"Filter headings"];
+    // No target/action: Enter arrives via insertNewline:, so the clear (x)
+    // button never misfires a jump.
+    [g_outline_search setDelegate:g_outline_delegate];
+    [content addSubview:g_outline_search];
+
+    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 12, 440 - 24, 380 - 56)];
+    [scroll setHasVerticalScroller:YES];
+    [scroll setBorderType:NSBezelBorder];
+    g_outline_table = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, 440 - 24, 380 - 56)];
+    NSTableColumn* col = [[NSTableColumn alloc] initWithIdentifier:@"heading"];
+    [g_outline_table addTableColumn:col];
+    [g_outline_table setHeaderView:nil];
+    // Data source only (no delegate methods exist); mouse users click a
+    // row then Enter (hidden default button below) — double-click is not
+    // in the acceptance criteria and costs sends + metadata.
+    [g_outline_table setDataSource:g_outline_delegate];
+    [scroll setDocumentView:g_outline_table];
+    [content addSubview:scroll];
+
+    // Hidden default button so Enter jumps even with the list focused.
+    NSButton* enter = [[NSButton alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
+    [enter setKeyEquivalent:@"\r"];
+    [enter setTarget:g_outline_delegate];
+    [enter setAction:@selector(outlineJump:)];
+    [enter setTransparent:YES];
+    [enter setAccessibilityElement:NO];
+    [content addSubview:enter];
+}
+
+static int outline_rebuild(NSString* filter) {
+    outline_ensure_built();
+    g_outline_row_count = 0;
+    // g_outline_count never exceeds OUTLINE_MAX (add caps it), so rows fits.
+    for (int i = 0; i < g_outline_count; i++) {
+        if (!outline_filter_matches(g_outline_items[i].text, filter)) continue;
+        g_outline_rows[g_outline_row_count++] = i;
+    }
+    [g_outline_table reloadData];
+    // No auto-select: Enter with no selection jumps to the first row
+    // (see outline_jump), so typing + Enter never needs the list focused.
+    return g_outline_row_count;
+}
+
+void platform_outline_show(void) {
+    outline_ensure_built();
+    [g_outline_search setStringValue:@""];
+    outline_rebuild(@"");
+    [g_outline_panel makeKeyAndOrderFront:nil];
+    [g_outline_panel makeFirstResponder:g_outline_search];
+    g_outline_count = 0; // accumulation consumed; the next open re-adds
+}
+
+#ifdef TEST_HOOKS
+// Filter contract: case-insensitive plain substring, empty matches all.
+// Length-delimited (never trusts NUL); -1 = bad input.
+int platform_test_outline_filter(const char* text, int text_len, const char* filter, int filter_len) {
+    if (!text || text_len < 0 || !filter || filter_len < 0) return -1;
+    char fb[256];
+    if (filter_len >= (int)sizeof(fb)) return -1;
+    memcpy(fb, filter, filter_len); fb[filter_len] = '\0';
+    NSString* f = [[NSString alloc] initWithUTF8String:fb];
+    if (!f) return -1;
+    char tb[1024];
+    int tn = text_len < (int)sizeof(tb) - 1 ? text_len : (int)sizeof(tb) - 1;
+    memcpy(tb, text, tn); tb[tn] = '\0';
+    return outline_filter_matches(tb, f);
+}
+
+// Panel-build contract: two adds + headless content build yields two rows
+// (construction only — never ordered front, so headless-safe).
+int platform_test_outline_build(void) {
+    outline_ensure_built();
+    g_outline_count = 0;
+    platform_outline_add(1, 50.0f, "Alpha", 5);
+    platform_outline_add(3, 300.0f, "Beta", 4);
+    int rows = outline_rebuild(@"");
+    g_outline_count = 0;
+    return rows == 2 ? 1 : 0;
 }
 #endif
