@@ -36,6 +36,8 @@ static unsigned long g_draw_seq = 0;
 #ifdef READ_ANIMATED_GIF
 static BOOL gif_window_visible(void); // defined with the image cache below
 #endif
+static int appearance_is_dark(NSAppearance* a); // defined at end-of-file
+static void apply_window_appearance(BOOL dark); // defined at end-of-file
 
 typedef struct {
     float x;
@@ -1482,6 +1484,17 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     [self setNeedsDisplay:YES];
 }
 
+// System appearance tracking (#47): fires live on every effectiveAppearance
+// change (System Settings switch, auto sunset, per-app override). Window
+// chrome updates synchronously here so there is no flash of the wrong theme;
+// content follows via on_appearance (Zig clears any `t` override).
+- (void)viewDidChangeEffectiveAppearance {
+    [super viewDidChangeEffectiveAppearance];
+    BOOL dark = appearance_is_dark(self.effectiveAppearance);
+    apply_window_appearance(dark);
+    if (g_callbacks.on_appearance) g_callbacks.on_appearance(dark ? 1 : 0);
+}
+
 @end
 
 // SIZE NOTE: no formal <NSApplicationDelegate>/<NSWindowDelegate> adoption.
@@ -1563,7 +1576,12 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     [g_window setTitle:[NSString stringWithUTF8String:title]];
     [g_window setTitlebarAppearsTransparent:YES];
     [g_window setTitleVisibility:NSWindowTitleHidden];
-    [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:18.0f/255.0f green:18.0f/255.0f blue:18.0f/255.0f alpha:1.0]];
+    // Initial theme follows the system (#47): syncs window chrome now and
+    // the Zig content theme via on_appearance below, so launch never flashes
+    // the wrong palette. Same AGENTS.md palettes, just selected by the OS.
+    apply_window_appearance(appearance_is_dark(g_window.effectiveAppearance));
+    if (callbacks.on_appearance)
+        callbacks.on_appearance(appearance_is_dark(g_window.effectiveAppearance) ? 1 : 0);
     [g_window center];
 
     ReadView* view = [[ReadView alloc] initWithFrame:frame];
@@ -2636,5 +2654,37 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
                                 error:NULL];
 
     return success ? 0 : -5;
+}
+#endif
+
+// System appearance (#47): mapping + window chrome, kept at end-of-file per
+// the SIZE NOTE (see prime_frame_decode above).
+static int appearance_is_dark(NSAppearance* a) {
+    if (!a) return 1; // fail dark: preserves the historical default theme
+    NSString* best = [a bestMatchFromAppearancesWithNames:@[
+        NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+    return [best isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
+}
+
+static void apply_window_appearance(BOOL dark) {
+    if (!g_window) return;
+    // AGENTS.md palettes verbatim: dark #121212, light #FAFAFA.
+    if (dark) {
+        [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:18.0f/255.0f
+            green:18.0f/255.0f blue:18.0f/255.0f alpha:1.0]];
+    } else {
+        [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:250.0f/255.0f
+            green:250.0f/255.0f blue:250.0f/255.0f alpha:1.0]];
+    }
+}
+
+#ifdef TEST_HOOKS
+// Mapping contract probe: DarkAqua must read dark, Aqua must read light.
+// Pure AppKit objects, no window server needed — deterministic headless.
+int platform_test_appearance(void) {
+    NSAppearance* dark = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    NSAppearance* aqua = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+    if (!dark || !aqua) return -1;
+    return (appearance_is_dark(dark) == 1 && appearance_is_dark(aqua) == 0) ? 1 : 0;
 }
 #endif

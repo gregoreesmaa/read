@@ -19,6 +19,9 @@ pub const PlatformCallbacks = extern struct {
     /// delta (0 when the image is at/below the viewport top: nothing above
     /// moved). Appended last for the same FFI stability reason.
     on_images_changed: ?*const fn (delta_above: f32) callconv(.c) void = null,
+    /// System appearance changed (effectiveAppearance): 1 = dark, 0 =
+    /// light. Appended last for the same FFI stability reason.
+    on_appearance: ?*const fn (is_dark: c_int) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_init(
@@ -146,6 +149,7 @@ pub extern "c" fn platform_glyph_cache_stats(
 ) void;
 
 pub extern "c" fn platform_test_image_draws() c_ulong;
+pub extern "c" fn platform_test_appearance() c_int;
 pub extern "c" fn platform_test_image_primed(total_frames: *c_ulong, primed_frames: *c_ulong) void;
 pub extern "c" fn platform_set_test_scale(s: f32) void;
 pub extern "c" fn platform_render_select_drag_png(
