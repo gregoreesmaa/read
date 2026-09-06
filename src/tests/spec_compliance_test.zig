@@ -1280,6 +1280,81 @@ test "regression: entities decode inline, bare amps stay literal" {
     try std.testing.expect(hasRun(cmds[0..m], "&"));
 }
 
+test "spec compliance: autolinks validate URI and email forms, else literal" {
+    const doc =
+        \\See <https://ok.example> and <user@host.example> but <foo bar> and <> and <a:b> stay.
+    ;
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    // Valid URI and email autolinks resolve; everything else is plain text.
+    try std.testing.expect(hasLink(cmds[0..m], "https://ok.example"));
+    try std.testing.expect(hasLink(cmds[0..m], "user@host.example"));
+    var link_runs: usize = 0;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run and c.style.link) link_runs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), link_runs);
+    try std.testing.expect(hasRun(cmds[0..m], "<foo"));
+    try std.testing.expect(hasRun(cmds[0..m], "<>"));
+    try std.testing.expect(hasRun(cmds[0..m], "<a:b>"));
+}
+
+test "spec compliance: bare URLs stay literal while linkify is off" {
+    // No bare-URL linkifier is enabled: trailing punctuation has nothing
+    // to strip because no link forms (the acceptance gate for linkify,
+    // when it lands, is trailing-punctuation stripping).
+    const doc = "See https://example.com/foo. next";
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) try std.testing.expect(!c.style.link);
+    }
+    try std.testing.expect(hasRun(cmds[0..m], "https://example.com/foo."));
+}
+
+test "spec compliance: backslash escapes win over emphasis and autolinks" {
+    const doc = "A \\*b\\* plus \\<https://x.example> stays.";
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    // Escaped stars and angles render literally; nothing links or slants.
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run) {
+            try std.testing.expect(!c.style.link);
+            try std.testing.expect(!c.style.italic);
+        }
+    }
+    try std.testing.expect(hasRun(cmds[0..m], "*"));
+    // The escaped angle survives as its own run, detached from the URL text.
+    try std.testing.expect(hasRun(cmds[0..m], "<"));
+    try std.testing.expect(hasRun(cmds[0..m], "https://x.example>"));
+}
+
+test "spec compliance: entities decode exactly once" {
+    // `&amp;amp;` decodes its outer reference only; the inner survivor is
+    // never rescanned. Unknown names stay literal text.
+    const doc = "A &amp;amp; B &bogus; C";
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    try std.testing.expect(hasRun(cmds[0..m], "&amp;"));
+    try std.testing.expect(hasRun(cmds[0..m], "&bogus;"));
+}
+
 test "regression: reference links resolve and defs are hidden" {
     const doc =
         \\Foo [bar][1].
