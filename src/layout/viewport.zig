@@ -120,6 +120,7 @@ pub const DrawCommandKind = enum {
     text_run,
     line,
     code_block_bg,
+    inline_code_bg,
     register_scrollable_block,
     begin_clip,
     end_clip,
@@ -142,6 +143,7 @@ pub const Color = struct {
     pub const text_muted_dark = Color{ .r = 140, .g = 140, .b = 145, .a = 255 };
     pub const accent_dark = Color{ .r = 96, .g = 165, .b = 250, .a = 255 };
     pub const code_bg_dark = Color{ .r = 26, .g = 26, .b = 28, .a = 255 };
+    pub const code_border_dark = Color{ .r = 54, .g = 54, .b = 60, .a = 255 };
     pub const quote_bar_dark = Color{ .r = 70, .g = 70, .b = 80, .a = 255 };
     pub const hr_dark = Color{ .r = 40, .g = 40, .b = 45, .a = 255 };
     pub const table_border_dark = Color{ .r = 45, .g = 45, .b = 52, .a = 255 };
@@ -153,6 +155,7 @@ pub const Color = struct {
     pub const text_muted_light = Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
     pub const accent_light = Color{ .r = 37, .g = 99, .b = 235, .a = 255 };
     pub const code_bg_light = Color{ .r = 240, .g = 241, .b = 243, .a = 255 };
+    pub const code_border_light = Color{ .r = 218, .g = 221, .b = 227, .a = 255 };
     pub const quote_bar_light = Color{ .r = 203, .g = 213, .b = 225, .a = 255 };
     pub const hr_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
     pub const table_border_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
@@ -184,6 +187,7 @@ pub const Theme = struct {
     muted: Color,
     accent: Color,
     code_bg: Color,
+    code_border: Color,
     quote_bar: Color,
     hr: Color,
     table_border: Color,
@@ -195,6 +199,7 @@ pub const Theme = struct {
         .muted = Color.text_muted_dark,
         .accent = Color.accent_dark,
         .code_bg = Color.code_bg_dark,
+        .code_border = Color.code_border_dark,
         .quote_bar = Color.quote_bar_dark,
         .hr = Color.hr_dark,
         .table_border = Color.table_border_dark,
@@ -207,6 +212,7 @@ pub const Theme = struct {
         .muted = Color.text_muted_light,
         .accent = Color.accent_light,
         .code_bg = Color.code_bg_light,
+        .code_border = Color.code_border_light,
         .quote_bar = Color.quote_bar_light,
         .hr = Color.hr_light,
         .table_border = Color.table_border_light,
@@ -432,6 +438,8 @@ pub fn layoutWrappedSpans(
     line_h: f32,
     default_color: Color,
     accent_color: Color,
+    code_bg: Color,
+    code_border: Color,
     vp_bottom: f32,
     commands_out: []DrawCommand,
     cmd_count: *usize,
@@ -442,6 +450,8 @@ pub fn layoutWrappedSpans(
         .line_h = line_h,
         .default_color = default_color,
         .accent_color = accent_color,
+        .code_bg = code_bg,
+        .code_border = code_border,
         .start_x = start_x,
         .max_w = max_w,
         .vp_bottom = vp_bottom,
@@ -451,7 +461,7 @@ pub fn layoutWrappedSpans(
 
     for (spans) |span| {
         if (commands_out.len >= 4 and cmd_count.* >= commands_out.len - 4) break;
-        flowSpans(span.text, span.style, span.link_target, &pen, flow);
+        flowSpans(span.text, span.style, span.link_target, &pen, flow, false);
     }
 
     return pen.y + line_h;
@@ -474,6 +484,8 @@ pub const FlowCtx = struct {
     line_h: f32,
     default_color: Color,
     accent_color: Color,
+    code_bg: Color,
+    code_border: Color,
     start_x: f32,
     max_w: f32,
     vp_bottom: f32,
@@ -482,6 +494,13 @@ pub const FlowCtx = struct {
     defs: []const simd.RefDef = &.{},
     entities: ?*EntityStore = null,
 };
+
+/// Inline code span design tokens (issue #23): JetBrains Mono at ~0.88em
+/// inside a subtle pill. Padding 2–4px, radius 4–6px per acceptance.
+pub const inline_code_scale: f32 = 0.88;
+pub const inline_code_pad_x: f32 = 3.0;
+pub const inline_code_radius: f32 = 5.0;
+pub const inline_code_pill_h_em: f32 = 1.4;
 
 /// Lays out one word at the pen: wraps to the next visual row on overflow,
 /// emits a text_run when visible, and advances past the word. Conditions are
@@ -536,14 +555,23 @@ pub fn flowSpace(pen: *FlowPen, space_w: f32) void {
     pen.x += space_w;
 }
 
-/// Flows words and spaces of one span-text at the pen.
+/// Flows words and spaces of one span-text at the pen. Inline code spans
+/// (never block code: `is_block_code`) flow atomically through
+/// `flowCodeSpan` — one pill, no mid-span wrap. Pen advancement is
+/// identical whether commands are emitted or not, so measurement passes
+/// agree with rendering bit-for-bit.
 pub fn flowSpans(
     span_text: []const u8,
     style: parser.SpanStyle,
     link_target: ?[]const u8,
     pen: *FlowPen,
     ctx: FlowCtx,
+    is_block_code: bool,
 ) void {
+    if (style.code and !is_block_code) {
+        flowCodeSpan(span_text, style, link_target, pen, ctx);
+        return;
+    }
     const space_w = measureCharEx(' ', ctx.font_size, false, false, false, style.heading);
     var i: usize = 0;
     while (i < span_text.len) {
@@ -556,6 +584,164 @@ pub fn flowSpans(
         while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
         flowWord(span_text[w_start..i], style, link_target, pen, ctx);
     }
+}
+
+/// Flows one inline code span as an atomic pill unit: the whole span wraps
+/// to the next row when it overflows, never breaking mid-phrase. Text runs
+/// emit at `inline_code_scale` of the surrounding size; the pill hugs the
+/// span with `inline_code_pad_x` each side. Block code keeps the legacy
+/// word-flow path (see `flowSpans`).
+fn flowCodeSpan(
+    span_text: []const u8,
+    style: parser.SpanStyle,
+    link_target: ?[]const u8,
+    pen: *FlowPen,
+    ctx: FlowCtx,
+) void {
+    const fs = ctx.font_size * inline_code_scale;
+    const space_w = fs * 0.60;
+    var total: f32 = 0;
+    var i: usize = 0;
+    while (i < span_text.len) {
+        if (span_text[i] == ' ') {
+            total += space_w;
+            i += 1;
+            continue;
+        }
+        const w_start = i;
+        while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
+        total += measureTextEx(span_text[w_start..i], fs, style.bold, style.italic, true, style.heading);
+    }
+
+    if (pen.x + total > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
+        pen.y += ctx.line_h;
+        pen.x = ctx.start_x;
+    }
+
+    const can_emit = pen.y + ctx.line_h >= 0 and pen.y <= ctx.vp_bottom and
+        ctx.cmd_count.* < ctx.commands_out.len;
+    if (can_emit) {
+        const pill_h = @min(fs * inline_code_pill_h_em, ctx.line_h);
+        ctx.commands_out[ctx.cmd_count.*] = .{
+            .kind = .inline_code_bg,
+            .rect = .{
+                .x = pen.x - inline_code_pad_x,
+                .y = pen.y + (ctx.line_h - pill_h) * 0.5,
+                .w = total + inline_code_pad_x * 2.0,
+                .h = pill_h,
+            },
+            .color = ctx.code_bg,
+        };
+        ctx.cmd_count.* += 1;
+    }
+
+    i = 0;
+    while (i < span_text.len) {
+        if (span_text[i] == ' ') {
+            pen.x += space_w;
+            i += 1;
+            continue;
+        }
+        const w_start = i;
+        while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
+        const word = span_text[w_start..i];
+        const word_w = measureTextEx(word, fs, style.bold, style.italic, true, style.heading);
+        if (pen.y + ctx.line_h >= 0 and pen.y <= ctx.vp_bottom and
+            ctx.cmd_count.* < ctx.commands_out.len)
+        {
+            const span_color = if (style.link) ctx.accent_color else ctx.default_color;
+            ctx.commands_out[ctx.cmd_count.*] = .{
+                .kind = .text_run,
+                .rect = .{ .x = pen.x, .y = pen.y, .w = word_w, .h = ctx.line_h },
+                .color = span_color,
+                .text = word,
+                .font_size = fs,
+                .style = style,
+                .link_target = link_target,
+            };
+            ctx.cmd_count.* += 1;
+        }
+        pen.x += word_w;
+    }
+}
+
+test "design #23: inline code pill geometry + atomic wrap" {
+    // Acceptance bands: mono ~0.88em, 2–4px horizontal padding, 4–6px radius.
+    try std.testing.expectApproxEqAbs(inline_code_scale, 0.88, 0.005);
+    try std.testing.expect(inline_code_pad_x >= 2.0 and inline_code_pad_x <= 4.0);
+    try std.testing.expect(inline_code_radius >= 4.0 and inline_code_radius <= 6.0);
+    // Pill fill + border differ per theme (subtle edge, never invisible).
+    try std.testing.expect(!std.meta.eql(Theme.dark.code_bg, Theme.dark.code_border));
+    try std.testing.expect(!std.meta.eql(Theme.light.code_bg, Theme.light.code_border));
+
+    const fs: f32 = 17.0 * inline_code_scale;
+    const word_w: f32 = 3.0 * fs * 0.60;
+    const total: f32 = word_w + fs * 0.60 + word_w;
+    var cmds: [16]DrawCommand = undefined;
+    var n: usize = 0;
+    var pen = FlowPen{ .x = 0, .y = 0 };
+    const ctx = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds,
+        .cmd_count = &n,
+    };
+    flowSpans("foo bar", .{ .code = true }, null, &pen, ctx, false);
+    // One pill + two word runs; words at 0.88em mono.
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(DrawCommandKind.inline_code_bg, cmds[0].kind);
+    try std.testing.expectEqual(Theme.dark.code_bg, cmds[0].color);
+    try std.testing.expectApproxEqAbs(cmds[0].rect.x, 0.0 - inline_code_pad_x, 0.01);
+    try std.testing.expectApproxEqAbs(cmds[0].rect.w, total + inline_code_pad_x * 2.0, 0.01);
+    try std.testing.expectEqual(DrawCommandKind.text_run, cmds[1].kind);
+    try std.testing.expectApproxEqAbs(cmds[1].font_size, fs, 0.001);
+    try std.testing.expectApproxEqAbs(cmds[1].rect.w, word_w, 0.01);
+    try std.testing.expectApproxEqAbs(cmds[2].rect.x, word_w + fs * 0.60, 0.01);
+    try std.testing.expectApproxEqAbs(pen.x, total, 0.01);
+    try std.testing.expectApproxEqAbs(pen.y, 0.0, 0.001);
+
+    // Measurement passes (empty buffer) advance the pen identically.
+    var zn: usize = 0;
+    var zpen = FlowPen{ .x = 0, .y = 0 };
+    var zctx = ctx;
+    zctx.commands_out = &.{};
+    zctx.cmd_count = &zn;
+    flowSpans("foo bar", .{ .code = true }, null, &zpen, zctx, false);
+    try std.testing.expectEqual(@as(usize, 0), zn);
+    try std.testing.expectApproxEqAbs(zpen.x, total, 0.001);
+    try std.testing.expectApproxEqAbs(zpen.y, 0.0, 0.001);
+
+    // Atomic wrap: a span wider than the remaining row moves whole.
+    var cmds2: [16]DrawCommand = undefined;
+    var n2: usize = 0;
+    var pen2 = FlowPen{ .x = 590, .y = 0 };
+    var ctx2 = ctx;
+    ctx2.commands_out = &cmds2;
+    ctx2.cmd_count = &n2;
+    flowSpans("foo bar", .{ .code = true }, null, &pen2, ctx2, false);
+    try std.testing.expectApproxEqAbs(pen2.y, 29.75, 0.001);
+    try std.testing.expectApproxEqAbs(pen2.x, total, 0.01);
+    try std.testing.expectEqual(DrawCommandKind.inline_code_bg, cmds2[0].kind);
+    try std.testing.expectApproxEqAbs(cmds2[0].rect.x, 0.0 - inline_code_pad_x, 0.01);
+
+    // Block code keeps the legacy path: no pill, full-size runs.
+    var cmds3: [16]DrawCommand = undefined;
+    var n3: usize = 0;
+    var pen3 = FlowPen{ .x = 0, .y = 0 };
+    var ctx3 = ctx;
+    ctx3.commands_out = &cmds3;
+    ctx3.cmd_count = &n3;
+    flowSpans("foo bar", .{ .code = true }, null, &pen3, ctx3, true);
+    try std.testing.expectEqual(@as(usize, 2), n3);
+    try std.testing.expectEqual(DrawCommandKind.text_run, cmds3[0].kind);
+    try std.testing.expectApproxEqAbs(cmds3[0].font_size, 17.0, 0.001);
 }
 
 /// Flows one raw source line at the pen. Trims leading whitespace when
@@ -583,6 +769,9 @@ pub fn flowSourceLine(
     for (span_buf[0..n]) |span| {
         if (ctx.commands_out.len >= 4 and ctx.cmd_count.* >= ctx.commands_out.len - 4) break;
         var style = span.style;
+        // Block code (quoted/indented lines) keeps the legacy word flow at
+        // full size; only true inline spans take the pill path.
+        const is_block_code = force_code;
         if (force_code) style.code = true;
         if (force_heading) {
             style.bold = true;
@@ -601,7 +790,7 @@ pub fn flowSourceLine(
                 if (ctx.entities.?.decodeInto(tgt.?)) |d| tgt = d;
             }
         }
-        flowSpans(txt, style, tgt, pen, ctx);
+        flowSpans(txt, style, tgt, pen, ctx, is_block_code);
     }
 }
 
@@ -1071,6 +1260,8 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .line_h = line_h,
         .default_color = color,
         .accent_color = ux.theme.accent,
+        .code_bg = ux.theme.code_bg,
+        .code_border = ux.theme.code_border,
         .start_x = tx,
         .max_w = tw,
         .vp_bottom = ux.vp_bottom,
@@ -2395,6 +2586,8 @@ pub fn renderViewportCore(
                 heading_line_h,
                 theme.text,
                 theme.accent,
+                theme.code_bg,
+                theme.code_border,
                 vp_bottom,
                 commands_out,
                 &cmd_count,
@@ -2768,6 +2961,8 @@ pub fn computeDocumentHeightEx(
                 cur_y,
                 font_size,
                 heading_line_h,
+                Color.transparent,
+                Color.transparent,
                 Color.transparent,
                 Color.transparent,
                 std.math.inf(f32),
@@ -3668,7 +3863,7 @@ pub fn refineLineHeight(
                 listContentBase(&mux_h, idx, 4) orelse content_x
             else
                 content_x;
-            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy);
+            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy);
             return .{ .height = margin_top + end_y + margin_bottom, .consumed = 1 };
         },
         .quote => {

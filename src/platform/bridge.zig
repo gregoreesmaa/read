@@ -82,6 +82,23 @@ pub extern "c" fn platform_draw_image(
     h: f32,
 ) void;
 
+/// Inline-code pill: rounded-rect fill + 1px border (radius in px).
+pub extern "c" fn platform_draw_pill(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+    fr: u8,
+    fg: u8,
+    fb: u8,
+    fa: u8,
+    br: u8,
+    bg: u8,
+    bb: u8,
+    ba: u8,
+) void;
+
 pub extern "c" fn platform_get_image_size(
     url: ?[*]const u8,
     url_len: c_int,

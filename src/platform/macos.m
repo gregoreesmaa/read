@@ -1725,6 +1725,35 @@ void platform_draw_rect(float x, float y, float w, float h, unsigned char r, uns
     CGContextFillRect(ctx, CGRectMake(x, y, w, h));
 }
 
+// Inline-code pill (issue #23): rounded-rect fill + 1px border. Pure
+// CoreGraphics (no NSBezierPath) so headless bitmap captures take the
+// identical path as windows. Same coordinate convention as
+// platform_draw_rect; the caller's damage clip confines pixels.
+void platform_draw_pill(float x, float y, float w, float h, float radius,
+                        unsigned char fr, unsigned char fg, unsigned char fb, unsigned char fa,
+                        unsigned char br, unsigned char bg, unsigned char bb, unsigned char ba) {
+    if (!g_current_cg_context) return;
+    if (w <= 0.0f || h <= 0.0f) return;
+    CGContextRef ctx = g_current_cg_context;
+
+    float r = fminf(radius, fminf(w, h) * 0.5f);
+    float x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    CGContextMoveToPoint(ctx, x0 + r, y0);
+    CGContextAddLineToPoint(ctx, x1 - r, y0);
+    CGContextAddArcToPoint(ctx, x1, y0, x1, y0 + r, r);
+    CGContextAddLineToPoint(ctx, x1, y1 - r);
+    CGContextAddArcToPoint(ctx, x1, y1, x1 - r, y1, r);
+    CGContextAddLineToPoint(ctx, x0 + r, y1);
+    CGContextAddArcToPoint(ctx, x0, y1, x0, y1 - r, r);
+    CGContextAddLineToPoint(ctx, x0, y0 + r);
+    CGContextAddArcToPoint(ctx, x0, y0, x0 + r, y0, r);
+    CGContextClosePath(ctx);
+    CGContextSetRGBFillColor(ctx, fr / 255.0f, fg / 255.0f, fb / 255.0f, fa / 255.0f);
+    CGContextSetRGBStrokeColor(ctx, br / 255.0f, bg / 255.0f, bb / 255.0f, ba / 255.0f);
+    CGContextSetLineWidth(ctx, 1.0);
+    CGContextDrawPath(ctx, kCGPathFillStroke);
+}
+
 void platform_register_code_block(float x, float y, float w, float h, const char* code_text, int code_len) {
     if (g_code_block_count >= MAX_CODE_BLOCKS) return;
     CodeBlockRecord* b = &g_code_blocks[g_code_block_count++];
