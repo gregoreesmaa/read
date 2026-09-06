@@ -368,7 +368,7 @@ pub const SmoothScroll = struct {
     current: f32 = 0.0,
     target: f32 = 0.0,
 
-    pub const RATE: f32 = 16.0;
+    pub const RATE: f32 = 28.0;
     pub const SNAP_PX: f32 = 0.5;
 
     pub fn setTarget(self: *SmoothScroll, v: f32, max: f32) void {

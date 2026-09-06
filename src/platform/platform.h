@@ -6,7 +6,7 @@ extern "C" {
 #endif
 
 typedef struct {
-    void (*on_scroll)(float delta_x, float delta_y, int hovered_block_id);
+    void (*on_scroll)(float delta_x, float delta_y, int hovered_block_id, int precise);
     void (*on_resize)(int width, int height);
     void (*on_key)(int key_code, int hovered_block_id);
     void (*on_draw)(int width, int height);
