@@ -116,7 +116,7 @@ test "block store: fold lines into flat SoA blocks with u32 links" {
         \\Trailing.
     ;
     var lines: [16]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n_lines = simd.scanLines(md, &lines, &in_fence);
 
     var buf: [16]Block = undefined;
@@ -148,7 +148,7 @@ test "block store: fold lines into flat SoA blocks with u32 links" {
 test "block store: fold output is ordered with chained siblings" {
     const md = "# A\nBody line here.\nBody line two.\n> Quote.\n";
     var lines: [8]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n_lines = simd.scanLines(md, &lines, &in_fence);
 
     var buf: [8]Block = undefined;

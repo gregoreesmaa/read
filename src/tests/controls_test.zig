@@ -286,7 +286,7 @@ test "controls: accurate document height computation ensures tables and end of d
     const showcase_doc = file.bytes;
 
     var lines_buf: [256]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(showcase_doc, &lines_buf, &in_fence);
 
     const vp_config = layout.ViewportConfig{
@@ -464,7 +464,7 @@ fn gifSizeLoaded(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) cal
 
 fn trailingY(doc: []const u8, size_fn: *const fn ([*]const u8, c_int, *f32, *f32) callconv(.c) void) !f32 {
     var lines_buf: [32]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines_buf, &in_fence);
     var commands_buf: [256]layout.DrawCommand = undefined;
     const count = layout.layoutViewport(
@@ -527,7 +527,7 @@ test "controls: image arrival anchors scroll by above-viewport deltas" {
 
 fn layoutAt(doc: []const u8, scroll: f32, size_fn: *const fn ([*]const u8, c_int, *f32, *f32) callconv(.c) void, out: []layout.DrawCommand) usize {
     var lines_buf: [32]simd.Line = undefined;
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines_buf, &in_fence);
     return layout.layoutViewport(
         doc,

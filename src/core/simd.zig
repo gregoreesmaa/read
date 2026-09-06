@@ -52,7 +52,7 @@ inline fn emitNewlines(
     line_start: usize,
     lines_out: []Line,
     line_count: *usize,
-    in_code_fence_state: *bool,
+    in_code_fence_state: *FenceState,
     in_comment_state: *bool,
 ) usize {
     var ls = line_start;
@@ -81,6 +81,15 @@ inline fn emitNewlines(
     return ls;
 }
 
+/// Fence tracking across lines: an open fence remembers its character
+/// and opening run length so only a matching, long-enough, info-less run
+/// closes it (``` never closes ~~~, short runs never close long fences).
+pub const FenceState = struct {
+    open: bool = false,
+    char: u8 = '`',
+    len: usize = 0,
+};
+
 /// Single byte-search core for the whole renderer. Replaces std's two
 /// monomorphized copies (`indexOfScalar` + `indexOfScalarPos`) with one
 /// `inline` instantiation shared by every call site: identical loop codegen
@@ -107,7 +116,7 @@ pub inline fn findByte(haystack: []const u8, start: usize, needle: u8) ?usize {
 pub fn scanLines(
     bytes: []const u8,
     lines_out: []Line,
-    in_code_fence_state: *bool,
+    in_code_fence_state: *FenceState,
 ) usize {
     var line_count: usize = 0;
     var line_start: usize = 0;
@@ -200,14 +209,14 @@ pub fn scanLines(
 }
 
 /// True for a thematic break of `marker` (`-`, `*`, `_`): at least three
-/// markers with only spaces between/around (`---`, `- - -`, `***`, ...).
+/// markers with only spaces/tabs between/around (`---`, `- - -`, `***`, ...).
 /// Contiguous runs fold through the same check, so one helper covers both.
 fn isSpacedHr(trimmed: []const u8, marker: u8) bool {
     var count: usize = 0;
     for (trimmed) |c| {
         if (c == marker) {
             count += 1;
-        } else if (c != ' ') {
+        } else if (c != ' ' and c != '\t') {
             return false;
         }
     }
@@ -228,52 +237,62 @@ pub const RefDef = struct {
 pub const MAX_REF_DEFS: usize = 128;
 
 /// End index (at the closing quote/paren) of a `"..."`, `'...'`, or `(...)`
-/// title starting at `pos`. Quote titles run greedily to the LAST same-quote
-/// whose remainder satisfies the terminator: Markdown 1.0 links
-/// `("Title with "quotes" inside")` with the full inner text preserved.
+/// title starting at `pos`. Quote titles close at the FIRST unescaped
+/// same-quote (CommonMark: titles cannot contain their own quote, so
+/// `("a "b" c")` is not a title at all); paren titles nest nothing.
 /// Backslash escapes never terminate. `want_paren` selects the terminator:
 /// spaces-then-`)` for inline links, spaces-then-EOL for definitions.
-pub fn parseTitleEnd(line: []const u8, pos: usize, want_paren: bool) ?usize {
+/// Newlines may appear inside quote titles and around the terminator.
+/// End index (at the closing quote/paren) of a `"..."`, `'...'`, or `(...)`
+/// title starting at `pos`, with no terminator check: quote titles close at
+/// the first unescaped same-quote, paren titles hold no parens at all.
+/// Newlines may appear inside quote titles.
+pub fn scanTitleEnd(line: []const u8, pos: usize) ?usize {
     if (pos >= line.len) return null;
     const q = line[pos];
     if (q == '"' or q == '\'') {
         var j = pos + 1;
-        var best: ?usize = null;
         while (j < line.len) {
             if (line[j] == '\\' and j + 1 < line.len) {
                 j += 2;
                 continue;
             }
-            if (line[j] == q) {
-                var k = j + 1;
-                while (k < line.len and (line[k] == ' ' or line[k] == '\t')) : (k += 1) {}
-                const ok = if (want_paren)
-                    (k < line.len and line[k] == ')')
-                else
-                    (k >= line.len);
-                if (ok) best = j;
-            }
+            if (line[j] == q) return j;
             j += 1;
         }
-        return best;
+        return null;
     } else if (q == '(') {
-        var depth: usize = 1;
         var k = pos + 1;
         while (k < line.len) {
             if (line[k] == '\\' and k + 1 < line.len) {
                 k += 2;
                 continue;
-            } else if (line[k] == '(') {
-                depth += 1;
-            } else if (line[k] == ')') {
-                depth -= 1;
-                if (depth == 0) return k;
+            } else if (line[k] == '(' or line[k] == ')') {
+                if (line[k] == ')') return k;
+                return null;
             }
             k += 1;
         }
         return null;
     }
     return null;
+}
+
+pub fn parseTitleEnd(line: []const u8, pos: usize, want_paren: bool) ?usize {
+    const j = scanTitleEnd(line, pos) orelse return null;
+    var k = j + 1;
+    while (k < line.len and isTitleSpace(line[k])) : (k += 1) {}
+    const ok = if (want_paren)
+        (k < line.len and line[k] == ')')
+    else
+        (k >= line.len);
+    if (ok) return j;
+    return null;
+}
+
+/// Whitespace around a link title: spaces, tabs, and line endings.
+fn isTitleSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\x0B' or c == '\x0C' or c == '\r';
 }
 
 /// Parses a single-line reference definition. Up to 3 leading spaces (a tab
@@ -377,35 +396,108 @@ pub fn scanRefDefs(bytes: []const u8, lines: []const Line, out: []RefDef) usize 
 
 /// ASCII case-insensitive label match with inner whitespace collapsed
 /// (CommonMark reference matching, line-local edition).
+/// Whitespace inside reference labels: spaces, tabs, and line endings all
+/// collapse to a single space when matching (labels may span lines).
+fn isLabelSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\x0B' or c == '\x0C' or c == '\r';
+}
+
+/// Folded-byte iterator over a label: ASCII and Latin-1 capitals lowercase,
+/// Greek capitals (plain and tonos-bearing) lowercase, final sigma merges,
+/// and ẞ/ß expand to "ss", mirroring the reference case fold closely
+/// enough for label matching without a Unicode table.
+const FoldIter = struct {
+    s: []const u8,
+    i: usize = 0,
+    buf: [2]u8 = undefined,
+    n_buf: u2 = 0,
+    fn next(it: *FoldIter) ?u8 {
+        if (it.n_buf > 0) {
+            const c = it.buf[0];
+            if (it.n_buf == 2) it.buf[0] = it.buf[1];
+            it.n_buf -= 1;
+            return c;
+        }
+        if (it.i >= it.s.len) return null;
+        const c0 = it.s[it.i];
+        if (c0 < 0x80) {
+            it.i += 1;
+            if (c0 >= 'A' and c0 <= 'Z') return c0 + 32;
+            return c0;
+        }
+        const cp_len = std.unicode.utf8ByteSequenceLength(c0) catch {
+            it.i += 1;
+            return c0;
+        };
+        if (cp_len < 2 or it.i + cp_len > it.s.len) {
+            it.i += 1;
+            return c0;
+        }
+        const cp = std.unicode.utf8Decode(it.s[it.i..][0..cp_len]) catch {
+            it.i += 1;
+            return c0;
+        };
+        it.i += cp_len;
+        // ß/ẞ expand to two bytes; everything else folds in place.
+        if (cp == 0x00DF or cp == 0x1E9E) {
+            it.buf[0] = 's';
+            it.n_buf = 1;
+            return 's';
+        }
+        const folded: u21 = if (cp >= 0xC0 and cp <= 0xDE and cp != 0xD7)
+            cp + 0x20
+        else if (cp >= 0x391 and cp <= 0x3A9 and cp != 0x3A2)
+            cp + 0x20
+        else if (cp == 0x386)
+            0x3AC
+        else if (cp >= 0x388 and cp <= 0x38A)
+            cp + 0x25
+        else if (cp == 0x38C)
+            0x3CC
+        else if (cp == 0x38E or cp == 0x38F)
+            cp + 0x20
+        else if (cp == 0x3C2)
+            0x3C3
+        else
+            cp;
+        var enc: [3]u8 = undefined;
+        const n = std.unicode.utf8Encode(folded, &enc) catch return c0;
+        if (n > 1) {
+            @memcpy(it.buf[0 .. n - 1], enc[1..n]);
+            it.n_buf = @intCast(n - 1);
+        }
+        return enc[0];
+    }
+};
+
 fn matchLabel(a: []const u8, b: []const u8) bool {
     var x = a;
     var y = b;
-    while (x.len > 0 and (x[0] == ' ' or x[0] == '\t')) : (x = x[1..]) {}
-    while (y.len > 0 and (y[0] == ' ' or y[0] == '\t')) : (y = y[1..]) {}
+    while (x.len > 0 and isLabelSpace(x[0])) : (x = x[1..]) {}
+    while (y.len > 0 and isLabelSpace(y[0])) : (y = y[1..]) {}
     // Empty labels never match (an empty `[]` stays literal text).
     if (x.len == 0 or y.len == 0) return false;
-    while (x.len > 0 and (x[x.len - 1] == ' ' or x[x.len - 1] == '\t')) : (x = x[0 .. x.len - 1]) {}
-    while (y.len > 0 and (y[y.len - 1] == ' ' or y[y.len - 1] == '\t')) : (y = y[0 .. y.len - 1]) {}
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < x.len and j < y.len) {
-        const sx = x[i] == ' ' or x[i] == '\t';
-        const sy = y[j] == ' ' or y[j] == '\t';
+    while (x.len > 0 and isLabelSpace(x[x.len - 1])) : (x = x[0 .. x.len - 1]) {}
+    while (y.len > 0 and isLabelSpace(y[y.len - 1])) : (y = y[0 .. y.len - 1]) {}
+    if (x.len == 0 or y.len == 0) return false;
+    var xi = FoldIter{ .s = x };
+    var yi = FoldIter{ .s = y };
+    var cx = xi.next();
+    var cy = yi.next();
+    while (cx != null and cy != null) {
+        const sx = isLabelSpace(cx.?);
+        const sy = isLabelSpace(cy.?);
         if (sx or sy) {
             if (!(sx and sy)) return false;
-            while (i < x.len and (x[i] == ' ' or x[i] == '\t')) : (i += 1) {}
-            while (j < y.len and (y[j] == ' ' or y[j] == '\t')) : (j += 1) {}
+            while (cx != null and isLabelSpace(cx.?)) : (cx = xi.next()) {}
+            while (cy != null and isLabelSpace(cy.?)) : (cy = yi.next()) {}
             continue;
         }
-        var cx = x[i];
-        var cy = y[j];
-        if (cx >= 'A' and cx <= 'Z') cx += 32;
-        if (cy >= 'A' and cy <= 'Z') cy += 32;
-        if (cx != cy) return false;
-        i += 1;
-        j += 1;
+        if (cx.? != cy.?) return false;
+        cx = xi.next();
+        cy = yi.next();
     }
-    return i >= x.len and j >= y.len;
+    return cx == null and cy == null;
 }
 
 /// First definition whose label matches (case-insensitive, collapsed).
@@ -421,7 +513,7 @@ pub fn findRefDef(defs: []const RefDef, label: []const u8) ?RefDef {
 /// to a jump table, so the common paragraph case costs one indirect jump.
 /// `in_comment` tracks CommonMark HTML block type 2 (`<!--` … `-->`)
 /// across lines; callers thread one state per scanned document.
-pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool, in_comment: *bool) Line {
+pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *FenceState, in_comment: *bool) Line {
     const raw_len: u20 = @intCast(@min(line.len, (1 << 20) - 1));
 
     // Fast check for blank lines
@@ -481,31 +573,49 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool, 
         }
     }
 
-    // Code fence toggle: ``` or ~~~ (only these starters can toggle).
+    // Code fence toggle: ``` or ~~~ runs (only these starters can toggle).
+    // Closes need the opening character, at least the opening length, a
+    // blank rest, and under-4 indent; backtick opens reject backtick info.
     if ((first == '`' or first == '~') and trimmed.len >= 3 and trimmed[1] == first and trimmed[2] == first) {
-        if (in_code_fence.*) {
-            in_code_fence.* = false;
-            return Line{
-                .offset = offset,
-                .len = raw_len,
-                .block_type = .code_fence_end,
-                .indent = indent,
-            };
-        } else {
-            in_code_fence.* = true;
-            return Line{
-                .offset = offset,
-                .len = raw_len,
-                .block_type = .code_fence_start,
-                .indent = indent,
-            };
+        var run: usize = 3;
+        while (run < trimmed.len and trimmed[run] == first) : (run += 1) {}
+        var rest = run;
+        while (rest < trimmed.len and (trimmed[rest] == ' ' or trimmed[rest] == '\t')) : (rest += 1) {}
+        var iw: usize = 0;
+        for (line[0..idx]) |c| {
+            iw += if (c == '\t') 4 - (iw % 4) else 1;
+        }
+        if (iw < 4) {
+            if (in_code_fence.open) {
+                if (first == in_code_fence.char and run >= in_code_fence.len and rest >= trimmed.len) {
+                    in_code_fence.open = false;
+                    return Line{
+                        .offset = offset,
+                        .len = raw_len,
+                        .block_type = .code_fence_end,
+                        .indent = indent,
+                    };
+                }
+            } else {
+                if (first == '~' or std.mem.indexOfScalar(u8, trimmed[run..], '`') == null) {
+                    in_code_fence.open = true;
+                    in_code_fence.char = first;
+                    in_code_fence.len = run;
+                    return Line{
+                        .offset = offset,
+                        .len = raw_len,
+                        .block_type = .code_fence_start,
+                        .indent = indent,
+                    };
+                }
+            }
         }
     }
 
     // If already inside a code fence, everything is code content.
     // (Resolved before dispatch so fenced code starting with a letter
     // can never be mistaken for a paragraph.)
-    if (in_code_fence.*) {
+    if (in_code_fence.open) {
         return Line{
             .offset = offset,
             .len = raw_len,
@@ -531,7 +641,10 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool, 
         '#' => {
             var h_level: u8 = 1;
             while (h_level < 6 and h_level < trimmed.len and trimmed[h_level] == '#') : (h_level += 1) {}
-            const block_type: BlockType = if (h_level < trimmed.len and trimmed[h_level] == ' ')
+            // ATX needs EOL, space, or tab after the run (`#`, `# foo`,
+            // `#\tfoo`); anything else is a paragraph (`#foo`).
+            const block_type: BlockType = if (h_level >= trimmed.len or
+                trimmed[h_level] == ' ' or trimmed[h_level] == '\t')
                 @enumFromInt(h_level)
             else
                 .paragraph;
@@ -577,8 +690,12 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool, 
                     .indent = indent,
                 };
             }
-            // Bullet list: - , * , + (tab counts as the following space)
-            if (trimmed.len >= 2 and (trimmed[1] == ' ' or trimmed[1] == '\t')) {
+            // Bullet list: - , * , + (tab counts as the following space).
+            // A lone marker is an empty item (setext disambiguation happens
+            // downstream: `-` after paragraph text still underlines H2).
+            if (trimmed.len == 1 or
+                (trimmed.len >= 2 and (trimmed[1] == ' ' or trimmed[1] == '\t')))
+            {
                 return Line{
                     .offset = offset,
                     .len = raw_len,
@@ -649,11 +766,12 @@ pub inline fn classifyLine(line: []const u8, offset: u32, in_code_fence: *bool, 
                 .indent = indent,
             };
         },
-        // Ordered list: digit(s) followed by '.' or ')' and space or tab.
+        // Ordered list: 1-9 digits followed by '.' or ')' and space, tab,
+        // or EOL (a lone `2.` is an empty item); 10+ digits never mark (§5.2).
         '0'...'9' => {
             var d_idx: usize = 1;
             while (d_idx < trimmed.len and trimmed[d_idx] >= '0' and trimmed[d_idx] <= '9') : (d_idx += 1) {}
-            const block_type: BlockType = if (d_idx + 1 < trimmed.len and (trimmed[d_idx] == '.' or trimmed[d_idx] == ')') and (trimmed[d_idx + 1] == ' ' or trimmed[d_idx + 1] == '\t'))
+            const block_type: BlockType = if (d_idx <= 9 and d_idx < trimmed.len and (trimmed[d_idx] == '.' or trimmed[d_idx] == ')') and (d_idx + 1 >= trimmed.len or trimmed[d_idx + 1] == ' ' or trimmed[d_idx + 1] == '\t'))
                 .ordered_list
             else
                 .paragraph;
@@ -1077,7 +1195,7 @@ test "pass1: findBlockForOffset binary search" {
 
 fn classifyOne(line: []const u8) BlockType {
     var lines: [1]Line = undefined;
-    var fence = false;
+    var fence: FenceState = .{};
     const n = scanLines(line, &lines, &fence);
     std.debug.assert(n == 1);
     return lines[0].block_type;
@@ -1115,16 +1233,16 @@ test "classify: link definitions and HTML comments" {
     try std.testing.expectEqual(BlockType.link_def, classifyOne(" [once]: /url"));
     try std.testing.expectEqual(BlockType.link_def, classifyOne("[2]: http://att.com/  \"AT&T\""));
     // Use sites, indented code, and garbage tails are not definitions
-    // (greedy quote titles stay valid, Markdown 1.0).
+    // (first-close titles: a title holding its own quote invalidates).
     try std.testing.expectEqual(BlockType.paragraph, classifyOne("Foo [bar] [1]."));
     try std.testing.expectEqual(BlockType.paragraph, classifyOne("    [four]: /url"));
-    try std.testing.expectEqual(BlockType.link_def, classifyOne("[b]: /url/ \"bad \"q\" t\""));
+    try std.testing.expectEqual(BlockType.paragraph, classifyOne("[b]: /url/ \"bad \"q\" t\""));
     try std.testing.expectEqual(BlockType.paragraph, classifyOne("[1]."));
 
     // Comment blocks hide from the single line to the multiline span.
     const doc = "one\n<!-- x -->\n<!--\nbody\n-->\nafter\n<div>\n";
     var lines: [8]Line = undefined;
-    var fence = false;
+    var fence: FenceState = .{};
     const n = scanLines(doc, &lines, &fence);
     try std.testing.expectEqual(@as(usize, 7), n);
     try std.testing.expectEqual(BlockType.paragraph, lines[0].block_type);
@@ -1135,7 +1253,7 @@ test "classify: link definitions and HTML comments" {
     try std.testing.expectEqual(BlockType.paragraph, lines[5].block_type);
     // Other inline HTML is literal text, never a comment.
     try std.testing.expectEqual(BlockType.paragraph, lines[6].block_type);
-    try std.testing.expect(!fence);
+    try std.testing.expect(!fence.open);
 }
 
 fn recordBlockRun(bytes_inner: []const u8, nl_pos: usize, out: []u32, n: *usize) void {
@@ -1293,7 +1411,7 @@ test "scroll illusion: block map records one u32 per blank separator" {
 
     // Binary search from byte offset back to line index.
     var lines: [16]Line = undefined;
-    var fence = false;
+    var fence: FenceState = .{};
     const lc = scanLines(doc, &lines, &fence);
     const idx = byteOffsetToLineIndex(lines[0..lc], map[0]);
     try std.testing.expectEqual(map[0], lines[idx].offset);

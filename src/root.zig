@@ -11,11 +11,13 @@ pub const glyph_cache = @import("platform/glyph_cache.zig");
 pub const strict_benchmarks = @import("core/strict_benchmarks.zig");
 pub const controls_test = @import("tests/controls_test.zig");
 pub const spec_compliance_test = @import("tests/spec_compliance_test.zig");
+pub const commonmark_harness = @import("tests/commonmark_harness.zig");
 
 test {
     _ = strict_benchmarks;
     _ = controls_test;
     _ = spec_compliance_test;
+    _ = commonmark_harness;
     _ = block_index;
     _ = idle;
     _ = damage;
@@ -41,7 +43,7 @@ test "simd line scanner and block classification" {
     ;
 
     var lines: [32]simd.Line = undefined;
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
     const count = simd.scanLines(md_sample, &lines, &in_fence);
 
     try std.testing.expectEqual(@as(usize, 14), count);
@@ -113,7 +115,7 @@ test "microsecond benchmark on 50,000 lines" {
     const line_entries = try allocator.alloc(simd.Line, lines_target + 100);
     defer allocator.free(line_entries);
 
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
 
     var ts_start: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
@@ -168,7 +170,7 @@ test "mmap mapped file read and parse" {
     try std.testing.expectEqualStrings(test_content, mapped.bytes);
 
     var lines: [8]simd.Line = undefined;
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
     const count = simd.scanLines(mapped.bytes, &lines, &in_fence);
 
     try std.testing.expectEqual(@as(usize, 4), count);
@@ -203,7 +205,7 @@ test "virtualized layout performance on 50,000 lines" {
     const line_entries = try allocator.alloc(simd.Line, lines_target + 100);
     defer allocator.free(line_entries);
 
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
     var commands: [512]layout.DrawCommand = undefined;

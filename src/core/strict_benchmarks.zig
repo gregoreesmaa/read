@@ -61,7 +61,7 @@ test "STRICT: SIMD Line Scanner Throughput and Latency" {
     // is hardened. Both metrics derive from the same run, so min time == max
     // throughput.
     {
-        var warm_fence: bool = false;
+        var warm_fence: simd.FenceState = .{};
         _ = simd.scanLines(mem, line_entries, &warm_fence);
     }
     var min_elapsed_us: i128 = 999999;
@@ -70,7 +70,7 @@ test "STRICT: SIMD Line Scanner Throughput and Latency" {
     var last_mb: f64 = 0.0;
     var iter: usize = 0;
     while (iter < 7) : (iter += 1) {
-        var in_fence: bool = false;
+        var in_fence: simd.FenceState = .{};
 
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
@@ -174,7 +174,7 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
 
         var mapped = try mmap.MappedFile.open("showcase.md");
         const bytes = mapped.bytes;
-        var in_fence: bool = false;
+        var in_fence: simd.FenceState = .{};
         const line_count = simd.scanLines(bytes, &lines_buf, &in_fence);
         const vp_config = layout.ViewportConfig{
             .window_width = 1000.0,
@@ -249,7 +249,7 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
     const line_entries = try allocator.alloc(simd.Line, lines_target + 100);
     defer allocator.free(line_entries);
 
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
     var commands: [1024]layout.DrawCommand = undefined;
@@ -379,7 +379,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
     const line_entries = try allocator.alloc(simd.Line, lines_target + 100);
     defer allocator.free(line_entries);
 
-    var in_fence: bool = false;
+    var in_fence: simd.FenceState = .{};
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
     // Sized for the 32-line checkpoint grid over 50,000 lines.

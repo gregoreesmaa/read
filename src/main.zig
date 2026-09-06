@@ -608,7 +608,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var in_fence = false;
+    var in_fence: simd.FenceState = .{};
     var file_path: ?[]const u8 = null;
 
     // Parse command line arguments.
