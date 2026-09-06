@@ -368,13 +368,6 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
 // (a single giant run) must not cost 12 MiB forever.
 #define ATLAS_THRASH_FLUSHES 3
 #define ATLAS_THRASH_WINDOW_DRAWS 180
-// Shelf retention journal: every committed shelf row records its band and
-// the draw seq that last packed into it, so flush logs can show whether the
-// working set is churning (all shelves young) or stable. Fixed 128 slots,
-// BSS-resident (~1 KiB), zero hot-path allocations.
-#define ATLAS_MAX_SHELVES 128
-typedef struct { short y0; short h; unsigned long last_use; } AtlasShelf;
-
 typedef struct {
     uint64_t key;      // FNV-1a(text bytes, style, font size bits)
     int len;           // byte length (exact-match guard)
@@ -390,8 +383,6 @@ typedef struct {
 static ShapedEntry g_shape_cache[SHAPE_CACHE_CAP]; // BSS: no binary cost
 static unsigned char* g_atlas_px = NULL;  // one buffer per tier, malloc-once
 static int g_atlas_dim = ATLAS_PX_BASE;   // live tier dimension (px)
-static AtlasShelf g_atlas_shelves[ATLAS_MAX_SHELVES]; // BSS: no binary cost
-static int g_atlas_shelf_count = 0;
 static unsigned long g_atlas_window_draw = 0; // draw seq at thrash-window start
 static int g_atlas_window_flushes = 0;        // flushes inside the window
 static CGContextRef g_atlas_ctx = NULL;
@@ -431,19 +422,10 @@ static uint64_t shape_key(const char* text, int len, float font_size,
 }
 
 // Shelf-pack `pw x ph` device px into the atlas. Returns 1 on success.
-// Committed shelf rows are journaled for the retention stats in flush logs.
 static int atlas_alloc(int pw, int ph, short* out_x, short* out_y) {
     int dim = g_atlas_dim;
     if (pw <= 0 || ph <= 0 || pw > dim || ph > dim) return 0;
     if (g_atlas_x + pw > dim) {
-        // Commit the finished shelf row to the retention journal before
-        // advancing: its band + draw stamp survive until the next flush.
-        if (g_atlas_shelf_h > 0 && g_atlas_shelf_count < ATLAS_MAX_SHELVES) {
-            g_atlas_shelves[g_atlas_shelf_count].y0 = (short)g_atlas_y;
-            g_atlas_shelves[g_atlas_shelf_count].h = (short)g_atlas_shelf_h;
-            g_atlas_shelves[g_atlas_shelf_count].last_use = g_draw_seq;
-            g_atlas_shelf_count++;
-        }
         g_atlas_y += g_atlas_shelf_h;
         g_atlas_x = 0;
         g_atlas_shelf_h = 0;
@@ -487,7 +469,6 @@ static void atlas_reclaim(void) {
 static void atlas_flush(void) {
     atlas_reclaim();
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
-    g_atlas_shelf_count = 0;
     for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
     g_atlas_flushes++;
     // Thrash window: roll the window when it ages out, then count.
@@ -500,8 +481,8 @@ static void atlas_flush(void) {
         g_atlas_window_flushes >= ATLAS_THRASH_FLUSHES)
         atlas_grow();
 #ifdef TEST_HOOKS
-    DBGLOG("EV atlas_flush t=%llu n=%llu dim=%d shelves=%d", dbg_t_ms(),
-        (unsigned long long)g_atlas_flushes, g_atlas_dim, g_atlas_shelf_count);
+    DBGLOG("EV atlas_flush t=%llu n=%llu dim=%d", dbg_t_ms(),
+        (unsigned long long)g_atlas_flushes, g_atlas_dim);
 #endif
 }
 
@@ -548,7 +529,6 @@ static void atlas_grow(void) {
     if (g_atlas_px) { free(g_atlas_px); g_atlas_px = NULL; }
     g_atlas_dim = ATLAS_PX_LARGE;
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
-    g_atlas_shelf_count = 0;
     g_atlas_window_flushes = 0;
     g_atlas_window_draw = g_draw_seq;
     atlas_ensure();
@@ -1813,7 +1793,8 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
 // reports settled, so a static screen keeps zero wakeups (0% CPU).
 // Each fire scroll-copies backing store by the tick's whole-point delta
 // and repaints only the exposed strip (plus the ambient scrollbar thumb's
-// old/new boxes); anything the copy cannot cover falls back to full.
+// and Copy pill's old/new boxes); anything the copy cannot cover falls
+// back to full.
 // ---------------------------------------------------------------------------
 static CFRunLoopTimerRef g_smooth_timer = NULL;
 static CFAbsoluteTime g_smooth_last = 0;
@@ -1868,24 +1849,36 @@ static float thumb_y_for_scroll(float scroll) {
     return p * (g_view_h - SCROLLBAR_THUMB_H);
 }
 
-// The hover Copy pill is a window-space overlay: while it is up, a copy
-// would smear it, so those frames fall back to a full repaint.
-static BOOL copy_pill_visible(void) {
-    if (g_hovered_code_btn >= 0) return YES;
-    if (g_copied_block_idx >= 0 &&
-        ([NSDate timeIntervalSinceReferenceDate] - g_copied_timestamp < 1.5))
-        return YES;
-    return NO;
+// Copy-pill damage for the scroll-copy path, same old/new-box pattern as the
+// thumb below. The pill rides with its block (document-space), so the copy
+// lands it exactly; invalidating its old box (vacated area repaints clean,
+// covering expiry and blocks sliding out) and its new box (idempotent
+// repaint, covering blocks sliding under a stationary cursor) keeps pixels
+// identical with no full-repaint fallback. Unconditional on the 1.5s
+// "Copied!" timer: a stale index only ever over-invalidates two small boxes.
+static void smooth_pill_damage(float dy) {
+    for (int i = 0; i < g_code_block_count; i++) {
+        CodeBlockRecord* b = &g_code_blocks[i];
+        if (i != g_hovered_code_btn && i != g_copied_block_idx &&
+            !(g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
+              g_mouse_pos.y + dy >= b->y && g_mouse_pos.y + dy <= b->y + b->h))
+            continue;
+        NSRect pr = copy_button_damage_rect_for_block(b);
+        invalidate_rect(pr);
+        pr.origin.y -= dy;
+        invalidate_rect(pr);
+    }
 }
 
 // Shift backing store by -dy points and repaint the window-space thumb.
 // scrollRect:by: moves the pixels and auto-invalidates the exposed strip;
 // the two thumb boxes union into that strip's band, never a full view.
-// All document-space content (text, highlight, images) rides the copy
-// exactly; text records are still rebuilt unconditionally in drawRect.
+// All document-space content (text, highlight, images, Copy pill) rides the
+// copy exactly; text records are still rebuilt unconditionally in drawRect.
 static void smooth_scroll_copy(NSView* v, float dy) {
     NSRect bounds = [v bounds];
     [v scrollRect:bounds by:NSMakeSize(0.0, (CGFloat)-dy)];
+    smooth_pill_damage(dy);
     if (g_max_scroll_y > 0.0f) {
         float w = (float)bounds.size.width;
         float old_t = thumb_y_for_scroll(g_last_drawn_scroll);
@@ -1917,11 +1910,11 @@ static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
     NSView* v = damage_target_view();
     if (!v) return;
     float h = (float)[v bounds].size.height;
-    if (dy == roundf(dy) && fabsf(dy) < h && !copy_pill_visible()) {
+    if (dy == roundf(dy) && fabsf(dy) < h) {
         smooth_scroll_copy(v, dy);
     } else {
-        // Fallback: fractional snap landings, full-height jumps, and
-        // visible overlays repaint every pixel.
+        // Fallback: fractional snap landings and full-height jumps repaint
+        // every pixel (the Copy pill rides the copy with old/new invalidation).
         [v setNeedsDisplay:YES];
     }
 }

@@ -148,7 +148,21 @@ pub fn build(b: *std.Build) void {
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
-    b.installArtifact(exe);
+    //
+    // Binary diet (AGENTS.md §1: < 180 KiB): the ship binary installs via a
+    // `strip -x` copy step, dropping local symbols and their strings from
+    // __LINKEDIT (no runtime effect: dyld binds and ObjC metadata live
+    // elsewhere). The read-test binary installs unstripped: debugging and
+    // observability tooling stays in the separate binary, never in ship.
+    // (Darwin-only, matching the platform glue above.)
+    if (target.result.os.tag.isDarwin()) {
+        const strip_ship = b.addSystemCommand(&.{ "strip", "-x", "-o" });
+        const stripped = strip_ship.addOutputFileArg("read");
+        strip_ship.addFileArg(exe.getEmittedBin());
+        b.getInstallStep().dependOn(&b.addInstallFile(stripped, "bin/read").step);
+    } else {
+        b.installArtifact(exe);
+    }
     b.installArtifact(exe_test);
 
     // This creates a top level step. Top level steps have a name and can be

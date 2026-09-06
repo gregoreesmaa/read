@@ -324,6 +324,16 @@ pub const LineLayoutCache = struct {
         return true;
     }
 
+    /// Resets and stores the generation when stale (shared prefix of `lookup`
+    /// and `store`, one copy). True when the generation was already current
+    /// (lookups hit only then); stores proceed either way.
+    fn syncGeneration(self: *LineLayoutCache, config: ViewportConfig, content_width: f32) bool {
+        if (self.generationMatches(config, content_width)) return true;
+        self.reset();
+        self.storeGeneration(config, content_width);
+        return false;
+    }
+
     /// Exact cached measurement for the unit starting at `idx`, or null on
     /// any generation/content mismatch (caller re-measures exactly).
     pub fn lookup(
@@ -334,11 +344,7 @@ pub const LineLayoutCache = struct {
         config: ViewportConfig,
         content_width: f32,
     ) ?LineCacheHit {
-        if (!self.generationMatches(config, content_width)) {
-            self.reset();
-            self.storeGeneration(config, content_width);
-            return null;
-        }
+        if (!self.syncGeneration(config, content_width)) return null;
         if (idx >= lines.len) return null;
         const slot = idx & LINE_CACHE_MASK;
         const c = self.consumed[slot];
@@ -364,10 +370,7 @@ pub const LineLayoutCache = struct {
         config: ViewportConfig,
         content_width: f32,
     ) void {
-        if (!self.generationMatches(config, content_width)) {
-            self.reset();
-            self.storeGeneration(config, content_width);
-        }
+        _ = self.syncGeneration(config, content_width);
         if (idx >= lines.len or consumed == 0) return;
         if (consumed > lines.len - idx) return;
         if (consumed > std.math.maxInt(u32)) return;
@@ -2054,6 +2057,202 @@ fn lineCacheSkip(ux: *UnitCx, i: usize, hit: LineCacheHit, cur_y: f32) ?usize {
     return i + consumed;
 }
 
+/// Unit kinds served by the shared cacheable-unit path below.
+const CachedUnitKind = enum { heading, quote, list, paragraph };
+
+/// Post-unit state for `flowCachedUnit`: viewport y plus the next unconsumed
+/// line index (caller assigns `i = next_i - 1` under the loop's `i += 1`).
+const CachedUnitOut = struct {
+    cur_y: f32,
+    next_i: usize,
+};
+
+/// One shared probe/skip/snapshot/store path for the four parse-heavy arms
+/// of `renderViewportCore` (headings, quotes, lists, paragraph runs), which
+/// previously inlined a copy each. Exact same semantics per arm: probe; on a
+/// hit for a fully above-viewport unit (strict `< 0`, matching every emission
+/// guard) reserve scratch counts, reset numbering carry, fold scrollable ids
+/// over the span, and return early; otherwise snapshot scratch counts, flow
+/// the unit for `kind` (kind-specific x, margins, spans), store the fresh
+/// measurement on a miss, and return the flowed state. Kept large enough to
+/// outline: one copy serves all four arms (binary budget).
+fn flowCachedUnit(
+    ux: *UnitCx,
+    i: usize,
+    kind: CachedUnitKind,
+    cur_y: f32,
+    next_block_id: *usize,
+    span_buf: *[32]parser.InlineSpan,
+) CachedUnitOut {
+    const hit = lineCacheProbe(ux, i);
+    if (hit) |h| {
+        if (lineCacheSkip(ux, i, h, cur_y)) |next| {
+            next_block_id.* += countScrollableBlocks(ux.lines, i, next);
+            return .{ .cur_y = cur_y + h.height, .next_i = next };
+        }
+    }
+    const y0 = cur_y;
+    var y = cur_y;
+    const mk0: usize = if (ux.config.ordered_markers) |st| st.count else 0;
+    const en0: usize = if (ux.config.entities) |e| e.count else 0;
+    var consumed: usize = 1;
+    switch (kind) {
+        .heading => {
+            y = flowHeadingUnit(ux, i, y, span_buf);
+        },
+        .quote => {
+            const base_x = listContentBase(ux, i, 4) orelse ux.content_x;
+            const r = layoutQuoteLine(ux, i, base_x, y);
+            y = r.y;
+            consumed = r.consumed;
+        },
+        .list => {
+            const r = layoutListUnit(ux, i, y);
+            y = r.y;
+            consumed = r.consumed;
+        },
+        .paragraph => {
+            const pbase = if (enclosingListMarker(ux.bytes, ux.lines, i)) |m|
+                itemContentX(ux.lines[m], ux.content_x)
+            else
+                ux.content_x;
+            const r = layoutParagraphUnit(ux, i, pbase, y);
+            y = r.y;
+            consumed = r.consumed;
+        },
+    }
+    if (hit == null) {
+        if (ux.config.line_cache) |cache| {
+            const mk1: usize = if (ux.config.ordered_markers) |st| st.count else 0;
+            const en1: usize = if (ux.config.entities) |e| e.count else 0;
+            cache.store(ux.bytes, ux.lines, i, y - y0, consumed, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), ux.config, ux.content_width);
+        }
+    }
+    return .{ .cur_y = y, .next_i = i + consumed };
+}
+
+/// Shared heading-unit flow for the render, height, and refine passes (one
+/// copy instead of three): scale/margins, `#` strip, item-column x, span
+/// resolution, and wrapped emission. Everything derives from `ux`, so each
+/// pass flows with its own context (live stores, warmup dummy, or throwaway
+/// measure). Colors also come from `ux.theme`: exact in render, unobservable
+/// in measurement passes (their command buffer is empty, so nothing emits).
+/// Returns the post-unit y; headings always consume exactly one line.
+fn flowHeadingUnit(ux: *UnitCx, i: usize, y: f32, span_buf: *[32]parser.InlineSpan) f32 {
+    const line_info = ux.lines[i];
+    const line_bytes = ux.bytes[line_info.offset..][0..line_info.len];
+    const scale: f32 = switch (@intFromEnum(line_info.block_type)) {
+        1 => 2.1,
+        2 => 1.6,
+        3 => 1.3,
+        4 => 1.15,
+        else => 1.05,
+    };
+    const font_size = ux.config.base_font_size * scale;
+    const heading_line_h = font_size * 1.3;
+    const margin_top = font_size * 2.5;
+    const margin_bottom = font_size * 0.5;
+    var h_offset: usize = 0;
+    while (h_offset < line_bytes.len and line_bytes[h_offset] == '#') : (h_offset += 1) {}
+    while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
+    const hx = if (lineIndentWidth(ux.bytes, line_info) >= 4)
+        listContentBase(ux, i, 4) orelse ux.content_x
+    else
+        ux.content_x;
+    const hw = ux.content_x + ux.content_width - hx;
+    const span_count = resolveHeadingSpans(ux.config, line_bytes[h_offset..], span_buf);
+    return layoutWrappedSpans(
+        span_buf[0..span_count],
+        hx,
+        hw,
+        y + margin_top,
+        font_size,
+        heading_line_h,
+        ux.theme.text,
+        ux.theme.accent,
+        ux.vp_bottom,
+        ux.commands_out,
+        ux.cmd_count,
+    ) + margin_bottom;
+}
+
+/// Shared image geometry for the render, height, and refine passes (one copy
+/// instead of three): alt/url parse, natural-size query, display width and
+/// height with aspect preservation, and caption height. Slices borrow the
+/// source line (zero-copy); render additionally emits from them.
+const ImageDims = struct {
+    alt_text: []const u8,
+    img_url: []const u8,
+    img_w: f32,
+    img_h: f32,
+    caption_h: f32,
+};
+
+fn imageDimsFor(config: ViewportConfig, line_bytes: []const u8, content_width: f32) ImageDims {
+    var text_slice = line_bytes;
+    while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
+    var alt_text: []const u8 = "";
+    var img_url: []const u8 = "";
+    if (text_slice.len >= 5 and text_slice[0] == '!' and text_slice[1] == '[') {
+        var cb: usize = 2;
+        while (cb < text_slice.len and text_slice[cb] != ']') : (cb += 1) {}
+        if (cb + 1 < text_slice.len and text_slice[cb + 1] == '(') {
+            var cp: usize = cb + 2;
+            while (cp < text_slice.len and text_slice[cp] != ')') : (cp += 1) {}
+            if (cp <= text_slice.len) {
+                alt_text = text_slice[2..cb];
+                img_url = text_slice[cb + 2 .. cp];
+            }
+        }
+    }
+    var nat_w: f32 = 0.0;
+    var nat_h: f32 = 0.0;
+    if (config.image_size_fn) |fn_ptr| {
+        if (img_url.len > 0) {
+            fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w, &nat_h);
+        }
+    }
+    const img_w: f32 = if (nat_w > 0.0) @min(nat_w, content_width) else content_width;
+    const img_h: f32 = if (nat_w > 0.0 and nat_h > 0.0)
+        nat_h * (img_w / nat_w)
+    else
+        240.0;
+    const caption_h: f32 = if (alt_text.len > 0) (config.line_height * 0.85 + 8.0) else 0.0;
+    return .{ .alt_text = alt_text, .img_url = img_url, .img_w = img_w, .img_h = img_h, .caption_h = caption_h };
+}
+
+/// Shared fence scan for the render, height, and refine passes (one copy
+/// instead of three): counts code lines and returns the closing-fence index
+/// (or `lines.len` when unterminated, matching each pass's legacy math).
+const FenceSpan = struct {
+    count: usize,
+    end: usize,
+};
+
+fn fenceSpan(lines: []const simd.Line, i: usize) FenceSpan {
+    var n: usize = 0;
+    var j = i + 1;
+    while (j < lines.len and lines[j].block_type != .code_fence_end) : ({
+        j += 1;
+        n += 1;
+    }) {}
+    return .{ .count = n, .end = j };
+}
+
+/// Shared indented-code dispatch for the render and height passes (one copy
+/// instead of two): in-list code flows at the item column, top-level leaders
+/// at the content edge, anything else falls through to plain dispatch
+/// (mid-unit seeks). Null unless the line is code-claimable, exactly like
+/// the legacy preambles.
+fn indentedCodeBase(bytes: []const u8, lines: []const simd.Line, i: usize, content_x: f32) ?f32 {
+    if (!isCodeClaimable(lines[i].block_type)) return null;
+    if (listContentMarker(bytes, lines, i, 8)) |m| return itemContentX(lines[m], content_x);
+    if (indentedCodeLeader(bytes, lines, i)) |lead| {
+        if (lead == i) return content_x;
+    }
+    return null;
+}
+
 /// Shared virtualized render core: emits draw commands for `lines[start_line..]`,
 /// positioned with `start_line` at viewport-relative `origin_y`, assigning
 /// scrollable block ids from `start_block_id`.
@@ -2129,34 +2328,21 @@ pub fn renderViewportCore(
         // Mid-unit seeks fall through to plain dispatch below; window
         // snapping keeps production starts on unit boundaries.
         // ----------------------------------------------------
-        if (isCodeClaimable(line_info.block_type)) {
-            if (listContentBase(&unit_cx, i, 8)) |item_base| {
-                const r = layoutIndentedCodeUnit(&unit_cx, i, item_base, cur_y);
-                cur_y = r.y;
-                i += r.consumed - 1;
-                continue;
-            }
-            if (indentedCodeLeader(bytes, lines, i)) |lead| {
-                if (lead == i) {
-                    const r = layoutIndentedCodeUnit(&unit_cx, i, content_x, cur_y);
-                    cur_y = r.y;
-                    i += r.consumed - 1;
-                    continue;
-                }
-            }
+        if (indentedCodeBase(bytes, lines, i, content_x)) |base| {
+            const r = layoutIndentedCodeUnit(&unit_cx, i, base, cur_y);
+            cur_y = r.y;
+            i += r.consumed - 1;
+            continue;
         }
 
         // ----------------------------------------------------
         // Handle Code Blocks: ```start ... lines ... ```end
         // ----------------------------------------------------
         if (line_info.block_type == .code_fence_start) {
-            var code_line_count: usize = 0;
-            var scan_i = i + 1;
-            while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
-                code_line_count += 1;
-            }
+            const fs = fenceSpan(lines, i);
+            const scan_i = fs.end;
 
-            const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0;
+            const code_block_h = (@as(f32, @floatFromInt(fs.count)) * (config.line_height * 0.88)) + 24.0;
             const block_top = cur_y;
             const block_bottom = cur_y + code_block_h;
             const block_id = next_block_id;
@@ -2480,69 +2666,9 @@ pub fn renderViewportCore(
         if (@intFromEnum(line_info.block_type) >= @intFromEnum(simd.BlockType.heading1) and
             @intFromEnum(line_info.block_type) <= @intFromEnum(simd.BlockType.heading6))
         {
-            const level = @intFromEnum(line_info.block_type);
-            const scale: f32 = switch (level) {
-                1 => 2.1,
-                2 => 1.6,
-                3 => 1.3,
-                4 => 1.15,
-                else => 1.05,
-            };
-            const font_size = config.base_font_size * scale;
-            const heading_line_h = font_size * 1.3;
-            const margin_top = font_size * 2.5;
-            const margin_bottom = font_size * 0.5;
-
-            var h_offset: usize = 0;
-            while (h_offset < line_bytes.len and line_bytes[h_offset] == '#') : (h_offset += 1) {}
-            while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
-
-            // In-list headings (4sp+) render at the item column.
-            const hx = if (lineIndentWidth(bytes, line_info) >= 4)
-                listContentBase(&unit_cx, i, 4) orelse content_x
-            else
-                content_x;
-            const hw = content_x + content_width - hx;
-
-            const hit = lineCacheProbe(&unit_cx, i);
-            if (hit) |h| {
-                if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
-                    cur_y += h.height;
-                    next_block_id += countScrollableBlocks(lines, i, next);
-                    i = next - 1;
-                    continue;
-                }
-            }
-            const y0 = cur_y;
-            const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
-            const en0: usize = if (config.entities) |e| e.count else 0;
-            cur_y += margin_top;
-
-            const h_text = line_bytes[h_offset..];
-            const span_count = resolveHeadingSpans(config, h_text, &span_buf);
-
-            const end_y = layoutWrappedSpans(
-                span_buf[0..span_count],
-                hx,
-                hw,
-                cur_y,
-                font_size,
-                heading_line_h,
-                theme.text,
-                theme.accent,
-                vp_bottom,
-                commands_out,
-                &cmd_count,
-            );
-
-            cur_y = end_y + margin_bottom;
-            if (config.line_cache) |cache| {
-                if (hit == null) {
-                    const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
-                    const en1: usize = if (config.entities) |e| e.count else 0;
-                    cache.store(bytes, lines, i, cur_y - y0, 1, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
-                }
-            }
+            const r = flowCachedUnit(&unit_cx, i, .heading, cur_y, &next_block_id, &span_buf);
+            cur_y = r.cur_y;
+            i = r.next_i - 1;
             continue;
         }
 
@@ -2586,43 +2712,16 @@ pub fn renderViewportCore(
         // Standalone Images: ![alt](url)
         // ----------------------------------------------------
         if (line_info.block_type == .image) {
-            var text_slice = line_bytes;
-            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
-            var alt_text: []const u8 = "";
-            var img_url: []const u8 = "";
-            if (text_slice.len >= 5 and text_slice[0] == '!' and text_slice[1] == '[') {
-                var cb: usize = 2;
-                while (cb < text_slice.len and text_slice[cb] != ']') : (cb += 1) {}
-                if (cb + 1 < text_slice.len and text_slice[cb + 1] == '(') {
-                    var cp: usize = cb + 2;
-                    while (cp < text_slice.len and text_slice[cp] != ')') : (cp += 1) {}
-                    if (cp <= text_slice.len) {
-                        alt_text = text_slice[2..cb];
-                        img_url = text_slice[cb + 2 .. cp];
-                    }
-                }
-            }
-
-            // Compute display dimensions: natural size capped to content_width,
-            // maintaining aspect ratio. Falls back to 240px if not yet loaded.
-            var nat_w: f32 = 0.0;
-            var nat_h: f32 = 0.0;
-            if (config.image_size_fn) |fn_ptr| {
-                if (img_url.len > 0) {
-                    fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w, &nat_h);
-                }
-            }
-
-            const img_w: f32 = if (nat_w > 0.0) @min(nat_w, content_width) else content_width;
-            const img_h: f32 = if (nat_w > 0.0 and nat_h > 0.0)
-                nat_h * (img_w / nat_w)
-            else
-                240.0;
+            const d = imageDimsFor(config, line_bytes, content_width);
+            const alt_text = d.alt_text;
+            const img_url = d.img_url;
+            const img_w = d.img_w;
+            const img_h = d.img_h;
 
             const margin_top: f32 = 18.0;
             const margin_bottom: f32 = 18.0;
             const has_caption = alt_text.len > 0;
-            const caption_h: f32 = if (has_caption) (config.line_height * 0.85 + 8.0) else 0.0;
+            const caption_h: f32 = d.caption_h;
 
             cur_y += margin_top;
 
@@ -2670,29 +2769,9 @@ pub fn renderViewportCore(
         // Blockquote (nested quotes, lazy tails, quoted blocks)
         // ----------------------------------------------------
         if (line_info.block_type == .quote) {
-            const hit = lineCacheProbe(&unit_cx, i);
-            if (hit) |h| {
-                if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
-                    cur_y += h.height;
-                    next_block_id += countScrollableBlocks(lines, i, next);
-                    i = next - 1;
-                    continue;
-                }
-            }
-            const y0 = cur_y;
-            const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
-            const en0: usize = if (config.entities) |e| e.count else 0;
-            const base_x = listContentBase(&unit_cx, i, 4) orelse content_x;
-            const r = layoutQuoteLine(&unit_cx, i, base_x, cur_y);
-            cur_y = r.y;
-            if (config.line_cache) |cache| {
-                if (hit == null) {
-                    const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
-                    const en1: usize = if (config.entities) |e| e.count else 0;
-                    cache.store(bytes, lines, i, cur_y - y0, r.consumed, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
-                }
-            }
-            i += r.consumed - 1;
+            const r = flowCachedUnit(&unit_cx, i, .quote, cur_y, &next_block_id, &span_buf);
+            cur_y = r.cur_y;
+            i = r.next_i - 1;
             continue;
         }
 
@@ -2700,28 +2779,9 @@ pub fn renderViewportCore(
         // Lists (tasks, bullets, ordered with corrected numbers)
         // ----------------------------------------------------
         if (isListLeader(line_info.block_type)) {
-            const hit = lineCacheProbe(&unit_cx, i);
-            if (hit) |h| {
-                if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
-                    cur_y += h.height;
-                    next_block_id += countScrollableBlocks(lines, i, next);
-                    i = next - 1;
-                    continue;
-                }
-            }
-            const y0 = cur_y;
-            const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
-            const en0: usize = if (config.entities) |e| e.count else 0;
-            const r = layoutListUnit(&unit_cx, i, cur_y);
-            cur_y = r.y;
-            if (config.line_cache) |cache| {
-                if (hit == null) {
-                    const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
-                    const en1: usize = if (config.entities) |e| e.count else 0;
-                    cache.store(bytes, lines, i, cur_y - y0, r.consumed, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
-                }
-            }
-            i += r.consumed - 1;
+            const r = flowCachedUnit(&unit_cx, i, .list, cur_y, &next_block_id, &span_buf);
+            cur_y = r.cur_y;
+            i = r.next_i - 1;
             continue;
         }
         // ----------------------------------------------------
@@ -2729,32 +2789,9 @@ pub fn renderViewportCore(
         // List-owned runs past intervening quote/code blocks resolve
         // to the item column via backward context.
         // ----------------------------------------------------
-        const hit = lineCacheProbe(&unit_cx, i);
-        if (hit) |h| {
-            if (lineCacheSkip(&unit_cx, i, h, cur_y)) |next| {
-                cur_y += h.height;
-                next_block_id += countScrollableBlocks(lines, i, next);
-                i = next - 1;
-                continue;
-            }
-        }
-        const y0 = cur_y;
-        const mk0: usize = if (config.ordered_markers) |st| st.count else 0;
-        const en0: usize = if (config.entities) |e| e.count else 0;
-        const pbase = if (enclosingListMarker(bytes, lines, i)) |m|
-            itemContentX(lines[m], content_x)
-        else
-            content_x;
-        const r = layoutParagraphUnit(&unit_cx, i, pbase, cur_y);
-        cur_y = r.y;
-        if (config.line_cache) |cache| {
-            if (hit == null) {
-                const mk1: usize = if (config.ordered_markers) |st| st.count else 0;
-                const en1: usize = if (config.entities) |e| e.count else 0;
-                cache.store(bytes, lines, i, cur_y - y0, r.consumed, satSlotDelta(mk0, mk1), satSlotDelta(en0, en1), config, content_width);
-            }
-        }
-        i += r.consumed - 1;
+        const r = flowCachedUnit(&unit_cx, i, .paragraph, cur_y, &next_block_id, &span_buf);
+        cur_y = r.cur_y;
+        i = r.next_i - 1;
     }
 
     return cmd_count;
@@ -2846,6 +2883,35 @@ pub fn layoutViewport(
     }
 
     return renderViewportCore(bytes, lines, config, i, cur_y, next_block_id, commands_out);
+}
+
+/// Warmup snapshot for one `computeDocumentHeightEx` unit arm (binary budget:
+/// one copy serves all four arms). Records the pre-unit viewport y and live
+/// entity count, and wires the throwaway marker store when a line cache is
+/// present — otherwise a no-op so the sweep stays bit-for-bit the legacy one.
+const WarmupSnap = struct {
+    y0: f32,
+    en0: usize,
+};
+
+fn warmupBegin(ux: *UnitCx, warm_markers: *OrderedMarkerStore, cur_y: f32) WarmupSnap {
+    var en0: usize = 0;
+    if (ux.config.line_cache != null) {
+        en0 = if (ux.config.entities) |e| e.count else 0;
+        warm_markers.count = 0;
+        ux.markers = warm_markers;
+    }
+    return .{ .y0 = cur_y, .en0 = en0 };
+}
+
+/// Warmup store matching `warmupBegin`: the height sweep always measures, so
+/// it records the fresh unit with the throwaway marker count and live entity
+/// delta, then unwires the dummy. No-op without a line cache.
+fn warmupEnd(ux: *UnitCx, warm_markers: *const OrderedMarkerStore, snap: WarmupSnap, cur_y: f32, i: usize, consumed: usize) void {
+    const cache = ux.config.line_cache orelse return;
+    ux.markers = null;
+    const en1: usize = if (ux.config.entities) |e| e.count else 0;
+    cache.store(ux.bytes, ux.lines, i, cur_y - snap.y0, consumed, @intCast(@min(warm_markers.count, 255)), satSlotDelta(snap.en0, en1), ux.config, ux.content_width);
 }
 
 /// Computes accurate document height and optionally records sparse checkpoints
@@ -2954,34 +3020,20 @@ pub fn computeDocumentHeightEx(
         const line_bytes = bytes[line_info.offset..][0..line_info.len];
 
         // 0. Indented code blocks (shared unit; no scrollable id consumed).
-        if (isCodeClaimable(line_info.block_type)) {
-            if (listContentBase(&unit_cx, i, 8)) |item_base| {
-                const r = layoutIndentedCodeUnit(&unit_cx, i, item_base, cur_y);
-                cur_y = r.y;
-                i += r.consumed - 1;
-                continue;
-            }
-            if (indentedCodeLeader(bytes, lines, i)) |lead| {
-                if (lead == i) {
-                    const r = layoutIndentedCodeUnit(&unit_cx, i, content_x, cur_y);
-                    cur_y = r.y;
-                    i += r.consumed - 1;
-                    continue;
-                }
-            }
+        if (indentedCodeBase(bytes, lines, i, content_x)) |base| {
+            const r = layoutIndentedCodeUnit(&unit_cx, i, base, cur_y);
+            cur_y = r.y;
+            i += r.consumed - 1;
+            continue;
         }
 
         // 1. Code blocks
         if (line_info.block_type == .code_fence_start) {
-            var code_line_count: usize = 0;
-            var scan_i = i + 1;
-            while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
-                code_line_count += 1;
-            }
-            const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0;
+            const fs = fenceSpan(lines, i);
+            const code_block_h = (@as(f32, @floatFromInt(fs.count)) * (config.line_height * 0.88)) + 24.0;
             cur_y += code_block_h + 16.0;
             next_block_id += 1;
-            i = scan_i;
+            i = fs.end;
             continue;
         }
 
@@ -3008,62 +3060,9 @@ pub fn computeDocumentHeightEx(
         if (@intFromEnum(line_info.block_type) >= @intFromEnum(simd.BlockType.heading1) and
             @intFromEnum(line_info.block_type) <= @intFromEnum(simd.BlockType.heading6))
         {
-            const level = @intFromEnum(line_info.block_type);
-            const scale: f32 = switch (level) {
-                1 => 2.1,
-                2 => 1.6,
-                3 => 1.3,
-                4 => 1.15,
-                else => 1.05,
-            };
-            const font_size = config.base_font_size * scale;
-            const heading_line_h = font_size * 1.3;
-            const margin_top = font_size * 2.5;
-            const margin_bottom = font_size * 0.5;
-
-            var h_offset: usize = 0;
-            while (h_offset < line_bytes.len and line_bytes[h_offset] == '#') : (h_offset += 1) {}
-            while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
-
-            const hx = if (lineIndentWidth(bytes, line_info) >= 4)
-                listContentBase(&unit_cx, i, 4) orelse content_x
-            else
-                content_x;
-            const hw = content_x + content_width - hx;
-
-            const warming = config.line_cache != null;
-            const y0 = cur_y;
-            var en0: usize = 0;
-            if (warming) {
-                en0 = if (config.entities) |e| e.count else 0;
-                warm_markers.count = 0;
-                unit_cx.markers = &warm_markers;
-            }
-            cur_y += margin_top;
-
-            const h_text = line_bytes[h_offset..];
-            const span_count = resolveHeadingSpans(config, h_text, &span_buf);
-
-            const end_y = layoutWrappedSpans(
-                span_buf[0..span_count],
-                hx,
-                hw,
-                cur_y,
-                font_size,
-                heading_line_h,
-                Color.transparent,
-                Color.transparent,
-                std.math.inf(f32),
-                &.{},
-                &dummy_cmd_count,
-            );
-
-            cur_y = end_y + margin_bottom;
-            if (config.line_cache) |cache| {
-                unit_cx.markers = null;
-                const en1: usize = if (config.entities) |e| e.count else 0;
-                cache.store(bytes, lines, i, cur_y - y0, 1, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
-            }
+            const snap = warmupBegin(&unit_cx, &warm_markers, cur_y);
+            cur_y = flowHeadingUnit(&unit_cx, i, cur_y, &span_buf);
+            warmupEnd(&unit_cx, &warm_markers, snap, cur_y, i, 1);
             continue;
         }
 
@@ -3086,103 +3085,41 @@ pub fn computeDocumentHeightEx(
 
         // Image
         if (line_info.block_type == .image) {
-            var text_slice = line_bytes;
-            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
-            var alt_len: usize = 0;
-            var img_url: []const u8 = "";
-            if (text_slice.len >= 5 and text_slice[0] == '!' and text_slice[1] == '[') {
-                var cb: usize = 2;
-                while (cb < text_slice.len and text_slice[cb] != ']') : (cb += 1) {}
-                alt_len = cb - 2;
-                if (cb + 1 < text_slice.len and text_slice[cb + 1] == '(') {
-                    var cp: usize = cb + 2;
-                    while (cp < text_slice.len and text_slice[cp] != ')') : (cp += 1) {}
-                    img_url = text_slice[cb + 2 .. cp];
-                }
-            }
-            // Use natural size if callback available, else fixed fallback
-            var nat_w2: f32 = 0.0;
-            var nat_h2: f32 = 0.0;
-            if (config.image_size_fn) |fn_ptr| {
-                if (img_url.len > 0) {
-                    fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w2, &nat_h2);
-                }
-            }
-            const disp_w2: f32 = if (nat_w2 > 0.0) @min(nat_w2, content_width) else content_width;
-            const img_h: f32 = if (nat_w2 > 0.0 and nat_h2 > 0.0)
-                nat_h2 * (disp_w2 / nat_w2)
-            else
-                240.0;
-            const margin_top: f32 = 18.0;
-            const margin_bottom: f32 = 18.0;
-            const caption_h: f32 = if (alt_len > 0) (config.line_height * 0.85 + 8.0) else 0.0;
-            cur_y += margin_top + img_h + caption_h + margin_bottom;
+            const d = imageDimsFor(config, line_bytes, content_width);
+            cur_y += 18.0 + d.img_h + d.caption_h + 18.0;
             continue;
         }
 
         // 6. Blockquote (shared unit: nested, lazy tails, quoted blocks)
         if (line_info.block_type == .quote) {
-            const warming = config.line_cache != null;
-            const y0 = cur_y;
-            var en0: usize = 0;
-            if (warming) {
-                en0 = if (config.entities) |e| e.count else 0;
-                warm_markers.count = 0;
-                unit_cx.markers = &warm_markers;
-            }
+            const snap = warmupBegin(&unit_cx, &warm_markers, cur_y);
             const base_x = listContentBase(&unit_cx, i, 4) orelse content_x;
             const r = layoutQuoteLine(&unit_cx, i, base_x, cur_y);
             cur_y = r.y;
-            if (config.line_cache) |cache| {
-                unit_cx.markers = null;
-                const en1: usize = if (config.entities) |e| e.count else 0;
-                cache.store(bytes, lines, i, cur_y - y0, r.consumed, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
-            }
+            warmupEnd(&unit_cx, &warm_markers, snap, cur_y, i, r.consumed);
             i += r.consumed - 1;
             continue;
         }
 
         // 7+8. Lists (shared unit: markers, continuations, sub-paragraphs)
         if (isListLeader(line_info.block_type)) {
-            const warming = config.line_cache != null;
-            const y0 = cur_y;
-            var en0: usize = 0;
-            if (warming) {
-                en0 = if (config.entities) |e| e.count else 0;
-                warm_markers.count = 0;
-                unit_cx.markers = &warm_markers;
-            }
+            const snap = warmupBegin(&unit_cx, &warm_markers, cur_y);
             const r = layoutListUnit(&unit_cx, i, cur_y);
             cur_y = r.y;
-            if (config.line_cache) |cache| {
-                unit_cx.markers = null;
-                const en1: usize = if (config.entities) |e| e.count else 0;
-                cache.store(bytes, lines, i, cur_y - y0, r.consumed, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
-            }
+            warmupEnd(&unit_cx, &warm_markers, snap, cur_y, i, r.consumed);
             i += r.consumed - 1;
             continue;
         }
 
         // 9. Paragraph runs and setext headings (shared unit)
-        const warming = config.line_cache != null;
-        const y0 = cur_y;
-        var en0: usize = 0;
-        if (warming) {
-            en0 = if (config.entities) |e| e.count else 0;
-            warm_markers.count = 0;
-            unit_cx.markers = &warm_markers;
-        }
+        const snap = warmupBegin(&unit_cx, &warm_markers, cur_y);
         const pbase = if (enclosingListMarker(bytes, lines, i)) |m|
             itemContentX(lines[m], content_x)
         else
             content_x;
         const r = layoutParagraphUnit(&unit_cx, i, pbase, cur_y);
         cur_y = r.y;
-        if (config.line_cache) |cache| {
-            unit_cx.markers = null;
-            const en1: usize = if (config.entities) |e| e.count else 0;
-            cache.store(bytes, lines, i, cur_y - y0, r.consumed, @intCast(@min(warm_markers.count, 255)), satSlotDelta(en0, en1), config, content_width);
-        }
+        warmupEnd(&unit_cx, &warm_markers, snap, cur_y, i, r.consumed);
         i += r.consumed - 1;
     }
 
@@ -4092,21 +4029,14 @@ pub fn refineLineHeight(
     const e0: usize = if (config.entities) |e| e.count else 0;
 
     // Indented code units (top-level and in-list) before type dispatch,
-    // mirroring renderViewportCore and computeDocumentHeightEx.
-    if (isCodeClaimable(info.block_type)) {
+    // mirroring renderViewportCore and computeDocumentHeightEx. A
+    // mid-unit line (leader elsewhere, no owning marker) refines to zero.
+    if (indentedCodeBase(bytes, lines, idx, content_x)) |base| {
         var mux0 = measureCx(bytes, lines, config, content_width, content_x, &dummy);
-        if (listContentMarker(bytes, lines, idx, 8)) |m| {
-            const base = itemContentX(lines[m], content_x);
-            const r = layoutIndentedCodeUnit(&mux0, idx, base, 0);
-            return .{ .height = r.y, .consumed = r.consumed };
-        }
-        if (indentedCodeLeader(bytes, lines, idx)) |lead| {
-            if (lead == idx) {
-                const r = layoutIndentedCodeUnit(&mux0, idx, content_x, 0);
-                return .{ .height = r.y, .consumed = r.consumed };
-            }
-            return .{ .height = 0.0, .consumed = 1 };
-        }
+        const r = layoutIndentedCodeUnit(&mux0, idx, base, 0);
+        return .{ .height = r.y, .consumed = r.consumed };
+    } else if (isCodeClaimable(info.block_type) and indentedCodeLeader(bytes, lines, idx) != null) {
+        return .{ .height = 0.0, .consumed = 1 };
     }
 
     switch (info.block_type) {
@@ -4119,14 +4049,9 @@ pub fn refineLineHeight(
         .code_line => return .{ .height = lh * 0.88, .consumed = 1 },
         .code_fence_end => return .{ .height = 0.0, .consumed = 1 },
         .code_fence_start => {
-            var n: usize = 0;
-            var j = idx + 1;
-            while (j < lines.len and lines[j].block_type != .code_fence_end) : ({
-                j += 1;
-                n += 1;
-            }) {}
-            const h = @as(f32, @floatFromInt(n)) * (lh * 0.88) + 24.0 + 16.0;
-            const consumed = if (j < lines.len) j - idx + 1 else lines.len - idx;
+            const fs = fenceSpan(lines, idx);
+            const h = @as(f32, @floatFromInt(fs.count)) * (lh * 0.88) + 24.0 + 16.0;
+            const consumed = if (fs.end < lines.len) fs.end - idx + 1 else lines.len - idx;
             return .{ .height = h, .consumed = consumed };
         },
         .table_row => {
@@ -4136,56 +4061,15 @@ pub fn refineLineHeight(
             return .{ .height = h, .consumed = j - idx };
         },
         .image => {
-            var text_slice = line_bytes;
-            while (text_slice.len > 0 and (text_slice[0] == ' ' or text_slice[0] == '\t')) : (text_slice = text_slice[1..]) {}
-            var alt_len: usize = 0;
-            var img_url: []const u8 = "";
-            if (text_slice.len >= 5 and text_slice[0] == '!' and text_slice[1] == '[') {
-                var cb: usize = 2;
-                while (cb < text_slice.len and text_slice[cb] != ']') : (cb += 1) {}
-                alt_len = if (cb >= 2) cb - 2 else 0;
-                if (cb + 1 < text_slice.len and text_slice[cb + 1] == '(') {
-                    var cp: usize = cb + 2;
-                    while (cp < text_slice.len and text_slice[cp] != ')') : (cp += 1) {}
-                    img_url = text_slice[cb + 2 .. cp];
-                }
-            }
-            var nat_w: f32 = 0.0;
-            var nat_h: f32 = 0.0;
-            if (config.image_size_fn) |fn_ptr| {
-                if (img_url.len > 0) fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w, &nat_h);
-            }
-            const disp_w: f32 = if (nat_w > 0.0) @min(nat_w, content_width) else content_width;
-            const img_h: f32 = if (nat_w > 0.0 and nat_h > 0.0) nat_h * (disp_w / nat_w) else 240.0;
-            const caption_h: f32 = if (alt_len > 0) (lh * 0.85 + 8.0) else 0.0;
-            return .{ .height = 18.0 + img_h + caption_h + 18.0, .consumed = 1 };
+            const d = imageDimsFor(config, line_bytes, content_width);
+            return .{ .height = 18.0 + d.img_h + d.caption_h + 18.0, .consumed = 1 };
         },
         .heading1, .heading2, .heading3, .heading4, .heading5, .heading6 => {
-            const level = @intFromEnum(info.block_type);
-            const scale: f32 = switch (level) {
-                1 => 2.1,
-                2 => 1.6,
-                3 => 1.3,
-                4 => 1.15,
-                else => 1.05,
-            };
-            const font_size = config.base_font_size * scale;
-            const heading_line_h = font_size * 1.3;
-            const margin_top = font_size * 2.5;
-            const margin_bottom = font_size * 0.5;
-            var h_offset: usize = 0;
-            while (h_offset < line_bytes.len and line_bytes[h_offset] == '#') : (h_offset += 1) {}
-            while (h_offset < line_bytes.len and line_bytes[h_offset] == ' ') : (h_offset += 1) {}
-            const span_count = resolveHeadingSpans(config, line_bytes[h_offset..], &span_buf);
             var mux_h = measureCx(bytes, lines, config, content_width, content_x, &dummy);
             mux_h.markers = &dummy_markers;
-            const hx = if (lineIndentWidth(bytes, info) >= 4)
-                listContentBase(&mux_h, idx, 4) orelse content_x
-            else
-                content_x;
-            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy);
+            const h = flowHeadingUnit(&mux_h, idx, 0, &span_buf);
             const sl_h = refineSlots(config, &dummy_markers, e0);
-            return .{ .height = margin_top + end_y + margin_bottom, .consumed = 1, .marker_slots = sl_h.m, .entity_slots = sl_h.e };
+            return .{ .height = h, .consumed = 1, .marker_slots = sl_h.m, .entity_slots = sl_h.e };
         },
         .quote => {
             var mux = measureCx(bytes, lines, config, content_width, content_x, &dummy);
