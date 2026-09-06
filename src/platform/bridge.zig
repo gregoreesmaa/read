@@ -135,14 +135,6 @@ pub extern "c" fn platform_begin_clip(
 
 pub extern "c" fn platform_end_clip() void;
 
-pub extern "c" fn platform_measure_text(
-    text: [*]const u8,
-    len: c_int,
-    font_size: f32,
-    is_bold: c_int,
-    is_mono: c_int,
-) f32;
-
 pub extern "c" fn platform_glyph_cache_stats(
     hits: *u64,
     misses: *u64,

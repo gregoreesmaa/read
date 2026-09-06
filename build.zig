@@ -125,6 +125,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Post-link `strip -x` on the ship binary (Darwin, non-Debug only).
+    // Set inside the Darwin block; wired to the install below.
+    var strip_ship: ?*std.Build.Step.Run = null;
     if (target.result.os.tag.isDarwin()) {
         // -Os for the platform glue TU only: its cost is dominated by
         // CoreText/CG/UIColor calls, while the microsecond hot paths (scan,
@@ -144,6 +147,18 @@ pub fn build(b: *std.Build) void {
             e.root_module.linkFramework("CoreGraphics", .{});
         }
         if (optimize != .Debug) exe.root_module.strip = true;
+        // Binary diet: post-link `strip -x` on the ship binary only. The
+        // linker's own strip leaves ~238 local symbols (OUTLINED_FUNCTION_*,
+        // EH/data locals); -x drops them while keeping dynamic symbols, for
+        // ~9 KB of file. Never applied to read-test or Debug (backtraces).
+        // (wired to install_exe below: exe -> strip -> copy, so the
+        // installed file is always the stripped one.)
+        if (optimize != .Debug) {
+            const s = b.addSystemCommand(&.{ "strip", "-x" });
+            s.addFileArg(exe.getEmittedBin());
+            s.step.dependOn(&exe.step);
+            strip_ship = s;
+        }
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
             .flags = &.{"-fobjc-arc", "-Os", "-DREAD_ANIMATED_GIF=1"},
@@ -164,8 +179,12 @@ pub fn build(b: *std.Build) void {
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
     if (target.result.os.tag.isDarwin()) {
-        b.installArtifact(exe);
+        const install_exe = b.addInstallArtifact(exe, .{});
         b.installArtifact(exe_test);
+        // Serialize strip before the install copy (sibling steps under the
+        // install step otherwise race: the copy could read pre-strip bytes).
+        if (strip_ship) |s| install_exe.step.dependOn(&s.step);
+        b.getInstallStep().dependOn(&install_exe.step);
 
         // This creates a top level step. Top level steps have a name and can be
         // invoked by name when running `zig build` (e.g. `zig build run`).
