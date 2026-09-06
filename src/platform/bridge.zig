@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const PlatformCallbacks = extern struct {
-    on_scroll: ?*const fn (delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void,
+    on_scroll: ?*const fn (delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void,
     on_resize: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
     on_key: ?*const fn (key_code: c_int, hovered_block_id: c_int) callconv(.c) void,
     on_draw: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
@@ -15,6 +15,10 @@ pub const PlatformCallbacks = extern struct {
     /// Scrollbar drag target (absolute scroll_y, clamped by the Zig side).
     /// Appended last for the same FFI stability reason.
     on_scroll_to: ?*const fn (scroll_y: f32) callconv(.c) void = null,
+    /// Async image natural sizes landed, with the above-viewport height
+    /// delta (0 when the image is at/below the viewport top: nothing above
+    /// moved). Appended last for the same FFI stability reason.
+    on_images_changed: ?*const fn (delta_above: f32) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_init(

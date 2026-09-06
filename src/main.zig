@@ -97,6 +97,21 @@ fn snapScroll(v: f32) void {
     g_app.scroll_y = g_smooth.current;
 }
 
+/// Async image natural sizes landed (platform completion): recompute metrics
+/// with live sizes (stale checkpoints would misplace content), then absorb
+/// the above-viewport height delta so content below stays put instead of
+/// jumping. The platform computes the delta from its last drawn rect
+/// (same laidOutImageHeight/above-viewport math, pinned by contract tests
+/// in controls_test.zig — see the scrollbar mirror precedent). Cold path:
+/// one metrics walk; zero allocations. No animation — snapScroll lands it
+/// synchronously and clamps to the fresh max.
+fn onImagesChanged(delta_above: f32) callconv(.c) void {
+    updateDocumentMetrics();
+    if (delta_above != 0.0) {
+        snapScroll(g_app.scroll_y + delta_above);
+    }
+}
+
 // 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
 // previous 2048 x 128-line coverage exactly (~98 KB static, zero heap).
 const MAX_CHECKPOINTS = 8192;
@@ -162,15 +177,28 @@ var g_drag_vals: [8]f32 = [_]f32{0.0} ** 8;
 fn onScrollTo(scroll_y: f32) callconv(.c) void {
     // Scrollbar drag target from the platform layer. Already clamped there
     // against the synced max, but clamp again: metrics may have moved.
-    g_app.scroll_y = std.math.clamp(scroll_y, 0.0, g_app.max_scroll_y);
+    // Syncs the easing state too so the next tick cannot yank back.
+    snapScroll(scroll_y);
 }
 
-fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int) callconv(.c) void {
+fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void {
     const now_ms = getTimestampMs();
     const locked = g_scroll_lock.processScroll(delta_x, delta_y, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
-        retargetScroll(g_smooth.target - locked.dy);
+        // Routing (precise 1:1 vs eased wheel) lives in
+        // SmoothScroll.applyScrollDelta, pinned by strict tests; the full
+        // rationale is documented there. Sync the displayed offset, then arm
+        // the tick while unsettled (snaps settle synchronously, no timer).
+        g_smooth = layout.SmoothScroll.applyScrollDelta(
+            g_smooth.target,
+            g_smooth.current,
+            locked.dy,
+            precise != 0,
+            g_app.max_scroll_y,
+        );
+        g_app.scroll_y = g_smooth.current;
+        if (!g_smooth.settled()) bridge.platform_smooth_kick();
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);
@@ -838,6 +866,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_link = onLink,
         .on_tick = onTick,
         .on_scroll_to = onScrollTo,
+        .on_images_changed = onImagesChanged,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);

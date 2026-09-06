@@ -6,13 +6,14 @@ extern "C" {
 #endif
 
 typedef struct {
-    void (*on_scroll)(float delta_x, float delta_y, int hovered_block_id);
+    void (*on_scroll)(float delta_x, float delta_y, int hovered_block_id, int precise);
     void (*on_resize)(int width, int height);
     void (*on_key)(int key_code, int hovered_block_id);
     void (*on_draw)(int width, int height);
     void (*on_link)(const char* url, int url_len);
     int (*on_tick)(float dt_ms);
     void (*on_scroll_to)(float scroll_y);
+    void (*on_images_changed)(float delta_above);
 } PlatformCallbacks;
 
 int platform_init(const char* title, int width, int height, PlatformCallbacks callbacks);

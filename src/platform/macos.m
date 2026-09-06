@@ -1387,7 +1387,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         NSEventPhase momentum = [event momentumPhase];
         if (phase == NSEventPhaseEnded || phase == NSEventPhaseCancelled ||
             momentum == NSEventPhaseEnded || momentum == NSEventPhaseCancelled) {
-            g_callbacks.on_scroll(0.0f, 0.0f, -1);
+            g_callbacks.on_scroll(0.0f, 0.0f, -1, 1);
             // Damage: scroll-lock reset changes no pixels, so no repaint.
 #ifdef TEST_HOOKS
             DBGLOG("EV scroll_end");
@@ -1412,7 +1412,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 break;
             }
         }
-        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id);
+        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id, (int)[event hasPreciseScrollingDeltas]);
 #ifdef TEST_HOOKS
         DBGLOG("EV scroll t=%llu dx=%.1f dy=%.1f hover=%d phase=%lu mom=%lu", dbg_t_ms(), dx, dy, hovered_block_id,
             (unsigned long)phase, (unsigned long)momentum);
@@ -2181,6 +2181,33 @@ static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         load_image_sync(rec, resolvedCopy);
         dispatch_async(dispatch_get_main_queue(), ^{
+            // Sizes just went live: recompute metrics and anchor scroll
+            // BEFORE the repaint below, so the draw uses fresh geometry
+            // and content below doesn't jump. Failures keep the fallback
+            // box (no geometry change), so only successes notify, with the
+            // above-viewport height delta: laid-out new height (same
+            // aspect-fit math as laidOutImageHeight in viewport.zig,
+            // pinned by contract tests) minus the last drawn height, when
+            // the drawn box sits fully above the viewport top — else 0.
+            // last_h advances to the new height so a repeat arrival for
+            // the same image reports zero instead of shifting twice (the
+            // next genuine draw re-stamps the rect anyway).
+            float delta_above = 0.0f;
+            if (!rec->failed && rec->frame_count > 0 && rec->has_rect) {
+                __unsafe_unretained NSView* av = damage_target_view();
+                float vw = av ? (float)[av bounds].size.width : 0.0f;
+                float cw = vw > 600.0f ? 600.0f : fmaxf(vw - 64.0f, 100.0f);
+                float new_h = (rec->natural_w > 0.0f && rec->natural_h > 0.0f)
+                    ? rec->natural_h * (fminf(rec->natural_w, cw) / rec->natural_w)
+                    : 240.0f;
+                if (rec->last_doc_y + rec->last_h <= g_scroll_y) {
+                    delta_above = new_h - rec->last_h;
+                }
+                rec->last_h = new_h;
+            }
+            if (g_callbacks.on_images_changed) {
+                g_callbacks.on_images_changed(delta_above);
+            }
             [g_main_view setNeedsDisplay:YES];
 #ifdef TEST_HOOKS
             DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
