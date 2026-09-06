@@ -97,7 +97,9 @@ fn snapScroll(v: f32) void {
     g_app.scroll_y = g_smooth.current;
 }
 
-const MAX_CHECKPOINTS = 2048;
+// 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
+// previous 2048 x 128-line coverage exactly (~98 KB static, zero heap).
+const MAX_CHECKPOINTS = 8192;
 var g_checkpoints: [MAX_CHECKPOINTS]layout.Checkpoint = undefined;
 var g_checkpoint_count: usize = 0;
 
