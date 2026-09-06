@@ -1823,6 +1823,16 @@ fn layoutIndentedCodeUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) Unit
     return .{ .y = start_y + card_h + 16.0, .consumed = n };
 }
 
+/// True for a table separator row: only pipes, dashes, colons, and
+/// whitespace. The structure pass guarantees row 1 is the delimiter;
+/// dash-looking body rows keep the same rule styling for continuity.
+fn isTableSepRow(r_bytes: []const u8) bool {
+    for (r_bytes) |c| {
+        if (c != '|' and c != '-' and c != ':' and c != ' ' and c != '\t') return false;
+    }
+    return true;
+}
+
 /// Shared virtualized render core: emits draw commands for `lines[start_line..]`,
 /// positioned with `start_line` at viewport-relative `origin_y`, assigning
 /// Scroll affordance shadows for horizontally scrollable code blocks and
@@ -2154,39 +2164,44 @@ pub fn renderViewportCore(
             next_block_id += 1;
 
             if (cur_y + table_h >= 0 and cur_y <= vp_bottom) {
-                // Pass 1: measure column count and column widths
-                var col_widths: [8]f32 = [_]f32{80.0} ** 8;
-                var col_count: usize = 0;
-
-                var r_scan = i;
-                while (r_scan < scan_i) : (r_scan += 1) {
-                    const r_bytes = bytes[lines[r_scan].offset..][0..lines[r_scan].len];
-                    var cell_start: usize = 0;
-                    var c_idx: usize = 0;
-
-                    for (r_bytes, 0..) |c, char_idx| {
-                        if (c == '|') {
-                            if (char_idx > cell_start) {
-                                var cell_text = r_bytes[cell_start..char_idx];
-                                while (cell_text.len > 0 and cell_text[0] == ' ') : (cell_text = cell_text[1..]) {}
-                                while (cell_text.len > 0 and cell_text[cell_text.len - 1] == ' ') : (cell_text = cell_text[0 .. cell_text.len - 1]) {}
-
-                                // Skip separator row from width calculations
-                                if (cell_text.len > 0 and cell_text[0] != '-' and cell_text[0] != ':') {
-                                    if (c_idx < 8) {
-                                        const w = measureTextEx(cell_text, config.base_font_size * 0.92, false, false, false, false) + 24.0;
-                                        col_widths[c_idx] = @max(col_widths[c_idx], w);
-                                        if (c_idx + 1 > col_count) col_count = c_idx + 1;
-                                    }
-                                }
-                                c_idx += 1;
-                            }
-                            cell_start = char_idx + 1;
+                // Pass 1: the header row fixes the column count (body rows
+                // pad/truncate to it); the delimiter row fixes alignment.
+                // Escaped pipes never split cells (simd helpers, no alloc).
+                var col_aligns: [simd.MAX_TABLE_COLS]simd.TableAlign = [_]simd.TableAlign{.left} ** simd.MAX_TABLE_COLS;
+                var col_count: usize = 1;
+                {
+                    const header_bytes = bytes[lines[i].offset..][0..lines[i].len];
+                    var header_cells: [simd.MAX_TABLE_COLS]simd.TableCell = undefined;
+                    const header_total = simd.splitTableCells(header_bytes, header_cells[0..]);
+                    if (header_total > 0) col_count = @min(header_total, simd.MAX_TABLE_COLS);
+                    if (i + 1 < scan_i) {
+                        const delim_bytes = bytes[lines[i + 1].offset..][0..lines[i + 1].len];
+                        if (simd.parseTableDelimiter(delim_bytes, col_aligns[0..]) != header_total) {
+                            for (col_aligns[0..]) |*a| a.* = .left;
                         }
                     }
                 }
 
-                if (col_count == 0) col_count = 1;
+                // Pass 2: measure column widths (delimiter and separator
+                // rows contribute no text width).
+                var col_widths: [simd.MAX_TABLE_COLS]f32 = [_]f32{80.0} ** simd.MAX_TABLE_COLS;
+
+                var r_scan = i;
+                while (r_scan < scan_i) : (r_scan += 1) {
+                    if (r_scan == i + 1) continue; // delimiter row
+                    const r_bytes = bytes[lines[r_scan].offset..][0..lines[r_scan].len];
+                    if (isTableSepRow(r_bytes)) continue;
+                    var cells: [simd.MAX_TABLE_COLS]simd.TableCell = undefined;
+                    const total = simd.splitTableCells(r_bytes, cells[0..]);
+                    const show = @min(total, col_count);
+                    var c_idx: usize = 0;
+                    while (c_idx < show) : (c_idx += 1) {
+                        const cell_text = r_bytes[cells[c_idx].start..][0..cells[c_idx].len];
+                        if (cell_text.len == 0) continue;
+                        const w = measureTextEx(cell_text, config.base_font_size * 0.92, false, false, false, false) + 24.0;
+                        col_widths[c_idx] = @max(col_widths[c_idx], w);
+                    }
+                }
 
                 // Scale columns to fill content_width comfortably
                 var total_measured_w: f32 = 0;
@@ -2241,14 +2256,8 @@ pub fn renderViewportCore(
                     if (cmd_count >= commands_out.len - 16) break;
                     const r_bytes = bytes[lines[r_idx].offset..][0..lines[r_idx].len];
 
-                    // Check if separator row
-                    var is_sep = true;
-                    for (r_bytes) |c| {
-                        if (c != '|' and c != '-' and c != ':' and c != ' ' and c != '\t') {
-                            is_sep = false;
-                            break;
-                        }
-                    }
+                    // Check if separator row (delimiter or dash data row).
+                    const is_sep = isTableSepRow(r_bytes);
 
                     if (is_sep) {
                         commands_out[cmd_count] = .{
@@ -2262,54 +2271,62 @@ pub fn renderViewportCore(
                         continue;
                     }
 
-                    // Render row cells with inline parsing
-                    var cell_start: usize = 0;
+                    // Render row cells with inline parsing: escape-aware
+                    // split, rows padded/truncated to the header count,
+                    // delimiter alignment honored per column.
+                    var row_cells: [simd.MAX_TABLE_COLS]simd.TableCell = undefined;
+                    const row_total = simd.splitTableCells(r_bytes, row_cells[0..]);
                     var c_idx: usize = 0;
                     var cur_col_x = content_x - cur_scroll_x;
 
-                    for (r_bytes, 0..) |c, char_idx| {
-                        if (c == '|') {
-                            if (char_idx > cell_start) {
-                                var cell_text = r_bytes[cell_start..char_idx];
-                                while (cell_text.len > 0 and cell_text[0] == ' ') : (cell_text = cell_text[1..]) {}
-                                while (cell_text.len > 0 and cell_text[cell_text.len - 1] == ' ') : (cell_text = cell_text[0 .. cell_text.len - 1]) {}
-
-                                if (c_idx < col_count) {
-                                    const this_col_w = col_widths[c_idx];
-                                    if (cell_text.len > 0 and cmd_count < commands_out.len) {
-                                        const cell_spans = parser.parseInlines(cell_text, &span_buf);
-                                        const cell_color = if (is_header) theme.accent else theme.text;
-
-                                        var span_x = cur_col_x + 8.0;
-                                        for (span_buf[0..cell_spans]) |s| {
-                                            if (cmd_count >= commands_out.len) break;
-                                            var s_style = s.style;
-                                            if (is_header) s_style.bold = true;
-                                            const w = measureTextEx(s.text, config.base_font_size * 0.90, s_style.bold, false, s_style.code, false);
-
-                                            commands_out[cmd_count] = .{
-                                                .kind = .text_run,
-                                                .rect = .{
-                                                    .x = span_x,
-                                                    .y = row_y,
-                                                    .w = w,
-                                                    .h = row_h,
-                                                },
-                                                .color = cell_color,
-                                                .text = s.text,
-                                                .font_size = config.base_font_size * 0.90,
-                                                .style = s_style,
-                                            };
-                                            cmd_count += 1;
-                                            span_x += w + measureCharEx(' ', config.base_font_size * 0.90, false, false, false, false);
-                                        }
-                                    }
-                                    cur_col_x += this_col_w;
-                                    c_idx += 1;
-                                }
+                    while (c_idx < col_count) : (c_idx += 1) {
+                        const this_col_w = col_widths[c_idx];
+                        const cell_text = if (c_idx < row_total and c_idx < row_cells.len)
+                            r_bytes[row_cells[c_idx].start..][0..row_cells[c_idx].len]
+                        else
+                            "";
+                        if (cell_text.len > 0 and cmd_count < commands_out.len) {
+                            const cell_spans = parser.parseInlines(cell_text, &span_buf);
+                            const cell_color = if (is_header) theme.accent else theme.text;
+                            const cell_fs = config.base_font_size * 0.90;
+                            const space_w = measureCharEx(' ', cell_fs, false, false, false, false);
+                            var content_w: f32 = 0;
+                            for (span_buf[0..cell_spans]) |s| {
+                                content_w += measureTextEx(s.text, cell_fs, s.style.bold or is_header, false, s.style.code, false) + space_w;
                             }
-                            cell_start = char_idx + 1;
+                            var span_x = cur_col_x + 8.0;
+                            switch (col_aligns[c_idx]) {
+                                .left => {},
+                                .right => span_x = cur_col_x + this_col_w - 8.0 - content_w,
+                                .center => span_x = cur_col_x + (this_col_w - content_w) / 2.0,
+                            }
+                            // Overwide content clamps to the left pad so it
+                            // never overlaps the previous column.
+                            span_x = @max(span_x, cur_col_x + 8.0);
+                            for (span_buf[0..cell_spans]) |s| {
+                                if (cmd_count >= commands_out.len) break;
+                                var s_style = s.style;
+                                if (is_header) s_style.bold = true;
+                                const w = measureTextEx(s.text, cell_fs, s_style.bold, false, s.style.code, false);
+
+                                commands_out[cmd_count] = .{
+                                    .kind = .text_run,
+                                    .rect = .{
+                                        .x = span_x,
+                                        .y = row_y,
+                                        .w = w,
+                                        .h = row_h,
+                                    },
+                                    .color = cell_color,
+                                    .text = s.text,
+                                    .font_size = cell_fs,
+                                    .style = s_style,
+                                };
+                                cmd_count += 1;
+                                span_x += w + space_w;
+                            }
                         }
+                        cur_col_x += this_col_w;
                     }
 
                     // Row divider line

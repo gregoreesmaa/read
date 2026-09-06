@@ -124,8 +124,13 @@ pub fn scanLines(
     const in_comment_state: *bool = &in_comment;
     var i: usize = 0;
     const len = bytes.len;
+    // Doc-level pipe census fused into the scan: GFM table resolution only
+    // runs when a `|` exists, so pipe-free documents (the common case and
+    // every strict benchmark doc) pay no second byte pass at all.
+    var saw_pipe = false;
 
     const nl_vec: ByteVec = @splat('\n');
+    const pipe_vec: ByteVec = @splat('|');
 
     // 128-byte quad-vector loop: four compares per iteration keep multiple
     // vector units busy (ILP) while staying on low-power SIMD, and a single
@@ -143,6 +148,13 @@ pub fn scanLines(
         const bitmask1: MaskType = @as(MaskType, @bitCast(matches1));
         const bitmask2: MaskType = @as(MaskType, @bitCast(matches2));
         const bitmask3: MaskType = @as(MaskType, @bitCast(matches3));
+        if (!saw_pipe) {
+            const p0: MaskType = @as(MaskType, @bitCast(@as(@Vector(VecSize, bool), chunk0 == pipe_vec)));
+            const p1: MaskType = @as(MaskType, @bitCast(@as(@Vector(VecSize, bool), chunk1 == pipe_vec)));
+            const p2: MaskType = @as(MaskType, @bitCast(@as(@Vector(VecSize, bool), chunk2 == pipe_vec)));
+            const p3: MaskType = @as(MaskType, @bitCast(@as(@Vector(VecSize, bool), chunk3 == pipe_vec)));
+            saw_pipe = (p0 | p1 | p2 | p3) != 0;
+        }
 
         if ((bitmask0 | bitmask1 | bitmask2 | bitmask3) != 0) {
             if (bitmask0 != 0) {
@@ -166,6 +178,10 @@ pub fn scanLines(
         const chunk: ByteVec = bytes[i..][0..VecSize].*;
         const matches: @Vector(VecSize, bool) = (chunk == nl_vec);
         const bitmask: MaskType = @as(MaskType, @bitCast(matches));
+        if (!saw_pipe) {
+            const pm: MaskType = @as(MaskType, @bitCast(@as(@Vector(VecSize, bool), chunk == pipe_vec)));
+            saw_pipe = pm != 0;
+        }
 
         if (bitmask != 0) {
             line_start = emitNewlines(bytes, i, bitmask, line_start, lines_out, &line_count, in_code_fence_state, in_comment_state);
@@ -175,6 +191,7 @@ pub fn scanLines(
 
     // Scalar tail for remainder
     while (i < len) : (i += 1) {
+        if (!saw_pipe and bytes[i] == '|') saw_pipe = true;
         if (bytes[i] == '\n') {
             if (line_count < lines_out.len) {
                 var end_pos = i;
@@ -204,6 +221,11 @@ pub fn scanLines(
         );
         line_count += 1;
     }
+
+    // GFM table structure needs header+delimiter adjacency, which only
+    // exists once every line is classified. Gated on the fused pipe census
+    // above: pipe-free documents skip the Line-array pass entirely.
+    if (saw_pipe) resolveTables(bytes, lines_out[0..line_count]);
 
     return line_count;
 }
@@ -506,6 +528,183 @@ pub fn findRefDef(defs: []const RefDef, label: []const u8) ?RefDef {
         if (matchLabel(d.label, label)) return d;
     }
     return null;
+}
+
+// ============================================================================
+// GFM tables: delimiter validation, escape-aware cells, column alignment.
+// Tables are a GFM extension (absent from CommonMark core), so structure
+// resolution runs here as a post-pass over the classified Line array:
+// a header line plus an adjacent valid delimiter row promotes both (and
+// following pipe rows) to `.table_row`; stray `|` lines demote back to
+// `.paragraph`. Fixed stack buffers throughout, zero heap allocations.
+// ============================================================================
+
+/// Column alignment from a delimiter cell (`:---` left, `---:` right,
+/// `:---:` center, bare `---` default-left).
+pub const TableAlign = enum(u2) { left = 0, center = 1, right = 2 };
+
+/// Hard cap on stored table columns per row. Counts still run past it so
+/// header/delimiter matching stays exact; the renderer clamps to this.
+pub const MAX_TABLE_COLS: usize = 16;
+
+/// One table cell: byte range relative to the passed line slice, trimmed
+/// of surrounding spaces/tabs. Backslash escapes are kept verbatim so the
+/// inline parser can unescape them (`\|` renders as `|`).
+pub const TableCell = struct {
+    start: usize,
+    len: usize,
+};
+
+/// True when `line[pos]` opens a new cell: a pipe preceded by an even
+/// number of consecutive backslashes (`\\|` splits, `\|` is literal).
+fn isCellSplit(line: []const u8, pos: usize) bool {
+    var bs: usize = 0;
+    var k = pos;
+    while (k > 0 and line[k - 1] == '\\') : (k -= 1) {
+        bs += 1;
+    }
+    return bs % 2 == 0;
+}
+
+fn trimCellRange(line: []const u8, s: usize, e: usize) TableCell {
+    var a = s;
+    var b = e;
+    while (a < b and (line[a] == ' ' or line[a] == '\t')) : (a += 1) {}
+    while (b > a and (line[b - 1] == ' ' or line[b - 1] == '\t')) : (b -= 1) {}
+    return .{ .start = a, .len = b - a };
+}
+
+/// Splits a table row on unescaped pipes. One empty edge cell from outer
+/// pipes is dropped (`| a |` yields one cell, not three). Returns the
+/// TOTAL cell count (which may exceed `out.len`); stores up to
+/// `out.len` trimmed cells. Returns 0 for lines with no cell content.
+pub fn splitTableCells(line: []const u8, out: []TableCell) usize {
+    var s: usize = 0;
+    while (s < line.len and (line[s] == ' ' or line[s] == '\t')) : (s += 1) {}
+    var e: usize = line.len;
+    while (e > s and (line[e - 1] == ' ' or line[e - 1] == '\t')) : (e -= 1) {}
+    // Outer pipes contribute no cell (a leading pipe is preceded only by
+    // whitespace here, so it is always a real split).
+    if (s < e and line[s] == '|') s += 1;
+    if (e > s and line[e - 1] == '|' and isCellSplit(line, e - 1)) e -= 1;
+    if (s >= e) return 0;
+    var total: usize = 0;
+    var seg = s;
+    var p = s;
+    while (true) {
+        if (p >= e or (line[p] == '|' and isCellSplit(line, p))) {
+            if (total < out.len) out[total] = trimCellRange(line, seg, p);
+            total += 1;
+            if (p >= e) break;
+            seg = p + 1;
+        }
+        p += 1;
+    }
+    return total;
+}
+
+/// Validates a delimiter row (`| :--- | ---: | :--: |`). Every cell must
+/// hold 1+ hyphens with at most one edge colon per side; anything else
+/// (including an empty cell) invalidates the whole row. A bare `---`
+/// without any pipe is hr/setext territory, never a delimiter. Returns 0
+/// when invalid, else the total cell count (fills `aligns_out` up to its
+/// length).
+pub fn parseTableDelimiter(line: []const u8, aligns_out: []TableAlign) usize {
+    if (findByte(line, 0, '|') == null) return 0;
+    var cells: [32]TableCell = undefined;
+    const n = splitTableCells(line, cells[0..]);
+    if (n == 0 or n > cells.len) return 0;
+    for (cells[0..n], 0..) |c, k| {
+        const t = line[c.start..][0..c.len];
+        var a: usize = 0;
+        var b: usize = t.len;
+        var left_colon = false;
+        var right_colon = false;
+        if (a < b and t[a] == ':') {
+            left_colon = true;
+            a += 1;
+        }
+        if (b > a and t[b - 1] == ':') {
+            right_colon = true;
+            b -= 1;
+        }
+        if (b - a == 0) return 0;
+        for (t[a..b]) |ch| {
+            if (ch != '-') return 0;
+        }
+        if (k < aligns_out.len) {
+            aligns_out[k] = if (left_colon and right_colon)
+                .center
+            else if (right_colon)
+                .right
+            else
+                .left;
+        }
+    }
+    return n;
+}
+
+/// Visual indent column of a raw line (tab advances to the next multiple
+/// of 4, matching the fence/comment checks in classifyLine). Tables allow
+/// up to 3 columns of indent; 4+ is indented code, never a table.
+fn tableIndentColumn(text: []const u8) usize {
+    var col: usize = 0;
+    var k: usize = 0;
+    while (k < text.len) {
+        if (text[k] == ' ') {
+            col += 1;
+        } else if (text[k] == '\t') {
+            col += 4 - (col % 4);
+        } else break;
+        k += 1;
+    }
+    return col;
+}
+
+/// True for lines that can belong to a table: flow text only (never code,
+/// fences, headings, lists, quotes, blanks, or definitions), indented
+/// less than a full level, and holding at least one pipe.
+fn isTableCandidate(bytes: []const u8, ln: Line) bool {
+    if (ln.block_type != .paragraph and ln.block_type != .table_row) return false;
+    const text = bytes[ln.offset..][0..ln.len];
+    if (tableIndentColumn(text) >= 4) return false;
+    return findByte(text, 0, '|') != null;
+}
+
+/// GFM table structure pass over classified lines. A candidate header line
+/// followed by a valid delimiter row with the same cell count forms a
+/// table: header, delimiter, and following candidate pipe lines all become
+/// `.table_row` (body rows pad/truncate to the header count at render).
+/// Candidate `|` lines without that structure demote to `.paragraph`, so
+/// only real tables ever reach the table renderer. Deliberately permits
+/// interrupting a paragraph (GitHub behavior); setext/hr lines never
+/// qualify (a delimiter needs a pipe, a header needs a matching count).
+pub fn resolveTables(bytes: []const u8, lines: []Line) void {
+    var i: usize = 0;
+    while (i < lines.len) {
+        if (isTableCandidate(bytes, lines[i]) and i + 1 < lines.len and
+            isTableCandidate(bytes, lines[i + 1]))
+        {
+            const header_text = bytes[lines[i].offset..][0..lines[i].len];
+            const delim_text = bytes[lines[i + 1].offset..][0..lines[i + 1].len];
+            var header_cells: [32]TableCell = undefined;
+            var aligns: [MAX_TABLE_COLS]TableAlign = undefined;
+            const header_n = splitTableCells(header_text, header_cells[0..]);
+            const delim_n = parseTableDelimiter(delim_text, aligns[0..]);
+            if (header_n > 0 and header_n == delim_n) {
+                lines[i].block_type = .table_row;
+                lines[i + 1].block_type = .table_row;
+                var j = i + 2;
+                while (j < lines.len and isTableCandidate(bytes, lines[j])) : (j += 1) {
+                    lines[j].block_type = .table_row;
+                }
+                i = j;
+                continue;
+            }
+        }
+        if (lines[i].block_type == .table_row) lines[i].block_type = .paragraph;
+        i += 1;
+    }
 }
 
 /// Fast single-dispatch classifier for a single line of markdown.
@@ -1254,6 +1453,110 @@ test "classify: link definitions and HTML comments" {
     // Other inline HTML is literal text, never a comment.
     try std.testing.expectEqual(BlockType.paragraph, lines[6].block_type);
     try std.testing.expect(!fence.open);
+}
+
+fn scanTypes(doc: []const u8, out: []BlockType) usize {
+    var lines: [16]Line = undefined;
+    var fence: FenceState = .{};
+    const n = scanLines(doc, &lines, &fence);
+    var k: usize = 0;
+    for (lines[0..n]) |ln| {
+        if (k >= out.len) break;
+        out[k] = ln.block_type;
+        k += 1;
+    }
+    return k;
+}
+
+test "tables: escape-aware split and delimiter validation" {
+    var cells: [8]TableCell = undefined;
+    // Outer pipes contribute no cell; surrounding whitespace trims.
+    var n = splitTableCells("| a | b |", cells[0..]);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("a", "| a | b |"[cells[0].start..][0..cells[0].len]);
+    try std.testing.expectEqualStrings("b", "| a | b |"[cells[1].start..][0..cells[1].len]);
+    // No outer pipes: same two cells.
+    n = splitTableCells("a | b", cells[0..]);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    // Escaped pipes never split (backslash kept for inline parsing).
+    n = splitTableCells("| a \\| b | c |", cells[0..]);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("a \\| b", "| a \\| b | c |"[cells[0].start..][0..cells[0].len]);
+    // A doubled backslash ends the escape: the pipe splits.
+    n = splitTableCells("| a \\\\| b |", cells[0..]);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    // Empty middle cells occupy a column; edge-only pipes hold no cells.
+    n = splitTableCells("| a || b |", cells[0..]);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(usize, 0), splitTableCells("||", cells[0..]));
+    try std.testing.expectEqual(@as(usize, 0), splitTableCells("", cells[0..]));
+
+    var aligns: [4]TableAlign = undefined;
+    // All four delimiter forms with per-column alignment.
+    n = parseTableDelimiter("| :--- | ---: | :--: | --- |", aligns[0..]);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(TableAlign.left, aligns[0]);
+    try std.testing.expectEqual(TableAlign.right, aligns[1]);
+    try std.testing.expectEqual(TableAlign.center, aligns[2]);
+    try std.testing.expectEqual(TableAlign.left, aligns[3]);
+    // A single hyphen is a valid (minimal) delimiter cell.
+    try std.testing.expectEqual(@as(usize, 1), parseTableDelimiter("| - |", aligns[0..]));
+    // Invalid rows: text cells, empty cells, colon-only cells, no pipe.
+    try std.testing.expectEqual(@as(usize, 0), parseTableDelimiter("| --- | x |", aligns[0..]));
+    try std.testing.expectEqual(@as(usize, 0), parseTableDelimiter("| --- ||", aligns[0..]));
+    try std.testing.expectEqual(@as(usize, 0), parseTableDelimiter("| : |", aligns[0..]));
+    try std.testing.expectEqual(@as(usize, 0), parseTableDelimiter("---", aligns[0..]));
+    try std.testing.expectEqual(@as(usize, 0), parseTableDelimiter(":--:", aligns[0..]));
+}
+
+test "tables: structure resolve promotes tables, demotes stray pipes" {
+    var t: [8]BlockType = undefined;
+    // Valid table with outer pipes: header, delimiter, body.
+    var n = scanTypes("| a | b |\n| --- | --- |\n| c | d |\n", &t);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(BlockType.table_row, t[0]);
+    try std.testing.expectEqual(BlockType.table_row, t[1]);
+    try std.testing.expectEqual(BlockType.table_row, t[2]);
+    // Outer pipes optional on header and body rows.
+    n = scanTypes("a | b\n--- | ---\nc | d\n", &t);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(BlockType.table_row, t[0]);
+    try std.testing.expectEqual(BlockType.table_row, t[1]);
+    try std.testing.expectEqual(BlockType.table_row, t[2]);
+    // No delimiter row: not a table.
+    n = scanTypes("| a |\n| x |\n", &t);
+    try std.testing.expectEqual(BlockType.paragraph, t[0]);
+    try std.testing.expectEqual(BlockType.paragraph, t[1]);
+    // Invalid delimiter content: not a table.
+    n = scanTypes("| a |\n| --- | x |\n| b |\n", &t);
+    try std.testing.expectEqual(BlockType.paragraph, t[0]);
+    try std.testing.expectEqual(BlockType.paragraph, t[1]);
+    try std.testing.expectEqual(BlockType.paragraph, t[2]);
+    // Header/delimiter count mismatch: not a table.
+    n = scanTypes("| a | b |\n| --- |\n| c | d |\n", &t);
+    try std.testing.expectEqual(BlockType.paragraph, t[0]);
+    try std.testing.expectEqual(BlockType.paragraph, t[1]);
+    try std.testing.expectEqual(BlockType.paragraph, t[2]);
+    // Bare `---` stays hr/setext territory, never a delimiter.
+    n = scanTypes("para\n---\n", &t);
+    try std.testing.expectEqual(BlockType.paragraph, t[0]);
+    try std.testing.expectEqual(BlockType.hr, t[1]);
+    // Fenced code fences tables out: no promotion inside.
+    n = scanTypes("```\n| a |\n| --- |\n```\n", &t);
+    try std.testing.expectEqual(BlockType.code_fence_start, t[0]);
+    try std.testing.expectEqual(BlockType.code_line, t[1]);
+    try std.testing.expectEqual(BlockType.code_line, t[2]);
+    try std.testing.expectEqual(BlockType.code_fence_end, t[3]);
+    // Four-space indent is code, never a table (demoted to paragraph flow).
+    n = scanTypes("    | a |\n    | --- |\n", &t);
+    try std.testing.expectEqual(BlockType.paragraph, t[0]);
+    try std.testing.expectEqual(BlockType.paragraph, t[1]);
+    // A blank line ends the body run; following pipes start nothing new.
+    n = scanTypes("| a |\n| --- |\n| b |\n\n| c |\n", &t);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqual(BlockType.table_row, t[2]);
+    try std.testing.expectEqual(BlockType.blank, t[3]);
+    try std.testing.expectEqual(BlockType.paragraph, t[4]);
 }
 
 fn recordBlockRun(bytes_inner: []const u8, nl_pos: usize, out: []u32, n: *usize) void {
