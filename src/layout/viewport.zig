@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const parser = @import("../core/parser.zig");
+const bidi = @import("../core/bidi.zig");
 
 // Calibrated ASCII advance widths for IBM Plex Serif Regular (in 1/1000 em)
 pub const SERIF_FONT_WIDTHS = [128]u16{
@@ -423,6 +424,7 @@ pub const SmoothScroll = struct {
 };
 
 /// Renders a series of inline spans with automatic word wrapping and exact typography.
+/// `rtl` right-anchors the pen (issue #50): false preserves history exactly.
 pub fn layoutWrappedSpans(
     spans: []const parser.InlineSpan,
     start_x: f32,
@@ -435,8 +437,9 @@ pub fn layoutWrappedSpans(
     vp_bottom: f32,
     commands_out: []DrawCommand,
     cmd_count: *usize,
+    rtl: bool,
 ) f32 {
-    var pen = FlowPen{ .x = start_x, .y = base_y };
+    var pen = flowPenStart(start_x, max_w, base_y, rtl);
     const flow = FlowCtx{
         .font_size = font_size,
         .line_h = line_h,
@@ -447,6 +450,7 @@ pub fn layoutWrappedSpans(
         .vp_bottom = vp_bottom,
         .commands_out = commands_out,
         .cmd_count = cmd_count,
+        .rtl = rtl,
     };
 
     for (spans) |span| {
@@ -481,6 +485,10 @@ pub const FlowCtx = struct {
     cmd_count: *usize,
     defs: []const simd.RefDef = &.{},
     entities: ?*EntityStore = null,
+    /// RTL paragraph flow (issue #50): the pen tracks the RIGHT edge and
+    /// words lay right-to-left. Defaults false: the LTR path below is
+    /// byte-identical to the historical layout.
+    rtl: bool = false,
 };
 
 /// Lays out one word at the pen: wraps to the next visual row on overflow,
@@ -502,7 +510,17 @@ pub fn flowWord(
         style.heading,
     );
 
-    if (pen.x + word_w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
+    // RTL mirror of the LTR wrap above: the pen tracks the right edge, a
+    // word that no longer fits opens a new visual row at the right edge.
+    // The guard is symmetric (no wrap when already at line start), so both
+    // directions break lines at identical word boundaries.
+    if (ctx.rtl) {
+        const right_x = ctx.start_x + ctx.max_w;
+        if (pen.x - word_w < ctx.start_x and pen.x < right_x) {
+            pen.y += ctx.line_h;
+            pen.x = right_x;
+        }
+    } else if (pen.x + word_w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
         pen.y += ctx.line_h;
         pen.x = ctx.start_x;
     }
@@ -514,7 +532,7 @@ pub fn flowWord(
         ctx.commands_out[ctx.cmd_count.*] = .{
             .kind = .text_run,
             .rect = .{
-                .x = pen.x,
+                .x = if (ctx.rtl) pen.x - word_w else pen.x,
                 .y = pen.y,
                 .w = word_w,
                 .h = ctx.line_h,
@@ -528,12 +546,21 @@ pub fn flowWord(
         ctx.cmd_count.* += 1;
     }
 
-    pen.x += word_w;
+    if (ctx.rtl) {
+        pen.x -= word_w;
+    } else {
+        pen.x += word_w;
+    }
 }
 
 /// Advances the pen past one space (never wraps: matches historical layout).
-pub fn flowSpace(pen: *FlowPen, space_w: f32) void {
-    pen.x += space_w;
+/// Direction-aware: LTR advances right, RTL advances left.
+pub fn flowSpace(pen: *FlowPen, space_w: f32, rtl: bool) void {
+    if (rtl) {
+        pen.x -= space_w;
+    } else {
+        pen.x += space_w;
+    }
 }
 
 /// Flows words and spaces of one span-text at the pen.
@@ -548,7 +575,7 @@ pub fn flowSpans(
     var i: usize = 0;
     while (i < span_text.len) {
         if (span_text[i] == ' ') {
-            flowSpace(pen, space_w);
+            flowSpace(pen, space_w, ctx.rtl);
             i += 1;
             continue;
         }
@@ -1095,20 +1122,41 @@ fn emitCmd(ux: *UnitCx, cmd: DrawCommand) void {
 }
 
 /// Single soft-break space between flowed lines (never wraps, like spaces).
-fn softSpace(pen: *FlowPen, tx: f32, font_size: f32) void {
-    if (pen.x > tx) flowSpace(pen, measureCharEx(' ', font_size, false, false, false, false));
+/// Direction-aware: "not at line start" is the left edge for LTR, the
+/// right edge for RTL. Takes the flow context (its start/width/rtl always
+/// match the `tx` the callers historically passed: verified at every site).
+fn softSpace(pen: *FlowPen, ctx: FlowCtx, font_size: f32) void {
+    const w = measureCharEx(' ', font_size, false, false, false, false);
+    if (ctx.rtl) {
+        if (pen.x < ctx.start_x + ctx.max_w) flowSpace(pen, w, true);
+    } else {
+        if (pen.x > ctx.start_x) flowSpace(pen, w, false);
+    }
+}
+
+/// Pen start for a flow region: left edge for LTR, right edge for RTL.
+fn flowPenStart(tx: f32, tw: f32, y: f32, rtl: bool) FlowPen {
+    return .{ .x = if (rtl) tx + tw else tx, .y = y };
 }
 
 /// Quote bars for one quote line: one bar per depth level spanning the whole
 /// unit (leader line plus absorbed lazy tail).
-fn quoteBars(ux: *UnitCx, base_x: f32, depth: usize, start_y: f32, end_y: f32) void {
+/// Mirrors a rect's x edge into the content column (issue #50): RTL list
+/// markers, checkboxes, and quote bars sit at the mirrored position with
+/// identical widths, so wrapping geometry never changes.
+fn mirrorX(x: f32, w: f32, ux: *UnitCx) f32 {
+    return 2.0 * ux.content_x + ux.content_width - x - w;
+}
+
+fn quoteBars(ux: *UnitCx, base_x: f32, depth: usize, start_y: f32, end_y: f32, rtl: bool) void {
     if (end_y < 0 or start_y > ux.vp_bottom) return;
     var d: usize = 1;
     while (d <= depth) : (d += 1) {
+        const bar_x = base_x + @as(f32, @floatFromInt(d)) * 16.0 - 12.0;
         emitCmd(ux, .{
             .kind = .fill_rect,
             .rect = .{
-                .x = base_x + @as(f32, @floatFromInt(d)) * 16.0 - 12.0,
+                .x = if (rtl) mirrorX(bar_x, 3.0, ux) else bar_x,
                 .y = start_y,
                 .w = 3.0,
                 .h = end_y - start_y,
@@ -1209,6 +1257,21 @@ fn orderedMarkerText(ux: *UnitCx, n: u32, delim: u8, fallback: []const u8) []con
     return fallback;
 }
 
+/// Base direction for a lead paragraph (issue #50): first strong character
+/// of the first text wins, else the lazy followers in order (the UBA
+/// first-strong rule over the paragraph). Scans the same follower lines
+/// the flow loop below consumes, so measurement and render always agree;
+/// returns false (LTR) when nothing strong is found.
+noinline fn leadParaDirection(ux: *UnitCx, first: []const u8, from: usize) bool {
+    if (bidi.firstStrong(first)) |s| return s == .r;
+    var j = from;
+    while (j < ux.lines.len and isLazyContinuation(ux.bytes, ux.lines, j)) : (j += 1) {
+        const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
+        if (bidi.firstStrong(lb)) |s| return s == .r;
+    }
+    return false;
+}
+
 /// Flows a lead paragraph: first text plus lazy follower lines joined by
 /// soft-break spaces. Never inlined (shared by quote/list units).
 fn flowLeadPara(
@@ -1220,17 +1283,31 @@ fn flowLeadPara(
     first: []const u8,
     from: usize,
 ) struct { y: f32, next: usize } {
-    var pen = FlowPen{ .x = tx, .y = y };
-    const ctx = flowCtxFor(ux, tx, tw, ux.config.base_font_size, ux.config.line_height, color);
+    const rtl = leadParaDirection(ux, first, from);
+    var pen = flowPenStart(tx, tw, y, rtl);
+    var ctx = flowCtxFor(ux, tx, tw, ux.config.base_font_size, ux.config.line_height, color);
+    ctx.rtl = rtl;
     flowSourceLine(first, false, false, false, &pen, ctx);
     var j = from;
     while (j < ux.lines.len and isLazyContinuation(ux.bytes, ux.lines, j)) {
-        softSpace(&pen, tx, ux.config.base_font_size);
+        softSpace(&pen, ctx, ux.config.base_font_size);
         const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
         flowSourceLine(lb, true, false, false, &pen, ctx);
         j += 1;
     }
     return .{ .y = pen.y + ux.config.line_height, .next = j };
+}
+
+/// Base direction over one lazy run starting at `from` (issue #50).
+/// Outlined (not inlined): one copy serves every sub-paragraph; the scan
+/// exits at the first strong character so the cold cost is a few bytes.
+noinline fn lazyRunDirection(ux: *UnitCx, from: usize) bool {
+    var sj = from;
+    while (sj < ux.lines.len and isLazyContinuation(ux.bytes, ux.lines, sj)) : (sj += 1) {
+        const slb = ux.bytes[ux.lines[sj].offset..][0..ux.lines[sj].len];
+        if (bidi.firstStrong(slb)) |s| return s == .r;
+    }
+    return false;
 }
 
 /// Consumes blank-separated subsequent paragraphs at the item column.
@@ -1257,10 +1334,15 @@ fn flowListSubParagraphs(
             isIndentedBy(ux.bytes, ux.lines[b], 8)) break;
         yy += @as(f32, @floatFromInt(b - j)) * ux.config.line_height * 0.75;
         j = b;
-        var pen = FlowPen{ .x = tx, .y = yy };
-        const ctx = flowCtxFor(ux, tx, tw, ux.config.base_font_size, ux.config.line_height, ux.theme.text);
+        // Each subsequent paragraph takes its own base direction (UBA:
+        // direction is per-paragraph), scanned over the same lazy run the
+        // loop below consumes.
+        const rtl = lazyRunDirection(ux, j);
+        var pen = flowPenStart(tx, tw, yy, rtl);
+        var ctx = flowCtxFor(ux, tx, tw, ux.config.base_font_size, ux.config.line_height, ux.theme.text);
+        ctx.rtl = rtl;
         while (j < ux.lines.len and isLazyContinuation(ux.bytes, ux.lines, j)) {
-            if (j > b) softSpace(&pen, tx, ux.config.base_font_size);
+            if (j > b) softSpace(&pen, ctx, ux.config.base_font_size);
             const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
             flowSourceLine(lb, true, false, false, &pen, ctx);
             j += 1;
@@ -1428,10 +1510,16 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
     const tw = ux.content_width - (tx - ux.content_x);
     var y = start_y;
     var consumed: usize = 1;
+    // RTL quotes (issue #50) mirror the text region into the column and
+    // move the bars right; the mirrored regions keep identical widths so
+    // wrapping never changes. Set per text-carrying branch below.
+    var quote_rtl = false;
 
     switch (body.kind) {
         .text => {
-            const f = flowLeadPara(ux, tx, tw, y, ux.theme.muted, sq.body, i + 1);
+            quote_rtl = leadParaDirection(ux, sq.body, i + 1);
+            const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
+            const f = flowLeadPara(ux, rtx, tw, y, ux.theme.muted, sq.body, i + 1);
             y = f.y;
             consumed = f.next - i;
         },
@@ -1444,29 +1532,39 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
         .heading => {
             const m = atxMetrics(ux.config, body.level);
             y += m.margin_top;
-            var pen = FlowPen{ .x = tx, .y = y };
-            const ctx = flowCtxFor(ux, tx, tw, m.font_size, m.line_h, ux.theme.muted);
             const hp = @min(body.prefix_len, sq.body.len);
             const htext = sq.body[hp + skipSpaces(sq.body[hp..]) ..];
+            quote_rtl = bidi.baseDirection(htext) == .rtl;
+            const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
+            var pen = flowPenStart(rtx, tw, y, quote_rtl);
+            var ctx = flowCtxFor(ux, rtx, tw, m.font_size, m.line_h, ux.theme.muted);
+            ctx.rtl = quote_rtl;
             flowSourceLine(htext, false, false, true, &pen, ctx);
             y = pen.y + m.line_h + m.margin_bottom;
             ux.qord_active = false;
         },
         .bullet => {
+            const bp = @min(body.prefix_len, sq.body.len);
+            const item_text = sq.body[bp + skipSpaces(sq.body[bp..]) ..];
+            quote_rtl = bidi.baseDirection(item_text) == .rtl;
+            const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
             if (y + ux.config.line_height >= 0 and y <= ux.vp_bottom) {
                 emitCmd(ux, .{
                     .kind = .text_run,
-                    .rect = .{ .x = tx, .y = y, .w = 14.0, .h = ux.config.line_height },
+                    .rect = .{ .x = if (quote_rtl) mirrorX(tx, 14.0, ux) else tx, .y = y, .w = 14.0, .h = ux.config.line_height },
                     .color = ux.theme.accent,
                     .text = "•",
                     .font_size = ux.config.base_font_size * 1.1,
                     .style = .{ .bold = true },
                 });
             }
-            var pen = FlowPen{ .x = tx + 18.0, .y = y };
-            const ctx = flowCtxFor(ux, tx + 18.0, tw - 18.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
-            const bp = @min(body.prefix_len, sq.body.len);
-            const item_text = sq.body[bp + skipSpaces(sq.body[bp..]) ..];
+            // Text starts past the marker in both directions: LTR at
+            // tx+18, RTL at the mirrored region start (= rtx, the exact
+            // mirror of [tx+18, tw-18] with identical width).
+            const ttx = if (quote_rtl) rtx else tx + 18.0;
+            var pen = flowPenStart(ttx, tw - 18.0, y, quote_rtl);
+            var ctx = flowCtxFor(ux, ttx, tw - 18.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
+            ctx.rtl = quote_rtl;
             flowSourceLine(item_text, false, false, false, &pen, ctx);
             y = pen.y + ux.config.line_height;
             ux.qord_active = false;
@@ -1474,35 +1572,43 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
         .ordered => {
             const num = quotedNumber(ux, i, body.number, sq.depth);
             const marker = orderedMarkerText(ux, num, body.delim, sq.body[0..@min(body.prefix_len, sq.body.len)]);
+            const op = @min(body.prefix_len, sq.body.len);
+            const item_text = sq.body[op + skipSpaces(sq.body[op..]) ..];
+            quote_rtl = bidi.baseDirection(item_text) == .rtl;
+            const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
             if (y + ux.config.line_height >= 0 and y <= ux.vp_bottom) {
                 emitCmd(ux, .{
                     .kind = .text_run,
-                    .rect = .{ .x = tx, .y = y, .w = 18.0, .h = ux.config.line_height },
+                    .rect = .{ .x = if (quote_rtl) mirrorX(tx, 18.0, ux) else tx, .y = y, .w = 18.0, .h = ux.config.line_height },
                     .color = ux.theme.muted,
                     .text = marker,
                     .font_size = ux.config.base_font_size * 0.95,
                 });
             }
-            var pen = FlowPen{ .x = tx + 18.0, .y = y };
-            const ctx = flowCtxFor(ux, tx + 18.0, tw - 18.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
-            const op = @min(body.prefix_len, sq.body.len);
-            const item_text = sq.body[op + skipSpaces(sq.body[op..]) ..];
+            const ttx = if (quote_rtl) rtx else tx + 18.0;
+            var pen = flowPenStart(ttx, tw - 18.0, y, quote_rtl);
+            var ctx = flowCtxFor(ux, ttx, tw - 18.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
+            ctx.rtl = quote_rtl;
             flowSourceLine(item_text, false, false, false, &pen, ctx);
             y = pen.y + ux.config.line_height;
         },
         .task => {
-            emitCheckbox(ux, tx, y, body.checked);
-            var pen = FlowPen{ .x = tx + 28.0, .y = y };
-            const ctx = flowCtxFor(ux, tx + 28.0, tw - 28.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
             const tp = @min(body.prefix_len, sq.body.len);
             const item_text = sq.body[tp + skipSpaces(sq.body[tp..]) ..];
+            quote_rtl = bidi.baseDirection(item_text) == .rtl;
+            const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
+            emitCheckbox(ux, if (quote_rtl) mirrorX(tx, 16.0, ux) else tx, y, body.checked);
+            const ttx = if (quote_rtl) rtx else tx + 28.0;
+            var pen = flowPenStart(ttx, tw - 28.0, y, quote_rtl);
+            var ctx = flowCtxFor(ux, ttx, tw - 28.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
+            ctx.rtl = quote_rtl;
             flowSourceLine(item_text, false, false, false, &pen, ctx);
             y = pen.y + ux.config.line_height;
             ux.qord_active = false;
         },
     }
 
-    quoteBars(ux, base_x, sq.depth, start_y, y);
+    quoteBars(ux, base_x, sq.depth, start_y, y, quote_rtl);
     return .{ .y = y, .consumed = consumed };
 }
 
@@ -1524,15 +1630,21 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
     var item_text: []const u8 = "";
     var bullet_x = tx;
 
+    // RTL items (issue #50) mirror markers/checkboxes and the text region
+    // with identical widths, so wrapping never changes. The region passed
+    // to flowLeadPara matches the direction it re-derives internally
+    // (same inputs), so the two can never disagree.
     if (info.block_type == .task_list) {
         const is_checked = (text_slice.len >= 4 and (text_slice[3] == 'x' or text_slice[3] == 'X'));
         var text_start: usize = @min(5, text_slice.len);
         text_start += skipSpaces(text_slice[text_start..]);
         item_text = text_slice[text_start..];
-        emitCheckbox(ux, ux.content_x, y, is_checked);
+        const rtl = leadParaDirection(ux, item_text, i + 1);
+        const rtx = if (rtl) mirrorX(tx, tw, ux) else tx;
+        emitCheckbox(ux, if (rtl) mirrorX(ux.content_x, 16.0, ux) else ux.content_x, y, is_checked);
         const txt_color = if (is_checked) ux.theme.muted else ux.theme.text;
-        const f = flowLeadPara(ux, tx, tw, y, txt_color, item_text, i + 1);
-        const sub = flowListSubParagraphs(ux, tx, tw, f.y, f.next);
+        const f = flowLeadPara(ux, rtx, tw, y, txt_color, item_text, i + 1);
+        const sub = flowListSubParagraphs(ux, rtx, tw, f.y, f.next);
         ux.ord_active = false;
         return .{ .y = sub.y, .consumed = sub.next - i };
     }
@@ -1544,10 +1656,11 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         var text_start: usize = 1; // past the marker; skip all padding
         text_start += skipSpaces(text_slice[@min(text_start, text_slice.len)..]);
         item_text = text_slice[@min(text_start, text_slice.len)..];
+        const rtl = leadParaDirection(ux, item_text, i + 1);
         if (y + ux.config.line_height >= 0 and y <= ux.vp_bottom) {
             emitCmd(ux, .{
                 .kind = .text_run,
-                .rect = .{ .x = bullet_x, .y = y, .w = 14.0, .h = ux.config.line_height },
+                .rect = .{ .x = if (rtl) mirrorX(bullet_x, 14.0, ux) else bullet_x, .y = y, .w = 14.0, .h = ux.config.line_height },
                 .color = ux.theme.accent,
                 .text = "•",
                 .font_size = ux.config.base_font_size * 1.1,
@@ -1571,10 +1684,11 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         const delim: u8 = if (d < text_slice.len and text_slice[d] == ')') ')' else '.';
         const num = orderedNumber(ux, i, own, info.indent);
         const marker = orderedMarkerText(ux, num, delim, text_slice[0..@min(prefix_len, text_slice.len)]);
+        const rtl = leadParaDirection(ux, item_text, i + 1);
         if (y + ux.config.line_height >= 0 and y <= ux.vp_bottom) {
             emitCmd(ux, .{
                 .kind = .text_run,
-                .rect = .{ .x = bullet_x, .y = y, .w = 18.0, .h = ux.config.line_height },
+                .rect = .{ .x = if (rtl) mirrorX(bullet_x, 18.0, ux) else bullet_x, .y = y, .w = 18.0, .h = ux.config.line_height },
                 .color = ux.theme.muted,
                 .text = marker,
                 .font_size = ux.config.base_font_size * 0.95,
@@ -1584,8 +1698,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
 
     const list_tx = bullet_x + 18.0;
     const list_tw = textRight(ux) - list_tx;
-    const f = flowLeadPara(ux, list_tx, list_tw, y, ux.theme.text, item_text, i + 1);
-    const sub = flowListSubParagraphs(ux, list_tx, list_tw, f.y, f.next);
+    const list_rtl = leadParaDirection(ux, item_text, i + 1);
+    const list_rtx = if (list_rtl) mirrorX(list_tx, list_tw, ux) else list_tx;
+    const f = flowLeadPara(ux, list_rtx, list_tw, y, ux.theme.text, item_text, i + 1);
+    const sub = flowListSubParagraphs(ux, list_rtx, list_tw, f.y, f.next);
     return .{ .y = sub.y, .consumed = sub.next - i };
 }
 
@@ -1655,7 +1771,7 @@ fn listContinuationStart(bytes: []const u8, lines: []const simd.Line, j: usize) 
 /// flows exactly like `Foo [bar] [1].`, Markdown 1.0). The next line must be
 /// a lazy continuation so setext pairs and foreign units never merge.
 /// Returns the next unflowed index (`k+1` normally, `k+2` after a joint).
-fn flowParaLineJoint(ux: *UnitCx, pen: *FlowPen, tx: f32, ctx: FlowCtx, k: usize, strip: bool) usize {
+fn flowParaLineJoint(ux: *UnitCx, pen: *FlowPen, ctx: FlowCtx, k: usize, strip: bool) usize {
     const raw = ux.bytes[ux.lines[k].offset..][0..ux.lines[k].len];
     var lb = raw;
     if (strip) {
@@ -1678,15 +1794,38 @@ fn flowParaLineJoint(ux: *UnitCx, pen: *FlowPen, tx: f32, ctx: FlowCtx, k: usize
                 @memcpy(jb[a.len + 1 ..][0..b.len], b);
                 // Head lines flow without a leading soft space; followers
                 // take one exactly like the non-joint path.
-                if (strip) softSpace(pen, tx, ux.config.base_font_size);
+                if (strip) softSpace(pen, ctx, ux.config.base_font_size);
                 flowSourceLine(jb[0 .. a.len + 1 + b.len], false, false, false, pen, ctx);
                 return nk + 1;
             }
         }
     }
-    if (strip) softSpace(pen, tx, ux.config.base_font_size);
+    if (strip) softSpace(pen, ctx, ux.config.base_font_size);
     flowSourceLine(lb, strip, false, false, pen, ctx);
     return k + 1;
+}
+
+/// Base direction for a paragraph unit (issue #50): first strong character
+/// over the unit's source lines in order (the UBA first-strong rule).
+/// Scans the same continuation lines the unit consumes below, so the
+/// decision — and therefore every wrap — is identical across the render,
+/// measure, and refine passes. False (LTR) preserves history exactly.
+noinline fn paragraphDirection(ux: *UnitCx, i: usize) bool {
+    const lb0 = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
+    if (bidi.firstStrong(lb0)) |s| return s == .r;
+    // Setext pairs decide on the text line alone: the underline is neutral
+    // but must not leak the scan into the following paragraph.
+    if (setextLevel(ux.bytes, ux.lines, i) != null) return false;
+    var j = i + 1;
+    while (j < ux.lines.len and
+        ((ux.lines[j].block_type == .paragraph and
+            setextLevel(ux.bytes, ux.lines, j) == null) or
+            ((listContinuationStart(ux.bytes, ux.lines, j) orelse (j + 1)) == i))) : (j += 1)
+    {
+        const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
+        if (bidi.firstStrong(lb)) |s| return s == .r;
+    }
+    return false;
 }
 
 /// Lays out a paragraph unit: setext pair (consumes 2) or a flowed run of
@@ -1697,18 +1836,21 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
     ux.ord_active = false;
     ux.qord_active = false;
     const bw = ux.content_x + ux.content_width - base_x;
+    const rtl = paragraphDirection(ux, i);
     if (setextLevel(ux.bytes, ux.lines, i)) |lvl| {
         const m = setextMetrics(ux.config, lvl);
         var y = start_y + m.margin_top;
-        var pen = FlowPen{ .x = base_x, .y = y };
-        const ctx = flowCtxFor(ux, base_x, bw, m.font_size, m.line_h, ux.theme.text);
+        var pen = flowPenStart(base_x, bw, y, rtl);
+        var ctx = flowCtxFor(ux, base_x, bw, m.font_size, m.line_h, ux.theme.text);
+        ctx.rtl = rtl;
         const lb = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
         flowSourceLine(lb, false, false, true, &pen, ctx);
         y = pen.y + m.line_h + m.margin_bottom;
         return .{ .y = y, .consumed = 2 };
     }
-    var pen = FlowPen{ .x = base_x, .y = start_y };
-    const ctx = flowCtxFor(ux, base_x, bw, ux.config.base_font_size, ux.config.line_height, ux.theme.text);
+    var pen = flowPenStart(base_x, bw, start_y, rtl);
+    var ctx = flowCtxFor(ux, base_x, bw, ux.config.base_font_size, ux.config.line_height, ux.theme.text);
+    ctx.rtl = rtl;
     // Cross-line reference joints only in top-level runs (list/quote-owned
     // followers absorb paragraph lines only, and unitStartAt agrees).
     const allow_joint = ux.config.join_buf != null and
@@ -1716,7 +1858,7 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
         quoteLeader(ux.bytes, ux.lines, i) == null;
     var j = i + 1;
     if (allow_joint) {
-        j = flowParaLineJoint(ux, &pen, base_x, ctx, i, false);
+        j = flowParaLineJoint(ux, &pen, ctx, i, false);
     } else {
         const first = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
         flowSourceLine(first, false, false, false, &pen, ctx);
@@ -1729,13 +1871,13 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
         if (allow_joint) {
             const strip = true;
             const before = j;
-            j = flowParaLineJoint(ux, &pen, base_x, ctx, j, strip);
+            j = flowParaLineJoint(ux, &pen, ctx, j, strip);
             if (j == before) {
                 // Defensive: helper always advances; never spin.
                 j += 1;
             }
         } else {
-            softSpace(&pen, base_x, ux.config.base_font_size);
+            softSpace(&pen, ctx, ux.config.base_font_size);
             const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
             flowSourceLine(lb, true, false, false, &pen, ctx);
             j += 1;
@@ -2385,6 +2527,7 @@ pub fn renderViewportCore(
 
             const h_text = line_bytes[h_offset..];
             const span_count = resolveHeadingSpans(config, h_text, &span_buf);
+            const h_rtl = bidi.baseDirection(h_text) == .rtl;
 
             const end_y = layoutWrappedSpans(
                 span_buf[0..span_count],
@@ -2398,6 +2541,7 @@ pub fn renderViewportCore(
                 vp_bottom,
                 commands_out,
                 &cmd_count,
+                h_rtl,
             );
 
             cur_y = end_y + margin_bottom;
@@ -2760,6 +2904,7 @@ pub fn computeDocumentHeightEx(
 
             const h_text = line_bytes[h_offset..];
             const span_count = resolveHeadingSpans(config, h_text, &span_buf);
+            const h_rtl = bidi.baseDirection(h_text) == .rtl;
 
             const end_y = layoutWrappedSpans(
                 span_buf[0..span_count],
@@ -2773,6 +2918,7 @@ pub fn computeDocumentHeightEx(
                 std.math.inf(f32),
                 &.{},
                 &dummy_cmd_count,
+                h_rtl,
             );
 
             cur_y = end_y + margin_bottom;
@@ -3668,7 +3814,8 @@ pub fn refineLineHeight(
                 listContentBase(&mux_h, idx, 4) orelse content_x
             else
                 content_x;
-            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy);
+            const h_rtl = bidi.baseDirection(line_bytes[h_offset..]) == .rtl;
+            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy, h_rtl);
             return .{ .height = margin_top + end_y + margin_bottom, .consumed = 1 };
         },
         .quote => {
