@@ -2456,10 +2456,7 @@ pub fn renderViewportCore(
             }
 
             const img_w: f32 = if (nat_w > 0.0) @min(nat_w, content_width) else content_width;
-            const img_h: f32 = if (nat_w > 0.0 and nat_h > 0.0)
-                nat_h * (img_w / nat_w)
-            else
-                240.0;
+            const img_h: f32 = laidOutImageHeight(nat_w, nat_h, content_width);
 
             const margin_top: f32 = 18.0;
             const margin_bottom: f32 = 18.0;
@@ -2807,11 +2804,7 @@ pub fn computeDocumentHeightEx(
                     fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w2, &nat_h2);
                 }
             }
-            const disp_w2: f32 = if (nat_w2 > 0.0) @min(nat_w2, content_width) else content_width;
-            const img_h: f32 = if (nat_w2 > 0.0 and nat_h2 > 0.0)
-                nat_h2 * (disp_w2 / nat_w2)
-            else
-                240.0;
+            const img_h: f32 = laidOutImageHeight(nat_w2, nat_h2, content_width);
             const margin_top: f32 = 18.0;
             const margin_bottom: f32 = 18.0;
             const caption_h: f32 = if (alt_len > 0) (config.line_height * 0.85 + 8.0) else 0.0;
@@ -3430,7 +3423,17 @@ pub const MAX_WINDOW_LINES: usize = 1024;
 pub const GOLDILOCKS_SCREENS_ABOVE: f32 = 1.0;
 pub const GOLDILOCKS_SCREENS_BELOW: f32 = 1.0;
 
-fn contentWidthOf(config: ViewportConfig) f32 {
+/// Shared image height: natural size aspect-fit into `content_width`, 240px
+/// fallback while loading. One definition for the render, height, and
+/// refine paths plus arrival anchoring, so all four always agree.
+pub fn laidOutImageHeight(nat_w: f32, nat_h: f32, content_width: f32) f32 {
+    if (nat_w > 0.0 and nat_h > 0.0) {
+        return nat_h * (@min(nat_w, content_width) / nat_w);
+    }
+    return 240.0;
+}
+
+pub fn contentWidthOf(config: ViewportConfig) f32 {
     return if (config.window_width > config.content_max_width)
         config.content_max_width
     else
@@ -3510,6 +3513,32 @@ pub fn estimateDocumentHeight(lines: []const simd.Line, config: ViewportConfig) 
 /// moved, so content never jumps (`scroll_y` clamped at 0).
 pub fn anchorScrollForDelta(scroll_y: f32, delta_above: f32) f32 {
     return @max(0.0, scroll_y + delta_above);
+}
+
+/// Retained on-screen image box (document coordinates) for arrival anchoring.
+pub const ImageBox = struct {
+    doc_y: f32 = 0.0,
+    h: f32 = 0.0,
+};
+
+/// Scroll shift owed when image natural sizes resolve asynchronously: the
+/// summed laid-out height deltas of boxes fully above the viewport top.
+/// `new_h[i]` is the freshly queried height for `boxes[i]` (equal to the
+/// retained height while still loading, hence contributing nothing). Boxes
+/// straddling or below the top keep the viewport stable by construction
+/// (their tops don't move), so they contribute nothing. Top-down order:
+/// each box is tested against the running shift so stacked arrivals above
+/// compose exactly. Zero allocations; pure.
+pub fn imageArrivalShift(scroll_y: f32, boxes: []const ImageBox, new_h: []const f32) f32 {
+    var shift: f32 = 0.0;
+    const n = @min(boxes.len, new_h.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (boxes[i].doc_y + shift + boxes[i].h <= scroll_y) {
+            shift += new_h[i] - boxes[i].h;
+        }
+    }
+    return shift;
 }
 
 /// Exact height of the layout unit starting at `lines[idx]`, measured with
@@ -3597,8 +3626,7 @@ pub fn refineLineHeight(
             if (config.image_size_fn) |fn_ptr| {
                 if (img_url.len > 0) fn_ptr(img_url.ptr, @intCast(img_url.len), &nat_w, &nat_h);
             }
-            const disp_w: f32 = if (nat_w > 0.0) @min(nat_w, content_width) else content_width;
-            const img_h: f32 = if (nat_w > 0.0 and nat_h > 0.0) nat_h * (disp_w / nat_w) else 240.0;
+            const img_h: f32 = laidOutImageHeight(nat_w, nat_h, content_width);
             const caption_h: f32 = if (alt_len > 0) (lh * 0.85 + 8.0) else 0.0;
             return .{ .height = 18.0 + img_h + caption_h + 18.0, .consumed = 1 };
         },

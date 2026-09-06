@@ -97,6 +97,21 @@ fn snapScroll(v: f32) void {
     g_app.scroll_y = g_smooth.current;
 }
 
+/// Async image natural sizes landed (platform completion): recompute metrics
+/// with live sizes (stale checkpoints would misplace content), then absorb
+/// the above-viewport height delta so content below stays put instead of
+/// jumping. The platform computes the delta from its last drawn rect
+/// (same laidOutImageHeight/above-viewport math, pinned by contract tests
+/// in controls_test.zig — see the scrollbar mirror precedent). Cold path:
+/// one metrics walk; zero allocations. No animation — snapScroll lands it
+/// synchronously and clamps to the fresh max.
+fn onImagesChanged(delta_above: f32) callconv(.c) void {
+    updateDocumentMetrics();
+    if (delta_above != 0.0) {
+        snapScroll(g_app.scroll_y + delta_above);
+    }
+}
+
 // 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
 // previous 2048 x 128-line coverage exactly (~98 KB static, zero heap).
 const MAX_CHECKPOINTS = 8192;
@@ -855,6 +870,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_link = onLink,
         .on_tick = onTick,
         .on_scroll_to = onScrollTo,
+        .on_images_changed = onImagesChanged,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);

@@ -15,6 +15,10 @@ pub const PlatformCallbacks = extern struct {
     /// Scrollbar drag target (absolute scroll_y, clamped by the Zig side).
     /// Appended last for the same FFI stability reason.
     on_scroll_to: ?*const fn (scroll_y: f32) callconv(.c) void = null,
+    /// Async image natural sizes landed, with the above-viewport height
+    /// delta (0 when the image is at/below the viewport top: nothing above
+    /// moved). Appended last for the same FFI stability reason.
+    on_images_changed: ?*const fn (delta_above: f32) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_init(
