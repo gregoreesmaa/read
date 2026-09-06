@@ -1012,15 +1012,23 @@ const HeadingMetrics = struct {
     margin_bottom: f32,
 };
 
-fn atxMetrics(config: ViewportConfig, level: u8) HeadingMetrics {
-    const scale: f32 = switch (level) {
-        1 => 2.1,
-        2 => 1.6,
-        3 => 1.3,
-        4 => 1.15,
-        else => 1.05,
+/// Display scale for a heading level (issue #22): H1 2.0x, H2 1.5x,
+/// H3 1.2x body with strictly decreasing steps down to H6. Single source
+/// shared by the ATX/setext render, measure, and estimate paths so the
+/// scale can never diverge between passes.
+pub fn headingScale(level: u8) f32 {
+    return switch (level) {
+        1 => 2.0,
+        2 => 1.5,
+        3 => 1.2,
+        4 => 1.1,
+        5 => 1.05,
+        else => 1.0,
     };
-    const font_size = config.base_font_size * scale;
+}
+
+fn atxMetrics(config: ViewportConfig, level: u8) HeadingMetrics {
+    const font_size = config.base_font_size * headingScale(level);
     return .{
         .font_size = font_size,
         .line_h = font_size * 1.3,
@@ -1030,13 +1038,37 @@ fn atxMetrics(config: ViewportConfig, level: u8) HeadingMetrics {
 }
 
 fn setextMetrics(config: ViewportConfig, level: u8) HeadingMetrics {
-    const font_size = config.base_font_size * (if (level == 1) @as(f32, 2.2) else @as(f32, 1.7));
+    const font_size = config.base_font_size * headingScale(level);
     return .{
         .font_size = font_size,
         .line_h = config.line_height * (if (level == 1) @as(f32, 1.5) else @as(f32, 1.35)),
-        .margin_top = font_size * 1.5,
+        .margin_top = font_size * 2.5,
         .margin_bottom = font_size * 0.5,
     };
+}
+
+test "design #22: H1/H2/H3 scale 2.0/1.5/1.2 with 2.5/0.5em rhythm" {
+    // Acceptance: H1 ~2.0x, H2 ~1.5x, H3 ~1.2x body; strictly decreasing.
+    try std.testing.expectApproxEqAbs(headingScale(1), 2.0, 0.05);
+    try std.testing.expectApproxEqAbs(headingScale(2), 1.5, 0.05);
+    try std.testing.expectApproxEqAbs(headingScale(3), 1.2, 0.05);
+    var l: u8 = 1;
+    while (l < 6) : (l += 1) {
+        try std.testing.expect(headingScale(l) > headingScale(l + 1));
+    }
+    const cfg = ViewportConfig{ .window_width = 800, .window_height = 600, .scroll_y = 0 };
+    // 2.5em top / 0.5em bottom margins on the 1.75 baseline grid, ATX + setext.
+    try std.testing.expectApproxEqAbs(cfg.line_height, cfg.base_font_size * 1.75, 0.01);
+    const m1 = atxMetrics(cfg, 1);
+    try std.testing.expectApproxEqAbs(m1.font_size, cfg.base_font_size * 2.0, 0.01);
+    try std.testing.expectApproxEqAbs(m1.margin_top, m1.font_size * 2.5, 0.01);
+    try std.testing.expectApproxEqAbs(m1.margin_bottom, m1.font_size * 0.5, 0.01);
+    const s1 = setextMetrics(cfg, 1);
+    try std.testing.expectApproxEqAbs(s1.font_size, cfg.base_font_size * 2.0, 0.01);
+    try std.testing.expectApproxEqAbs(s1.margin_top, s1.font_size * 2.5, 0.01);
+    const s2 = setextMetrics(cfg, 2);
+    try std.testing.expectApproxEqAbs(s2.font_size, cfg.base_font_size * 1.5, 0.01);
+    try std.testing.expectApproxEqAbs(s2.margin_top, s2.font_size * 2.5, 0.01);
 }
 
 /// Per-call layout context shared by every unit function below. Render passes
@@ -2358,14 +2390,7 @@ pub fn renderViewportCore(
             @intFromEnum(line_info.block_type) <= @intFromEnum(simd.BlockType.heading6))
         {
             const level = @intFromEnum(line_info.block_type);
-            const scale: f32 = switch (level) {
-                1 => 2.1,
-                2 => 1.6,
-                3 => 1.3,
-                4 => 1.15,
-                else => 1.05,
-            };
-            const font_size = config.base_font_size * scale;
+            const font_size = config.base_font_size * headingScale(level);
             const heading_line_h = font_size * 1.3;
             const margin_top = font_size * 2.5;
             const margin_bottom = font_size * 0.5;
@@ -2734,14 +2759,7 @@ pub fn computeDocumentHeightEx(
             @intFromEnum(line_info.block_type) <= @intFromEnum(simd.BlockType.heading6))
         {
             const level = @intFromEnum(line_info.block_type);
-            const scale: f32 = switch (level) {
-                1 => 2.1,
-                2 => 1.6,
-                3 => 1.3,
-                4 => 1.15,
-                else => 1.05,
-            };
-            const font_size = config.base_font_size * scale;
+            const font_size = config.base_font_size * headingScale(level);
             const heading_line_h = font_size * 1.3;
             const margin_top = font_size * 2.5;
             const margin_bottom = font_size * 0.5;
@@ -3488,14 +3506,7 @@ pub fn estimateBlockHeight(line: simd.Line, config: ViewportConfig, content_widt
     var margin_top: f32 = 0.0;
     var margin_bottom: f32 = 0.0;
     if (level >= 1 and level <= 6) {
-        const s: f32 = switch (level) {
-            1 => 2.1,
-            2 => 1.6,
-            3 => 1.3,
-            4 => 1.15,
-            else => 1.05,
-        };
-        font_size = config.base_font_size * s;
+        font_size = config.base_font_size * headingScale(level);
         line_h = font_size * 1.3;
         margin_top = font_size * 2.5;
         margin_bottom = font_size * 0.5;
@@ -3648,14 +3659,7 @@ pub fn refineLineHeight(
         },
         .heading1, .heading2, .heading3, .heading4, .heading5, .heading6 => {
             const level = @intFromEnum(info.block_type);
-            const scale: f32 = switch (level) {
-                1 => 2.1,
-                2 => 1.6,
-                3 => 1.3,
-                4 => 1.15,
-                else => 1.05,
-            };
-            const font_size = config.base_font_size * scale;
+            const font_size = config.base_font_size * headingScale(level);
             const heading_line_h = font_size * 1.3;
             const margin_top = font_size * 2.5;
             const margin_bottom = font_size * 0.5;
