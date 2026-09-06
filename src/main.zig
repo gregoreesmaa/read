@@ -607,16 +607,175 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Minimal production CLI surface (issue #55): --help, --version, one
+// positional document path, and `-`/piped stdin via bounded temp-file
+// buffering (mmap needs a real file). Anything outside this interface is
+// rejected with a usage hint, never silently absorbed. Raw std.c.write
+// only: no std.fmt linkage may leak into ship builds (__TEXT budget).
+const READ_VERSION = "0.1.0";
+const CLI_USAGE =
+    \\Usage: read [--help] [--version] [file]
+    \\  file       Markdown document to open (default: built-in welcome doc)
+    \\  -          Read Markdown from stdin (max 32 MiB)
+    \\  --help     Print this help and exit
+    \\  --version  Print version and exit
+    \\
+    \\With no file and piped stdin (`curl … | read`), stdin is read instead.
+    \\
+;
+const CLI_VERSION_LINE = "read " ++ READ_VERSION ++ "\n";
+/// Bounded stdin spool: mmap needs a seekable file, so piped input lands in
+/// a temp file first. Caps temp/resident cost; larger input is a clean
+/// error, never a hang or OOM.
+const STDIN_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+fn cliIsHelp(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help");
+}
+
+fn cliIsVersion(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--version");
+}
+
+fn cliIsStdinDash(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-");
+}
+
+fn cliWriteStderr(msg: []const u8) void {
+    _ = std.c.write(std.posix.STDERR_FILENO, msg.ptr, msg.len);
+}
+
+fn cliWriteStdout(msg: []const u8) void {
+    _ = std.c.write(std.posix.STDOUT_FILENO, msg.ptr, msg.len);
+}
+
+fn cliUsageError(detail: ?[]const u8) noreturn {
+    if (detail) |msg| {
+        cliWriteStderr("read: ");
+        cliWriteStderr(msg);
+        cliWriteStderr("\n");
+    }
+    cliWriteStderr(CLI_USAGE);
+    std.c.exit(2);
+}
+
+/// fstat mode carries a piped/redirected document (FIFO, regular file,
+/// socket) as opposed to an interactive terminal, /dev/null, or TTY.
+fn stdinCarriesDocument(mode: std.posix.mode_t) bool {
+    return switch (mode & std.posix.S.IFMT) {
+        std.posix.S.IFIFO, std.posix.S.IFREG, std.posix.S.IFSOCK => true,
+        else => false,
+    };
+}
+
+/// fstat mode of stdin, or null when it cannot be queried (closed stdin,
+/// Windows). Darwin uses libc fstat; Linux uses statx(AT_EMPTY_PATH) — the
+/// same split as MappedFile.open (see mmap.zig), because Zig 0.16 leaves
+/// libc fstat void on Linux.
+fn stdinMode() ?std.posix.mode_t {
+    if (builtin.os.tag == .windows) return null;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx = std.mem.zeroes(linux.Statx);
+        const err = linux.errno(linux.statx(
+            std.posix.STDIN_FILENO,
+            "",
+            linux.AT.EMPTY_PATH,
+            .{ .MODE = true },
+            &sx,
+        ));
+        if (err != .SUCCESS or !sx.mask.MODE) return null;
+        return @intCast(sx.mode & 0xFFFF);
+    } else {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(std.posix.STDIN_FILENO, &st) != 0) return null;
+        return st.mode;
+    }
+}
+
+/// True when stdin is a pipe/file/socket (i.e. `curl … | read` should read
+/// it). Terminals and character devices keep the default welcome doc.
+fn stdinPiped() bool {
+    const mode = stdinMode() orelse return false;
+    return stdinCarriesDocument(mode);
+}
+
+/// Spool stdin (bounded by STDIN_MAX_BYTES) into a temp file and return its
+/// path (borrowed from `buf`). The name embeds our pid, so no live process
+/// shares it; stale files from crashed runs are unlinked before create.
+fn spoolStdinToTemp(buf: *[std.fs.max_path_bytes:0]u8) ![:0]const u8 {
+    const tmpdir = if (std.c.getenv("TMPDIR")) |z| std.mem.span(z) else "/tmp";
+    const stem = "/read-stdin-";
+    const suffix = ".md";
+    // 20 digits of pid + slack; fall back to /tmp when TMPDIR is absurd.
+    const need = tmpdir.len + stem.len + 20 + suffix.len;
+    const dir: []const u8 = if (need <= buf.len) tmpdir else "/tmp";
+    var len: usize = 0;
+    @memcpy(buf[len..][0..dir.len], dir);
+    len += dir.len;
+    @memcpy(buf[len..][0..stem.len], stem);
+    len += stem.len;
+    var pid: u32 = @bitCast(std.c.getpid());
+    var digits: [20]u8 = undefined;
+    var ndigits: usize = 0;
+    if (pid == 0) {
+        digits[0] = '0';
+        ndigits = 1;
+    } else {
+        while (pid > 0) : (pid /= 10) {
+            digits[ndigits] = @intCast('0' + (pid % 10));
+            ndigits += 1;
+        }
+        std.mem.reverse(u8, digits[0..ndigits]);
+    }
+    @memcpy(buf[len..][0..ndigits], digits[0..ndigits]);
+    len += ndigits;
+    @memcpy(buf[len..][0..suffix.len], suffix);
+    len += suffix.len;
+    buf[len] = 0;
+    const path = buf[0..len :0];
+
+    _ = std.c.unlink(path);
+    const fd = try std.posix.openat(
+        std.posix.AT.FDCWD,
+        path,
+        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true },
+        0o600,
+    );
+    defer _ = std.c.close(fd);
+    var chunk: [64 * 1024]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+        if (n == 0) break;
+        total += n;
+        if (total > STDIN_MAX_BYTES) {
+            _ = std.c.unlink(path);
+            return error.StdinTooLarge;
+        }
+        var off: usize = 0;
+        while (off < n) {
+            const w: isize = std.c.write(fd, chunk[off..n].ptr, n - off);
+            if (w <= 0 or w > @as(isize, @intCast(n - off))) return error.StdinSpoolFailed;
+            off += @intCast(w);
+        }
+    }
+    return path;
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var in_fence: simd.FenceState = .{};
     var file_path: ?[]const u8 = null;
+    var stdin_dash = false;
 
     // Parse command line arguments.
-    // Production ships a positional document path only. The whole headless
-    // test CLI (--screenshot, --scroll, --scroll-sweep, --damage,
-    // --dump-*, --select*, --probe-px, --force-scale, --settle-images)
-    // lives behind ONE comptime gate so the ship binary contains none of
-    // it; it runs only in the read-test binary. Trust the compiler.
+    // Production surface is --help, --version, one positional path, and `-`
+    // for stdin. The whole headless test CLI (--screenshot, --scroll,
+    // --scroll-sweep, --damage, --dump-*, --select*, --probe-px,
+    // --force-scale, --settle-images) lives behind ONE comptime gate so the
+    // ship binary contains none of it; it runs only in the read-test
+    // binary. Trust the compiler.
     var args_it = std.process.Args.Iterator.init(init.args);
     _ = args_it.next(); // skip exe name
     var screenshot_path: ?[*:0]const u8 = null;
@@ -630,18 +789,35 @@ pub fn main(init: std.process.Init.Minimal) !void {
         dump_records = false;
         settle_images_ms = 0;
         while (args_it.next()) |arg| {
-            if (std.mem.startsWith(u8, arg, "--")) {
-                const pre = "Unknown option (testing flags live in read-test): ";
-                _ = std.c.write(std.posix.STDERR_FILENO, pre, pre.len);
-                _ = std.c.write(std.posix.STDERR_FILENO, arg.ptr, arg.len);
-                _ = std.c.write(std.posix.STDERR_FILENO, "\n", 1);
-                std.c.exit(2);
+            if (cliIsHelp(arg)) {
+                cliWriteStdout(CLI_USAGE);
+                std.c.exit(0);
+            } else if (cliIsVersion(arg)) {
+                cliWriteStdout(CLI_VERSION_LINE);
+                std.c.exit(0);
+            } else if (cliIsStdinDash(arg)) {
+                if (stdin_dash or file_path != null) cliUsageError("unexpected extra document argument");
+                stdin_dash = true;
+            } else if (arg.len > 0 and arg[0] == '-') {
+                cliUsageError(arg);
+            } else if (file_path != null) {
+                cliUsageError("unexpected extra document argument");
+            } else {
+                file_path = arg;
             }
-            file_path = arg;
         }
     } else {
         while (args_it.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--screenshot")) {
+            if (cliIsHelp(arg)) {
+                cliWriteStdout(CLI_USAGE);
+                std.c.exit(0);
+            } else if (cliIsVersion(arg)) {
+                cliWriteStdout(CLI_VERSION_LINE);
+                std.c.exit(0);
+            } else if (cliIsStdinDash(arg)) {
+                if (stdin_dash or file_path != null) cliUsageError("unexpected extra document argument");
+                stdin_dash = true;
+            } else if (std.mem.eql(u8, arg, "--screenshot")) {
                 if (args_it.next()) |sc_path| {
                     screenshot_path = @ptrCast(sc_path.ptr);
                 }
@@ -659,7 +835,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Document paths land in file_path from any position; hook
             // flags (and their consumed values, taken above) never do, so
             // a missing document still falls back to the default doc.
-            if (!std.mem.startsWith(u8, arg, "--")) file_path = arg;
+            // Single-dash non-`-` tokens are rejected (never absorbed as a
+            // path); same for a second positional and unknown `--` flags
+            // (the chain below ends in a usage error for those).
+            if (arg.len > 0 and arg[0] == '-') {
+                if (!std.mem.startsWith(u8, arg, "--")) cliUsageError(arg);
+            } else if (file_path != null) {
+                cliUsageError("unexpected extra document argument");
+            } else {
+                file_path = arg;
+            }
             // Headless test-hooks matching (read-test binary only): ONE
             // comptime gate for the whole tail, so ship builds emit zero
             // bytes here — no per-flag scaffolding, no flag literals, no
@@ -736,16 +921,39 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         }
                         g_drag_active = true;
                     }
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    // Unknown `--` flags are rejected, never silently
+                    // absorbed (issue #55; previously fell through to the
+                    // default doc). Positional paths never reach here:
+                    // they don't start with `--`.
+                    cliUsageError(arg);
                 }
             }
         }
         } // end while (test CLI arg parse)
     } // end test-CLI else (ship builds skip all of the above)
 
+    // Stdin decision (issue #55): explicit `-` always reads stdin; with no
+    // positional, a pipe/file/socket on stdin (`curl … | read`) is read
+    // instead of showing the welcome doc. Terminals and character devices
+    // (/dev/null, TTYs) keep the default doc. Bounded temp spool: mmap
+    // needs a real file.
+    var stdin_tmp: [std.fs.max_path_bytes:0]u8 = undefined;
+    var stdin_tmp_c: ?[*:0]const u8 = null;
+    if (stdin_dash or (file_path == null and stdinPiped())) {
+        const spooled = spoolStdinToTemp(&stdin_tmp) catch {
+            cliWriteStderr("read: failed to read stdin (or exceeds 32 MiB limit)\n");
+            std.c.exit(1);
+        };
+        stdin_tmp_c = spooled;
+        file_path = spooled;
+    }
+
     if (file_path) |path| {
         const mapped = mmap.MappedFile.open(path) catch {
             // Ship-safe error path: raw writes only, so no std.fmt
             // error-formatting machinery is linked into ship builds.
+            if (stdin_tmp_c) |cpath| _ = std.c.unlink(cpath);
             const pre = "Failed to open file: ";
             _ = std.c.write(std.posix.STDERR_FILENO, pre, pre.len);
             _ = std.c.write(std.posix.STDERR_FILENO, path.ptr, path.len);
@@ -755,6 +963,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         g_app.mapped_file = mapped;
         g_app.bytes = mapped.bytes;
+        // The spool has served its purpose: the mapping and open fd survive
+        // the unlink, and no temp file lingers after startup.
+        if (stdin_tmp_c) |cpath| _ = std.c.unlink(cpath);
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
@@ -1069,4 +1280,45 @@ test "retina atlas text stays crisp (no-blur regression)" {
         try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
     }
+}
+
+test "cli surface: help/version/dash classification (issue #55)" {
+    // Pure classification shared by both binaries; runs everywhere.
+    const t = std.testing;
+    try t.expect(cliIsHelp("--help"));
+    try t.expect(!cliIsHelp("--help=x"));
+    try t.expect(!cliIsHelp("-h"));
+    try t.expect(!cliIsHelp("--heap"));
+    try t.expect(!cliIsHelp(""));
+    try t.expect(cliIsVersion("--version"));
+    try t.expect(!cliIsVersion("--v"));
+    try t.expect(!cliIsVersion("--version=x"));
+    try t.expect(cliIsStdinDash("-"));
+    try t.expect(!cliIsStdinDash("--"));
+    try t.expect(!cliIsStdinDash("-x"));
+    try t.expect(!cliIsStdinDash(""));
+    // --help/--version/- must not be mistaken for each other.
+    try t.expect(!cliIsVersion("--help"));
+    try t.expect(!cliIsHelp("--version"));
+    try t.expect(!cliIsHelp("-"));
+    // Version line carries the single-source version constant.
+    try t.expect(std.mem.startsWith(u8, CLI_VERSION_LINE, "read "));
+    try t.expect(std.mem.indexOf(u8, CLI_VERSION_LINE, READ_VERSION) != null);
+}
+
+test "cli surface: piped-stdin mode decision (issue #55)" {
+    // Pipes, redirected files, and sockets carry a document; terminals,
+    // /dev/null (char device), directories, and mode 0 keep the welcome doc.
+    const t = std.testing;
+    const S = std.posix.S;
+    try t.expect(stdinCarriesDocument(S.IFIFO));
+    try t.expect(stdinCarriesDocument(S.IFREG));
+    try t.expect(stdinCarriesDocument(S.IFSOCK));
+    try t.expect(!stdinCarriesDocument(S.IFCHR));
+    try t.expect(!stdinCarriesDocument(S.IFDIR));
+    try t.expect(!stdinCarriesDocument(S.IFBLK));
+    try t.expect(!stdinCarriesDocument(S.IFLNK));
+    try t.expect(!stdinCarriesDocument(0));
+    // Spool bound is a real cap, not zero and not unbounded.
+    try t.expect(STDIN_MAX_BYTES == 32 * 1024 * 1024);
 }
