@@ -259,13 +259,14 @@ pub const LINE_CACHE_MASK: usize = LINE_CACHE_SIZE - 1;
 ///
 /// Soundness: entries are content-addressed (FNV-1a over the unit's line
 /// offsets/lengths/indents/block-types/bytes with the unit start mixed in)
-/// and versioned by a geometry + parse-input generation (content width, font
-/// sizes, ref-def/join/entity store identity). Any mismatch is a miss that
-/// re-measures exactly, so the cache can only skip work, never change
-/// pixels. Units whose heights depend on live async state (images via
-/// `image_size_fn`) are never cached. Fenced code, tables, and indented
-/// code are never cached either: their heights are branch-light arithmetic
-/// and their above-viewport emission is already block-culled.
+/// and versioned by a document + geometry + parse-input generation (mapped
+/// bytes identity, content width, font sizes, ref-def/join/entity store
+/// identity). Any mismatch is a miss that re-measures exactly, so the cache
+/// can only skip work, never change pixels. Units whose heights depend on
+/// live async state (images via `image_size_fn`) are never cached. Fenced
+/// code, tables, and indented code are never cached either: their heights
+/// are branch-light arithmetic and their above-viewport emission is already
+/// block-culled.
 ///
 /// Scratch replication: each entry records how many entity/marker scratch
 /// slots its unit consumed at measure time; a skipped unit reserves the same
@@ -283,6 +284,8 @@ pub const LineLayoutCache = struct {
     ref_defs_len: usize = 0,
     join_ptr: usize = 0,
     entities_ptr: usize = 0,
+    doc_ptr: usize = 0,
+    doc_len: usize = 0,
     hash: [LINE_CACHE_SIZE]u64 = [_]u64{0} ** LINE_CACHE_SIZE,
     height: [LINE_CACHE_SIZE]f32 = [_]f32{0} ** LINE_CACHE_SIZE,
     consumed: [LINE_CACHE_SIZE]u32 = [_]u32{0} ** LINE_CACHE_SIZE,
@@ -294,10 +297,12 @@ pub const LineLayoutCache = struct {
         self.consumed = [_]u32{0} ** LINE_CACHE_SIZE;
     }
 
-    fn storeGeneration(self: *LineLayoutCache, config: ViewportConfig, content_width: f32) void {
+    fn storeGeneration(self: *LineLayoutCache, bytes: []const u8, config: ViewportConfig, content_width: f32) void {
         self.content_width_bits = @bitCast(content_width);
         self.base_font_size_bits = @bitCast(config.base_font_size);
         self.line_height_bits = @bitCast(config.line_height);
+        self.doc_ptr = if (bytes.len > 0) @intFromPtr(bytes.ptr) else 0;
+        self.doc_len = bytes.len;
         if (config.ref_defs.len > 0) {
             self.ref_defs_ptr = @intFromPtr(config.ref_defs.ptr);
             self.ref_defs_len = config.ref_defs.len;
@@ -310,8 +315,10 @@ pub const LineLayoutCache = struct {
         self.valid = true;
     }
 
-    fn generationMatches(self: *const LineLayoutCache, config: ViewportConfig, content_width: f32) bool {
+    fn generationMatches(self: *const LineLayoutCache, bytes: []const u8, config: ViewportConfig, content_width: f32) bool {
         if (!self.valid) return false;
+        const doc_ptr: usize = if (bytes.len > 0) @intFromPtr(bytes.ptr) else 0;
+        if (self.doc_ptr != doc_ptr or self.doc_len != bytes.len) return false;
         if (self.content_width_bits != @as(u32, @bitCast(content_width))) return false;
         if (self.base_font_size_bits != @as(u32, @bitCast(config.base_font_size))) return false;
         if (self.line_height_bits != @as(u32, @bitCast(config.line_height))) return false;
@@ -327,10 +334,10 @@ pub const LineLayoutCache = struct {
     /// Resets and stores the generation when stale (shared prefix of `lookup`
     /// and `store`, one copy). True when the generation was already current
     /// (lookups hit only then); stores proceed either way.
-    fn syncGeneration(self: *LineLayoutCache, config: ViewportConfig, content_width: f32) bool {
-        if (self.generationMatches(config, content_width)) return true;
+    fn syncGeneration(self: *LineLayoutCache, bytes: []const u8, config: ViewportConfig, content_width: f32) bool {
+        if (self.generationMatches(bytes, config, content_width)) return true;
         self.reset();
-        self.storeGeneration(config, content_width);
+        self.storeGeneration(bytes, config, content_width);
         return false;
     }
 
@@ -344,7 +351,7 @@ pub const LineLayoutCache = struct {
         config: ViewportConfig,
         content_width: f32,
     ) ?LineCacheHit {
-        if (!self.syncGeneration(config, content_width)) return null;
+        if (!self.syncGeneration(bytes, config, content_width)) return null;
         if (idx >= lines.len) return null;
         const slot = idx & LINE_CACHE_MASK;
         const c = self.consumed[slot];
@@ -370,7 +377,7 @@ pub const LineLayoutCache = struct {
         config: ViewportConfig,
         content_width: f32,
     ) void {
-        _ = self.syncGeneration(config, content_width);
+        _ = self.syncGeneration(bytes, config, content_width);
         if (idx >= lines.len or consumed == 0) return;
         if (consumed > lines.len - idx) return;
         if (consumed > std.math.maxInt(u32)) return;
