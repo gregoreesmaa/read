@@ -396,6 +396,20 @@ fn anchorTargetY(frag: []const u8) ?f32 {
     );
 }
 
+/// Shared measure config for document walks that need live geometry
+/// (anchor jumps, outline enumeration): zero scroll, live image sizes.
+fn measureConfig() layout.ViewportConfig {
+    return layout.ViewportConfig{
+        .window_width = g_app.window_width,
+        .window_height = g_app.window_height,
+        .scroll_y = 0.0,
+        .image_size_fn = gatedImageSize,
+        .ref_defs = g_refdefs[0..g_refdef_count],
+        .entities = &g_entities,
+        .join_buf = &g_joinbuf,
+    };
+}
+
 /// Open a sibling `.md` document in the same window (#46): swap the mmap,
 /// rescan, reset viewport state, optionally land on `#frag`. Any failure
 /// (missing file, overlong path) is a silent no-op — never an error dialog.
@@ -456,6 +470,29 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
             bridge.platform_open_url_external(url_ptr, url_len);
         },
     }
+}
+
+// Outline picker model (#48): caller-owned mark + text arenas (BSS, zero
+// file cost). 512 headings cover any realistic doc; enumeration caps, the
+// panel shows the prefix.
+var g_outline_marks: [512]layout.HeadingMark = undefined;
+var g_outline_arena: [512 * layout.OUTLINE_TEXT_MAX]u8 = undefined;
+
+/// Cmd+J pressed (platform panel key): enumerate headings and hand them to
+/// the native picker. Jumps reuse on_scroll_to (exact y, no slug roundtrip,
+/// so duplicate headings land precisely). Cold path: zero heap.
+fn onOutlineOpen() callconv(.c) void {
+    const n = layout.collectHeadings(
+        g_app.bytes,
+        g_app.lines[0..g_app.line_count],
+        measureConfig(),
+        &g_outline_arena,
+        &g_outline_marks,
+    );
+    for (g_outline_marks[0..n]) |m| {
+        bridge.platform_outline_add(m.level, m.y, m.text.ptr, @intCast(m.text.len));
+    }
+    bridge.platform_outline_show();
 }
 
 fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
@@ -1432,6 +1469,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_scroll_to = onScrollTo,
         .on_images_changed = onImagesChanged,
         .on_appearance = onAppearance,
+        .on_outline_open = onOutlineOpen,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);
@@ -1827,5 +1865,31 @@ test "image completeness contracts: doc-dir resolve + URL session (#45)" {
         try t.expectEqual(@as(c_int, -1), bridge.platform_test_image_resolve("", 0, "tmp", 3));
         // Session: shared, ephemeral, no shared cache, bounded timeouts.
         try t.expectEqual(@as(c_int, 1), bridge.platform_test_image_session());
+    }
+}
+
+fn outlineFilterCase(text: []const u8, filter: []const u8) c_int {
+    return bridge.platform_test_outline_filter(
+        text.ptr,
+        @intCast(text.len),
+        filter.ptr,
+        @intCast(filter.len),
+    );
+}
+
+test "outline picker contracts: filter + panel build (#48)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the crisp test). Only the read-test binary executes it.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        // Plain-substring filter: case-insensitive, empty matches all.
+        try t.expectEqual(@as(c_int, 1), outlineFilterCase("Hello World", "hello"));
+        try t.expectEqual(@as(c_int, 1), outlineFilterCase("Hello World", "WORLD"));
+        try t.expectEqual(@as(c_int, 1), outlineFilterCase("Hello World", ""));
+        try t.expectEqual(@as(c_int, 1), outlineFilterCase("abc", "b"));
+        try t.expectEqual(@as(c_int, 0), outlineFilterCase("Hello World", "xyz"));
+        try t.expectEqual(@as(c_int, 0), outlineFilterCase("Hi", "hello"));
+        // Panel construction: two adds build two native rows headlessly.
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_outline_build());
     }
 }
