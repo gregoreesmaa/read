@@ -1,0 +1,102 @@
+name: Release
+
+# Versioned tags (v*) ship installable artifacts. The release honors the
+# same contract as a local build (AGENTS.md §1): strict tests green,
+# ship binary under 180 KiB, test tooling never in the artifact.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast --summary all
+
+      - name: Release build (ship binary only ships)
+        run: |
+          zig build -Doptimize=ReleaseFast
+          ./scripts/size_gate.sh zig-out/bin/read
+          ls -lh zig-out/bin/read
+
+      - name: Reproducibility check (same tag, same bytes)
+        run: |
+          zig build -Doptimize=ReleaseFast --prefix /tmp/repro-a
+          zig build -Doptimize=ReleaseFast --prefix /tmp/repro-b
+          cmp /tmp/repro-a/bin/read /tmp/repro-b/bin/read
+          cmp /tmp/repro-a/bin/read zig-out/bin/read
+          echo "reproducible: identical bytes across rebuilds"
+
+      - name: Codesign (Developer ID, when secrets exist)
+        if: ${{ secrets.APPLE_DEVELOPER_IDENTITY != '' }}
+        run: |
+          codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
+            --options runtime --timestamp -v zig-out/bin/read
+          codesign -vv zig-out/bin/read
+
+      - name: Notarize (Apple notarytool, when secrets exist)
+        if: ${{ secrets.APPLE_ID != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent zig-out/bin/read /tmp/notarize.zip
+          xcrun notarytool submit /tmp/notarize.zip --wait \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          xcrun stapler staple zig-out/bin/read
+          echo "notarized + stapled"
+
+      - name: Package, checksum, changelog
+        run: |
+          DIST="read-$TAG-macos-arm64"
+          mkdir -p "dist/$DIST"
+          cp zig-out/bin/read LICENSE "dist/$DIST/"
+          tar -czf "dist/$DIST.tar.gz" -C dist "$DIST"
+          (cd dist && shasum -a 256 "$DIST.tar.gz" > "$DIST.tar.gz.sha256")
+          PREV=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || true)
+          {
+            echo "Read $TAG"
+            echo
+            if [ -z "$PREV" ]; then
+              echo "First versioned release."
+            else
+              echo "Changes since $PREV:"
+              echo
+              git log "$PREV"..HEAD --pretty=format:'- %s'
+              echo
+            fi
+            echo
+            echo "Checksum (sha256):"
+            cat "dist/$DIST.tar.gz.sha256"
+            if [ -z "${{ secrets.APPLE_ID }}" ]; then
+              echo
+              echo "Note: built without Apple signing secrets, so this artifact is"
+              echo "unsigned (Gatekeeper will block it on other Macs until a signed"
+              echo "release is cut). See docs/release.md."
+            fi
+          } > dist/NOTES.md
+          cat dist/NOTES.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DIST="read-$TAG-macos-arm64"
+          gh release create "$TAG" --title "$TAG" --notes-file dist/NOTES.md \
+            "dist/$DIST.tar.gz" "dist/$DIST.tar.gz.sha256"
