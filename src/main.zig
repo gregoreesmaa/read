@@ -797,6 +797,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 // the platform loader (which is what would fetch them).
                 // They degrade to the same muted placeholder box the loader
                 // draws for failures — pixels only, no fetch, no hang.
+                // Alt text rides along for the muted placeholder box (#45);
+                // loaded images ignore it.
                 if (cmd.link_target) |t| {
                     if (remote_policy.blockedByPolicy(t, g_app.remote_images)) {
                         bridge.platform_draw_rect(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h, 28, 28, 32, 255);
@@ -811,6 +813,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.rect.y,
                     cmd.rect.w,
                     cmd.rect.h,
+                    cmd.text.ptr,
+                    @intCast(cmd.text.len),
                 );
             },
             .inline_code_bg => {
@@ -1294,6 +1298,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (stdin_tmp_c) |cpath| _ = std.c.unlink(cpath);
         // Anchor relative `.md` links (and image paths) to this file's dir.
         setDocDir(path);
+        // Document directory for relative image paths (#45). The platform
+        // takes the full path and keeps the dirname; empty clears it.
+        bridge.platform_set_document_dir(path.ptr, @intCast(path.len));
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
@@ -1787,4 +1794,23 @@ test "link routing: anchors, local .md, external (#46)" {
     try t.expectEqualStrings("/docs/sub/sub/nested.md", resolveDocPath("sub/nested.md", &rbuf).?);
     try t.expectEqualStrings("/abs/x.md", resolveDocPath("/abs/x.md", &rbuf).?);
     try t.expect(resolveDocPath("", &rbuf) == null);
+}
+test "image completeness contracts: doc-dir resolve + URL session (#45)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the crisp test). Only the read-test binary executes it.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        // Doc-dir join: ("/","tmp") exists on any macOS; nonsense does not.
+        try t.expectEqual(
+            @as(c_int, 1),
+            bridge.platform_test_image_resolve("/", 1, "tmp", 3),
+        );
+        try t.expectEqual(
+            @as(c_int, 0),
+            bridge.platform_test_image_resolve("/", 1, "read-definitely-missing-zzz", 25),
+        );
+        try t.expectEqual(@as(c_int, -1), bridge.platform_test_image_resolve("", 0, "tmp", 3));
+        // Session: shared, ephemeral, no shared cache, bounded timeouts.
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_image_session());
+    }
 }
