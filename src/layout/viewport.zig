@@ -578,6 +578,19 @@ pub fn flowSourceLine(
     }
     while (text.len > 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) : (text = text[0 .. text.len - 1]) {}
     if (text.len == 0) return;
+    // Fast path: text with no inline-significant byte parses to exactly one
+    // default-style span, so skip the full inline parser and flow it
+    // directly. The common case for quotes, bullets, and plain paragraphs.
+    if (!hasInlineMarkup(text)) {
+        var style: parser.SpanStyle = .{};
+        if (force_code) style.code = true;
+        if (force_heading) {
+            style.bold = true;
+            style.heading = true;
+        }
+        flowSpans(text, style, null, pen, ctx);
+        return;
+    }
     var span_buf: [32]parser.InlineSpan = undefined;
     const n = parser.parseInlinesWithDefs(text, &span_buf, ctx.defs);
     for (span_buf[0..n]) |span| {
@@ -603,6 +616,24 @@ pub fn flowSourceLine(
         }
         flowSpans(txt, style, tgt, pen, ctx);
     }
+}
+
+/// True when `text` holds a byte that can open an inline construct:
+/// code span (`` ` ``), emphasis (`*`, `_`), link/image/ref (`[`),
+/// autolink (`<`), entity (`&`), escape (`\`), strikethrough (`~`).
+/// Every construct needs one of these openers, so text without any of them
+/// always parses to a single default-style span and flowSourceLine can skip
+/// the full inline parser. closers alone (`]`, `)`) fall back only when an
+/// opener is present; block-level markers (`>`, `#`, `-`, `|`) are literal
+/// in text or stripped upstream, so they never force the slow path.
+fn hasInlineMarkup(text: []const u8) bool {
+    for (text) |c| {
+        switch (c) {
+            '`', '*', '_', '[', '<', '&', '\\', '~' => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Caller-owned scratch for decoded `&entity;` text (see `EntityStore` on
