@@ -36,6 +36,7 @@ static unsigned long g_draw_seq = 0;
 #ifdef READ_ANIMATED_GIF
 static BOOL gif_window_visible(void); // defined with the image cache below
 #endif
+static void apply_native_tabbing(NSWindow* w); // defined at end-of-file
 
 typedef struct {
     float x;
@@ -619,6 +620,107 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     return (float)(w + tr);
 }
 
+// ---------------------------------------------------------------------------
+// VoiceOver (#29): the custom CoreText view exposes an AXTextArea element
+// (value, selected text/range, visible range), heading + code-block
+// children, and posts AXSelectedTextChanged / AXValueChanged.
+// String building is on-demand (AX queries) or a scalar compare per
+// draw; the scroll/render hot path is untouched.
+// ---------------------------------------------------------------------------
+static unsigned long g_ax_text_seq = 0; // draw seq backing the caches
+static NSString* g_ax_text = nil;       // joined document text cache
+static long g_ax_rec_off[MAX_QUAD_RECORDS]; // UTF-16 start offset per record
+static int g_ax_last_count = -1; // value-change detection scalars
+static long g_ax_last_len = -1;
+static NSArray* g_ax_children = nil;
+static unsigned long g_ax_children_seq = 0;
+
+// Join the text records into one AX string, remembering each record's
+// UTF-16 start offset for selection mapping. Same row -> space, new
+// row -> newline (mirrors the clipboard join shape, plain-text only).
+static NSString* ax_cached_text(void) {
+    if (g_ax_text && g_ax_text_seq == g_draw_seq) return g_ax_text;
+    NSMutableString* s = [NSMutableString string];
+    float last_doc_y = -9999.0f;
+    for (int q = 0; q < g_text_record_count; q++) {
+        QuadTextRecord* rec = &g_text_records[q];
+        NSString* t = [[NSString alloc] initWithBytes:rec->text length:rec->len encoding:NSUTF8StringEncoding];
+        if (!t) { g_ax_rec_off[q] = (long)[s length]; continue; }
+        if (last_doc_y > -9000.0f) {
+            if (fabsf(rec->doc_y - last_doc_y) > 35.0f) [s appendString:@"\n\n"];
+            else if (fabsf(rec->doc_y - last_doc_y) > 10.0f) [s appendString:@"\n"];
+            else [s appendString:@" "];
+        }
+        g_ax_rec_off[q] = (long)[s length];
+        [s appendString:t];
+        last_doc_y = rec->doc_y;
+    }
+    g_ax_text = s;
+    g_ax_text_seq = g_draw_seq;
+    return s;
+}
+
+// Map a document point to a UTF-16 offset in the cached AX string:
+// nearest record by row band, CoreText-precise char index within it.
+static long ax_offset_for_doc_point(NSPoint doc_pt) {
+    NSString* full = ax_cached_text();
+    long best = -1;
+    float best_d = 1e30f;
+    int best_q = -1;
+    for (int q = 0; q < g_text_record_count; q++) {
+        QuadTextRecord* rec = &g_text_records[q];
+        float mid = rec->doc_y + rec->h * 0.5f;
+        float d = fabsf(mid - doc_pt.y);
+        if (d < best_d) { best_d = d; best_q = q; }
+    }
+    if (best_q < 0) return 0;
+    QuadTextRecord* rec = &g_text_records[best_q];
+    NSString* t = [[NSString alloc] initWithBytes:rec->text length:rec->len encoding:NSUTF8StringEncoding];
+    long u16len = t ? (long)[t length] : 0;
+    int u16 = 0;
+    if (doc_pt.x <= rec->x) u16 = 0;
+    else if (doc_pt.x >= rec->x + rec->w) u16 = (int)u16len;
+    else u16 = get_char_index_at_x(rec, doc_pt.x - rec->x);
+    if (u16 < 0) u16 = 0;
+    if (u16 > u16len) u16 = (int)u16len;
+    best = g_ax_rec_off[best_q] + u16;
+    long total = (long)[full length];
+    if (best < 0) best = 0;
+    if (best > total) best = total;
+    return best;
+}
+
+static NSRange ax_selected_range(void) {
+    if (!g_has_selection && !g_select_all) return NSMakeRange(0, 0);
+    NSString* full = ax_cached_text();
+    long total = (long)[full length];
+    if (g_select_all) return NSMakeRange(0, total);
+    long a = ax_offset_for_doc_point(g_select_start);
+    long b = ax_offset_for_doc_point(g_select_end);
+    long lo = a < b ? a : b;
+    long hi = a < b ? b : a;
+    return NSMakeRange((NSUInteger)lo, (NSUInteger)(hi - lo));
+}
+
+static void ax_notify_selection_changed(void) {
+    NSAccessibilityPostNotification(g_main_view, NSAccessibilitySelectedTextChangedNotification);
+}
+
+// End-of-draw check: scalar compare only (no string build). A changed
+// record count or total length means new document text -> AXValueChanged
+// plus a children-cache invalidation. Runs once per draw, zero heap.
+static void ax_note_draw_locked(void) {
+    long len = 0;
+    for (int q = 0; q < g_text_record_count; q++) len += g_text_records[q].len + 1;
+    if (g_text_record_count != g_ax_last_count || len != g_ax_last_len) {
+        g_ax_last_count = g_text_record_count;
+        g_ax_last_len = len;
+        g_ax_text = nil;
+        g_ax_children = nil;
+        NSAccessibilityPostNotification(g_main_view, NSAccessibilityValueChangedNotification);
+    }
+}
+
 @interface ReadView : NSView
 - (void)copySelectionToClipboard;
 - (void)selectAllDocument;
@@ -927,6 +1029,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         }
     }
 
+    // VoiceOver: scalar value-change check (posts AXValueChanged only when
+    // the document text actually changed).
+    ax_note_draw_locked();
+
     g_current_cg_context = NULL;
     g_pending_dirty_valid = NO;
 }
@@ -1104,6 +1210,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
     // Damage: old selection bounds + new caret/word/line box only.
     invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+    // VoiceOver: the selection committed (set or cleared) above.
+    ax_notify_selection_changed();
 #ifdef TEST_HOOKS
     DBGLOG("EV mousedown clicks=%d mode=%d pt=%.0f,%.0f", (int)[event clickCount], g_selection_mode,
         g_select_start.x, g_select_start.y);
@@ -1130,6 +1238,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #endif
         g_select_end = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
         invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+        // VoiceOver: the drag moved the selection end.
+        ax_notify_selection_changed();
 #ifdef TEST_HOOKS
         DBGLOG("EV mousedrag mode=%d end=%.0f,%.0f->%.0f,%.0f dmg=%.0f,%.0f,%.0fx%.0f",
             g_selection_mode, prev_end.x, prev_end.y, g_select_end.x, g_select_end.y,
@@ -1196,6 +1306,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
             // Damage: cleared selection repaints its old bounds only.
             invalidate_rect(old_sel);
+            // VoiceOver: the selection cleared.
+            ax_notify_selection_changed();
 #ifdef TEST_HOOKS
             DBGLOG("EV mouseup mode=%d action=clear", g_selection_mode);
 #endif
@@ -1206,6 +1318,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
 
     invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+    // VoiceOver: the release committed the drag end. (The word/line lock
+    // path above returns early and posts nothing: no change, no event.)
+    ax_notify_selection_changed();
 #ifdef TEST_HOOKS
     DBGLOG("EV mouseup mode=%d action=extend end=%.0f,%.0f", g_selection_mode,
         g_select_end.x, g_select_end.y);
@@ -1280,6 +1395,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
     DBGLOG("EV selectall_full");
 #endif
+    // VoiceOver: the whole document is now selected.
+    ax_notify_selection_changed();
     [self setNeedsDisplay:YES];
 }
 
@@ -1375,6 +1492,91 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         [pb clearContents];
         [pb setString:result forType:NSPasteboardTypeString];
     }
+}
+
+// VoiceOver element: the view is one AXTextArea. Headings surface as
+// "heading" static texts and code blocks as "code block" groups so the
+// rotor can jump structure; everything else reads as continuous text.
+- (BOOL)isAccessibilityElement {
+    return YES;
+}
+
+- (NSString *)accessibilityLabel {
+    NSString* t = g_window ? [g_window title] : nil;
+    return (t && [t length] > 0) ? t : @"Read document";
+}
+
+- (NSString *)accessibilityRole {
+    return NSAccessibilityTextAreaRole;
+}
+
+- (NSString *)accessibilityValue {
+    return ax_cached_text();
+}
+
+- (NSNumber *)accessibilityNumberOfCharacters {
+    return @([[self accessibilityValue] length]);
+}
+
+- (NSString *)accessibilitySelectedText {
+    NSRange r = ax_selected_range();
+    if (r.length == 0) return nil;
+    NSString* full = ax_cached_text();
+    if (NSMaxRange(r) > [full length]) return nil;
+    return [full substringWithRange:r];
+}
+
+- (NSValue *)accessibilitySelectedTextRange {
+    return [NSValue valueWithRange:ax_selected_range()];
+}
+
+- (NSValue *)accessibilityVisibleCharacterRange {
+    NSString* full = ax_cached_text();
+    long total = (long)[full length];
+    if (g_text_record_count == 0 || total == 0) return [NSValue valueWithRange:NSMakeRange(0, 0)];
+    float top = g_scroll_y, bottom = g_scroll_y + (float)self.bounds.size.height;
+    long lo = total, hi = 0;
+    for (int q = 0; q < g_text_record_count; q++) {
+        QuadTextRecord* rec = &g_text_records[q];
+        if (rec->doc_y + rec->h < top || rec->doc_y > bottom) continue;
+        if (g_ax_rec_off[q] < lo) lo = g_ax_rec_off[q];
+        NSString* t = [[NSString alloc] initWithBytes:rec->text length:rec->len encoding:NSUTF8StringEncoding];
+        long end = g_ax_rec_off[q] + (t ? (long)[t length] : 0);
+        if (end > hi) hi = end;
+    }
+    if (hi <= lo) return [NSValue valueWithRange:NSMakeRange(0, 0)];
+    return [NSValue valueWithRange:NSMakeRange((NSUInteger)lo, (NSUInteger)(hi - lo))];
+}
+
+- (NSArray *)accessibilityChildren {
+    if (g_ax_children && g_ax_children_seq == g_draw_seq) return g_ax_children;
+    NSMutableArray* kids = [NSMutableArray array];
+    for (int q = 0; q < g_text_record_count; q++) {
+        QuadTextRecord* rec = &g_text_records[q];
+        if (!rec->is_heading) continue;
+        NSString* t = [[NSString alloc] initWithBytes:rec->text length:rec->len encoding:NSUTF8StringEncoding];
+        if (!t || [t length] == 0) continue;
+        NSAccessibilityElement* el = [[NSAccessibilityElement alloc] init];
+        el.accessibilityParent = self;
+        el.accessibilityRole = NSAccessibilityStaticTextRole;
+        el.accessibilityRoleDescription = @"heading";
+        el.accessibilityLabel = t;
+        el.accessibilityFrameInParentSpace = NSMakeRect(rec->x, rec->doc_y - g_scroll_y, rec->w, rec->h);
+        [kids addObject:el];
+    }
+    for (int b = 0; b < g_code_block_count; b++) {
+        CodeBlockRecord* blk = &g_code_blocks[b];
+        NSAccessibilityElement* el = [[NSAccessibilityElement alloc] init];
+        el.accessibilityParent = self;
+        el.accessibilityRole = NSAccessibilityGroupRole;
+        el.accessibilityRoleDescription = @"code block";
+        el.accessibilityLabel = @"Code block";
+        el.accessibilityFrameInParentSpace = NSMakeRect(blk->x, blk->y - g_scroll_y, blk->w, blk->h);
+        [kids addObject:el];
+    }
+    g_ax_children = kids;
+    g_ax_children_seq = g_draw_seq;
+    return kids;
 }
 
 - (void)scrollWheel:(NSEvent *)event {
@@ -1563,6 +1765,10 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     [g_window setTitle:[NSString stringWithUTF8String:title]];
     [g_window setTitlebarAppearsTransparent:YES];
     [g_window setTitleVisibility:NSWindowTitleHidden];
+    // Native tabbing (#49): group multi-document windows into the system
+    // tab bar. Two calls, no custom chrome; a single document shows no tab
+    // bar (macOS default). See apply_native_tabbing at end-of-file.
+    apply_native_tabbing(g_window);
     [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:18.0f/255.0f green:18.0f/255.0f blue:18.0f/255.0f alpha:1.0]];
     [g_window center];
 
@@ -2636,5 +2842,33 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
                                 error:NULL];
 
     return success ? 0 : -5;
+}
+#endif
+
+// Native window tabbing (#49): two AppKit calls, no custom chrome. Kept at
+// end-of-file per the SIZE NOTE (mid-file bytes shift hot layout and cost
+// ~3x via page-boundary cascade; see prime_frame_decode above).
+static void apply_native_tabbing(NSWindow* w) {
+    if (!w) return;
+    w.tabbingMode = NSWindowTabbingModePreferred;
+    [NSWindow setAllowsAutomaticWindowTabbing:YES];
+}
+
+#ifdef TEST_HOOKS
+// Contract probe: configures a scratch window through the exact helper
+// platform_init uses and reports whether the preference stuck. Headless-safe
+// (the window is never shown); restores the class default it overwrote.
+int platform_test_tabbing(void) {
+    [NSApplication sharedApplication];
+    BOOL prev = [NSWindow allowsAutomaticWindowTabbing];
+    NSWindow* w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 100, 100)
+        styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    if (!w) { [NSWindow setAllowsAutomaticWindowTabbing:prev]; return 0; }
+    apply_native_tabbing(w);
+    int ok = ([w tabbingMode] == NSWindowTabbingModePreferred &&
+        [NSWindow allowsAutomaticWindowTabbing]) ? 1 : 0;
+    [w close];
+    [NSWindow setAllowsAutomaticWindowTabbing:prev];
+    return ok;
 }
 #endif

@@ -108,6 +108,20 @@ pub const MappedFile = struct {
         }
     }
 
+    /// Cold-start prefetch (issue #11): the open → scan → metrics →
+    /// first-frame path walks the mapping front to back exactly once, with no
+    /// `read()`/copy anywhere. `MADV_SEQUENTIAL` on the whole mapping tells
+    /// the pager to readahead aggressively and reclaim behind the scan;
+    /// `MADV_WILLNEED` on the leading window faults the first pages in up
+    /// front so the scan never stalls on a cold fault. The WILLNEED window is
+    /// capped so a giant file never pages itself fully resident: RSS grows
+    /// only with touched pages. Best-effort (failures silently ignored),
+    /// zero heap allocations, called once per open — never on the
+    /// scroll/layout hot path.
+    pub fn adviseSequential(self: *const MappedFile) void {
+        adviseSequentialRange(self.bytes);
+    }
+
     /// Volatile release: drop clean pages outside the resident window.
     /// Best-effort MADV_DONTNEED hint; the mapping stays open and zero-copy,
     /// faulted pages are re-read from the file on next access. Zero heap
@@ -143,6 +157,49 @@ pub const goldilocks_screens_below: usize = 1;
 /// it saves and risks EINVAL noise on tiny mappings.
 pub const min_advise_bytes: usize = 64 * 1024;
 
+/// Leading window for the WILLNEED half of cold-start prefetch: the first
+/// viewport + scan head start resident immediately, while the SEQUENTIAL
+/// hint streams the rest. Capped so opening a huge file never faults it
+/// fully resident up front.
+pub const willneed_window_bytes: usize = 256 * 1024;
+
+/// Pure arithmetic: WILLNEED length for a mapping of `total_len` bytes.
+/// Zero for empty mappings (madvise on a zero-length range is EINVAL
+/// noise); otherwise the leading window capped at the mapping size.
+pub fn willneedLen(total_len: usize) usize {
+    if (total_len == 0) return 0;
+    return @min(total_len, willneed_window_bytes);
+}
+
+/// Advise a mapped byte range for a single front-to-back cold pass.
+/// Ranges are page-aligned inward (sub-page slivers are already resident —
+/// a single fault at most — so there is nothing to prefetch there).
+/// Best-effort: failures silently ignored; empty ranges and Windows return
+/// without a syscall. Zero allocations.
+pub fn adviseSequentialRange(bytes: []const u8) void {
+    if (bytes.len == 0) return;
+    if (builtin.os.tag == .windows) return;
+    const page = runtimePageSize();
+    const base = @intFromPtr(bytes.ptr);
+    const aligned_start = std.mem.alignForward(usize, base, page);
+    const aligned_end = std.mem.alignBackward(usize, base + bytes.len, page);
+    if (aligned_start >= aligned_end) return;
+    const ptr: [*]u8 = @ptrFromInt(aligned_start);
+    _ = std.c.madvise(
+        @ptrCast(@alignCast(ptr)),
+        aligned_end - aligned_start,
+        std.c.MADV.SEQUENTIAL,
+    );
+    const want_end = @min(base + willneedLen(bytes.len), aligned_end);
+    if (want_end > aligned_start) {
+        _ = std.c.madvise(
+            @ptrCast(@alignCast(ptr)),
+            want_end - aligned_start,
+            std.c.MADV.WILLNEED,
+        );
+    }
+}
+
 /// Pure arithmetic: expand a visible byte range by one screen of bytes in
 /// each direction, clamped to [0, total_len). No syscalls, no allocations.
 pub fn goldilocksWindow(
@@ -176,6 +233,76 @@ fn dontNeedRange(addr: usize, len: usize) void {
         len,
         std.c.MADV.DONTNEED,
     );
+}
+
+test "mmap: willneed window is capped, zero for empty" {
+    try std.testing.expectEqual(@as(usize, 0), willneedLen(0));
+    try std.testing.expectEqual(@as(usize, 1), willneedLen(1));
+    try std.testing.expectEqual(@as(usize, 4096), willneedLen(4096));
+    try std.testing.expectEqual(willneed_window_bytes, willneedLen(willneed_window_bytes));
+    try std.testing.expectEqual(willneed_window_bytes, willneedLen(willneed_window_bytes + 1));
+    try std.testing.expectEqual(willneed_window_bytes, willneedLen(1 << 40));
+}
+
+test "mmap: cold-start advise leaves bytes intact, safe on empty" {
+    // Empty range: must return without a syscall (zero-length madvise is
+    // EINVAL noise), never crash.
+    adviseSequentialRange(&[_]u8{});
+    var empty_file = MappedFile{ .bytes = &[_]u8{}, .fd = undefined };
+    empty_file.adviseSequential();
+
+    // Real mapping: hints must not alter a single byte; the scan path reads
+    // the same zero-copy bytes before and after.
+    const path = "mmap_advise_test.md";
+    const content = "# Cold Start\nscan me twice\n";
+    const fd = try std.posix.openat(
+        std.posix.AT.FDCWD,
+        path,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+        0o644,
+    );
+    _ = std.c.write(fd, content.ptr, content.len);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    var mapped = try MappedFile.open(path);
+    defer mapped.close();
+    mapped.adviseSequential();
+    try std.testing.expectEqualStrings(content, mapped.bytes);
+
+    // Large mapping (past the WILLNEED cap): exercises the real page-aligned
+    // syscall path; content must still be bit-identical afterwards.
+    const big_path = "mmap_advise_big_test.md";
+    const big_fd = try std.posix.openat(
+        std.posix.AT.FDCWD,
+        big_path,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+        0o644,
+    );
+    var written: usize = 0;
+    while (written < willneed_window_bytes + 64 * 1024) {
+        _ = std.c.write(big_fd, content.ptr, content.len);
+        written += content.len;
+    }
+    _ = std.c.close(big_fd);
+    defer _ = std.c.unlink(big_path);
+
+    var big = try MappedFile.open(big_path);
+    defer big.close();
+    try std.testing.expect(big.bytes.len > willneed_window_bytes);
+    big.adviseSequential();
+    try std.testing.expectEqual(written, big.bytes.len);
+    try std.testing.expect(std.mem.startsWith(u8, big.bytes, content));
+    try std.testing.expect(std.mem.endsWith(u8, big.bytes, content));
+}
+
+test "mmap: startup path advises sequential (issue #11 wiring audit)" {
+    // The cold-open gate depends on main.zig calling adviseSequential right
+    // after MappedFile.open on the startup path — pin the wiring, not just
+    // the helper. Same audit convention as idle.zig's run-loop test.
+    var main_src = try MappedFile.open("src/main.zig");
+    defer main_src.close();
+    try std.testing.expect(std.mem.indexOf(u8, main_src.bytes, "adviseSequential") != null);
 }
 
 /// Release pages of `bytes` outside [keep_start, keep_end).

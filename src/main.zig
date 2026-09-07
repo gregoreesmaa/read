@@ -755,6 +755,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         g_app.mapped_file = mapped;
         g_app.bytes = mapped.bytes;
+        // Cold-start prefetch (issue #11): SEQUENTIAL readahead over the
+        // whole file plus WILLNEED on the leading window, once per open.
+        // No read()/copy anywhere on this path — the scan below walks the
+        // mapping in place.
+        mapped.adviseSequential();
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
@@ -1068,5 +1073,17 @@ test "retina atlas text stays crisp (no-blur regression)" {
         std.debug.print("\n[CRISP] acutance={d:.1} edge_frac={d:.4}\n", .{ m.acutance, m.edge_frac });
         try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
+    }
+}
+
+test "native window tabbing enabled (two-call contract, #49)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the crisp test above). Only the read-test binary executes
+    // it, against the exact helper platform_init uses.
+    if (build_options.test_hooks) {
+        try std.testing.expectEqual(
+            @as(c_int, 1),
+            bridge.platform_test_tabbing(),
+        );
     }
 }

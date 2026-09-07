@@ -17,10 +17,14 @@ jobs:
           version: 0.16.0
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Parser short fuzz (malformed + huge inputs, issue #34)
+        run: sh scripts/fuzz_parser.sh
       - name: Release build
         run: zig build -Doptimize=ReleaseFast
       - name: Binary size budget (ship binary, see AGENTS.md §1)
         run: ./scripts/size_gate.sh zig-out/bin/read
+      - name: Ship/test separation (no hooks in ship binary, see AGENTS.md §1)
+        run: sh scripts/ship_separation.sh ./zig-out/bin/read ./zig-out/bin/read-test showcase.md
       - name: Screenshot smoke test (testing binary carries the headless CLI)
         run: ./zig-out/bin/read-test --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
       - name: Damage parity (selection records under partial redraws)
@@ -37,5 +41,7 @@ jobs:
           version: 0.16.0
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
+      - name: Parser short fuzz (malformed + huge inputs, issue #34)
+        run: sh scripts/fuzz_parser.sh
       - name: Release build
         run: zig build -Doptimize=ReleaseFast
