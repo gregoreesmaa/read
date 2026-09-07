@@ -1099,8 +1099,8 @@ test "regression: section-link anchors resolve to headings" {
         if (c.kind == .text_run and std.mem.eql(u8, c.text, "Blockquotes")) head_y = c.rect.y;
     }
     try std.testing.expect(head_y >= 0);
-    // h3 margin_top = 17 * 1.3 * 2.5
-    try std.testing.expectApproxEqAbs(head_y, y_bq.? + 17.0 * 1.3 * 2.5, 1.0);
+    // h3 margin_top = 17 * headingScale(3) * 2.5 (single source; see #22)
+    try std.testing.expectApproxEqAbs(head_y, y_bq.? + 17.0 * layout.headingScale(3) * 2.5, 1.0);
 }
 
 test "regression: trailing whitespace terminates layout" {
@@ -1150,8 +1150,8 @@ test "regression: exact slug wins over earlier fuzzy anchor match" {
         }
     }
     try std.testing.expectEqual(@as(usize, 2), hn);
-    try std.testing.expectApproxEqAbs(hy[0], y_blocks.? + 17.0 * 1.3 * 2.5, 1.0);
-    try std.testing.expectApproxEqAbs(hy[1], y_code.? + 17.0 * 1.3 * 2.5, 1.0);
+    try std.testing.expectApproxEqAbs(hy[0], y_blocks.? + 17.0 * layout.headingScale(3) * 2.5, 1.0);
+    try std.testing.expectApproxEqAbs(hy[1], y_code.? + 17.0 * layout.headingScale(3) * 2.5, 1.0);
 
     // Tiered resolution: `#blockquote` targets "Blockquotes", not the
     // earlier affix match "Block Elements"; `#link` targets "Links", not
