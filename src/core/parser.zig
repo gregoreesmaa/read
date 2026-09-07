@@ -822,6 +822,13 @@ fn isEmailAtom(c: u8) bool {
     };
 }
 
+/// Autolink probe shared with the layout raw-HTML fallback (issue #26):
+/// true when `<` at `lt` opens a URI/email autolink.
+pub fn isAutolinkAt(line: []const u8, lt: usize) bool {
+    if (lt >= line.len or line[lt] != '<') return false;
+    return matchAutolink(line, lt) != null;
+}
+
 /// Autolink `<...>` end (exclusive past `>`) per the reference scanners:
 /// any 2-32 byte `scheme:` (letter-led) plus space/control/`<>`-free body,
 /// else the strict email atom pattern. Backslash never escapes here, so
