@@ -594,6 +594,98 @@ pub const MotionPolicy = struct {
     }
 };
 
+/// Trackpad / Magic Mouse gesture conditioning. Precise devices pass
+/// through bit-exact (synchronous 1:1, never filtered); classic
+/// non-precise deltas accumulate fractional residue and emit whole
+/// points, so Magic Mouse jitter can never shimmer the viewport and no
+/// sub-point motion is ever lost. Pure, zero heap.
+pub const GestureFilter = struct {
+    res_x: f32 = 0.0,
+    res_y: f32 = 0.0,
+
+    pub fn filter(
+        self: *GestureFilter,
+        dx: f32,
+        dy: f32,
+        precise: bool,
+    ) struct { dx: f32, dy: f32 } {
+        if (precise) return .{ .dx = dx, .dy = dy };
+        self.res_x += dx;
+        self.res_y += dy;
+        const ex = std.math.trunc(self.res_x);
+        const ey = std.math.trunc(self.res_y);
+        self.res_x -= ex;
+        self.res_y -= ey;
+        return .{ .dx = ex, .dy = ey };
+    }
+};
+
+/// Edge rubber-band spring: scroll residual absorbed at a document bound
+/// becomes a capped visual overshoot that decays back to zero.
+/// Exponential decay (frame-rate independent), exact snap under 0.5px,
+/// never overshoots past zero. Pure, zero heap.
+pub const EdgeSpring = struct {
+    overshoot: f32 = 0.0,
+
+    pub const MAX_PX: f32 = 48.0;
+    pub const SNAP_PX: f32 = 0.5;
+    pub const RATE: f32 = 14.0;
+    pub const ABSORB: f32 = 0.35;
+
+    /// Fold clamped-away scroll (`desired - actual` in scroll coords:
+    /// positive = pushed past the bottom, negative = past the top) into
+    /// a view translate (positive = content shifted down). Capped.
+    pub fn absorb(self: *EdgeSpring, over: f32) void {
+        self.overshoot = std.math.clamp(
+            self.overshoot - over * ABSORB,
+            -MAX_PX,
+            MAX_PX,
+        );
+    }
+
+    pub fn active(self: *const EdgeSpring) bool {
+        return self.overshoot != 0.0;
+    }
+
+    /// Decay toward zero by dt seconds. Returns true when settled.
+    pub fn tick(self: *EdgeSpring, dt_s: f32) bool {
+        if (self.overshoot == 0.0) return true;
+        const dt = @max(0.0, dt_s);
+        const t = 1.0 - @exp(-RATE * dt);
+        const next = self.overshoot * (1.0 - t);
+        if (@abs(next) < SNAP_PX) {
+            self.overshoot = 0.0;
+        } else if (self.overshoot > 0.0) {
+            self.overshoot = @max(next, 0.0);
+        } else {
+            self.overshoot = @min(next, 0.0);
+        }
+        return self.overshoot == 0.0;
+    }
+};
+
+/// Pinch-tier detection: accumulate per-event magnification deltas and
+/// emit a zoom step each time a x1.25 tier boundary is crossed
+/// (magnification sums in log space: total scale ~= e^sum). Debounced by
+/// construction — one step per crossing, jitter below a tier is kept as
+/// residue, never lost. Pure, zero heap.
+pub const PinchState = struct {
+    acc: f32 = 0.0,
+
+    pub const TIER_LN: f32 = 0.22314355; // ln(1.25)
+
+    pub fn accumulate(self: *PinchState, m: f32) c_int {
+        self.acc += m;
+        const steps: c_int = @intFromFloat(std.math.trunc(self.acc / TIER_LN));
+        self.acc -= @as(f32, @floatFromInt(steps)) * TIER_LN;
+        return steps;
+    }
+
+    pub fn reset(self: *PinchState) void {
+        self.acc = 0.0;
+    }
+};
+
 /// Renders a series of inline spans with automatic word wrapping and exact typography.
 /// `rtl` right-anchors the pen (issue #50): false preserves history exactly.
 pub fn layoutWrappedSpans(

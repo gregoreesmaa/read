@@ -546,6 +546,90 @@ test "controls: reduced motion lands scroll inputs synchronously" {
     try std.testing.expectEqual(direct.current, wheel.current);
 }
 
+test "controls: gesture filter passes precise 1:1, quantizes wheel jitter" {
+    var f = layout.GestureFilter{};
+
+    // Precise devices (trackpad / Magic Mouse): bit-exact, even sub-point.
+    const p = f.filter(0.1, -0.3, true);
+    try std.testing.expectEqual(@as(f32, 0.1), p.dx);
+    try std.testing.expectEqual(@as(f32, -0.3), p.dy);
+
+    // Classic wheel jitter accumulates without loss and emits whole points.
+    const a = f.filter(0.3, 0.3, false);
+    try std.testing.expectEqual(@as(f32, 0.0), a.dx);
+    try std.testing.expectEqual(@as(f32, 0.0), a.dy);
+    const b = f.filter(0.4, 0.4, false);
+    try std.testing.expectEqual(@as(f32, 0.0), b.dx);
+    try std.testing.expectEqual(@as(f32, 0.0), b.dy);
+    const c = f.filter(0.3, 0.5, false);
+    try std.testing.expectEqual(@as(f32, 1.0), c.dx); // 0.3+0.4+0.3
+    try std.testing.expectEqual(@as(f32, 1.0), c.dy); // 0.3+0.4+0.5
+    // Residue carries: 0.0 x, 0.2 y left.
+    const d = f.filter(-2.7, -0.2, false);
+    try std.testing.expectEqual(@as(f32, -2.0), d.dx);
+    try std.testing.expectEqual(@as(f32, 0.0), d.dy);
+
+    // Large notches pass through (quantized, residue kept).
+    const e = f.filter(0.0, 40.0, false);
+    try std.testing.expectEqual(@as(f32, 40.0), e.dy);
+}
+
+test "controls: precise input mid-glide cancels the glide from the displayed offset" {
+    // A wheel glide is in flight toward 500 while 300 is displayed.
+    const gliding = layout.SmoothScroll{ .current = 300.0, .target = 500.0 };
+    // A precise trackpad delta snaps 1:1 from DISPLAYED (300), cancelling
+    // the in-flight glide with no teleport: inertia stays Finder-like.
+    const s = layout.SmoothScroll.applyScrollDelta(gliding.target, gliding.current, -20.0, true, 1000.0);
+    try std.testing.expectEqual(@as(f32, 320.0), s.current);
+    try std.testing.expectEqual(@as(f32, 320.0), s.target);
+    try std.testing.expect(s.settled());
+}
+
+test "controls: edge spring absorbs bound residual and decays without overshoot" {
+    var e = layout.EdgeSpring{};
+
+    // Pushed past the top (over<0): content shifts down, capped at 48px.
+    e.absorb(-10.0);
+    try std.testing.expect(e.active());
+    try std.testing.expectEqual(@as(f32, 3.5), e.overshoot);
+    for (0..100) |_| e.absorb(-100.0);
+    try std.testing.expectEqual(@as(f32, 48.0), e.overshoot);
+
+    // Pushed past the bottom: sign flips, still capped.
+    var b = layout.EdgeSpring{};
+    b.absorb(200.0);
+    try std.testing.expectEqual(@as(f32, -48.0), b.overshoot);
+
+    // Decay is monotonic toward zero with no overshoot past zero, and
+    // settles exactly (timer parks).
+    var prev: f32 = 48.0;
+    var frames: usize = 0;
+    while (!e.tick(1.0 / 120.0)) : (frames += 1) {
+        if (frames > 1200) break;
+        try std.testing.expect(e.overshoot >= 0.0);
+        try std.testing.expect(e.overshoot <= prev);
+        prev = e.overshoot;
+    }
+    try std.testing.expect(!e.active());
+    try std.testing.expect(e.tick(1.0 / 120.0));
+}
+
+test "controls: pinch tiers emit one zoom step per x1.25 crossing" {
+    var p = layout.PinchState{};
+
+    // Sub-tier jitter: no step, kept as residue.
+    try std.testing.expectEqual(@as(c_int, 0), p.accumulate(0.05));
+    try std.testing.expectEqual(@as(c_int, 0), p.accumulate(0.05));
+    // Crossing the first tier (0.10 + 0.15 = 0.25 > ln(1.25)): one step.
+    try std.testing.expectEqual(@as(c_int, 1), p.accumulate(0.15));
+    // Remainder kept: a -0.5 pull crosses back twice with residue.
+    try std.testing.expectEqual(@as(c_int, -2), p.accumulate(-0.5));
+    // Exact tier: single step, empty residue.
+    p.reset();
+    try std.testing.expectEqual(@as(c_int, 1), p.accumulate(layout.PinchState.TIER_LN));
+    try std.testing.expectEqual(@as(f32, 0.0), p.acc);
+}
+
 test "controls: keybindings j, k, space, t navigation" {
     var scroll_y: f32 = 0.0;
     const max_scroll_y: f32 = 1000.0;
