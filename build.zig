@@ -213,6 +213,26 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // Parser/line-scanner fuzz binary (issue #34): shares only the
+    // platform-independent `read` core module, links no Cocoa code, is
+    // installed under the `fuzz` step only (never the default build),
+    // and is never shipped. Driven by scripts/fuzz_parser.sh.
+    const fuzz_exe = b.addExecutable(.{
+        .name = "fuzz-parser",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fuzz/fuzz_parser.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "read", .module = mod },
+            },
+        }),
+    });
+    const install_fuzz = b.addInstallArtifact(fuzz_exe, .{});
+    const fuzz_step = b.step("fuzz", "Build the parser fuzz harness");
+    fuzz_step.dependOn(&install_fuzz.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
