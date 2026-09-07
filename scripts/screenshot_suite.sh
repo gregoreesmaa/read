@@ -52,6 +52,9 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # Same-file scrolled frame (mdtest precedent: no new test case) so reviewers
 # see the remote-URL placeholder state below the fold.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/images_scrolled.png" --scroll 450 test_cases/images.md
+# Case 7: RTL/bidi paragraphs, headings, lists, quotes (issue #50). Plain
+# initial viewport like cases 1-4 (not a scrolling test).
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/rtl_bidi.png" test_cases/rtl_bidi.md
 
 # Cases 6+: Original MarkdownTest 1.0 suite (.text sources copied verbatim to
 # test_cases/mdtest_*.md). scrollable_doc.md remains the single
