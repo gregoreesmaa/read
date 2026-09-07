@@ -184,3 +184,40 @@ test "idle: platform run loop is strictly event-driven (source audit)" {
         try std.testing.expect(std.mem.indexOf(u8, src, token) != null);
     }
 }
+
+test "idle: zero background threads on the hot path (issue #14 source audit)" {
+    // The #14 contract is structural: one thread, vsync-coalesced, fully
+    // asleep when idle. Any worker-thread creation or process forking in the
+    // hot-path Zig sources (scan/layout/render/startup) would break App Nap
+    // and 1:1 trackpad feel, so the construction tokens are banned by audit —
+    // same convention as the run-loop test above. (src/tests/ is excluded:
+    // the CommonMark conformance harness may use worker threads; it never
+    // ships. Tokens are split so this very list does not self-match.)
+    const hot = [_][]const u8{
+        "src/core/simd.zig",
+        "src/core/mmap.zig",
+        "src/core/parser.zig",
+        "src/core/block_index.zig",
+        "src/core/strict_benchmarks.zig",
+        "src/layout/viewport.zig",
+        "src/layout/damage.zig",
+        "src/main.zig",
+        "src/platform/bridge.zig",
+        "src/platform/glyph_cache.zig",
+        "src/platform/idle.zig",
+    };
+    const banned = [_][]const u8{
+        "std.Thr" ++ "ead",
+        "Thr" ++ "ead.spawn",
+        "pthr" ++ "ead",
+        "for" ++ "k(",
+        "spa" ++ "wn(",
+    };
+    for (hot) |path| {
+        var mapped = try mmap.MappedFile.open(path);
+        defer mapped.close();
+        for (banned) |token| {
+            try std.testing.expectEqual(null, std.mem.indexOf(u8, mapped.bytes, token));
+        }
+    }
+}
