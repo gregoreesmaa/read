@@ -24,6 +24,11 @@ pub const PlatformCallbacks = extern struct {
     on_appearance: ?*const fn (is_dark: c_int) callconv(.c) void = null,
     /// Cmd+J outline picker key. Appended last for the same FFI reason.
     on_outline_open: ?*const fn () callconv(.c) void = null,
+    /// Display preferences: system size class (0..4), persisted zoom
+    /// percent (50..300), Reduce Motion flag. Pushed at launch, on zoom
+    /// keys, on motion flips, and on re-activation. Appended last for the
+    /// same FFI stability reason.
+    on_display: ?*const fn (category_class: c_int, zoom_percent: c_int, reduce_motion: c_int) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_outline_add(level: c_int, y: f32, text: [*]const u8, text_len: c_int) void;

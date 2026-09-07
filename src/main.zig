@@ -110,10 +110,19 @@ var g_scroll_lock: layout.ScrollLockState = .{};
 // eases g_app.scroll_y (displayed) toward the target. Anchor jumps and
 // resizes snap both so they stay 1:1.
 var g_smooth: layout.SmoothScroll = .{};
+// Display text scaling (system size class x user zoom) and the OS Reduce
+// Motion switch, both pushed by the platform via onDisplay.
+var g_text_scale: layout.TextScale = .{};
+var g_reduce_motion: bool = false;
 
 /// Retarget the animated scroll offset and arm the platform tick while the
 /// displayed offset is still settling. No-op when already settled.
+/// Under Reduce Motion every step lands synchronously instead.
 fn retargetScroll(target: f32) void {
+    if (g_reduce_motion) {
+        snapScroll(target);
+        return;
+    }
     g_smooth.setTarget(target, g_app.max_scroll_y);
     if (!g_smooth.settled()) bridge.platform_smooth_kick();
 }
@@ -215,15 +224,17 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
 
     if (locked.dy != 0.0) {
         // Routing (precise 1:1 vs eased wheel) lives in
-        // SmoothScroll.applyScrollDelta, pinned by strict tests; the full
-        // rationale is documented there. Sync the displayed offset, then arm
-        // the tick while unsettled (snaps settle synchronously, no timer).
-        g_smooth = layout.SmoothScroll.applyScrollDelta(
+        // MotionPolicy.applyVertical, pinned by strict tests; the full
+        // rationale is documented there. Reduce Motion snaps here, so no
+        // timer is armed. Sync the displayed offset, then arm the tick
+        // while unsettled (snaps settle synchronously, no timer).
+        g_smooth = layout.MotionPolicy.applyVertical(
             g_smooth.target,
             g_smooth.current,
             locked.dy,
             precise != 0,
             g_app.max_scroll_y,
+            g_reduce_motion,
         );
         g_app.scroll_y = g_smooth.current;
         if (!g_smooth.settled()) bridge.platform_smooth_kick();
@@ -242,10 +253,34 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
 /// target. Returns 1 while more frames are needed, 0 when settled (the
 /// platform parks its timer on 0, so a static screen costs zero wakeups).
 fn onTick(dt_ms: f32) callconv(.c) c_int {
+    // Reduce Motion parks the timer immediately: nothing should have armed
+    // it, but a shrunk max could leave a stale target behind.
+    if (g_reduce_motion) {
+        snapScroll(g_smooth.target);
+        return 0;
+    }
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
     g_app.scroll_y = g_smooth.current;
     return if (settled) 0 else 1;
+}
+
+/// Display preferences pushed by the platform (launch, zoom keys, Reduce
+/// Motion flips, re-activation): size class, persisted zoom percent,
+/// motion flag. Re-wraps via the metrics walk and clamps the offset;
+/// enabling Reduce Motion also lands any in-flight glide instantly.
+fn onDisplay(category_class: c_int, zoom_percent: c_int, reduce_motion: c_int) callconv(.c) void {
+    g_text_scale.class = @intCast(std.math.clamp(category_class, 0, 4));
+    g_text_scale.setZoomPercent(zoom_percent);
+    const was_reduced = g_reduce_motion;
+    g_reduce_motion = reduce_motion != 0;
+    updateDocumentMetrics();
+    if (g_reduce_motion and !was_reduced) {
+        snapScroll(g_smooth.target);
+    } else {
+        snapScroll(g_app.scroll_y);
+    }
+    bridge.platform_request_redraw();
 }
 
 fn updateDocumentMetrics() void {
@@ -253,6 +288,8 @@ fn updateDocumentMetrics() void {
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
+        // Zoom + size class re-wrap here (metrics) and in onDraw below.
+        .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
@@ -383,6 +420,7 @@ fn anchorTargetY(frag: []const u8) ?f32 {
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
+        .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
@@ -643,6 +681,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = g_app.scroll_y,
+        .base_font_size = g_text_scale.effectiveBase(),
         .block_scroll_x = g_app.block_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
@@ -1470,6 +1509,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_images_changed = onImagesChanged,
         .on_appearance = onAppearance,
         .on_outline_open = onOutlineOpen,
+        .on_display = onDisplay,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);

@@ -16,6 +16,7 @@ typedef struct {
     void (*on_images_changed)(float delta_above);
     void (*on_appearance)(int is_dark);
     void (*on_outline_open)(void);
+    void (*on_display)(int category_class, int zoom_percent, int reduce_motion);
 } PlatformCallbacks;
 
 void platform_outline_add(int level, float y, const char* text, int text_len);
