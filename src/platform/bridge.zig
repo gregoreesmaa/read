@@ -22,7 +22,14 @@ pub const PlatformCallbacks = extern struct {
     /// System appearance changed (effectiveAppearance): 1 = dark, 0 =
     /// light. Appended last for the same FFI stability reason.
     on_appearance: ?*const fn (is_dark: c_int) callconv(.c) void = null,
+    /// Cmd+J outline picker key. Appended last for the same FFI reason.
+    on_outline_open: ?*const fn () callconv(.c) void = null,
 };
+
+pub extern "c" fn platform_outline_add(level: c_int, y: f32, text: [*]const u8, text_len: c_int) void;
+pub extern "c" fn platform_outline_show() void;
+pub extern "c" fn platform_test_outline_filter(text: [*]const u8, text_len: c_int, filter: [*]const u8, filter_len: c_int) c_int;
+pub extern "c" fn platform_test_outline_build() c_int;
 
 pub extern "c" fn platform_init(
     title: [*:0]const u8,

@@ -15,7 +15,11 @@ typedef struct {
     void (*on_scroll_to)(float scroll_y);
     void (*on_images_changed)(float delta_above);
     void (*on_appearance)(int is_dark);
+    void (*on_outline_open)(void);
 } PlatformCallbacks;
+
+void platform_outline_add(int level, float y, const char* text, int text_len);
+void platform_outline_show(void);
 
 int platform_init(const char* title, int width, int height, PlatformCallbacks callbacks);
 void platform_run_loop(void);
