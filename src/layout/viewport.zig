@@ -162,6 +162,7 @@ pub const Color = struct {
     pub const text_dark = Color{ .r = 224, .g = 224, .b = 224, .a = 255 };
     pub const text_muted_dark = Color{ .r = 140, .g = 140, .b = 145, .a = 255 };
     pub const accent_dark = Color{ .r = 96, .g = 165, .b = 250, .a = 255 };
+    pub const link_visited_dark = Color{ .r = 196, .g = 181, .b = 253, .a = 255 };
     pub const code_bg_dark = Color{ .r = 26, .g = 26, .b = 28, .a = 255 };
     pub const code_string_dark = Color{ .r = 134, .g = 239, .b = 172, .a = 255 };
     pub const code_number_dark = Color{ .r = 232, .g = 161, .b = 92, .a = 255 };
@@ -176,6 +177,7 @@ pub const Color = struct {
     pub const text_light = Color{ .r = 30, .g = 32, .b = 34, .a = 255 };
     pub const text_muted_light = Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
     pub const accent_light = Color{ .r = 37, .g = 99, .b = 235, .a = 255 };
+    pub const link_visited_light = Color{ .r = 109, .g = 40, .b = 217, .a = 255 };
     pub const code_bg_light = Color{ .r = 240, .g = 241, .b = 243, .a = 255 };
     pub const code_string_light = Color{ .r = 22, .g = 128, .b = 60, .a = 255 };
     pub const code_number_light = Color{ .r = 184, .g = 92, .b = 20, .a = 255 };
@@ -210,6 +212,7 @@ pub const Theme = struct {
     text: Color,
     muted: Color,
     accent: Color,
+    link_visited: Color,
     code_bg: Color,
     code_keyword: Color,
     code_string: Color,
@@ -226,6 +229,7 @@ pub const Theme = struct {
         .text = Color.text_dark,
         .muted = Color.text_muted_dark,
         .accent = Color.accent_dark,
+        .link_visited = Color.link_visited_dark,
         .code_bg = Color.code_bg_dark,
         .code_keyword = Color.accent_dark,
         .code_string = Color.code_string_dark,
@@ -243,6 +247,7 @@ pub const Theme = struct {
         .text = Color.text_light,
         .muted = Color.text_muted_light,
         .accent = Color.accent_light,
+        .link_visited = Color.link_visited_light,
         .code_bg = Color.code_bg_light,
         .code_keyword = Color.accent_light,
         .code_string = Color.code_string_light,
@@ -1489,6 +1494,17 @@ test "design #24: quote contrast >= 4.5:1, bar + spacing tokens" {
     // Quote body (muted) clears WCAG AA against its background, both themes.
     try std.testing.expect(contrastRatio(Theme.dark.muted, Theme.dark.bg) >= 4.5);
     try std.testing.expect(contrastRatio(Theme.light.muted, Theme.light.bg) >= 4.5);
+}
+
+test "design #25: link accent + visited contrast >= 4.5:1" {
+    // Accent blues clear WCAG AA against their backgrounds, both themes.
+    try std.testing.expect(contrastRatio(Theme.dark.accent, Theme.dark.bg) >= 4.5);
+    try std.testing.expect(contrastRatio(Theme.light.accent, Theme.light.bg) >= 4.5);
+    // Visited states stay distinguishable from accents and AA-clear too.
+    try std.testing.expect(!std.meta.eql(Theme.dark.accent, Theme.dark.link_visited));
+    try std.testing.expect(!std.meta.eql(Theme.light.accent, Theme.light.link_visited));
+    try std.testing.expect(contrastRatio(Theme.dark.link_visited, Theme.dark.bg) >= 4.5);
+    try std.testing.expect(contrastRatio(Theme.light.link_visited, Theme.light.bg) >= 4.5);
 }
 
 /// Quote bars for one quote line: one bar per depth level spanning the whole
