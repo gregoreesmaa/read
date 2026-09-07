@@ -10,6 +10,8 @@
 | `h` / `l` | Scroll hovered code block or table horizontally (30px) |
 | Trackpad swipe | Horizontal scroll on hovered code block or table |
 | `t` | Toggle dark / light theme |
+| `?` | Toggle keyboard-shortcut cheat sheet |
+| `Esc` | Dismiss cheat sheet |
 | `Cmd+C` | Copy selection to system clipboard |
 | `Cmd+A` | Select all text in document |
 | `q` | Quit |

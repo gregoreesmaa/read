@@ -85,7 +85,7 @@ pub const SERIF_FONT_ITALIC_WIDTHS = [128]u16{
 
 /// Space Grotesk heading tracking, in em. Tightens showcase-size headings so
 /// inter-letter air matches the typeface's display intent (issue #21).
-/// Mirrors the CoreText kern applied in macos.m (`ctline_with_font`):
+/// Mirrors the platform text kern applied in macos.m (`ctline_with_font`):
 /// both must move together or layout and pixels diverge.
 pub const heading_tracking_em: f32 = -0.015;
 /// Heading word space, in em. The raw Space Grotesk space (~0.25em) reads as
@@ -252,13 +252,11 @@ pub const Theme = struct {
 /// Tint for a syntax class (issue #39). Plain falls back to body text so
 /// untinted runs are pixel-identical to the pre-highlight renderer.
 pub fn codeClassColor(theme: Theme, class: highlight.Class) Color {
-    return switch (class) {
-        .plain => theme.text,
-        .keyword => theme.code_keyword,
-        .string => theme.code_string,
-        .comment => theme.code_comment,
-        .number => theme.code_number,
-    };
+    // Indexed by @intFromEnum(Class): plain=0, keyword=1, string=2,
+    // comment=3, number=4 (declaration order above). One load instead of a
+    // five-arm switch at every tinted run; identical colors.
+    const table = [_]Color{ theme.text, theme.code_keyword, theme.code_string, theme.code_comment, theme.code_number };
+    return table[@intFromEnum(class)];
 }
 
 pub const MAX_SCROLLABLE_BLOCKS = 128;
@@ -2218,46 +2216,11 @@ pub fn renderViewportCore(
 
                     if (code_y + 20.0 >= 0 and code_y <= vp_bottom) {
                         var seg_buf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
-                        const segs = highlight.tokenize(fence_lang, c_bytes, &seg_buf);
-                        if (segs) |runs| {
-                            if (runs.len == 0) {
-                                // Empty line: same plain run as before.
-                                commands_out[cmd_count] = .{
-                                    .kind = .text_run,
-                                    .rect = .{
-                                        .x = content_x - cur_scroll_x,
-                                        .y = code_y,
-                                        .w = content_width,
-                                        .h = config.line_height * 0.88,
-                                    },
-                                    .color = theme.text,
-                                    .text = c_bytes,
-                                    .font_size = mono_size,
-                                    .style = .{ .code = true },
-                                };
-                                cmd_count += 1;
-                            }
-                            for (runs) |run| {
-                                if (cmd_count >= commands_out.len - 16) break;
-                                const run_text = c_bytes[run.start..run.end];
-                                const run_x = content_x - cur_scroll_x +
-                                    @as(f32, @floatFromInt(run.start)) * mono_advance;
-                                commands_out[cmd_count] = .{
-                                    .kind = .text_run,
-                                    .rect = .{
-                                        .x = run_x,
-                                        .y = code_y,
-                                        .w = @as(f32, @floatFromInt(run_text.len)) * mono_advance,
-                                        .h = config.line_height * 0.88,
-                                    },
-                                    .color = codeClassColor(theme, run.class),
-                                    .text = run_text,
-                                    .font_size = mono_size,
-                                    .style = .{ .code = true },
-                                };
-                                cmd_count += 1;
-                            }
-                        } else {
+                        // Null (untokenizable) and empty runs share the one
+                        // plain run below — identical pixels, one literal.
+                        const runs: []highlight.Segment = if (highlight.tokenize(fence_lang, c_bytes, &seg_buf)) |r| r else &.{};
+                        if (runs.len == 0) {
+                            // Empty line / fallback: same plain run as before.
                             commands_out[cmd_count] = .{
                                 .kind = .text_run,
                                 .rect = .{
@@ -2268,6 +2231,26 @@ pub fn renderViewportCore(
                                 },
                                 .color = theme.text,
                                 .text = c_bytes,
+                                .font_size = mono_size,
+                                .style = .{ .code = true },
+                            };
+                            cmd_count += 1;
+                        }
+                        for (runs) |run| {
+                            if (cmd_count >= commands_out.len - 16) break;
+                            const run_text = c_bytes[run.start..run.end];
+                            const run_x = content_x - cur_scroll_x +
+                                @as(f32, @floatFromInt(run.start)) * mono_advance;
+                            commands_out[cmd_count] = .{
+                                .kind = .text_run,
+                                .rect = .{
+                                    .x = run_x,
+                                    .y = code_y,
+                                    .w = @as(f32, @floatFromInt(run_text.len)) * mono_advance,
+                                    .h = config.line_height * 0.88,
+                                },
+                                .color = codeClassColor(theme, run.class),
+                                .text = run_text,
                                 .font_size = mono_size,
                                 .style = .{ .code = true },
                             };

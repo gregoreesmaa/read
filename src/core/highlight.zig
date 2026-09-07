@@ -71,61 +71,38 @@ pub fn langFromFenceLine(line: []const u8) Lang {
     return .none;
 }
 
-const zig_keywords = [_][]const u8{
-    "const", "var",    "fn",      "pub",      "return", "if",    "else",
-    "while", "for",    "switch",  "break",    "continue", "defer",
-    "errdefer", "try", "catch",   "orelse",   "and",    "or",    "struct",
-    "enum",  "union",  "test",    "comptime", "inline", "noinline",
-    "extern", "threadlocal", "usingnamespace", "asm",   "volatile",
-    "unreachable", "null", "true", "false",   "undefined",
-};
+const zig_keywords = "const var fn pub return if else while for switch break continue defer errdefer try catch orelse and or struct enum union test comptime inline noinline extern threadlocal usingnamespace asm volatile unreachable null true false undefined";
 
-const c_keywords = [_][]const u8{
-    "int",   "char",   "float",  "double", "void",   "long",   "short",
-    "signed", "unsigned", "const", "static", "extern", "volatile",
-    "register", "auto", "return", "if",     "else",   "while",  "for",
-    "do",    "switch", "case",   "default", "break",  "continue",
-    "goto",  "sizeof", "typedef", "struct", "union",  "enum",   "true",
-    "false", "NULL",
-};
+const c_keywords = "int char float double void long short signed unsigned const static extern volatile register auto return if else while for do switch case default break continue goto sizeof typedef struct union enum true false NULL";
 
-const python_keywords = [_][]const u8{
-    "def",  "return", "if",   "elif",  "else",  "while", "for",  "in",
-    "not",  "and",    "or",   "is",    "None",  "True",  "False", "class",
-    "import", "from", "as",   "pass",  "break", "continue", "lambda",
-    "with", "try",    "except", "finally", "raise", "yield", "global",
-    "assert", "del",  "async", "await",
-};
+const python_keywords = "def return if elif else while for in not and or is None True False class import from as pass break continue lambda with try except finally raise yield global assert del async await";
 
-const js_keywords = [_][]const u8{
-    "const", "let",    "var",      "function", "return", "if",       "else",
-    "while", "for",    "do",       "switch",   "case",   "default",  "break",
-    "continue", "new", "delete",   "typeof",   "instanceof", "in",   "of",
-    "try",   "catch",  "finally",  "throw",    "class",  "extends",  "import",
-    "export", "from",  "default",  "async",    "await",  "this",     "null",
-    "true",  "false",  "undefined",
-};
+const js_keywords = "const let var function return if else while for do switch case default break continue new delete typeof instanceof in of try catch finally throw class extends import export from default async await this null true false undefined";
 
-const bash_keywords = [_][]const u8{
-    "if",   "then", "else", "elif", "fi",   "for",  "while", "until",
-    "do",   "done", "case", "esac", "in",   "function", "select",
-    "time", "echo", "exit", "return", "local", "export", "true", "false",
-};
+const bash_keywords = "if then else elif fi for while until do done case esac in function select time echo exit return local export true false";
 
-fn keywordsFor(lang: Lang) []const []const u8 {
+fn blobFor(lang: Lang) []const u8 {
     return switch (lang) {
-        .zig => &zig_keywords,
-        .c => &c_keywords,
-        .python => &python_keywords,
-        .js => &js_keywords,
-        .bash => &bash_keywords,
-        .none, .diff => &.{},
+        .zig => zig_keywords,
+        .c => c_keywords,
+        .python => python_keywords,
+        .js => js_keywords,
+        .bash => bash_keywords,
+        .none, .diff => "",
     };
 }
 
 fn isKeyword(lang: Lang, word: []const u8) bool {
-    for (keywordsFor(lang)) |kw| {
-        if (word.len == kw.len and std.mem.eql(u8, word, kw)) return true;
+    // Whole-token scan over the space-separated blob: identical match
+    // semantics to the per-word tables, without per-word slice headers.
+    const blob = blobFor(lang);
+    var i: usize = 0;
+    while (i < blob.len) {
+        var j = i;
+        while (j < blob.len and blob[j] != ' ') : (j += 1) {}
+        // eql implies equal length; no separate length check needed.
+        if (j > i and std.mem.eql(u8, word, blob[i..j])) return true;
+        i = j + 1;
     }
     return false;
 }
