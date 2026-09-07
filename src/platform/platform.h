@@ -14,6 +14,7 @@ typedef struct {
     int (*on_tick)(float dt_ms);
     void (*on_scroll_to)(float scroll_y);
     void (*on_images_changed)(float delta_above);
+    void (*on_appearance)(int is_dark);
 } PlatformCallbacks;
 
 int platform_init(const char* title, int width, int height, PlatformCallbacks callbacks);
