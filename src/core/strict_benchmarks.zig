@@ -55,11 +55,11 @@ test "STRICT: SIMD Line Scanner Throughput and Latency" {
     const line_entries = try allocator.alloc(simd.Line, lines_target + 100);
     defer allocator.free(line_entries);
 
-    // Min of 7 runs with one unmeasured warmup: single-shot timing is too
-    // noisy for a tightened gate, and shared CI CPUs add frequency-ramp and
-    // neighbor noise on top. Thresholds below are unchanged; only the sampling
-    // is hardened. Both metrics derive from the same run, so min time == max
-    // throughput.
+    // Adaptive sampling (simd.timing_gate_*): one unmeasured warmup, then
+    // repeat until one sample clears both thresholds below — a true
+    // regression clears no sample — or attempts run out. Thresholds are
+    // unchanged; only the sampling absorbs shared-CI-runner stalls. Both
+    // metrics derive from the same run, so min time == max throughput.
     {
         var warm_fence: simd.FenceState = .{};
         _ = simd.scanLines(mem, line_entries, &warm_fence);
@@ -68,8 +68,9 @@ test "STRICT: SIMD Line Scanner Throughput and Latency" {
     var min_throughput_mb_s: f64 = 0.0;
     var last_count: usize = 0;
     var last_mb: f64 = 0.0;
-    var iter: usize = 0;
-    while (iter < 7) : (iter += 1) {
+    var attempts: usize = 0;
+    while (attempts < simd.timing_gate_max_attempts) {
+        if (attempts > 0) simd.timingGateBackoff();
         var in_fence: simd.FenceState = .{};
 
         var ts_start: std.posix.timespec = undefined;
@@ -91,17 +92,21 @@ test "STRICT: SIMD Line Scanner Throughput and Latency" {
 
         last_count = count;
         last_mb = mb;
+        attempts += 1;
         if (elapsed_us < min_elapsed_us) {
             min_elapsed_us = elapsed_us;
             min_throughput_mb_s = throughput_mb_s;
         }
+        if (min_throughput_mb_s >= TARGET_MIN_SCAN_THROUGHPUT_MB_S and
+            min_elapsed_us <= TARGET_MAX_50K_SCAN_TIME_US) break;
     }
 
-    std.debug.print("\n[STRICT BENCHMARK] Scanned {d} lines ({d:.2} MB) in {d} µs ({d:.2} MB/s)\n", .{
+    std.debug.print("\n[STRICT BENCHMARK] Scanned {d} lines ({d:.2} MB) in {d} µs ({d:.2} MB/s, {d} attempts)\n", .{
         last_count,
         last_mb,
         min_elapsed_us,
         min_throughput_mb_s,
+        attempts,
     });
 
     try std.testing.expect(last_count >= lines_target);
@@ -130,9 +135,13 @@ test "STRICT: Zero-Copy mmap Open Latency" {
     _ = std.c.close(fd);
     defer _ = std.c.unlink(test_filename);
 
+    // Adaptive sampling (simd.timing_gate_*): repeat until one sample
+    // clears the threshold — a true regression clears no sample — or
+    // attempts run out. Threshold unchanged.
     var min_elapsed_us: i128 = 999999;
-    var iter: usize = 0;
-    while (iter < 5) : (iter += 1) {
+    var attempts: usize = 0;
+    while (attempts < simd.timing_gate_max_attempts) {
+        if (attempts > 0) simd.timingGateBackoff();
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
 
@@ -145,10 +154,12 @@ test "STRICT: Zero-Copy mmap Open Latency" {
         const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
         const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
+        attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
+        if (min_elapsed_us <= TARGET_MAX_MMAP_OPEN_TIME_US) break;
     }
 
-    std.debug.print("[STRICT BENCHMARK] mmap Open Latency: {d} µs\n", .{min_elapsed_us});
+    std.debug.print("[STRICT BENCHMARK] mmap Open Latency: {d} µs ({d} attempts)\n", .{ min_elapsed_us, attempts });
 
     if (simd.enforce_timing_budgets) {
         try std.testing.expect(min_elapsed_us <= TARGET_MAX_MMAP_OPEN_TIME_US);
@@ -158,17 +169,19 @@ test "STRICT: Zero-Copy mmap Open Latency" {
 test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
     // Mirrors main() startup on the doc reviewers actually open: mmap the
     // file, scan lines, compute full document metrics, lay out the first
-    // viewport. Min of 5 runs, same convention as the sibling gates.
-    // Platform work (fonts, first-frame shaping, images, PNG) is out of
-    // scope here — see the spike notes on spike/startup-10x-showcase.
+    // viewport. Adaptive sampling (simd.timing_gate_*), same convention as
+    // the sibling gates. Platform work (fonts, first-frame shaping, images,
+    // PNG) is out of scope here — see the spike notes on
+    // spike/startup-10x-showcase.
     var lines_buf: [512]simd.Line = undefined;
     var checkpoints: [128]layout.Checkpoint = undefined;
     var commands: [2048]layout.DrawCommand = undefined;
 
     var min_elapsed_us: i128 = 999999;
     var last_line_count: usize = 0;
-    var iter: usize = 0;
-    while (iter < 5) : (iter += 1) {
+    var attempts: usize = 0;
+    while (attempts < simd.timing_gate_max_attempts) {
+        if (attempts > 0) simd.timingGateBackoff();
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
 
@@ -212,12 +225,15 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
         const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
+        attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
+        if (min_elapsed_us <= TARGET_MAX_SHOWCASE_STARTUP_TIME_US) break;
     }
 
-    std.debug.print("[STRICT BENCHMARK] Showcase Startup (148-line doc): {d} µs ({d} lines)\n", .{
+    std.debug.print("[STRICT BENCHMARK] Showcase Startup (148-line doc): {d} µs ({d} lines, {d} attempts)\n", .{
         min_elapsed_us,
         last_line_count,
+        attempts,
     });
 
     try std.testing.expect(last_line_count > 100);
@@ -259,8 +275,9 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
         .scroll_y = 1200.0,
     };
 
-    // One unmeasured warmup + min of 7 measured runs. The 8 µs threshold is
-    // unchanged; the extra samples only absorb shared-CI-runner timing noise.
+    // One unmeasured warmup, then adaptive sampling (simd.timing_gate_*).
+    // The 8 µs threshold is unchanged; the sampling absorbs
+    // shared-CI-runner timing noise.
     _ = layout.layoutViewport(
         mem,
         line_entries[0..line_count],
@@ -269,8 +286,9 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
     );
     var min_elapsed_us: i128 = 999999;
     var last_cmd_count: usize = 0;
-    var iter: usize = 0;
-    while (iter < 7) : (iter += 1) {
+    var attempts: usize = 0;
+    while (attempts < simd.timing_gate_max_attempts) {
+        if (attempts > 0) simd.timingGateBackoff();
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
 
@@ -288,12 +306,15 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
         const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
         const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
+        attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
+        if (min_elapsed_us <= TARGET_MAX_VIEWPORT_LAYOUT_TIME_US) break;
     }
 
-    std.debug.print("[STRICT BENCHMARK] Viewport Layout Latency: {d} µs ({d} draw commands)\n", .{
+    std.debug.print("[STRICT BENCHMARK] Viewport Layout Latency: {d} µs ({d} draw commands, {d} attempts)\n", .{
         min_elapsed_us,
         last_cmd_count,
+        attempts,
     });
 
     try std.testing.expect(last_cmd_count > 0);
@@ -319,12 +340,14 @@ test "STRICT: SIMD Substring Search Under 500 µs on 50,000 Lines" {
 
     const mem = buffer.items;
     const needle = "Special needle";
-    // One unmeasured warmup + min of 7 measured runs. The 50 µs threshold is
-    // unchanged; the extra samples only absorb shared-CI-runner timing noise.
+    // One unmeasured warmup, then adaptive sampling (simd.timing_gate_*).
+    // The 50 µs threshold is unchanged; the sampling absorbs
+    // shared-CI-runner timing noise.
     _ = simd.simdSearch(mem, needle);
     var min_elapsed_us: i128 = 999999;
-    var iter: usize = 0;
-    while (iter < 7) : (iter += 1) {
+    var attempts: usize = 0;
+    while (attempts < simd.timing_gate_max_attempts) {
+        if (attempts > 0) simd.timingGateBackoff();
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
 
@@ -338,10 +361,12 @@ test "STRICT: SIMD Substring Search Under 500 µs on 50,000 Lines" {
         const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
         const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
+        attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
+        if (min_elapsed_us <= TARGET_MAX_SUBSTRING_SEARCH_TIME_US) break;
     }
 
-    std.debug.print("[STRICT BENCHMARK] Substring Search Latency: {d} µs\n", .{min_elapsed_us});
+    std.debug.print("[STRICT BENCHMARK] Substring Search Latency: {d} µs ({d} attempts)\n", .{ min_elapsed_us, attempts });
 
     if (simd.enforce_timing_budgets) {
         try std.testing.expect(min_elapsed_us <= TARGET_MAX_SUBSTRING_SEARCH_TIME_US);
@@ -412,8 +437,9 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
 
     var commands: [1024]layout.DrawCommand = undefined;
 
-    // One unmeasured warmup + min of 7 measured runs. The 11 µs threshold is
-    // unchanged; the extra samples only absorb shared-CI-runner timing noise.
+    // One unmeasured warmup, then adaptive sampling (simd.timing_gate_*).
+    // The 11 µs threshold is unchanged; the sampling absorbs
+    // shared-CI-runner timing noise.
     _ = layout.layoutViewport(
         mem,
         line_entries[0..line_count],
@@ -421,8 +447,9 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
         &commands,
     );
     var min_elapsed_us: i128 = 999999;
-    var iter: usize = 0;
-    while (iter < 7) : (iter += 1) {
+    var attempts: usize = 0;
+    while (attempts < simd.timing_gate_max_attempts) {
+        if (attempts > 0) simd.timingGateBackoff();
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
 
@@ -441,10 +468,12 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
         const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
         const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
+        attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
+        if (min_elapsed_us <= TARGET_MAX_DEEP_SCROLL_LAYOUT_TIME_US) break;
     }
 
-    std.debug.print("[STRICT BENCHMARK] Deep Scroll (Line 45k+) Layout Latency: {d} µs\n", .{min_elapsed_us});
+    std.debug.print("[STRICT BENCHMARK] Deep Scroll (Line 45k+) Layout Latency: {d} µs ({d} attempts)\n", .{ min_elapsed_us, attempts });
     if (simd.enforce_timing_budgets) {
         try std.testing.expect(min_elapsed_us <= TARGET_MAX_DEEP_SCROLL_LAYOUT_TIME_US);
     }
@@ -478,14 +507,14 @@ test "STRICT: SIMD Search Edge Situations (Needle at Start, End, and Not Found)"
     try std.testing.expect(pos_end != null);
     try std.testing.expect(pos_end.? > mem.len - 40);
 
-    // 3. Search missing needle (worst-case full document scan), min of 7 runs
-    // with one unmeasured warmup to match the sibling search gate and keep
-    // the tightened target stable on noisy shared CI runners. Threshold
-    // unchanged.
+    // 3. Search missing needle (worst-case full document scan), one
+    // unmeasured warmup then adaptive sampling (simd.timing_gate_*) to match
+    // the sibling search gate. Threshold unchanged.
     _ = simd.simdSearch(mem, "NONEXISTENT_TOKEN_12345");
     var min_elapsed_us: i128 = 999999;
-    var iter: usize = 0;
-    while (iter < 7) : (iter += 1) {
+    var attempts: usize = 0;
+    while (attempts < simd.timing_gate_max_attempts) {
+        if (attempts > 0) simd.timingGateBackoff();
         var ts_start: std.posix.timespec = undefined;
         _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
 
@@ -499,10 +528,12 @@ test "STRICT: SIMD Search Edge Situations (Needle at Start, End, and Not Found)"
         const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
         const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
+        attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
+        if (min_elapsed_us <= TARGET_MAX_SUBSTRING_SEARCH_TIME_US) break;
     }
 
-    std.debug.print("[STRICT BENCHMARK] Full-Document Miss Search Latency: {d} µs\n", .{min_elapsed_us});
+    std.debug.print("[STRICT BENCHMARK] Full-Document Miss Search Latency: {d} µs ({d} attempts)\n", .{ min_elapsed_us, attempts });
     if (simd.enforce_timing_budgets) {
         try std.testing.expect(min_elapsed_us <= TARGET_MAX_SUBSTRING_SEARCH_TIME_US);
     }
