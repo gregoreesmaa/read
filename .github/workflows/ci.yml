@@ -6,6 +6,22 @@ on:
   pull_request:
 
 jobs:
+  # Platform-seam gate (issue #53, docs/cross-platform-rfc.md §6): src/core
+  # and src/layout are OS-agnostic. Every Cocoa-ism lives behind the
+  # bridge.zig/platform.h boundary in src/platform + src/main.zig (app
+  # shell). Needs no toolchain; runs everywhere, fails on any match.
+  seam-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No platform symbols outside the seam
+        run: |
+          if grep -rnE 'NS[A-Z][A-Za-z]|AppKit|Cocoa|CoreText|CoreGraphics|CoreFoundation|NSString|NSURL|NSFont|CTFont|CTLine|CGContext|CGImage|dispatch_async' src/core src/layout; then
+            echo 'FAIL: platform symbol outside src/platform (see docs/cross-platform-rfc.md §6)'
+            exit 1
+          fi
+          echo 'PASS: seam clean'
+
   # Full gate on macOS: strict benchmarks + release build + screenshot smoke test.
   # The native Cocoa/CoreText window and headless screenshots only run here.
   test-macos:
