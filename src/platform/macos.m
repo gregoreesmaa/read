@@ -99,6 +99,7 @@ static BOOL g_has_selection = NO;
 static int g_selection_mode = 0; // 0 = none, 1 = range, 2 = word, 3 = line, 4 = all
 static NSPoint g_select_start = {0, 0}; // Stored in document coordinates
 static NSPoint g_select_end = {0, 0};   // Stored in document coordinates
+static NSPoint g_select_anchor = {0, 0}; // Fixed end for word/line drag extension
 static BOOL g_select_all = NO;
 
 // ---------------------------------------------------------------------------
@@ -745,6 +746,50 @@ static void ax_note_draw_locked(void) {
         NSAccessibilityPostNotification(g_main_view, NSAccessibilityValueChangedNotification);
     }
 }
+// Unicode word selection (mirrors isWordByte/wordStart/wordEnd in
+// src/tests/controls_test.zig — keep the classification in sync).
+// ASCII letters/digits plus `_` and `'`; every non-ASCII byte is a word
+// byte so UTF-8 sequences are never split. Zero allocations.
+static BOOL word_char_byte(unsigned char c) {
+    if (c >= 0x80) return YES;
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '\'';
+}
+static int word_start_in_bytes(const char* text, int len, int idx) {
+    if (idx < 0) idx = 0;
+    if (idx > len) idx = len;
+    while (idx > 0 && word_char_byte((unsigned char)text[idx - 1])) idx--;
+    return idx;
+}
+static int word_end_in_bytes(const char* text, int len, int idx) {
+    if (idx < 0) idx = 0;
+    if (idx > len) idx = len;
+    while (idx < len && word_char_byte((unsigned char)text[idx])) idx++;
+    return idx;
+}
+// CoreText string indices count UTF-16 units while records store UTF-8
+// bytes: map between the two by walking the sequence headers. BMP
+// characters cost 1 unit, astral (4-byte) sequences cost 2.
+static int utf16_to_utf8(const char* text, int len, int u16idx) {
+    int b = 0, u = 0;
+    while (b < len && u < u16idx) {
+        unsigned char c = (unsigned char)text[b];
+        int seqlen = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        b += seqlen;
+        u += (seqlen == 4) ? 2 : 1;
+    }
+    return b > len ? len : b;
+}
+static int utf8_to_utf16(const char* text, int bidx) {
+    int b = 0, u = 0;
+    while (b < bidx && text[b] != '\0') {
+        unsigned char c = (unsigned char)text[b];
+        int seqlen = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        b += seqlen;
+        u += (seqlen == 4) ? 2 : 1;
+    }
+    return u;
+}
 
 @interface ReadView : NSView
 - (void)copySelectionToClipboard;
@@ -1197,8 +1242,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     g_has_selection = YES;
     g_select_start = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
     g_select_end = g_select_start;
+    g_select_anchor = g_select_start;
 
-    // Double click: word selection
+    // Double click: word selection (Unicode word under the cursor, not the
+    // whole run; whitespace/punctuation clicks keep the run snap).
     if ([event clickCount] == 2) {
         g_selection_mode = 2;
         for (int q = 0; q < g_text_record_count; q++) {
@@ -1206,8 +1253,19 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (g_select_start.x >= rec->x && g_select_start.x <= rec->x + rec->w &&
                 g_select_start.y >= rec->doc_y && g_select_start.y <= rec->doc_y + rec->h)
             {
-                g_select_start = NSMakePoint(rec->x, rec->doc_y + rec->h * 0.5f);
-                g_select_end = NSMakePoint(rec->x + rec->w, rec->doc_y + rec->h * 0.5f);
+                float mid_y = rec->doc_y + rec->h * 0.5f;
+                int u16 = get_char_index_at_x(rec, g_select_start.x - rec->x);
+                int b = utf16_to_utf8(rec->text, rec->len, u16);
+                int ws = word_start_in_bytes(rec->text, rec->len, b);
+                int we = word_end_in_bytes(rec->text, rec->len, b);
+                if (we > ws) {
+                    g_select_start = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, ws)), mid_y);
+                    g_select_end = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, we)), mid_y);
+                } else {
+                    g_select_start = NSMakePoint(rec->x, mid_y);
+                    g_select_end = NSMakePoint(rec->x + rec->w, mid_y);
+                }
+                g_select_anchor = g_select_start;
                 break;
             }
         }
@@ -1251,6 +1309,65 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         [self setNeedsDisplay:YES];
         return;
     }
+    NSPoint drag_view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
+    NSPoint drag_doc = NSMakePoint(drag_view_pt.x, drag_view_pt.y + g_scroll_y);
+    if (g_selection_mode == 2) {
+        // Word-wise extension: the anchor never moves; the free end snaps
+        // to the word boundary under the cursor (word start when dragging
+        // back past the anchor, word end when dragging on).
+        NSRect old_sel = selection_bounds_expanded(24.0f);
+        for (int q = 0; q < g_text_record_count; q++) {
+            QuadTextRecord* rec = &g_text_records[q];
+            if (drag_doc.x >= rec->x && drag_doc.x <= rec->x + rec->w &&
+                drag_doc.y >= rec->doc_y && drag_doc.y <= rec->doc_y + rec->h)
+            {
+                float mid_y = rec->doc_y + rec->h * 0.5f;
+                int u16 = get_char_index_at_x(rec, drag_doc.x - rec->x);
+                int b = utf16_to_utf8(rec->text, rec->len, u16);
+                if (drag_doc.x < g_select_anchor.x) {
+                    int ws = word_start_in_bytes(rec->text, rec->len, b);
+                    g_select_end = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, ws)), mid_y);
+                } else {
+                    int ws = word_start_in_bytes(rec->text, rec->len, b);
+                    int we = word_end_in_bytes(rec->text, rec->len, b);
+                    if (we > ws) {
+                        g_select_end = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, we)), mid_y);
+                    }
+                }
+                break;
+            }
+        }
+        invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+#ifdef TEST_HOOKS
+        DBGLOG("EV mousedrag mode=2 word end=%.0f,%.0f", g_select_end.x, g_select_end.y);
+#endif
+        return;
+    }
+    if (g_selection_mode == 3) {
+        // Line-wise extension: the free end snaps to the row band under the
+        // cursor; dragging above the anchor re-seats the start.
+        NSRect old_sel = selection_bounds_expanded(24.0f);
+        float band_min = 9999.0f, band_max = -9999.0f;
+        for (int q = 0; q < g_text_record_count; q++) {
+            QuadTextRecord* rec = &g_text_records[q];
+            if (fabsf(rec->doc_y + rec->h * 0.5f - drag_doc.y) < 16.0f) {
+                band_min = fminf(band_min, rec->x);
+                band_max = fmaxf(band_max, rec->x + rec->w);
+            }
+        }
+        if (band_max > band_min) {
+            if (drag_doc.y < g_select_anchor.y) {
+                g_select_start = NSMakePoint(band_min, drag_doc.y);
+            } else {
+                g_select_end = NSMakePoint(band_max, drag_doc.y);
+            }
+        }
+        invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
+#ifdef TEST_HOOKS
+        DBGLOG("EV mousedrag mode=3 line end=%.0f,%.0f", g_select_end.x, g_select_end.y);
+#endif
+        return;
+    }
     if (g_selection_mode <= 1) {
         // Damage: the selection spans start->end across full line widths, not
         // just the cursor path, so invalidate old + new full bounds.
@@ -1276,7 +1393,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
 #ifdef TEST_HOOKS
     else {
-        DBGLOG("EV mousedrag mode=%d ignored (word/line lock)", g_selection_mode);
+        DBGLOG("EV mousedrag mode=%d ignored (select-all lock)", g_selection_mode);
     }
 #endif
 }
