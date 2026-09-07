@@ -1,6 +1,9 @@
 # Read: The Comprehensive Markdown Showcase
 
-Welcome to **Read**, the zero-dependency, microsecond-grade reader. This document tests and demonstrates the full typographic and parsing capabilities of the engine.
+Welcome to **Read**. This document exercises the typographic and parsing
+capabilities of the engine — every section below demos a supported construct.
+(Performance figures live in exactly one place: the
+[README benchmark table](README.md#benchmarks).)
 
 ---
 
@@ -10,7 +13,7 @@ Normal paragraph text supports rich inline styling. Here is an example combining
 
 You can also have [hyperlinks to ziglang.org](https://ziglang.org) embedded directly within sentences.
 
-Here is a second paragraph demonstrating automatic word wrapping across multiple lines. When text exceeds the maximum reading column width of 600 pixels, the layout engine automatically breaks lines between words without breaking character runs or miscalculating typographic advances. Every line snaps strictly to the baseline grid for effortless readability.
+Here is a second paragraph demonstrating automatic word wrapping across multiple lines. When text exceeds the maximum reading column, the layout engine automatically breaks lines between words without breaking character runs or miscalculating typographic advances. Every line snaps strictly to the baseline grid for effortless readability.
 
 ---
 
@@ -89,12 +92,14 @@ zig build -Doptimize=ReleaseFast
 
 ## 6. Tables
 
+A table exercising headers, alignment, and dividers:
+
 | Feature | Read | Standard Reader | Browser / Electron |
 | :--- | :--- | :--- | :--- |
-| **Startup Time** | **≤ 120 µs** | 40 – 80 ms | 350 – 1,200 ms |
-| **Active RAM** | **< 6 MB** | 30 – 60 MB | 150 – 400 MB |
-| **Binary Size** | **< 180 KiB** | 15 – 30 MB | 120 – 220 MB |
-| **Dependencies** | **0** | 10 – 30 | 800+ packages |
+| **Startup Time** | Opens before you blink | Noticeable pause | Long warm-up |
+| **Active RAM** | Sips memory | Moderate footprint | Heavy footprint |
+| **Binary Size** | Tiny native binary | Installer-sized app | Full runtime bundle |
+| **Dependencies** | None | Several frameworks | Hundreds of packages |
 
 ---
 
@@ -131,7 +136,7 @@ Read supports all major image and vector formats through zero-dependency native 
 
 ![GIF Palette Image](assets/images/sample_gif.gif)
 
-### Animated GIF — Rotating Earth (44 frames, public domain)
+### Animated GIF — Rotating Earth (public domain)
 
 Animated GIFs are loaded via native ImageIO. Source: Wikimedia Commons.
 
