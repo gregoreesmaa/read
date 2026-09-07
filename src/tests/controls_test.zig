@@ -434,6 +434,56 @@ test "controls: voiceover posts only on real selection or text change" {
     try std.testing.expectEqualStrings("heading", axRoleDescriptionForBlock(true, true).?);
 }
 
+/// Native editing validation contract (mirrored by
+/// edit_action_available + validateMenuItem: in src/platform/macos.m).
+/// Copy/Look Up/Search need a live selection and refuse while Secure
+/// Input is active; Select All is always available. Pure, zero heap.
+pub const EditPolicy = struct {
+    pub fn selectionActionEnabled(has_selection: bool, select_all: bool, secure_input: bool) bool {
+        return (has_selection or select_all) and !secure_input;
+    }
+
+    pub fn copyEnabled(has_selection: bool, select_all: bool, secure_input: bool) bool {
+        return selectionActionEnabled(has_selection, select_all, secure_input);
+    }
+
+    pub fn lookupEnabled(has_selection: bool, select_all: bool, secure_input: bool) bool {
+        return selectionActionEnabled(has_selection, select_all, secure_input);
+    }
+
+    pub fn searchEnabled(has_selection: bool, select_all: bool, secure_input: bool) bool {
+        return selectionActionEnabled(has_selection, select_all, secure_input);
+    }
+
+    pub fn selectAllEnabled() bool {
+        return true;
+    }
+};
+
+test "controls: editing validation disables copy without selection or under secure input" {
+    // No selection, no select-all: everything selection-scoped is off.
+    try std.testing.expect(!EditPolicy.copyEnabled(false, false, false));
+    try std.testing.expect(!EditPolicy.lookupEnabled(false, false, false));
+    try std.testing.expect(!EditPolicy.searchEnabled(false, false, false));
+
+    // Live range selection: on.
+    try std.testing.expect(EditPolicy.copyEnabled(true, false, false));
+    try std.testing.expect(EditPolicy.lookupEnabled(true, false, false));
+    try std.testing.expect(EditPolicy.searchEnabled(true, false, false));
+
+    // Select-all counts as a selection.
+    try std.testing.expect(EditPolicy.copyEnabled(false, true, false));
+
+    // Secure Input (a password field elsewhere is focused): all
+    // selection-scoped actions refuse, even with a selection.
+    try std.testing.expect(!EditPolicy.copyEnabled(true, false, true));
+    try std.testing.expect(!EditPolicy.lookupEnabled(false, true, true));
+    try std.testing.expect(!EditPolicy.searchEnabled(true, true, true));
+
+    // Select All never disables.
+    try std.testing.expect(EditPolicy.selectAllEnabled());
+}
+
 test "controls: keybindings j, k, space, t navigation" {
     var scroll_y: f32 = 0.0;
     const max_scroll_y: f32 = 1000.0;
