@@ -129,11 +129,17 @@ pub fn build(b: *std.Build) void {
     // Set inside the Darwin block; wired to the install below.
     var strip_ship: ?*std.Build.Step.Run = null;
     if (target.result.os.tag.isDarwin()) {
-        // -Os for the platform glue TU only: its cost is dominated by
-        // CoreText/CG/UIColor calls, while the microsecond hot paths (scan,
-        // layout, viewport) live in the Zig TU pinned by strict benchmarks.
-        // Keeps the ship binary under the 180 KiB budget (page-alignment
-        // padding makes even small __TEXT growth disproportionate).
+        // -Oz for the ship platform-glue TU, -Os for the test TU: the
+        // glue's cost is dominated by CoreText/CG/UIColor calls, while the
+        // microsecond hot paths (scan, layout, viewport) live in the Zig TU
+        // pinned by strict benchmarks. -Oz shrinks the glue TU by ~7 KiB
+        // of __TEXT (measured 2026-09: 132500 -> 125384 with the CLI
+        // surface aboard) and keeps the ship binary under the 180 KiB
+        // budget (page-alignment padding makes even small __TEXT growth
+        // disproportionate). No FP-semantic or API change: the glue TU
+        // renders pixel-identical PNGs under -Os and -Oz (verified by
+        // byte-compare of headless screenshots), so committed screenshots
+        // are unaffected; the test TU stays -Os for backtrace fidelity.
         // Binary diet (AGENTS.md §1: < 180 KiB): behavior-neutral linker
         // trims only — no codegen, API, or optimization-level change.
         // --gc-sections dead-strips unreachable sections, -dead_strip_dylibs
@@ -161,7 +167,7 @@ pub fn build(b: *std.Build) void {
         }
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = &.{"-fobjc-arc", "-Os", "-DREAD_ANIMATED_GIF=1"},
+            .flags = &.{"-fobjc-arc", "-Oz", "-DREAD_ANIMATED_GIF=1"},
         });
         exe_test.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
