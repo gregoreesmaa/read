@@ -1256,6 +1256,78 @@ test "classify: link definitions and HTML comments" {
     try std.testing.expect(!fence.open);
 }
 
+test "classify: vector-lane invariance (issue #10)" {
+    // The scanner folds prefix classification into the vector newline pass:
+    // a 128-byte quad-vector loop, a 32-byte single-vector remainder, and a
+    // scalar tail. A prefix-heavy document embedded at shifting byte
+    // alignments must classify identically on every path — any lane-dependent
+    // branch would show up as a block-type mismatch. Throughput/latency gates
+    // live in strict_benchmarks.zig ("STRICT: SIMD Line Scanner"); this test
+    // pins the correctness side of the #10 contract (branchless single
+    // dispatch, 8-byte Line, 0 hot-path allocations by construction: no
+    // allocator is referenced anywhere in this file).
+    const doc =
+        \\# H1 heading
+        \\> quoted line
+        \\```
+        \\code line one
+        \\code line two
+        \\```
+        \\- bullet alpha
+        \\- [ ] task beta
+        \\1. ordered gamma
+        \\| table | row |
+        \\![alt](url)
+        \\[1]: /url-target
+        \\___
+        \\plain paragraph text here
+        \\
+    ;
+    const want = [_]BlockType{
+        .heading1, .quote,          .code_fence_start, .code_line,
+        .code_line, .code_fence_end, .bullet_list,     .task_list,
+        .ordered_list, .table_row,  .image,            .link_def,
+        .hr,        .paragraph,
+    };
+
+    var ref_lines: [32]Line = undefined;
+    var ref_fence: FenceState = .{};
+    const ref_n = scanLines(doc, &ref_lines, &ref_fence);
+    try std.testing.expectEqual(want.len, ref_n);
+    for (want, 0..) |bt, i| {
+        try std.testing.expectEqual(bt, ref_lines[i].block_type);
+    }
+    try std.testing.expect(!ref_fence.open);
+
+    // Re-scan with 0..40 two-byte pad lines ahead: the doc body slides
+    // across every 32-byte lane and the 128-byte quad boundary while the
+    // fence/comment state machine stays cold in the prefix.
+    var shift: usize = 0;
+    while (shift <= 40) : (shift += 1) {
+        var buf: [512]u8 = undefined;
+        var pos: usize = 0;
+        var p: usize = 0;
+        while (p < shift) : (p += 1) {
+            buf[pos] = 'q';
+            buf[pos + 1] = '\n';
+            pos += 2;
+        }
+        @memcpy(buf[pos..][0..doc.len], doc);
+        pos += doc.len;
+
+        var lines: [80]Line = undefined;
+        var fence: FenceState = .{};
+        const n = scanLines(buf[0..pos], &lines, &fence);
+        try std.testing.expectEqual(shift + want.len, n);
+        try std.testing.expect(!fence.open);
+        for (want, 0..) |bt, i| {
+            const got = lines[shift + i];
+            try std.testing.expectEqual(bt, got.block_type);
+            try std.testing.expectEqual(ref_lines[i].len, got.len);
+        }
+    }
+}
+
 fn recordBlockRun(bytes_inner: []const u8, nl_pos: usize, out: []u32, n: *usize) void {
     // Only record the start of a blank run: previous byte must not be '\n'
     // so `\n\n\n` yields a single boundary, not two.
