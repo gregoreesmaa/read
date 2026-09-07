@@ -755,6 +755,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         g_app.mapped_file = mapped;
         g_app.bytes = mapped.bytes;
+        // Cold-start prefetch (issue #11): SEQUENTIAL readahead over the
+        // whole file plus WILLNEED on the leading window, once per open.
+        // No read()/copy anywhere on this path — the scan below walks the
+        // mapping in place.
+        mapped.adviseSequential();
     } else {
         g_app.bytes = DEFAULT_DOC;
     }
