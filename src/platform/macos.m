@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
+#include <Carbon/Carbon.h> // IsSecureEventInputEnabled for Copy validation
 #include "platform.h"
 
 static PlatformCallbacks g_callbacks = {0};
@@ -796,6 +797,8 @@ static int utf8_to_utf16(const char* text, int bidx) {
 - (void)selectAllDocument;
 - (void)openClickedLink:(id)sender;
 - (void)copyClickedLink:(id)sender;
+- (void)lookUpSelection:(id)sender;
+- (void)searchSelectionWithGoogle:(id)sender;
 @end
 
 @implementation ReadView
@@ -1503,13 +1506,23 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
 
     NSMenuItem *copyItem = [[NSMenuItem alloc] initWithTitle:@"Copy" action:@selector(copySelectionToClipboard) keyEquivalent:@"c"];
-    if (!g_has_selection && !g_select_all) {
+    if ((!g_has_selection && !g_select_all) || IsSecureEventInputEnabled()) {
         [copyItem setEnabled:NO];
     }
     [menu addItem:copyItem];
 
     NSMenuItem *selectAllItem = [[NSMenuItem alloc] initWithTitle:@"Select All" action:@selector(selectAllDocument) keyEquivalent:@"a"];
     [menu addItem:selectAllItem];
+
+    // Look Up / Search need a selection and refuse under Secure Input,
+    // same as Copy (see validateMenuItem: for the main-menu path).
+    if ((g_has_selection || g_select_all) && !IsSecureEventInputEnabled()) {
+        [menu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *lookUp = [[NSMenuItem alloc] initWithTitle:@"Look Up" action:@selector(lookUpSelection:) keyEquivalent:@""];
+        [menu addItem:lookUp];
+        NSMenuItem *search = [[NSMenuItem alloc] initWithTitle:@"Search with Google" action:@selector(searchSelectionWithGoogle:) keyEquivalent:@""];
+        [menu addItem:search];
+    }
 
     return menu;
 }
@@ -1537,6 +1550,76 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     [self copySelectionToClipboard];
 }
 
+- (void)selectAll:(id)sender {
+    (void)sender;
+    [self selectAllDocument];
+}
+
+// Dictionary lookup for the current selection via the system
+// Dictionary.app URL scheme; no-ops without a selection.
+- (void)lookUpSelection:(id)sender {
+    (void)sender;
+    NSString* s = [selected_text_string() stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([s length] == 0) return;
+    NSString* q = [s stringByAddingPercentEncodingWithAllowedCharacters:
+        [NSCharacterSet URLQueryAllowedCharacterSet]];
+    if (!q) return;
+    NSURL* url = [NSURL URLWithString:[@"dict://" stringByAppendingString:q]];
+    if (url) [[NSWorkspace sharedWorkspace] openURL:url];
+}
+
+// Web search for the current selection; no-ops without a selection.
+- (void)searchSelectionWithGoogle:(id)sender {
+    (void)sender;
+    NSString* s = [selected_text_string() stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([s length] == 0) return;
+    NSString* q = [s stringByAddingPercentEncodingWithAllowedCharacters:
+        [NSCharacterSet URLQueryAllowedCharacterSet]];
+    if (!q) return;
+    NSURL* url = [NSURL URLWithString:
+        [@"https://www.google.com/search?q=" stringByAppendingString:q]];
+    if (url) [[NSWorkspace sharedWorkspace] openURL:url];
+}
+
+// Responder-chain validation (mirrors EditPolicy in
+// src/tests/controls_test.zig — keep the truth table in sync):
+// Copy/Look Up/Search need a selection and refuse while Secure Input is
+// active (password fields elsewhere); Select All is always available.
+static BOOL edit_action_available(SEL action, BOOL has_selection, BOOL secure_input) {
+    if (action == @selector(selectAll:) || action == @selector(selectAllDocument)) return YES;
+    if (action == @selector(copy:) || action == @selector(copySelectionToClipboard) ||
+        action == @selector(lookUpSelection:) || action == @selector(searchSelectionWithGoogle:)) {
+        return has_selection && !secure_input;
+    }
+    return YES;
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    return edit_action_available([item action], g_has_selection || g_select_all,
+                                 IsSecureEventInputEnabled() ? YES : NO);
+}
+
+// Services: vend the selection as plain text; read-only, so no
+// readSelectionFromPasteboard. Returning nil without a selection keeps
+// the Services menu honest.
+- (id)validRequestorForSendType:(NSString *)sendType returnType:(NSString *)returnType {
+    (void)returnType;
+    if ([sendType isEqualToString:NSStringPboardType] && (g_has_selection || g_select_all)) {
+        return self;
+    }
+    return nil;
+}
+
+- (BOOL)writeSelectionToPasteboard:(NSPasteboard *)pboard types:(NSArray *)types {
+    if (![types containsObject:NSStringPboardType]) return NO;
+    NSString* s = selected_text_string();
+    if ([s length] == 0) return NO;
+    [pboard clearContents];
+    return [pboard setString:s forType:NSStringPboardType];
+}
+
 - (void)selectAllDocument {
     g_select_all = YES;
     g_has_selection = YES;
@@ -1549,7 +1632,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     [self setNeedsDisplay:YES];
 }
 
-- (void)copySelectionToClipboard {
+// Shared selection text for Copy, Look Up, Search, and Services: the
+// exact string the clipboard path writes. Empty when there is no
+// selection. Zero heap beyond the returned string.
+static NSString* selected_text_string(void) {
     NSMutableString* result = [NSMutableString string];
 
     if (g_select_all) {
@@ -1636,10 +1722,15 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         }
     }
 
-    if ([result length] > 0) {
+    return result;
+}
+
+- (void)copySelectionToClipboard {
+    NSString* s = selected_text_string();
+    if ([s length] > 0) {
         NSPasteboard* pb = [NSPasteboard generalPasteboard];
         [pb clearContents];
-        [pb setString:result forType:NSPasteboardTypeString];
+        [pb setString:s forType:NSPasteboardTypeString];
     }
 }
 
@@ -1994,6 +2085,35 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     g_main_view = view;  // for async image load → setNeedsDisplay callbacks
     [g_window setContentView:view];
     [g_window setDelegate:delegate];
+
+    // Main menu: App + Edit (+ Services) so Cmd+C/A route through the
+    // responder chain with validateMenuItem: instead of relying only on
+    // the view's keyDown fallback. Standard action names (copy:,
+    // selectAll:) keep Services and key equivalents working.
+    NSMenu* mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
+    NSMenuItem* appItem = [[NSMenuItem alloc] initWithTitle:@"Read" action:nil keyEquivalent:@""];
+    NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"Read"];
+    [appMenu addItemWithTitle:@"Quit Read" action:@selector(terminate:) keyEquivalent:@"q"];
+    [appItem setSubmenu:appMenu];
+    [mainMenu addItem:appItem];
+    NSMenuItem* editItem = [[NSMenuItem alloc] initWithTitle:@"Edit" action:nil keyEquivalent:@""];
+    NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItemWithTitle:@"Look Up" action:@selector(lookUpSelection:) keyEquivalent:@""];
+    [editMenu addItemWithTitle:@"Search with Google" action:@selector(searchSelectionWithGoogle:) keyEquivalent:@""];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    NSMenu* servicesMenu = [[NSMenu alloc] initWithTitle:@"Services"];
+    [NSApp setServicesMenu:servicesMenu];
+    NSMenuItem* servicesItem = [[NSMenuItem alloc] initWithTitle:@"Services" action:nil keyEquivalent:@""];
+    [servicesItem setSubmenu:servicesMenu];
+    [editMenu addItem:servicesItem];
+    [editItem setSubmenu:editMenu];
+    [mainMenu addItem:editItem];
+    [NSApp setMainMenu:mainMenu];
+    [NSApp setServicesProvider:view];
+
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:view];
 

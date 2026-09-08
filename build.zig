@@ -165,6 +165,10 @@ pub fn build(b: *std.Build) void {
             e.root_module.linkFramework("Cocoa", .{});
             e.root_module.linkFramework("CoreText", .{});
             e.root_module.linkFramework("CoreGraphics", .{});
+            // Carbon for IsSecureEventInputEnabled only (Copy validation
+            // refuses while secure input is active). One symbol; the
+            // dead-strip pass drops every other Carbon edge.
+            e.root_module.linkFramework("Carbon", .{});
         }
         // exe_tests is its own Compile step inheriting link edges from its
         // root module: give exe_mod the same frameworks (it is otherwise
@@ -172,6 +176,7 @@ pub fn build(b: *std.Build) void {
         exe_mod.linkFramework("Cocoa", .{});
         exe_mod.linkFramework("CoreText", .{});
         exe_mod.linkFramework("CoreGraphics", .{});
+        exe_mod.linkFramework("Carbon", .{});
         if (optimize != .Debug) exe.root_module.strip = true;
         // Binary diet: post-link `strip -x` on the ship binary only. The
         // linker's own strip leaves ~238 local symbols (OUTLINED_FUNCTION_*,
