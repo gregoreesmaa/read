@@ -1,5 +1,5 @@
 const std = @import("std");
-const simd = @import("../core/simd.zig");
+const simd = @import("hot");
 const parser = @import("../core/parser.zig");
 const layout = @import("../layout/viewport.zig");
 

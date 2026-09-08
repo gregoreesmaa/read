@@ -1,6 +1,6 @@
 const std = @import("std");
 const mmap = @import("../core/mmap.zig");
-const simd = @import("../core/simd.zig");
+const simd = @import("hot");
 const parser = @import("../core/parser.zig");
 const layout = @import("../layout/viewport.zig");
 

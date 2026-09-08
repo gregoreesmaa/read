@@ -1,5 +1,5 @@
 const std = @import("std");
-const simd = @import("../core/simd.zig");
+const simd = @import("hot");
 const parser = @import("../core/parser.zig");
 
 /// File-driven CommonMark 0.31.2 (latest) conformance harness.

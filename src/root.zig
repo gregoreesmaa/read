@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const mmap = @import("core/mmap.zig");
-pub const simd = @import("core/simd.zig");
+pub const simd = @import("hot");
 pub const parser = @import("core/parser.zig");
 pub const layout = @import("layout/viewport.zig");
 pub const block_index = @import("core/block_index.zig");
