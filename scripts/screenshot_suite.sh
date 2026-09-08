@@ -8,15 +8,8 @@ set -euo pipefail
 OUTPUT_DIR="${1:-screenshots}"
 mkdir -p "$OUTPUT_DIR"
 
-# Step 1 (skippable in CI via SKIP_SUITE_TESTS=1: the CI strict-gate step
-# already ran these same tests on the same commit minutes earlier, and a
-# second wall-clock pass only doubles shared-VM flake exposure).
-if [ -z "${SKIP_SUITE_TESTS:-}" ]; then
 echo "Step 1: Running all tests and strict benchmarks (ReleaseFast)..."
 zig build test -Doptimize=ReleaseFast --summary all
-else
-echo "Step 1: skipped (SKIP_SUITE_TESTS=1; CI strict gate covers it)."
-fi
 
 echo "Step 2: Building Read executable in ReleaseFast mode..."
 zig build -Doptimize=ReleaseFast
