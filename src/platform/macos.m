@@ -43,6 +43,7 @@ static BOOL gif_window_visible(void); // defined with the image cache below
 static void apply_native_tabbing(NSWindow* w); // defined at end-of-file
 static int appearance_is_dark(NSAppearance* a); // defined at end-of-file
 static void apply_window_appearance(BOOL dark); // defined at end-of-file
+static int g_synced_theme_dark; // tentative: real init (-1) at end-of-file
 static int image_url_is_remote(NSString* s); // defined at end-of-file
 static NSURLSession* image_session(void); // defined at end-of-file
 static int image_path_exists_joined(const char* dir, NSString* rel); // ditto
@@ -1839,7 +1840,11 @@ static NSString* selected_text_string(void) {
 - (void)viewDidChangeEffectiveAppearance {
     [super viewDidChangeEffectiveAppearance];
     BOOL dark = appearance_is_dark(self.effectiveAppearance);
-    apply_window_appearance(dark);
+    // Window chrome follows the system, but the background belongs to the
+    // app theme (#104): only paint it here before any Zig sync happened
+    // (first launch); afterwards on_appearance -> onDraw re-syncs the
+    // winning theme, so a `t` override is never flashed over.
+    if (g_synced_theme_dark < 0) apply_window_appearance(dark);
     if (g_callbacks.on_appearance) g_callbacks.on_appearance(dark ? 1 : 0);
 }
 
@@ -3291,17 +3296,41 @@ static int appearance_is_dark(NSAppearance* a) {
     return [best isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
 }
 
+// Overscroll strip (#104): the rubber-band translate leaves a strip the
+// view never paints, so the window background shows through. It must track
+// the APP theme — a `t` override can diverge it from system appearance —
+// and use DeviceRGB so the numbers match the CG content fills exactly
+// (calibrated-vs-device was a visible shade off in dark mode).
+static int g_synced_theme_dark = -1;
+
 static void apply_window_appearance(BOOL dark) {
     if (!g_window) return;
     // AGENTS.md palettes verbatim: dark #121212, light #FAFAFA.
     if (dark) {
-        [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:18.0f/255.0f
+        [g_window setBackgroundColor:[NSColor colorWithDeviceRed:18.0f/255.0f
             green:18.0f/255.0f blue:18.0f/255.0f alpha:1.0]];
     } else {
-        [g_window setBackgroundColor:[NSColor colorWithCalibratedRed:250.0f/255.0f
+        [g_window setBackgroundColor:[NSColor colorWithDeviceRed:250.0f/255.0f
             green:250.0f/255.0f blue:250.0f/255.0f alpha:1.0]];
     }
 }
+
+// App-theme sync (#104): Zig calls this whenever the app theme changes
+// (toggle, system appearance, first draw). Cached: repaints only on flip.
+void platform_sync_theme(int dark) {
+    int d = dark ? 1 : 0;
+    if (d == g_synced_theme_dark) return;
+    g_synced_theme_dark = d;
+    apply_window_appearance(d);
+}
+
+#ifdef TEST_HOOKS
+// Theme-sync contract probe (#104): headless-safe, no window needed.
+// Returns the last synced theme: 1 dark, 0 light, -1 never synced.
+int platform_test_theme_synced(void) {
+    return g_synced_theme_dark;
+}
+#endif
 
 #ifdef TEST_HOOKS
 // Mapping contract probe: DarkAqua must read dark, Aqua must read light.

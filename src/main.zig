@@ -356,6 +356,17 @@ fn updateDocumentMetrics() void {
     g_app.max_scroll_y = @max(0.0, total_height - g_app.window_height + 400.0);
 }
 
+/// Overscroll strip (#104): the rubber-band translate uncovers window
+/// background the view never paints, so the window must track the APP
+/// theme (a `t` override can diverge it from system appearance). Cached:
+/// the FFI call (itself cached platform-side) runs only on a real flip.
+var g_synced_theme_dark: ?bool = null;
+fn syncThemeToPlatform() void {
+    if (g_synced_theme_dark == g_app.is_dark_theme) return;
+    g_synced_theme_dark = g_app.is_dark_theme;
+    bridge.platform_sync_theme(if (g_app.is_dark_theme) 1 else 0);
+}
+
 /// System appearance changed (platform effectiveAppearance, #47):
 /// override-until-next-system-change — any manual `t` override is dropped
 /// and the system value wins. Redraws only on a real flip.
@@ -712,6 +723,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         updateDocumentMetrics();
     }
 
+    syncThemeToPlatform();
     bridge.platform_sync_scroll(g_app.scroll_y);
     bridge.platform_sync_overshoot(g_edge.overshoot);
     bridge.platform_set_scroll_info(g_app.scroll_y, g_app.max_scroll_y, g_app.window_height);
@@ -1859,6 +1871,34 @@ test "appearance mapping contract: DarkAqua dark, Aqua light (#47)" {
             @as(c_int, 1),
             bridge.platform_test_appearance(),
         );
+    }
+}
+
+test "overscroll strip tracks app theme, not system (#104)" {
+    // The window background must follow every app-theme change — `t`
+    // override, system appearance, first draw — or the rubber-band strip
+    // shows the wrong shade. Drives the real sync helper; the platform
+    // probe reports the last synced value (headless-safe, no window).
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const saved_app = g_app.is_dark_theme;
+        const saved_sync = g_synced_theme_dark;
+        defer {
+            g_app.is_dark_theme = saved_app;
+            g_synced_theme_dark = saved_sync;
+            syncThemeToPlatform();
+        }
+        g_synced_theme_dark = null;
+        g_app.is_dark_theme = true;
+        syncThemeToPlatform();
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_theme_synced());
+        // Idempotent: no-op re-sync keeps the value.
+        syncThemeToPlatform();
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_theme_synced());
+        // A `t` override to light (system still dark) must still sync.
+        g_app.is_dark_theme = false;
+        syncThemeToPlatform();
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_theme_synced());
     }
 }
 
