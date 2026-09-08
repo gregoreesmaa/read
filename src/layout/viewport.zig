@@ -191,6 +191,7 @@ pub const Color = struct {
     pub const code_number_dark = Color{ .r = 232, .g = 161, .b = 92, .a = 255 };
     pub const code_border_dark = Color{ .r = 54, .g = 54, .b = 60, .a = 255 };
     pub const quote_bar_dark = Color{ .r = 70, .g = 70, .b = 80, .a = 255 };
+    pub const mark_bg_dark = Color{ .r = 74, .g = 62, .b = 28, .a = 255 };
     pub const hr_dark = Color{ .r = 46, .g = 46, .b = 46, .a = 255 };
     pub const table_border_dark = Color{ .r = 45, .g = 45, .b = 52, .a = 255 };
     pub const table_header_bg_dark = Color{ .r = 28, .g = 28, .b = 32, .a = 255 };
@@ -206,6 +207,7 @@ pub const Color = struct {
     pub const code_number_light = Color{ .r = 184, .g = 92, .b = 20, .a = 255 };
     pub const code_border_light = Color{ .r = 218, .g = 221, .b = 227, .a = 255 };
     pub const quote_bar_light = Color{ .r = 203, .g = 213, .b = 225, .a = 255 };
+    pub const mark_bg_light = Color{ .r = 255, .g = 242, .b = 199, .a = 255 };
     pub const hr_light = Color{ .r = 220, .g = 221, .b = 221, .a = 255 };
     pub const table_border_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
     pub const table_header_bg_light = Color{ .r = 244, .g = 245, .b = 247, .a = 255 };
@@ -242,6 +244,7 @@ pub const Theme = struct {
     code_comment: Color,
     code_number: Color,
     code_border: Color,
+    mark_bg: Color,
     quote_bar: Color,
     hr: Color,
     table_border: Color,
@@ -259,6 +262,7 @@ pub const Theme = struct {
         .code_comment = Color.text_muted_dark,
         .code_number = Color.code_number_dark,
         .code_border = Color.code_border_dark,
+        .mark_bg = Color.mark_bg_dark,
         .quote_bar = Color.quote_bar_dark,
         .hr = Color.hr_dark,
         .table_border = Color.table_border_dark,
@@ -277,6 +281,7 @@ pub const Theme = struct {
         .code_comment = Color.text_muted_light,
         .code_number = Color.code_number_light,
         .code_border = Color.code_border_light,
+        .mark_bg = Color.mark_bg_light,
         .quote_bar = Color.quote_bar_light,
         .hr = Color.hr_light,
         .table_border = Color.table_border_light,
@@ -516,6 +521,7 @@ pub fn layoutWrappedSpans(
     code_bg: Color,
     code_border: Color,
     muted: Color,
+    mark_color: Color,
     vp_bottom: f32,
     commands_out: []DrawCommand,
     cmd_count: *usize,
@@ -530,6 +536,7 @@ pub fn layoutWrappedSpans(
         .code_bg = code_bg,
         .code_border = code_border,
         .muted = muted,
+        .mark_color = mark_color,
         .start_x = start_x,
         .max_w = max_w,
         .vp_bottom = vp_bottom,
@@ -566,6 +573,7 @@ pub const FlowCtx = struct {
     code_bg: Color,
     code_border: Color,
     muted: Color,
+    mark_color: Color,
     start_x: f32,
     max_w: f32,
     vp_bottom: f32,
@@ -624,9 +632,21 @@ pub fn flowWord(
     pen: *FlowPen,
     ctx: FlowCtx,
 ) void {
+    // Issue #40 <sub>/<sup>: smaller run shifted off the baseline. The
+    // line box is unchanged, so surrounding layout never shifts; measure
+    // and render share the same size/offset math.
+    var word_size = ctx.font_size;
+    var word_dy: f32 = 0.0;
+    if (style.sup) {
+        word_size = ctx.font_size * 0.75;
+        word_dy = -ctx.font_size * 0.30;
+    } else if (style.sub) {
+        word_size = ctx.font_size * 0.75;
+        word_dy = ctx.font_size * 0.15;
+    }
     const word_w = measureTextEx(
         word,
-        ctx.font_size,
+        word_size,
         style.bold,
         style.italic,
         style.code,
@@ -651,22 +671,46 @@ pub fn flowWord(
     if (pen.y + ctx.line_h >= 0 and pen.y <= ctx.vp_bottom and
         ctx.cmd_count.* < ctx.commands_out.len)
     {
-        const span_color = if (style.link) ctx.accent_color else ctx.default_color;
-        ctx.commands_out[ctx.cmd_count.*] = .{
-            .kind = .text_run,
-            .rect = .{
-                .x = if (ctx.rtl) pen.x - word_w else pen.x,
-                .y = pen.y,
-                .w = word_w,
-                .h = ctx.line_h,
-            },
-            .color = span_color,
-            .text = word,
-            .font_size = ctx.font_size,
-            .style = style,
-            .link_target = link_target,
-        };
-        ctx.cmd_count.* += 1;
+        // Issue #40 <mark>: highlight wash behind the word, then the word
+        // itself in the default color. Out-of-subset tags (`html_tag`)
+        // render muted mono, never serif body spill.
+        const span_color = if (style.link)
+            ctx.accent_color
+        else if (style.html_tag)
+            ctx.muted
+        else
+            ctx.default_color;
+        const run_x = if (ctx.rtl) pen.x - word_w else pen.x;
+        if (style.mark) {
+            ctx.commands_out[ctx.cmd_count.*] = .{
+                .kind = .fill_rect,
+                .rect = .{
+                    .x = run_x,
+                    .y = pen.y,
+                    .w = word_w,
+                    .h = ctx.line_h,
+                },
+                .color = ctx.mark_color,
+            };
+            ctx.cmd_count.* += 1;
+        }
+        if (ctx.cmd_count.* < ctx.commands_out.len) {
+            ctx.commands_out[ctx.cmd_count.*] = .{
+                .kind = .text_run,
+                .rect = .{
+                    .x = run_x,
+                    .y = pen.y + word_dy,
+                    .w = word_w,
+                    .h = ctx.line_h,
+                },
+                .color = span_color,
+                .text = word,
+                .font_size = word_size,
+                .style = style,
+                .link_target = link_target,
+            };
+            ctx.cmd_count.* += 1;
+        }
     }
 
     if (ctx.rtl) {
@@ -699,7 +743,16 @@ pub fn flowSpans(
     ctx: FlowCtx,
     is_block_code: bool,
 ) void {
-    if (style.code and !is_block_code) {
+    // Issue #40 <br>: forced line break. Measure and render share this
+    // path, so wrapped heights match bit-for-bit.
+    if (style.line_break) {
+        pen.y += ctx.line_h;
+        pen.x = ctx.start_x;
+        return;
+    }
+    // Out-of-subset tags stay pill-free muted mono (issue #40 fallback):
+    // only true inline code takes the pill path.
+    if (style.code and !is_block_code and !style.html_tag) {
         flowCodeSpan(span_text, style, link_target, pen, ctx);
         return;
     }
@@ -819,6 +872,7 @@ test "design #23: inline code pill geometry + atomic wrap" {
         .code_bg = Theme.dark.code_bg,
         .code_border = Theme.dark.code_border,
         .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
         .start_x = 0,
         .max_w = 600,
         .vp_bottom = 2000,
@@ -1310,7 +1364,7 @@ fn quoteLeader(bytes: []const u8, lines: []const simd.Line, j: usize) ?usize {
 /// paragraphs, so they still flow to code through this path.)
 fn isCodeClaimable(bt: simd.BlockType) bool {
     return switch (bt) {
-        .blank, .code_fence_start, .code_fence_end, .code_line, .table_row, .link_def, .html_comment => false,
+        .blank, .code_fence_start, .code_fence_end, .code_line, .table_row, .link_def, .html_comment, .html_block, .html_hidden => false,
         else => true,
     };
 }
@@ -1346,11 +1400,14 @@ fn indentedCodeLeader(bytes: []const u8, lines: []const simd.Line, j: usize) ?us
         k -= 1;
     }
     // Valid code only after a blank, document start, or a non-paragraph
-    // block (never interrupting text, quotes, or lists).
+    // block (never interrupting text, quotes, or lists). Raw-HTML blocks
+    // (issue #40) behave like paragraphs here: indented content under HTML
+    // stays a lazy paragraph continuation, so tags are muted while content
+    // keeps the same treatment indented or not.
     if (k == 0) return k;
     const pb = lines[k - 1].block_type;
     if (pb == .blank) return k;
-    if (pb == .paragraph or isListLeader(pb) or pb == .quote) return null;
+    if (pb == .paragraph or pb == .html_block or pb == .html_hidden or isListLeader(pb) or pb == .quote) return null;
     return k;
 }
 
@@ -1487,6 +1544,7 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .code_bg = ux.theme.code_bg,
         .code_border = ux.theme.code_border,
         .muted = ux.theme.muted,
+        .mark_color = ux.theme.mark_bg,
         .start_x = tx,
         .max_w = tw,
         .vp_bottom = ux.vp_bottom,
@@ -3052,6 +3110,7 @@ pub fn renderViewportCore(
                 theme.code_bg,
                 theme.code_border,
                 theme.muted,
+                theme.mark_bg,
                 vp_bottom,
                 commands_out,
                 &cmd_count,
@@ -3093,9 +3152,38 @@ pub fn renderViewportCore(
         }
 
         // ----------------------------------------------------
-        // Reference definitions and HTML comments never render.
+        // Reference definitions, HTML comments, and hidden details/
+        // summary tags never render.
         // ----------------------------------------------------
-        if (line_info.block_type == .link_def or line_info.block_type == .html_comment) {
+        if (line_info.block_type == .link_def or line_info.block_type == .html_comment or
+            line_info.block_type == .html_hidden)
+        {
+            continue;
+        }
+
+        // ----------------------------------------------------
+        // Raw HTML fallback (issue #40): muted monospace, never serif.
+        // ----------------------------------------------------
+        if (line_info.block_type == .html_block) {
+            const mono_size = config.base_font_size * 0.88;
+            const row_h = config.line_height * 0.88;
+            if (cur_y + row_h >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len) {
+                commands_out[cmd_count] = .{
+                    .kind = .text_run,
+                    .rect = .{
+                        .x = content_x,
+                        .y = cur_y,
+                        .w = content_width,
+                        .h = row_h,
+                    },
+                    .color = theme.muted,
+                    .text = line_bytes,
+                    .font_size = mono_size,
+                    .style = .{ .code = true },
+                };
+                cmd_count += 1;
+            }
+            cur_y += row_h;
             continue;
         }
 
@@ -3426,6 +3514,7 @@ pub fn computeDocumentHeightEx(
                 Color.transparent,
                 Color.transparent,
                 Color.transparent,
+                Color.transparent,
                 std.math.inf(f32),
                 &.{},
                 &dummy_cmd_count,
@@ -3448,8 +3537,16 @@ pub fn computeDocumentHeightEx(
             continue;
         }
 
-        // Reference definitions and HTML comments take no space.
-        if (line_info.block_type == .link_def or line_info.block_type == .html_comment) {
+        // Reference definitions, HTML comments, and hidden tags take no space.
+        if (line_info.block_type == .link_def or line_info.block_type == .html_comment or
+            line_info.block_type == .html_hidden)
+        {
+            continue;
+        }
+
+        // Raw HTML fallback rows match the render pass geometry exactly.
+        if (line_info.block_type == .html_block) {
+            cur_y += config.line_height * 0.88;
             continue;
         }
 
@@ -3864,6 +3961,87 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
     // Unknown info string: exactly one run, body-text color, as before.
     try std.testing.expectEqual(@as(usize, 1), rust_runs);
     try std.testing.expect(rust_plain);
+}
+
+test "html subset: break/kbd/mark/sub/sup/del render, fallback muted, details hidden" {
+    const test_doc =
+        \\First<br>second.
+        \\
+        \\Press <kbd>q</kbd> and <mark>note</mark> H<sub>2</sub>O x<sup>2</sup> <del>gone</del>.
+        \\
+        \\Text <span>tag</span> here. <!-- hush -->
+        \\
+        \\<div>
+        \\
+        \\<details>
+        \\Hidden tags take no space.
+        \\</details>
+        \\After details.
+    ;
+
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var cmds: [512]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1400.0,
+        .scroll_y = 0.0,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    var y_first: ?f32 = null;
+    var y_second: ?f32 = null;
+    var saw_kbd = false;
+    var saw_mark_wash = false;
+    var saw_mark_text = false;
+    var saw_sub = false;
+    var saw_sup = false;
+    var saw_del = false;
+    var saw_inline_tag = false;
+    var saw_block_tag = false;
+    var y_hidden: ?f32 = null;
+    var y_after: ?f32 = null;
+    for (cmds[0..count]) |c| {
+        // No tag source or comment may leak anywhere.
+        if (c.kind == .text_run) {
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "hush") == null);
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "<details") == null);
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "</details>") == null);
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "<br>") == null);
+            if (std.mem.eql(u8, c.text, "First")) y_first = c.rect.y;
+            if (std.mem.eql(u8, c.text, "second.")) y_second = c.rect.y;
+            if (std.mem.eql(u8, c.text, "q") and c.style.code and !c.style.html_tag) saw_kbd = true;
+            if (std.mem.eql(u8, c.text, "note")) saw_mark_text = true;
+            if (std.mem.eql(u8, c.text, "2") and c.style.sub and
+                c.font_size < config.base_font_size) saw_sub = true;
+            if (std.mem.eql(u8, c.text, "2") and c.style.sup and
+                c.font_size < config.base_font_size) saw_sup = true;
+            if (std.mem.eql(u8, c.text, "gone") and c.style.strikethrough) saw_del = true;
+            if (std.mem.eql(u8, c.text, "<span>") and c.style.code and c.style.html_tag and
+                c.color.r == Theme.dark.muted.r) saw_inline_tag = true;
+            if (std.mem.eql(u8, c.text, "<div>") and c.style.code and
+                c.color.r == Theme.dark.muted.r) saw_block_tag = true;
+            if (std.mem.eql(u8, c.text, "Hidden")) y_hidden = c.rect.y;
+            if (std.mem.eql(u8, c.text, "After")) y_after = c.rect.y;
+        }
+        if (c.kind == .fill_rect and c.color.r == Theme.dark.mark_bg.r and
+            c.color.g == Theme.dark.mark_bg.g and c.color.b == Theme.dark.mark_bg.b)
+        {
+            saw_mark_wash = true;
+        }
+    }
+    // The break moves "second." a full line below "First".
+    try std.testing.expect(y_first != null and y_second != null);
+    try std.testing.expectApproxEqAbs(config.line_height, y_second.? - y_first.?, 1.0);
+    try std.testing.expect(saw_kbd and saw_mark_text and saw_mark_wash);
+    try std.testing.expect(saw_sub and saw_sup and saw_del);
+    try std.testing.expect(saw_inline_tag and saw_block_tag);
+    // Hidden tags take no space: adjacent paragraphs sit exactly one
+    // paragraph step apart (line height plus the trailing paragraph gap).
+    try std.testing.expect(y_hidden != null and y_after != null);
+    try std.testing.expectApproxEqAbs(config.line_height + 4.0, y_after.? - y_hidden.?, 1.0);
 }
 
 /// Counts scroll-shadow strips (`fill_rect`s of shadow-strip width in the
@@ -4420,7 +4598,8 @@ pub fn estimateBlockHeight(line: simd.Line, config: ViewportConfig, content_widt
     const lh = config.line_height;
     const bt = line.block_type;
     if (bt == .blank) return lh * 0.75;
-    if (bt == .link_def or bt == .html_comment) return 0.0;
+    if (bt == .link_def or bt == .html_comment or bt == .html_hidden) return 0.0;
+    if (bt == .html_block) return lh * 0.88;
     if (bt == .hr) return config.base_font_size * hr_rhythm_em;
     if (bt == .code_fence_start or bt == .code_fence_end) return 20.0;
     if (bt == .code_line) return lh * 0.88;
@@ -4541,7 +4720,8 @@ pub fn refineLineHeight(
         // Reference definitions and HTML comments never render: their
         // block types exist so no paragraph, list, quote, or code unit can
         // absorb them (hiding is structural, not per-call).
-        .link_def, .html_comment => return .{ .height = 0.0, .consumed = 1 },
+        .link_def, .html_comment, .html_hidden => return .{ .height = 0.0, .consumed = 1 },
+        .html_block => return .{ .height = lh * 0.88, .consumed = 1 },
         .hr => return .{ .height = config.base_font_size * hr_rhythm_em, .consumed = 1 },
         .code_line => return .{ .height = lh * 0.88, .consumed = 1 },
         .code_fence_end => return .{ .height = 0.0, .consumed = 1 },
@@ -4602,7 +4782,7 @@ pub fn refineLineHeight(
             else
                 content_x;
             const h_rtl = bidi.baseDirection(line_bytes[h_offset..]) == .rtl;
-            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, Color.transparent, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy, h_rtl);
+            const end_y = layoutWrappedSpans(span_buf[0..span_count], hx, content_x + content_width - hx, 0, font_size, heading_line_h, Color.transparent, Color.transparent, Color.transparent, Color.transparent, Color.transparent, Color.transparent, std.math.inf(f32), &.{}, &dummy, h_rtl);
             return .{ .height = margin_top + end_y + margin_bottom, .consumed = 1 };
         },
         .quote => {
