@@ -62,6 +62,9 @@ static LinkUlState g_last_ul;
 static uint64_t link_url_hash(const char* url, int url_len);
 static inline BOOL link_run_hovered(float x, float y, float w, float h);
 static float link_underline_track(const char* url, int url_len, float x, float y, float w, float font_size, BOOL hovered);
+static BOOL read_url_is_markdown(NSURL* u); // defined at end-of-file (#43)
+static void read_open_file_url(NSURL* u); // defined at end-of-file (#43)
+static NSURL* read_drop_url(id sender); // defined at end-of-file (#43)
 static int image_url_is_remote(NSString* s); // defined at end-of-file
 static NSURLSession* image_session(void); // defined at end-of-file
 static int image_path_exists_joined(const char* dir, NSString* rel); // ditto
@@ -1606,6 +1609,29 @@ static BOOL edit_action_available(SEL action, BOOL has_selection, BOOL secure_in
     [self setNeedsDisplay:YES];
 }
 
+// Open-file entry points (issue #43): Cmd+O panel, window drag-and-drop,
+// Dock-icon drop. Implementations funnel through the C core at
+// end-of-file (SIZE NOTE: mid-file bytes cascade ~3x via page-boundary
+// shifts; only these thin methods live here).
+- (void)openDocument:(id)sender {
+    (void)sender;
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    [panel setAllowedFileTypes:@[@"md", @"markdown", @"mdown", @"mkd", @"txt", @"text"]];
+    if ([panel runModal] == NSModalResponseOK) {
+        read_open_file_url([[panel URLs] firstObject]);
+    }
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSURL* u = read_drop_url(sender);
+    return (u && read_url_is_markdown(u)) ? NSDragOperationCopy : NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    read_open_file_url(read_drop_url(sender));
+    return YES;
+}
+
 // Shared selection text for Copy, Look Up, Search, and Services: the
 // exact string the clipboard path writes. Empty when there is no
 // selection. Zero heap beyond the returned string.
@@ -1928,6 +1954,15 @@ int platform_test_key_plain(unsigned long flags) {
     return YES;
 }
 
+// Dock-icon drop (issue #43): same validation funnel as window drops
+// (informal delegate method, no protocol adoption per the SIZE NOTE).
+- (BOOL)application:(NSApplication *)app openFile:(NSString *)filename {
+    (void)app;
+    if (!filename) return NO;
+    read_open_file_url([NSURL fileURLWithPath:filename]);
+    return YES;
+}
+
 // Heading outline picker (#48): table + search drive. Thin wrappers over
 // the C implementation at end-of-file — logic lives there so the ObjC
 // method/metadata footprint stays at these five.
@@ -2038,6 +2073,8 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     ReadView* view = [[ReadView alloc] initWithFrame:frame];
     g_main_view = view;  // for async image load → setNeedsDisplay callbacks
     [g_window setContentView:view];
+    // Window drag-and-drop target (issue #43): file URLs only.
+    [view registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
     [g_window setDelegate:delegate];
 
     // Main menu: App + Edit (+ Services) so Cmd+C/A route through the
@@ -2050,6 +2087,13 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     [appMenu addItemWithTitle:@"Quit Read" action:@selector(terminate:) keyEquivalent:@"q"];
     [appItem setSubmenu:appMenu];
     [mainMenu addItem:appItem];
+    // File menu (issue #43): Open… carries Cmd+O through the responder
+    // chain to the view's openDocument: (always enabled, like Select All).
+    NSMenuItem* fileItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
+    NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+    [fileMenu addItemWithTitle:@"Open…" action:@selector(openDocument:) keyEquivalent:@"o"];
+    [fileItem setSubmenu:fileMenu];
+    [mainMenu addItem:fileItem];
     NSMenuItem* editItem = [[NSMenuItem alloc] initWithTitle:@"Edit" action:nil keyEquivalent:@""];
     NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
@@ -3705,5 +3749,68 @@ int platform_test_outline_build(void) {
     int rows = outline_rebuild(@"");
     g_outline_count = 0;
     return rows == 2 ? 1 : 0;
+}
+#endif
+
+// Open files (issue #43): Cmd+O panel, window drag-and-drop, Dock-icon
+// drop. All three entry points (thin methods, mid-file) funnel through
+// read_open_file_url: validated picks go to Zig (which swaps the mmap
+// and resets scroll/selection); anything else gets a native alert,
+// never silent absorption. Kept at end-of-file per the SIZE NOTE
+// (mid-file bytes shift hot layout and cost ~3x via page-boundary
+// cascade; see prime_frame_decode above).
+static BOOL read_url_is_markdown(NSURL* u) {
+    NSString* e = [[u pathExtension] lowercaseString];
+    return [e isEqualToString:@"md"] || [e isEqualToString:@"markdown"] ||
+           [e isEqualToString:@"mdown"] || [e isEqualToString:@"mkd"] ||
+           [e isEqualToString:@"txt"] || [e isEqualToString:@"text"];
+}
+
+static void read_reject_url(NSURL* u, NSString* reason) {
+    NSString* name = [u lastPathComponent];
+    if (!name) name = @"that file";
+    NSAlert* a = [[NSAlert alloc] init];
+    [a setMessageText:@"Could not open the file"];
+    [a setInformativeText:[NSString stringWithFormat:@"“%@” %@", name, reason]];
+    [a addButtonWithTitle:@"OK"];
+    [a setAlertStyle:NSAlertStyleWarning];
+    [a runModal];
+}
+
+static void read_open_file_url(NSURL* u) {
+    // Extension gate only: directories/unreadables that slip past fail
+    // the Zig mmap swap silently (document kept, no crash); anything
+    // else here is exactly what the alert is for.
+    if (!u || !g_callbacks.on_open_file) return;
+    if (!read_url_is_markdown(u)) {
+        read_reject_url(u, @"isn't a Markdown or text file.");
+        return;
+    }
+    const char* p = [[u path] fileSystemRepresentation];
+    if (p) g_callbacks.on_open_file(p, (int)strlen(p));
+}
+
+static NSURL* read_drop_url(id sender) {
+    NSArray* urls = [[sender draggingPasteboard] readObjectsForClasses:@[[NSURL class]]
+        options:@{NSPasteboardURLReadingFileURLsOnlyKey:@YES}];
+    return [urls count] > 0 ? urls[0] : nil;
+}
+
+// Document switch (issues #43/#46): the old selection belongs to the old
+// text model. Zig calls this after swapping the mmap, before redraw.
+void platform_clear_selection(void) {
+    g_has_selection = NO;
+    g_select_all = NO;
+    g_selection_mode = 0;
+}
+
+#ifdef TEST_HOOKS
+// Extension-gate contract probe (issue #43): 1 when this path would pass
+// the Markdown filter. Headless-safe: no panel, no window.
+int platform_test_markdown_ext(const char* path, int path_len) {
+    if (!path || path_len <= 0) return 0;
+    NSString* s = [[NSString alloc] initWithBytes:path length:(NSUInteger)path_len encoding:NSUTF8StringEncoding];
+    if (!s) return 0;
+    return read_url_is_markdown([NSURL fileURLWithPath:s]) ? 1 : 0;
 }
 #endif
