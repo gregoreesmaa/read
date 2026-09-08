@@ -1,5 +1,5 @@
 const std = @import("std");
-const simd = @import("../core/simd.zig");
+const simd = @import("hot");
 const parser = @import("../core/parser.zig");
 const highlight = @import("../core/highlight.zig");
 const bidi = @import("../core/bidi.zig");
@@ -510,7 +510,7 @@ pub const SmoothScroll = struct {
 /// Display text scaling: system size class x user zoom. Size classes are
 /// discrete so layout stays stable (re-wrap only on class change, never
 /// on fractional drift); zoom steps multiply geometrically and persist
-/// (integer percent) via NSUserDefaults on the platform side.
+/// (integer percent) in the platform defaults store (see macos.m).
 /// Pure value type, zero heap.
 pub const TextScale = struct {
     class: u3 = 1, // 0..4, 1 == system default
@@ -6506,7 +6506,7 @@ test "virtualized: warm JIT viewport layout under 12us" {
         attempts,
     });
     try std.testing.expect(last_cmd_count > 0);
-    if (simd.enforce_timing_budgets) {
+    if (simd.timingBudgetsEnforced()) {
         try std.testing.expect(min_elapsed_us <= 12);
     }
 }
@@ -6725,7 +6725,7 @@ test "scroll illusion: O(1) fraction jump resolves inside deep-scroll budget" {
     }
     std.testing.expect(sink < lines.len * 2) catch {};
     std.debug.print("[scroll illusion] fraction-jump resolution: {d} µs\n", .{min_us});
-    if (simd.enforce_timing_budgets) {
+    if (simd.timingBudgetsEnforced()) {
         try std.testing.expect(min_us <= 12);
     }
 

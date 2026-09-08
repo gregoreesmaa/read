@@ -1,5 +1,5 @@
 const std = @import("std");
-const simd = @import("simd.zig");
+const simd = @import("hot");
 
 /// Flat SoA block-index store (see todo/ideas2.txt:3-7).
 ///

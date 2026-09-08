@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const mmap = @import("core/mmap.zig");
-const simd = @import("core/simd.zig");
+const simd = @import("hot");
 const parser = @import("core/parser.zig");
 const layout = @import("layout/viewport.zig");
 const damage = @import("layout/damage.zig");
@@ -647,7 +647,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
 // table as the key handler (see help_overlay.emitOverlay). Painted after
 // the damage clip closes so the modal card is never partially culled;
 // pixels reuse platform_draw_text, which also records the runs in the
-// text model (selection now, VoiceOver via #29 later).
+// text model (selection and clipboard).
 fn drawHelpOverlay() void {
     const theme = if (g_app.is_dark_theme) layout.Theme.dark else layout.Theme.light;
     var cmds: [32]layout.DrawCommand = undefined;

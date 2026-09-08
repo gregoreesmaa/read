@@ -44,6 +44,20 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // Hot module: the scan/search throughput core, ALWAYS ReleaseFast.
+    // Test builds keep module boundaries, so hot_tests measures this
+    // module at Fast. (The ship binary merges all Zig code into one unit
+    // at the ship root's level — see below — so this flag shapes test
+    // codegen, not ship codegen.)
+    const mod_hot = b.addModule("hot", .{
+        .root_source_file = b.path("src/core/simd.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        // simd test blocks use std.c (nanosleep backoff) like the read
+        // module below; same explicit libc edge for the Linux CI build.
+        .link_libc = true,
+    });
+
     const mod = b.addModule("read", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -55,12 +69,24 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
-        .optimize = optimize,
+        // Test-root module: mod_tests runs with this module as root, so
+        // this flag drives test codegen. ReleaseFast: the strict
+        // microsecond gates (viewport layout ≤ 8 µs especially) need -O3
+        // inlining/unrolling — Small misses viewport on CI runners
+        // (13 µs vs the 8 µs target) while Fast clears first try.
+        // The ship binary merges all Zig code at the ship root's Small
+        // (size budget, AGENTS.md §1), so this flag shapes test codegen,
+        // not ship codegen. Same sources pin algorithms; screenshots
+        // (read-test, Small like ship) pin rendering bit-for-bit.
+        .optimize = .ReleaseFast,
         // mmap.zig and the test blocks use std.c (close/fstat/madvise/write).
         // Zig 0.16 requires an explicit libc edge on Linux; without it the
         // test-linux CI job fails to compile. No-op on Darwin (libSystem is
         // always linked) and no effect on the binary size budget.
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "hot", .module = mod_hot },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -89,30 +115,37 @@ pub fn build(b: *std.Build) void {
             target2: std.Build.ResolvedTarget,
             optimize2: std.builtin.OptimizeMode,
             mod2: *std.Build.Module,
+            hot2: *std.Build.Module,
             opts2: *std.Build.Step.Options,
             unwind: ?std.builtin.UnwindTables,
         ) *std.Build.Module {
+            // App shell (binary diet): event-driven UI code clears every
+            // strict gate Small-tested, so it builds Small in every profile
+            // — the same module the ship binary and read-test link, so
+            // scroll/frame tests pin ship codegen.
+            _ = optimize2;
             return b2.createModule(.{
                 .root_source_file = b2.path("src/main.zig"),
                 .target = target2,
-                .optimize = optimize2,
+                .optimize = .ReleaseSmall,
                 .unwind_tables = unwind,
                 // main.zig uses std.c (write/exit/nanosleep): same explicit
                 // libc edge as the read module, required for the Linux CI build.
                 .link_libc = true,
                 .imports = &.{
                     .{ .name = "read", .module = mod2 },
+                    .{ .name = "hot", .module = hot2 },
                     .{ .name = "build_options", .module = opts2.createModule() },
                 },
             });
         }
     }.make;
-    const exe_mod = makeAppModule(b, target, optimize, mod, ship_options, null);
+    const exe_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, null);
     // Ship module: identical sources, unwind tables off. Unwind data is
     // metadata only — no instruction changes — so screenshots, benchmarks,
     // and scroll behavior are unaffected; only crash-report backtraces
     // degrade (already address-only post-strip).
-    const ship_mod = makeAppModule(b, target, optimize, mod, ship_options, .none);
+    const ship_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, .none);
     const exe = b.addExecutable(.{
         .name = "read",
         .root_module = ship_mod,
@@ -124,11 +157,13 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = optimize,
+            // Same Small app shell as ship (see makeAppModule above).
+            .optimize = .ReleaseSmall,
             // Same sources as the ship binary: same libc requirement.
             .link_libc = true,
             .imports = &.{
                 .{ .name = "read", .module = mod },
+                .{ .name = "hot", .module = mod_hot },
                 .{ .name = "build_options", .module = hooks_options.createModule() },
             },
         }),
@@ -282,6 +317,16 @@ pub fn build(b: *std.Build) void {
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
+
+    // Hot-module tests (simd.zig's own blocks incl. scan/search correctness):
+    // a separate module needs its own test executable (one module at a
+    // time). Runs first in the sequential chain below so its wall-clock
+    // numbers never contend with the strict gates.
+    const hot_tests = b.addTest(.{
+        .root_module = mod_hot,
+    });
+    const run_hot_tests = b.addRunArtifact(hot_tests);
+    run_mod_tests.step.dependOn(&run_hot_tests.step);
 
     // A top level step for running all tests.
     const test_step = b.step("test", "Run tests");

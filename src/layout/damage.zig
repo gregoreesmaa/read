@@ -355,7 +355,7 @@ test "damage: fromPending collapses full-view and missing rects to full" {
 
 test "damage: redraw-region verification against real layout output" {
     const viewport = @import("viewport.zig");
-    const simd = @import("../core/simd.zig");
+    const simd = @import("hot");
 
     const doc =
         \\# Title

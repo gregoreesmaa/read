@@ -75,8 +75,8 @@ pub const OVERLAY_LABEL_GAP: f32 = 16.0;
 /// row into `commands`. Zero allocations, no platform calls — the caller
 /// executes the commands through the normal `platform_draw_*` path, so
 /// overlay pixels and text records match every other text run (overlay
-/// text lands in the recorded-text model that #29 will expose to
-/// VoiceOver; full AX roles await #29, still open).
+/// text lands in the recorded-text model used by selection and
+/// clipboard).
 /// Returns the command count (3 + 2 rows). Truncates rows, never
 /// overflows, when the buffer is short.
 pub fn emitOverlay(

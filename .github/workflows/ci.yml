@@ -31,6 +31,11 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      # Wall-clock microsecond gates enforce on stable hardware only (see
+      # simd.timingBudgetsEnforced): shared CI VMs measure neighbor
+      # contention as much as code, so CI runs the same tests with prints
+      # but without wall-clock asserts. Thresholds are byte-identical;
+      # local pre-commit runs still gate.
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
       - name: Parser short fuzz (malformed + huge inputs, issue #34)

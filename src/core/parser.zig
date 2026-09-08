@@ -1,5 +1,5 @@
 const std = @import("std");
-const simd = @import("simd.zig");
+const simd = @import("hot");
 
 pub const SpanStyle = packed struct {
     bold: bool = false,
