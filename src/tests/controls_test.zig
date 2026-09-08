@@ -18,11 +18,49 @@ pub const Point = struct {
     y: f32 = 0,
 };
 
+/// Word classification for double-click selection (mirrored by
+/// word_char_byte in src/platform/macos.m — keep the two in sync).
+/// ASCII letters/digits plus `_` and `'`; every non-ASCII byte (>= 0x80,
+/// i.e. UTF-8 leads and continuations) counts as a word byte so
+/// multibyte sequences are never split. No tables: O(n) scan, zero heap.
+pub fn isWordByte(b: u8) bool {
+    if (b >= 0x80) return true;
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or
+        (b >= '0' and b <= '9') or b == '_' or b == '\'';
+}
+
+pub fn wordStart(text: []const u8, idx: usize) usize {
+    var i = @min(idx, text.len);
+    while (i > 0 and isWordByte(text[i - 1])) : (i -= 1) {}
+    return i;
+}
+
+pub fn wordEnd(text: []const u8, idx: usize) usize {
+    var i = @min(idx, text.len);
+    while (i < text.len and isWordByte(text[i])) : (i += 1) {}
+    return i;
+}
+
+/// Proportional byte->x map for the simulation (the platform uses
+/// CoreText-precise get_x_for_char_index; the contract pinned here is
+/// anchor stability + snap-to-boundary semantics, not pixel mapping).
+fn xForByte(rect: layout.Rect, text_len: usize, byte_idx: usize) f32 {
+    if (text_len == 0) return rect.x;
+    return rect.x + rect.w * @as(f32, @floatFromInt(byte_idx)) / @as(f32, @floatFromInt(text_len));
+}
+
+fn byteAtX(rect: layout.Rect, text_len: usize, x: f32) usize {
+    if (rect.w <= 0.0 or text_len == 0) return 0;
+    const frac = std.math.clamp((x - rect.x) / rect.w, 0.0, 1.0);
+    return @intFromFloat(frac * @as(f32, @floatFromInt(text_len)));
+}
+
 pub const SelectionState = struct {
     has_selection: bool = false,
     mode: SelectionMode = .none,
     start: Point = .{},
     end: Point = .{},
+    anchor: Point = .{},
 
     pub fn onMouseDown(
         self: *SelectionState,
@@ -34,17 +72,29 @@ pub const SelectionState = struct {
         self.has_selection = true;
         self.start = .{ .x = click_x, .y = click_y };
         self.end = self.start;
+        self.anchor = self.start;
 
         if (click_count == 2) {
             self.mode = .word;
-            // Locate word boundary
+            // Snap to the Unicode word under the cursor (not the whole run).
             for (records) |cmd| {
                 if (cmd.kind == .text_run and
                     click_x >= cmd.rect.x and click_x <= cmd.rect.x + cmd.rect.w and
                     click_y >= cmd.rect.y and click_y <= cmd.rect.y + cmd.rect.h)
                 {
-                    self.start = .{ .x = cmd.rect.x, .y = cmd.rect.y + cmd.rect.h * 0.5 };
-                    self.end = .{ .x = cmd.rect.x + cmd.rect.w, .y = cmd.rect.y + cmd.rect.h * 0.5 };
+                    const idx = byteAtX(cmd.rect, cmd.text.len, click_x);
+                    const ws = wordStart(cmd.text, idx);
+                    const we = wordEnd(cmd.text, idx);
+                    const mid_y = cmd.rect.y + cmd.rect.h * 0.5;
+                    if (we > ws) {
+                        self.start = .{ .x = xForByte(cmd.rect, cmd.text.len, ws), .y = mid_y };
+                        self.end = .{ .x = xForByte(cmd.rect, cmd.text.len, we), .y = mid_y };
+                    } else {
+                        // Whitespace/punctuation click: keep the run snap.
+                        self.start = .{ .x = cmd.rect.x, .y = mid_y };
+                        self.end = .{ .x = cmd.rect.x + cmd.rect.w, .y = mid_y };
+                    }
+                    self.anchor = self.start;
                     break;
                 }
             }
@@ -67,9 +117,62 @@ pub const SelectionState = struct {
         }
     }
 
-    pub fn onMouseDragged(self: *SelectionState, drag_x: f32, drag_y: f32) void {
-        if (self.mode == .range or self.mode == .none) {
-            self.end = .{ .x = drag_x, .y = drag_y };
+    pub fn onMouseDragged(
+        self: *SelectionState,
+        drag_x: f32,
+        drag_y: f32,
+        records: []const layout.DrawCommand,
+    ) void {
+        switch (self.mode) {
+            .range, .none => {
+                self.end = .{ .x = drag_x, .y = drag_y };
+            },
+            // Word-wise extension: the anchor never moves; the free end
+            // snaps to the word boundary under the cursor (word start when
+            // dragging back past the anchor, word end when dragging on).
+            .word => {
+                for (records) |cmd| {
+                    if (cmd.kind == .text_run and
+                        drag_x >= cmd.rect.x and drag_x <= cmd.rect.x + cmd.rect.w and
+                        drag_y >= cmd.rect.y and drag_y <= cmd.rect.y + cmd.rect.h)
+                    {
+                        const idx = byteAtX(cmd.rect, cmd.text.len, drag_x);
+                        const mid_y = cmd.rect.y + cmd.rect.h * 0.5;
+                        if (drag_x < self.anchor.x) {
+                            const ws = wordStart(cmd.text, idx);
+                            self.end = .{ .x = xForByte(cmd.rect, cmd.text.len, ws), .y = mid_y };
+                        } else {
+                            const we = wordEnd(cmd.text, idx);
+                            const ws = wordStart(cmd.text, idx);
+                            if (we > ws) {
+                                self.end = .{ .x = xForByte(cmd.rect, cmd.text.len, we), .y = mid_y };
+                            }
+                        }
+                        break;
+                    }
+                }
+            },
+            // Line-wise extension: the free end snaps to the row band under
+            // the cursor; dragging above the anchor re-seats the start.
+            .line => {
+                var min_x: f32 = 9999.0;
+                var max_x: f32 = -9999.0;
+                for (records) |cmd| {
+                    if (cmd.kind == .text_run and @abs(cmd.rect.y + cmd.rect.h * 0.5 - drag_y) < 16.0) {
+                        min_x = @min(min_x, cmd.rect.x);
+                        max_x = @max(max_x, cmd.rect.x + cmd.rect.w);
+                    }
+                }
+                if (max_x > min_x) {
+                    if (drag_y < self.anchor.y) {
+                        self.start = .{ .x = min_x, .y = drag_y };
+                    } else {
+                        self.end = .{ .x = max_x, .y = drag_y };
+                    }
+                }
+            },
+            // Select-all is fully locked: drags change nothing.
+            .all => {},
         }
     }
 
@@ -150,6 +253,101 @@ test "controls: triple-click line selection is locked against mouse-up shift" {
     // End must remain at 200.0
     try std.testing.expectEqual(@as(f32, 50.0), state.start.x);
     try std.testing.expectEqual(@as(f32, 200.0), state.end.x);
+}
+
+test "controls: word boundaries keep UTF-8 sequences whole" {
+    try std.testing.expect(isWordByte('a'));
+    try std.testing.expect(isWordByte('Z'));
+    try std.testing.expect(isWordByte('7'));
+    try std.testing.expect(isWordByte('_'));
+    try std.testing.expect(isWordByte('\''));
+    try std.testing.expect(!isWordByte(' '));
+    try std.testing.expect(!isWordByte(','));
+    try std.testing.expect(!isWordByte('-'));
+    try std.testing.expect(!isWordByte('.'));
+    // Every non-ASCII byte is a word byte: multibyte runs never split.
+    try std.testing.expect(isWordByte(0xC3));
+    try std.testing.expect(isWordByte(0xAF));
+
+    // "naïve café": ï (2B) and é (2B) stay inside their words.
+    const text = "naïve café";
+    try std.testing.expectEqual(@as(usize, 0), wordStart(text, 2));
+    try std.testing.expectEqual(@as(usize, 6), wordEnd(text, 2));
+    try std.testing.expectEqual(@as(usize, 7), wordStart(text, 9));
+    try std.testing.expectEqual(@as(usize, text.len), wordEnd(text, 9));
+    // Comma splits ASCII words.
+    const csv = "hello,world";
+    try std.testing.expectEqual(@as(usize, 5), wordEnd(csv, 1));
+    try std.testing.expectEqual(@as(usize, 6), wordStart(csv, 8));
+}
+
+test "controls: double-click snaps to word, drag extends word-wise with locked anchor" {
+    var state = SelectionState{};
+
+    const sample_commands = [_]layout.DrawCommand{
+        .{
+            .kind = .text_run,
+            .rect = .{ .x = 100.0, .y = 50.0, .w = 220.0, .h = 24.0 },
+            .text = "hello brave world",
+        },
+    };
+
+    // Double-click inside "brave" (bytes 6..11): x=205 maps to byte 8.
+    state.onMouseDown(205.0, 60.0, 2, &sample_commands);
+    try std.testing.expectEqual(SelectionMode.word, state.mode);
+    const anchor_x = state.start.x;
+    try std.testing.expect(state.end.x > state.start.x);
+    // "brave" spans bytes 6..11 of 17.
+    try std.testing.expectEqual(@as(f32, 100.0 + 220.0 * 6.0 / 17.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 100.0 + 220.0 * 11.0 / 17.0), state.end.x);
+
+    // Drag on into "world" (bytes 12..17): end snaps to the word end,
+    // the anchor never moves.
+    state.onMouseDragged(300.0, 60.0, &sample_commands);
+    try std.testing.expectEqual(anchor_x, state.start.x);
+    try std.testing.expectEqual(@as(f32, 100.0 + 220.0), state.end.x);
+
+    // Release: the mouseUp-overwrite lock still holds after a word drag.
+    state.onMouseUp(300.0, 60.0, 2);
+    try std.testing.expectEqual(anchor_x, state.start.x);
+    try std.testing.expectEqual(@as(f32, 100.0 + 220.0), state.end.x);
+    try std.testing.expect(state.has_selection);
+}
+
+test "controls: triple-click drag extends line-wise up and down" {
+    var state = SelectionState{};
+
+    const sample_commands = [_]layout.DrawCommand{
+        .{ .kind = .text_run, .rect = .{ .x = 60.0, .y = 60.0, .w = 70.0, .h = 24.0 }, .text = "Top row" },
+        .{ .kind = .text_run, .rect = .{ .x = 50.0, .y = 100.0, .w = 60.0, .h = 24.0 }, .text = "First" },
+        .{ .kind = .text_run, .rect = .{ .x = 120.0, .y = 100.0, .w = 80.0, .h = 24.0 }, .text = "Second" },
+        .{ .kind = .text_run, .rect = .{ .x = 50.0, .y = 140.0, .w = 90.0, .h = 24.0 }, .text = "Third row" },
+    };
+
+    state.onMouseDown(70.0, 110.0, 3, &sample_commands);
+    try std.testing.expectEqual(SelectionMode.line, state.mode);
+    try std.testing.expectEqual(@as(f32, 50.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 200.0), state.end.x);
+
+    // Drag down to the next row: end snaps to that row's band.
+    state.onMouseDragged(80.0, 150.0, &sample_commands);
+    try std.testing.expectEqual(@as(f32, 50.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 140.0), state.end.x);
+
+    // Drag above the anchor row: start re-seats to the top band.
+    state.onMouseDragged(70.0, 72.0, &sample_commands);
+    try std.testing.expectEqual(@as(f32, 60.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 140.0), state.end.x);
+
+    // Drag over empty space (no row band near y=10): selection unchanged.
+    state.onMouseDragged(70.0, 10.0, &sample_commands);
+    try std.testing.expectEqual(@as(f32, 60.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 140.0), state.end.x);
+
+    // Release anywhere: line lock holds.
+    state.onMouseUp(80.0, 150.0, 3);
+    try std.testing.expectEqual(@as(f32, 60.0), state.start.x);
+    try std.testing.expectEqual(@as(f32, 140.0), state.end.x);
 }
 
 test "controls: single click without drag clears selection" {
