@@ -227,10 +227,18 @@ pub fn build(b: *std.Build) void {
         }
         // Ship glue TU: -fno-unwind-tables drops its __eh_frame share
         // (no ObjC exceptions in-tree; crash backtraces stay intact in the
-        // test TU below, which keeps these flags off).
+        // test TU below, which keeps these flags off). -fvisibility=hidden
+        // demotes the platform_* C entry points and our ObjC classes from
+        // dynamic exports to static-link locals (Zig refs resolve at static
+        // link time; the ObjC runtime registers classes from __objc_*
+        // sections, never from symbols — no NSClassFromString in-tree).
+        // Post-link `strip -x` above then drops them from the symtab/export
+        // trie, shrinking __LINKEDIT 1:1. No instruction change: screenshots,
+        // benchmarks, and scroll behavior are unaffected; ship crash
+        // backtraces were already address-only post-strip.
         ship_mod.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = &.{"-fobjc-arc", "-Oz", "-fno-unwind-tables", "-DREAD_ANIMATED_GIF=1"},
+            .flags = &.{ "-fobjc-arc", "-Oz", "-fno-unwind-tables", "-fvisibility=hidden", "-DREAD_ANIMATED_GIF=1" },
         });
         // Exe-test glue TU: same -Oz codegen as ship (pixel-identical
         // headless screenshots) with unwind tables kept for backtraces.
