@@ -135,6 +135,112 @@ pub fn measureTextEx(text: []const u8, font_size: f32, is_bold: bool, is_italic:
     return total;
 }
 
+/// Find in document (issue #42): case-insensitive byte-substring search
+/// over the mmap'd source. Zero-copy (slices the haystack, never copies)
+/// and zero allocations (the caller owns `out`). ASCII folds A-Z; bytes
+/// >= 0x80 compare literally. Matches are non-overlapping, emitted in
+/// offset order, and stop at the output cap. Cold path only (per query
+/// change): first-byte skip keeps common text near memchr speed.
+pub const FindMatch = struct {
+    start: usize,
+    len: usize,
+};
+
+pub fn foldAsciiByte(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+}
+
+pub fn foldAscii(dst: []u8, src: []const u8) usize {
+    const n = @min(dst.len, src.len);
+    for (dst[0..n], src[0..n]) |*d, s| d.* = foldAsciiByte(s);
+    return n;
+}
+
+pub fn findAll(haystack: []const u8, needle_folded: []const u8, out: []FindMatch) usize {
+    if (needle_folded.len == 0 or haystack.len < needle_folded.len or out.len == 0) return 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    const last = haystack.len - needle_folded.len;
+    const first = needle_folded[0];
+    while (i <= last) {
+        while (i <= last and foldAsciiByte(haystack[i]) != first) : (i += 1) {}
+        if (i > last) break;
+        var k: usize = 1;
+        while (k < needle_folded.len and foldAsciiByte(haystack[i + k]) == needle_folded[k]) : (k += 1) {}
+        if (k == needle_folded.len) {
+            out[count] = .{ .start = i, .len = needle_folded.len };
+            count += 1;
+            if (count == out.len) break;
+            i += needle_folded.len;
+        } else {
+            i += 1;
+        }
+    }
+    return count;
+}
+
+test "find: folding search over bytes (#42)" {
+    const t = std.testing;
+    var out: [8]FindMatch = undefined;
+    var folded: [16]u8 = undefined;
+    const n = foldAscii(&folded, "HeLLo");
+    try t.expectEqual(@as(usize, 5), n);
+    try t.expectEqualStrings("hello", folded[0..n]);
+    const hay = "say hello there, HELLO again, hell";
+    try t.expectEqual(@as(usize, 2), findAll(hay, folded[0..n], &out));
+    try t.expectEqual(@as(usize, 4), out[0].start);
+    try t.expectEqual(@as(usize, 5), out[0].len);
+    try t.expectEqual(@as(usize, 17), out[1].start);
+    // Non-overlapping: "aa" in "aaa" matches once at 0.
+    var one: [4]FindMatch = undefined;
+    try t.expectEqual(@as(usize, 1), findAll("aaa", "aa", &one));
+    try t.expectEqual(@as(usize, 0), one[0].start);
+    // Degenerate inputs match nothing.
+    try t.expectEqual(@as(usize, 0), findAll(hay, "", &out));
+    try t.expectEqual(@as(usize, 0), findAll("hi", "hello world", &out));
+    try t.expectEqual(@as(usize, 0), findAll(hay, folded[0..n], &.{}));
+    // Cap: stops at the output length, in order.
+    var cap: [3]FindMatch = undefined;
+    try t.expectEqual(@as(usize, 3), findAll("a a a a a", "a", &cap));
+    try t.expectEqual(@as(usize, 0), cap[0].start);
+    try t.expectEqual(@as(usize, 2), cap[1].start);
+    try t.expectEqual(@as(usize, 4), cap[2].start);
+    // Large input completes under the cap (no per-byte allocation).
+    const big = try t.allocator.alloc(u8, 1 << 20);
+    defer t.allocator.free(big);
+    @memset(big, 'a');
+    var big_out: [64]FindMatch = undefined;
+    try t.expectEqual(@as(usize, 64), findAll(big, "aa", &big_out));
+    try t.expectEqual(@as(usize, 0), big_out[0].start);
+    try t.expectEqual(@as(usize, 126), big_out[63].start);
+}
+
+test "findOffsetY lands on the match block (#42)" {
+    const t = std.testing;
+    const doc = "# Title\n\nFirst para here.\n\nSecond para here.\n";
+    var line_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &line_buf, &fence);
+    const lines = line_buf[0..n];
+    const cfg = ViewportConfig{
+        .window_width = 1200,
+        .window_height = 900,
+        .scroll_y = 0,
+        .base_font_size = 17,
+        .line_height = 29.75,
+        .is_dark_theme = true,
+    };
+    // Block-exact (not row-exact): offset 0 lands the top margin, and a
+    // later block lands strictly below on its own top.
+    try t.expectEqual(@as(f32, 50.0), findOffsetY(doc, lines, cfg, 0).?);
+    const second_off = std.mem.indexOf(u8, doc, "Second").?;
+    const y2 = findOffsetY(doc, lines, cfg, second_off).?;
+    try t.expect(y2 > 50.0);
+    // Past-the-end clamps to the last block instead of null.
+    try t.expect(findOffsetY(doc, lines, cfg, doc.len + 100).? >= y2);
+    try t.expect(findOffsetY(doc, lines[0..0], cfg, 0) == null);
+}
+
 pub const DrawCommandKind = enum {
     fill_rect,
     text_run,
@@ -192,6 +298,8 @@ pub const Color = struct {
     pub const code_border_dark = Color{ .r = 54, .g = 54, .b = 60, .a = 255 };
     pub const quote_bar_dark = Color{ .r = 70, .g = 70, .b = 80, .a = 255 };
     pub const mark_bg_dark = Color{ .r = 74, .g = 62, .b = 28, .a = 255 };
+    pub const find_bg_dark = Color{ .r = 38, .g = 68, .b = 120, .a = 255 };
+    pub const find_current_dark = Color{ .r = 58, .g = 110, .b = 190, .a = 255 };
     pub const hr_dark = Color{ .r = 46, .g = 46, .b = 46, .a = 255 };
     pub const table_border_dark = Color{ .r = 45, .g = 45, .b = 52, .a = 255 };
     pub const table_header_bg_dark = Color{ .r = 28, .g = 28, .b = 32, .a = 255 };
@@ -208,6 +316,8 @@ pub const Color = struct {
     pub const code_border_light = Color{ .r = 218, .g = 221, .b = 227, .a = 255 };
     pub const quote_bar_light = Color{ .r = 203, .g = 213, .b = 225, .a = 255 };
     pub const mark_bg_light = Color{ .r = 255, .g = 242, .b = 199, .a = 255 };
+    pub const find_bg_light = Color{ .r = 190, .g = 215, .b = 250, .a = 255 };
+    pub const find_current_light = Color{ .r = 120, .g = 170, .b = 240, .a = 255 };
     pub const hr_light = Color{ .r = 220, .g = 221, .b = 221, .a = 255 };
     pub const table_border_light = Color{ .r = 226, .g = 232, .b = 240, .a = 255 };
     pub const table_header_bg_light = Color{ .r = 244, .g = 245, .b = 247, .a = 255 };
@@ -245,6 +355,8 @@ pub const Theme = struct {
     code_number: Color,
     code_border: Color,
     mark_bg: Color,
+    find_bg: Color,
+    find_current: Color,
     quote_bar: Color,
     hr: Color,
     table_border: Color,
@@ -263,6 +375,8 @@ pub const Theme = struct {
         .code_number = Color.code_number_dark,
         .code_border = Color.code_border_dark,
         .mark_bg = Color.mark_bg_dark,
+        .find_bg = Color.find_bg_dark,
+        .find_current = Color.find_current_dark,
         .quote_bar = Color.quote_bar_dark,
         .hr = Color.hr_dark,
         .table_border = Color.table_border_dark,
@@ -282,6 +396,8 @@ pub const Theme = struct {
         .code_number = Color.code_number_light,
         .code_border = Color.code_border_light,
         .mark_bg = Color.mark_bg_light,
+        .find_bg = Color.find_bg_light,
+        .find_current = Color.find_current_light,
         .quote_bar = Color.quote_bar_light,
         .hr = Color.hr_light,
         .table_border = Color.table_border_light,
@@ -5980,6 +6096,33 @@ pub fn collectHeadings(
 /// beats an earlier affix (`#blockquote` targets "Blockquotes", not "Block
 /// Elements"). Within one tier the first document match wins. Clicks are
 /// rare, so replaying the pure height walk per tier is free. Empty = top.
+/// Find in document (issue #42): exact document y for a byte offset.
+/// Same block walk as anchorScrollY below (refineLineHeight per unit),
+/// stopping at the first block whose source span contains the target.
+/// Cold path (per cycle/Enter press): early-exits at the target, so the
+/// average cost is half a metrics walk — never hot-path layout.
+pub fn findOffsetY(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    config: ViewportConfig,
+    target: usize,
+) ?f32 {
+    if (lines.len == 0) return null;
+    const cw = contentWidthOf(config);
+    const cx = contentXOf(config);
+    var y: f32 = 50.0;
+    var i: usize = 0;
+    while (i < lines.len) {
+        const u = refineLineHeight(bytes, lines, i, config, cw, cx);
+        const end_i = @min(i + @max(u.consumed, 1), lines.len);
+        const block_end = lines[end_i - 1].offset + lines[end_i - 1].len;
+        if (target < block_end or end_i == lines.len) return y;
+        y += u.height;
+        i = end_i;
+    }
+    return y;
+}
+
 pub fn anchorScrollY(
     bytes: []const u8,
     lines: []const simd.Line,

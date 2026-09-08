@@ -51,6 +51,7 @@ pub const BINDINGS: []const Binding = &.{
     .{ .key = null, .label = "Cmd+C", .desc = "Copy selection to clipboard", .action = .native },
     .{ .key = null, .label = "Cmd+A", .desc = "Select all text in document", .action = .native },
     .{ .key = null, .label = "Cmd+O", .desc = "Open file…", .action = .native },
+    .{ .key = null, .label = "Cmd+F", .desc = "Find in document", .action = .native },
 };
 
 /// Table lookup for the key handler. Null when the key has no binding.
