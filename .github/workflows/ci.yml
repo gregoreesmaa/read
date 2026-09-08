@@ -44,6 +44,10 @@ jobs:
         run: zig build -Doptimize=ReleaseFast
       - name: Binary size budget (ship binary, see AGENTS.md §1)
         run: ./scripts/size_gate.sh zig-out/bin/read
+      - name: App bundle (icon + plist, issue #102)
+        run: |
+          sh scripts/make_app_bundle.sh zig-out/bin/read /tmp/ReadApp 0.0.0-ci
+          sh scripts/check_app_bundle.sh /tmp/ReadApp/Read.app
       - name: Ship/test separation (no hooks in ship binary, see AGENTS.md §1)
         run: sh scripts/ship_separation.sh ./zig-out/bin/read ./zig-out/bin/read-test showcase.md
       - name: Screenshot smoke test (testing binary carries the headless CLI)

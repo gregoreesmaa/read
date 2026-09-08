@@ -42,12 +42,19 @@ jobs:
           cmp /tmp/repro-a/bin/read zig-out/bin/read
           echo "reproducible: identical bytes across rebuilds"
 
+      - name: Assemble app bundle (icon + plist, issue #102)
+        run: |
+          sh scripts/make_app_bundle.sh zig-out/bin/read zig-out "${TAG#v}"
+          sh scripts/check_app_bundle.sh zig-out/Read.app
+
       - name: Codesign (Developer ID, when secrets exist)
         if: ${{ secrets.APPLE_DEVELOPER_IDENTITY != '' }}
         run: |
           codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
             --options runtime --timestamp -v zig-out/bin/read
-          codesign -vv zig-out/bin/read
+          codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
+            --options runtime --timestamp -v zig-out/Read.app
+          codesign -vv zig-out/bin/read zig-out/Read.app
 
       - name: Notarize (Apple notarytool, when secrets exist)
         if: ${{ secrets.APPLE_ID != '' }}
@@ -56,17 +63,22 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          ditto -c -k --keepParent zig-out/bin/read /tmp/notarize.zip
-          xcrun notarytool submit /tmp/notarize.zip --wait \
+          ditto -c -k --keepParent zig-out/bin/read /tmp/notarize-bin.zip
+          xcrun notarytool submit /tmp/notarize-bin.zip --wait \
             --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
           xcrun stapler staple zig-out/bin/read
-          echo "notarized + stapled"
+          ditto -c -k --keepParent zig-out/Read.app /tmp/notarize-app.zip
+          xcrun notarytool submit /tmp/notarize-app.zip --wait \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          xcrun stapler staple zig-out/Read.app
+          echo "notarized + stapled (binary and app bundle)"
 
       - name: Package, checksum, changelog
         run: |
           DIST="read-$TAG-macos-arm64"
           mkdir -p "dist/$DIST"
           cp zig-out/bin/read LICENSE "dist/$DIST/"
+          cp -R zig-out/Read.app "dist/$DIST/"
           tar -czf "dist/$DIST.tar.gz" -C dist "$DIST"
           (cd dist && shasum -a 256 "$DIST.tar.gz" > "$DIST.tar.gz.sha256")
           PREV=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || true)

@@ -10,7 +10,8 @@ Pushing a `v*` tag runs [.github/workflows/release.yml](../.github/workflows/rel
 which gates (strict tests, size budget), builds, checks reproducibility, optionally
 signs + notarizes, and publishes a GitHub release with:
 
-- `read-vX.Y.Z-macos-arm64.tar.gz` (the `read` ship binary + `LICENSE`)
+- `read-vX.Y.Z-macos-arm64.tar.gz` (the `read` ship binary + `LICENSE` + `Read.app`
+  bundle with the app icon, assembled by `scripts/make_app_bundle.sh`)
 - `read-vX.Y.Z-macos-arm64.tar.gz.sha256` (checksum)
 - Changelog generated from `git log` since the previous tag (or a first-release note
   when no earlier tag exists)
