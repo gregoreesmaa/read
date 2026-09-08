@@ -18,6 +18,7 @@ typedef struct {
     void (*on_outline_open)(void);
     void (*on_display)(int category_class, int zoom_percent, int reduce_motion);
     void (*on_pinch)(float magnification);
+    void (*on_open_file)(const char* path, int path_len);
 } PlatformCallbacks;
 
 void platform_outline_add(int level, float y, const char* text, int text_len);
@@ -33,6 +34,7 @@ void platform_sync_overshoot(float overshoot);
 void platform_smooth_kick(void);
 void platform_set_scroll_info(float scroll_y, float max_scroll_y, float view_h);
 void platform_sync_theme(int dark);
+void platform_clear_selection(void);
 
 void platform_draw_rect(float x, float y, float w, float h, unsigned char r, unsigned char g, unsigned char b, unsigned char a);
 void platform_register_text_run(const char* text, int len, float x, float y, float w, float h, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, const char* link_url, int link_url_len);

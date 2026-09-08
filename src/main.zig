@@ -529,6 +529,9 @@ fn openDocumentInPlace(link_path: []const u8, frag: []const u8) void {
     g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
     for (&g_app.block_scroll_x) |*s| s.* = 0.0;
     for (&g_app.block_max_scroll_x) |*s| s.* = 0.0;
+    // The old selection belongs to the old text model (#43): drop it so
+    // the first redraw of the new document highlights nothing stale.
+    bridge.platform_clear_selection();
     updateDocumentMetrics();
     snapScroll(0.0);
     if (frag.len > 0) {
@@ -546,6 +549,16 @@ var g_show_help: bool = false;
 // switch below is exhaustive over Action (no else), so a new table row
 // fails to compile until it is handled here — handler and sheet cannot
 // drift apart. Unknown keys are a no-op, as before.
+
+/// Open-file pick from the platform (Cmd+O panel, window or Dock-icon
+/// drop, #43): an absolute path, pre-validated (readable Markdown). Swap
+/// in place with scroll/selection reset; anything unmappable keeps the
+/// current document untouched, never a crash.
+fn onOpenFile(path_ptr: [*]const u8, path_len: c_int) callconv(.c) void {
+    if (path_len <= 0) return;
+    const path = path_ptr[0..@as(usize, @intCast(path_len))];
+    openDocumentInPlace(path, "");
+}
 
 fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
     if (url_len <= 0) return;
@@ -1575,6 +1588,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_outline_open = onOutlineOpen,
         .on_display = onDisplay,
         .on_pinch = onPinch,
+        .on_open_file = onOpenFile,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);
@@ -1924,6 +1938,94 @@ test "plain keys never hijack modified combos (#32)" {
         try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(option));
         try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(command | shift));
         try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(control | option));
+    }
+}
+
+test "open file: extension gate, overlay row, bad path keeps doc (#43)" {
+    // Extension gate is a pure platform probe (headless-safe); the
+    // overlay row is a table entry; a bad path must leave the current
+    // document (and its text model) completely untouched.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const yes = [_][]const u8{ "a.md", "A.MD", "doc.markdown", "n.mdown", "n.mkd", "r.txt", "R.TEXT" };
+        for (yes) |p| {
+            try t.expectEqual(@as(c_int, 1), bridge.platform_test_markdown_ext(p.ptr, @intCast(p.len)));
+        }
+        const no = [_][]const u8{ "a.png", "md", "a.md.bak", "a", ".mdfoo", "a.md " };
+        for (no) |p| {
+            try t.expectEqual(@as(c_int, 0), bridge.platform_test_markdown_ext(p.ptr, @intCast(p.len)));
+        }
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_markdown_ext("", 0));
+        var listed = false;
+        for (help_overlay.BINDINGS) |b| {
+            if (b.key == null and std.mem.eql(u8, b.label, "Cmd+O")) listed = true;
+        }
+        try t.expect(listed);
+        const before_bytes = g_app.bytes;
+        const before_lines = g_app.line_count;
+        onOpenFile("/nonexistent-dir-xyz/nope.md", 27);
+        try t.expectEqual(before_bytes.ptr, g_app.bytes.ptr);
+        try t.expectEqual(before_bytes.len, g_app.bytes.len);
+        try t.expectEqual(before_lines, g_app.line_count);
+        onOpenFile("", 0);
+        try t.expectEqual(before_bytes.len, g_app.bytes.len);
+    }
+}
+
+test "open file swaps document and resets viewport, restores cleanly (#43)" {
+    // Positive path with full save/restore: the swap mechanics are
+    // deterministic from g_app.bytes (metrics recompute), so restoring
+    // the saved fields + one recompute leaves zero trace for other tests.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const doc = "# Hi\n\nhello\n";
+        const tmp_name = "read_open_test.md";
+        const wfd = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            tmp_name,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            0o644,
+        );
+        _ = std.c.write(wfd, doc.ptr, doc.len);
+        _ = std.c.close(wfd);
+        const s_bytes = g_app.bytes;
+        const s_mapped = g_app.mapped_file;
+        var s_dir: [2048]u8 = undefined;
+        @memcpy(s_dir[0..g_doc_dir.len], g_doc_dir);
+        const s_dir_len = g_doc_dir.len;
+        const s_scroll = g_app.scroll_y;
+        const s_target = g_smooth.target;
+        const s_current = g_smooth.current;
+        var s_blocks: [MAX_SCROLLABLE_BLOCKS]f32 = undefined;
+        var s_maxblocks: [MAX_SCROLLABLE_BLOCKS]f32 = undefined;
+        @memcpy(&s_blocks, &g_app.block_scroll_x);
+        @memcpy(&s_maxblocks, &g_app.block_max_scroll_x);
+        defer {
+            // Restore is a re-scan, not a field copy: the swap overwrote
+            // the shared lines/refdef/checkpoint buffers, and all three
+            // rebuild deterministically from the restored bytes.
+            if (g_app.mapped_file) |*m| m.close();
+            g_app.mapped_file = s_mapped;
+            g_app.bytes = s_bytes;
+            var in_fence: simd.FenceState = .{};
+            g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
+            g_app.lines = g_lines_buffer[0..g_app.line_count];
+            g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
+            @memcpy(g_doc_dir_buf[0..s_dir_len], s_dir[0..s_dir_len]);
+            g_doc_dir = g_doc_dir_buf[0..s_dir_len];
+            g_app.scroll_y = s_scroll;
+            g_smooth.target = s_target;
+            g_smooth.current = s_current;
+            @memcpy(&g_app.block_scroll_x, &s_blocks);
+            @memcpy(&g_app.block_max_scroll_x, &s_maxblocks);
+            updateDocumentMetrics();
+            _ = std.c.unlink(tmp_name);
+        }
+        onOpenFile(tmp_name, @intCast(tmp_name.len));
+        try t.expectEqualStrings(doc, g_app.bytes);
+        try t.expectEqual(@as(usize, 3), g_app.line_count);
+        try t.expectEqual(@as(f32, 0.0), g_app.scroll_y);
+        try t.expectEqualStrings("", g_doc_dir);
     }
 }
 

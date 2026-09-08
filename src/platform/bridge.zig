@@ -34,6 +34,10 @@ pub const PlatformCallbacks = extern struct {
     /// smart-magnify toggle. Appended last for the same FFI stability
     /// reason.
     on_pinch: ?*const fn (magnification: f32) callconv(.c) void = null,
+    /// Open-file pick (Cmd+O panel, window or Dock-icon drop, #43):
+    /// absolute filesystem path, UTF-8. Appended last for the same
+    /// FFI stability reason.
+    on_open_file: ?*const fn (path: [*]const u8, path_len: c_int) callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_outline_add(level: c_int, y: f32, text: [*]const u8, text_len: c_int) void;
@@ -204,6 +208,12 @@ pub extern "c" fn platform_test_appearance() c_int;
 /// Modifier-gate probe (issue #32): 1 when the flag set reaches
 /// plain-letter bindings. Test-hooks builds only.
 pub extern "c" fn platform_test_key_plain(flags: c_ulong) c_int;
+/// Drop the selection/highlight model (issue #43): called after swapping
+/// the document, before redraw.
+pub extern "c" fn platform_clear_selection() void;
+/// Extension-gate probe (issue #43): 1 when the path passes the Markdown
+/// filter. Test-hooks builds only.
+pub extern "c" fn platform_test_markdown_ext(path: [*]const u8, path_len: c_int) c_int;
 pub extern "c" fn platform_open_url_external(url: [*]const u8, url_len: c_int) void;
 pub extern "c" fn platform_test_image_primed(total_frames: *c_ulong, primed_frames: *c_ulong) void;
 pub extern "c" fn platform_set_test_scale(s: f32) void;
