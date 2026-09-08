@@ -507,6 +507,93 @@ pub const SmoothScroll = struct {
     }
 };
 
+/// Display text scaling: system size class x user zoom. Size classes are
+/// discrete so layout stays stable (re-wrap only on class change, never
+/// on fractional drift); zoom steps multiply geometrically and persist
+/// (integer percent) via NSUserDefaults on the platform side.
+/// Pure value type, zero heap.
+pub const TextScale = struct {
+    class: u3 = 1, // 0..4, 1 == system default
+    zoom: f32 = 1.0,
+
+    pub const BASE_FONT_SIZE: f32 = 17.0;
+    pub const ZOOM_MIN: f32 = 0.5;
+    pub const ZOOM_MAX: f32 = 3.0;
+    pub const ZOOM_STEP: f32 = 1.25;
+
+    pub fn classMult(class: u3) f32 {
+        return switch (class) {
+            0 => 0.85,
+            1 => 1.0,
+            2 => 1.15,
+            3 => 1.30,
+            // 4, and defensively 5..7 (unreachable via the clamped
+            // onDisplay path): largest class rather than a trap.
+            else => 1.50,
+        };
+    }
+
+    /// Snap a measured system-font ratio (systemSize / 13pt default) to a
+    /// class. Midpoints between multipliers; anything huge is class 4.
+    pub fn classForRatio(ratio: f32) u3 {
+        if (ratio < 0.925) return 0;
+        if (ratio < 1.075) return 1;
+        if (ratio < 1.225) return 2;
+        if (ratio < 1.40) return 3;
+        return 4;
+    }
+
+    pub fn zoomIn(self: *TextScale) void {
+        self.zoom = @min(ZOOM_MAX, self.zoom * ZOOM_STEP);
+    }
+
+    pub fn zoomOut(self: *TextScale) void {
+        self.zoom = @max(ZOOM_MIN, self.zoom / ZOOM_STEP);
+    }
+
+    pub fn zoomReset(self: *TextScale) void {
+        self.zoom = 1.0;
+    }
+
+    /// Persisted form: integer percent in 50..300. Clamp on restore so a
+    /// corrupt default can never break layout.
+    pub fn zoomPercent(self: *const TextScale) c_int {
+        return @intFromFloat(@round(self.zoom * 100.0));
+    }
+
+    pub fn setZoomPercent(self: *TextScale, pct: c_int) void {
+        self.zoom = std.math.clamp(
+            @as(f32, @floatFromInt(pct)) / 100.0,
+            ZOOM_MIN,
+            ZOOM_MAX,
+        );
+    }
+
+    pub fn effectiveBase(self: *const TextScale) f32 {
+        return BASE_FONT_SIZE * classMult(self.class) * self.zoom;
+    }
+};
+
+/// Reduced-motion policy: when the OS Reduce Motion switch is on, every
+/// scroll input lands synchronously — no glide, no display-link timer.
+/// Precise devices already snap 1:1; wheel retargets snap too. Pure.
+pub const MotionPolicy = struct {
+    pub fn applyVertical(
+        target: f32,
+        current: f32,
+        dy: f32,
+        precise: bool,
+        max: f32,
+        reduce_motion: bool,
+    ) SmoothScroll {
+        if (reduce_motion) {
+            const v = std.math.clamp(current - dy, 0.0, @max(0.0, max));
+            return .{ .current = v, .target = v };
+        }
+        return SmoothScroll.applyScrollDelta(target, current, dy, precise, max);
+    }
+};
+
 /// Renders a series of inline spans with automatic word wrapping and exact typography.
 /// `rtl` right-anchors the pen (issue #50): false preserves history exactly.
 pub fn layoutWrappedSpans(

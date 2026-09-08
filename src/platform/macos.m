@@ -791,6 +791,54 @@ static int utf8_to_utf16(const char* text, int bidx) {
     }
     return u;
 }
+// Display preferences (#30): system size class x persisted zoom, plus the
+// OS Reduce Motion switch. The Zig TextScale owns the clamp math; this
+// percent mirror stays in 50..300 by the same x/1.25 step construction
+// (integer-rounded, so both sides agree on every pushed value).
+// ---------------------------------------------------------------------------
+#define READ_ZOOM_DEFAULTS_KEY @"ReadZoomPercent"
+static int g_zoom_percent = 100;
+static int g_last_pushed_class = -1;
+static int g_last_pushed_zoom = -1;
+static int g_last_pushed_rm = -1;
+
+static int display_size_class(void) {
+    float sys = (float)[NSFont systemFontSize]; // 13.0 at default
+    float ratio = sys > 0.0f ? sys / 13.0f : 1.0f;
+    // Mirrors TextScale.classForRatio thresholds in viewport.zig.
+    if (ratio < 0.925f) return 0;
+    if (ratio < 1.075f) return 1;
+    if (ratio < 1.225f) return 2;
+    if (ratio < 1.40f) return 3;
+    return 4;
+}
+
+static int display_reduce_motion(void) {
+    return [[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion] ? 1 : 0;
+}
+
+// Push the triple to Zig; skip redundant pushes (no metrics walk) unless
+// forced. The Zig onDisplay re-wraps and clamps; full repaint follows.
+static void display_push(int force) {
+    if (!g_callbacks.on_display) return;
+    int cls = display_size_class();
+    int rm = display_reduce_motion();
+    if (!force && cls == g_last_pushed_class && g_zoom_percent == g_last_pushed_zoom && rm == g_last_pushed_rm) return;
+    g_last_pushed_class = cls;
+    g_last_pushed_zoom = g_zoom_percent;
+    g_last_pushed_rm = rm;
+    g_callbacks.on_display(cls, g_zoom_percent, rm);
+}
+
+static void display_zoom_step(int dir) { // +1 in, -1 out, 0 reset
+    if (dir == 0) g_zoom_percent = 100;
+    else if (dir > 0) g_zoom_percent = (int)((g_zoom_percent * 125 + 50) / 100);
+    else g_zoom_percent = (int)((g_zoom_percent * 100 + 62) / 125);
+    if (g_zoom_percent < 50) g_zoom_percent = 50;
+    if (g_zoom_percent > 300) g_zoom_percent = 300;
+    [[NSUserDefaults standardUserDefaults] setInteger:g_zoom_percent forKey:READ_ZOOM_DEFAULTS_KEY];
+    display_push(0);
+}
 
 @interface ReadView : NSView
 - (void)copySelectionToClipboard;
@@ -1881,6 +1929,21 @@ static NSString* selected_text_string(void) {
             [self selectAllDocument];
             return;
         }
+        // Zoom: Cmd+Plus/Equals in, Cmd+Minus out, Cmd+0 reset. Persisted;
+        // the Zig onDisplay re-wraps via the viewport code. Other Cmd
+        // combos keep their existing routing below.
+        if ([chars isEqualToString:@"+"] || [chars isEqualToString:@"="]) {
+            display_zoom_step(+1);
+            return;
+        }
+        if ([chars isEqualToString:@"-"]) {
+            display_zoom_step(-1);
+            return;
+        }
+        if ([chars isEqualToString:@"0"]) {
+            display_zoom_step(0);
+            return;
+        }
     }
 
     if ([chars length] > 0) {
@@ -2013,6 +2076,13 @@ static NSString* selected_text_string(void) {
     outline_jump();
 }
 
+// Display prefs (#30): Reduce Motion flips and re-activation re-read the
+// OS state; display_push skips the Zig round-trip when nothing changed.
+- (void)displayPrefsChanged:(NSNotification *)notification {
+    (void)notification;
+    display_push(0);
+}
+
 // Visibility changes are OS events, not wakeups: a single redraw on restore
 // lets platform_draw_image re-arm any parked animation chain. While hidden,
 // parked chains schedule nothing, so idle stays at zero wakeups.
@@ -2116,6 +2186,23 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
 
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:view];
+
+    // Display prefs (#30): restore persisted zoom, push the initial triple
+    // (the size class may already differ from default), and observe Reduce
+    // Motion flips + re-activation (system size changes land live).
+    {
+        long saved = [[NSUserDefaults standardUserDefaults] integerForKey:READ_ZOOM_DEFAULTS_KEY];
+        if (saved >= 50 && saved <= 300) g_zoom_percent = (int)saved;
+    }
+    display_push(1);
+    [[NSWorkspace sharedWorkspace].notificationCenter addObserver:delegate
+                                                         selector:@selector(displayPrefsChanged:)
+                                                             name:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                                                           object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:delegate
+                                             selector:@selector(displayPrefsChanged:)
+                                                 name:NSApplicationDidBecomeActiveNotification
+                                               object:nil];
 
     return 0;
 }

@@ -484,6 +484,68 @@ test "controls: editing validation disables copy without selection or under secu
     try std.testing.expect(EditPolicy.selectAllEnabled());
 }
 
+test "controls: text scale classes, zoom steps, and persistence round-trip" {
+    // Identity: default class + 100% == the historical 17pt base, so
+    // screenshots stay pixel-identical until the user zooms.
+    var ts = layout.TextScale{};
+    try std.testing.expectEqual(@as(f32, 17.0), ts.effectiveBase());
+    try std.testing.expectEqual(@as(c_int, 100), ts.zoomPercent());
+
+    // System-size ratio snaps to discrete classes.
+    try std.testing.expectEqual(@as(u3, 1), layout.TextScale.classForRatio(1.0));
+    try std.testing.expectEqual(@as(u3, 0), layout.TextScale.classForRatio(0.85));
+    try std.testing.expectEqual(@as(u3, 2), layout.TextScale.classForRatio(1.15));
+    try std.testing.expectEqual(@as(u3, 4), layout.TextScale.classForRatio(2.0));
+    ts.class = 2;
+    try std.testing.expectEqual(@as(f32, 17.0 * 1.15), ts.effectiveBase());
+
+    // Geometric zoom steps with clamps.
+    ts.class = 1;
+    ts.zoomIn();
+    try std.testing.expectEqual(@as(f32, 1.25), ts.zoom);
+    ts.zoomOut();
+    ts.zoomOut();
+    try std.testing.expectEqual(@as(f32, 0.8), ts.zoom);
+    ts.zoomReset();
+    try std.testing.expectEqual(@as(f32, 1.0), ts.zoom);
+    for (0..20) |_| ts.zoomIn();
+    try std.testing.expectEqual(@as(f32, 3.0), ts.zoom);
+    for (0..40) |_| ts.zoomOut();
+    try std.testing.expectEqual(@as(f32, 0.5), ts.zoom);
+
+    // Persistence round-trip: percent out, clamp on restore.
+    ts.zoomReset();
+    ts.zoomIn();
+    try std.testing.expectEqual(@as(c_int, 125), ts.zoomPercent());
+    var restored = layout.TextScale{};
+    restored.setZoomPercent(ts.zoomPercent());
+    try std.testing.expectEqual(ts.zoom, restored.zoom);
+    restored.setZoomPercent(9999);
+    try std.testing.expectEqual(@as(f32, 3.0), restored.zoom);
+    restored.setZoomPercent(-50);
+    try std.testing.expectEqual(@as(f32, 0.5), restored.zoom);
+}
+
+test "controls: reduced motion lands scroll inputs synchronously" {
+    // Reduced: wheel and precise inputs snap, no glide, no timer needed.
+    var s = layout.MotionPolicy.applyVertical(0.0, 100.0, -40.0, false, 1000.0, true);
+    try std.testing.expectEqual(@as(f32, 140.0), s.current);
+    try std.testing.expectEqual(@as(f32, 140.0), s.target);
+    try std.testing.expect(s.settled());
+    s = layout.MotionPolicy.applyVertical(500.0, 500.0, 30.0, true, 1000.0, true);
+    try std.testing.expectEqual(@as(f32, 470.0), s.current);
+    try std.testing.expect(s.settled());
+    // Reduced still clamps to the document.
+    s = layout.MotionPolicy.applyVertical(0.0, 990.0, -50.0, false, 1000.0, true);
+    try std.testing.expectEqual(@as(f32, 1000.0), s.current);
+
+    // Normal motion delegates to the existing routing untouched.
+    const wheel = layout.MotionPolicy.applyVertical(100.0, 100.0, -40.0, false, 1000.0, false);
+    const direct = layout.SmoothScroll.applyScrollDelta(100.0, 100.0, -40.0, false, 1000.0);
+    try std.testing.expectEqual(direct.target, wheel.target);
+    try std.testing.expectEqual(direct.current, wheel.current);
+}
+
 test "controls: keybindings j, k, space, t navigation" {
     var scroll_y: f32 = 0.0;
     const max_scroll_y: f32 = 1000.0;
