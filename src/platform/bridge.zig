@@ -67,6 +67,10 @@ pub extern "c" fn platform_smooth_kick() void;
 /// height, so the platform can map pointer y to a scroll target with the
 /// same geometry the Zig filament draws. Called every draw.
 pub extern "c" fn platform_set_scroll_info(scroll_y: f32, max_scroll_y: f32, view_h: f32) void;
+/// Overscroll strip theme sync (issue #104): the window background tracks
+/// the app theme, which a `t` override can diverge from the system.
+pub extern "c" fn platform_sync_theme(dark: c_int) void;
+pub extern "c" fn platform_test_theme_synced() c_int;
 
 pub extern "c" fn platform_draw_rect(
     x: f32,
