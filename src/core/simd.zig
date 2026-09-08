@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 /// keeps every TARGET_* threshold identical and instead adapts the sampling:
 /// repeat the measurement until one sample clears the threshold — a true
 /// code regression clears no sample, however many are taken — or attempts
-/// are exhausted, backing off 1 ms between attempts so a transient stall
+/// are exhausted, backing off 2 ms between attempts so a transient stall
 /// decorrelates. Green machines exit after the first clearing sample, i.e.
 /// at the same cost as the old fixed loops. Shared Linux CI VMs are noisier
 /// still, so there every benchmark still runs and prints its numbers for log
@@ -33,9 +33,14 @@ pub fn mmapLatencyEnforced() bool {
 }
 
 /// Adaptive timing-gate sampling policy (see above): enough attempts to span
-/// a ~10 ms host stall, with a 1 ms backoff between uncleared attempts.
-pub const timing_gate_max_attempts: usize = 31;
-pub const timing_gate_backoff_ns: u64 = 1_000_000;
+/// a ~130 ms contention window, with a 2 ms backoff between uncleared
+/// attempts. CI showed the same cached binary measuring viewport 7 µs in
+/// the strict step and 12 µs (min over 31) in the screenshot step 90 s
+/// later, with scan/search/deep-scroll degraded 2-4x in the same window —
+/// sustained neighbor contention, not codegen. Green machines still exit
+/// after the first clearing sample, i.e. at unchanged cost.
+pub const timing_gate_max_attempts: usize = 63;
+pub const timing_gate_backoff_ns: u64 = 2_000_000;
 
 /// Backoff nap between uncleared timing-gate attempts (see above). Test-only
 /// measurement hygiene; never on a hot path.
