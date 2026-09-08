@@ -1773,6 +1773,22 @@ static NSString* selected_text_string(void) {
     [self setNeedsDisplay:YES];
 }
 
+// Plain-letter bindings (#32) must never hijack modified combos: only
+// bare keys reach on_key (Shift allowed: '?' needs it on US layouts;
+// CapsLock/NumericPad are lock states, not combos, and pass through).
+static inline BOOL key_combo_plain(NSUInteger flags) {
+    NSUInteger f = flags & ~(NSEventModifierFlagCapsLock | NSEventModifierFlagNumericPad);
+    return f == 0 || f == NSEventModifierFlagShift;
+}
+
+#ifdef TEST_HOOKS
+// Modifier-gate contract probe (#32): 1 when this flag set reaches
+// plain-letter bindings. Headless-safe: pure function, no AppKit state.
+int platform_test_key_plain(unsigned long flags) {
+    return key_combo_plain((NSUInteger)flags) ? 1 : 0;
+}
+#endif
+
 - (void)keyDown:(NSEvent *)event {
     NSUInteger flags = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
     NSString* chars = [event charactersIgnoringModifiers];
@@ -1808,7 +1824,9 @@ static NSString* selected_text_string(void) {
         }
     }
 
-    if ([chars length] > 0) {
+    // Modified combos never reach plain bindings (#32): Cmd combos returned
+    // above; Ctrl/Alt/Cmd+Shift fall through to here and must be dropped.
+    if ([chars length] > 0 && key_combo_plain(flags)) {
         unichar c = [chars characterAtIndex:0];
         // '?' arrives as '/' once Shift is ignored (US layout: Shift+/).
         // The cheat-sheet binding is '?', so restore it from the
