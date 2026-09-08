@@ -44,12 +44,11 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    // Hot module (binary diet, AGENTS.md §1: < 180 KiB): the scan/search
-    // throughput core, ALWAYS ReleaseFast. The strict scan/search gates
-    // pin this codegen; Small misses them (short-line throughput 3.2 vs
-    // 5.0 GB/s, search 110 vs 50 µs) while everything else clears every
-    // gate Small. Tests exercise the same module the ship binary links,
-    // so gates pin ship codegen at any top-level -Doptimize.
+    // Hot module: the scan/search throughput core, ALWAYS ReleaseFast.
+    // Test builds keep module boundaries, so hot_tests measures this
+    // module at Fast. (The ship binary merges all Zig code into one unit
+    // at the ship root's level — see below — so this flag shapes test
+    // codegen, not ship codegen.)
     const mod_hot = b.addModule("hot", .{
         .root_source_file = b.path("src/core/simd.zig"),
         .target = target,
@@ -70,12 +69,16 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
-        // Cold module (binary diet): everything outside the scan/search
-        // core builds Small in every profile — event-driven UI, layout,
-        // parser, and app shell clear all strict gates Small-tested, and
-        // the ship binary links this same module, so tests pin ship
-        // codegen. Saves ~20 KiB of __TEXT (one 16 KiB page).
-        .optimize = .ReleaseSmall,
+        // Test-root module: mod_tests runs with this module as root, so
+        // this flag drives test codegen. ReleaseFast: the strict
+        // microsecond gates (viewport layout ≤ 8 µs especially) need -O3
+        // inlining/unrolling — Small misses viewport on CI runners
+        // (13 µs vs the 8 µs target) while Fast clears first try.
+        // The ship binary merges all Zig code at the ship root's Small
+        // (size budget, AGENTS.md §1), so this flag shapes test codegen,
+        // not ship codegen. Same sources pin algorithms; screenshots
+        // (read-test, Small like ship) pin rendering bit-for-bit.
+        .optimize = .ReleaseFast,
         // mmap.zig and the test blocks use std.c (close/fstat/madvise/write).
         // Zig 0.16 requires an explicit libc edge on Linux; without it the
         // test-linux CI job fails to compile. No-op on Darwin (libSystem is
