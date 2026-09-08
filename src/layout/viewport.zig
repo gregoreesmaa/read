@@ -510,7 +510,7 @@ pub const SmoothScroll = struct {
 /// Display text scaling: system size class x user zoom. Size classes are
 /// discrete so layout stays stable (re-wrap only on class change, never
 /// on fractional drift); zoom steps multiply geometrically and persist
-/// (integer percent) via NSUserDefaults on the platform side.
+/// (integer percent) in the platform defaults store (see macos.m).
 /// Pure value type, zero heap.
 pub const TextScale = struct {
     class: u3 = 1, // 0..4, 1 == system default

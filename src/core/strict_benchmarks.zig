@@ -161,7 +161,7 @@ test "STRICT: Zero-Copy mmap Open Latency" {
 
     std.debug.print("[STRICT BENCHMARK] mmap Open Latency: {d} µs ({d} attempts)\n", .{ min_elapsed_us, attempts });
 
-    if (simd.enforce_timing_budgets) {
+    if (simd.mmapLatencyEnforced()) {
         try std.testing.expect(min_elapsed_us <= TARGET_MAX_MMAP_OPEN_TIME_US);
     }
 }
