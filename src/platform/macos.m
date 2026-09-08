@@ -44,6 +44,24 @@ static void apply_native_tabbing(NSWindow* w); // defined at end-of-file
 static int appearance_is_dark(NSAppearance* a); // defined at end-of-file
 static void apply_window_appearance(BOOL dark); // defined at end-of-file
 static int g_synced_theme_dark; // tentative: real init (-1) at end-of-file
+// Continuous link underline (#101): state lives with the underline code
+// below; tentative definitions here merge with the real ones (same
+// pattern as the outline picker decls above). Hover identity is the
+// FNV-1a URL hash (zero = none): one word, no buffers, same no-false-hit
+// rationale as the visited-link ring below.
+static uint64_t g_hover_link_hash;
+typedef struct {
+    uint64_t hash;
+    float y;
+    float x_end;
+    float font_size;
+    BOOL hovered;
+    BOOL valid;
+} LinkUlState;
+static LinkUlState g_last_ul;
+static uint64_t link_url_hash(const char* url, int url_len);
+static inline BOOL link_run_hovered(float x, float y, float w, float h);
+static float link_underline_track(const char* url, int url_len, float x, float y, float w, float font_size, BOOL hovered);
 static int image_url_is_remote(NSString* s); // defined at end-of-file
 static NSURLSession* image_session(void); // defined at end-of-file
 static int image_path_exists_joined(const char* dir, NSString* rel); // ditto
@@ -1003,6 +1021,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     g_text_record_count = 0;
     g_code_block_count = 0;
     g_scrollable_block_count = 0;
+    g_last_ul.valid = NO; // link-underline continuation is per-frame (#101)
     g_current_cg_context = ctx;
     NSScreen* draw_screen = [self.window screen];
     g_output_scale = draw_screen ? (float)[draw_screen backingScaleFactor] : 1.0f;
@@ -1070,6 +1089,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     g_mouse_pos = [self convertPoint:[event locationInWindow] fromView:nil];
 
     BOOL over_link = NO;
+    uint64_t hover_hash = 0;
     for (int i = 0; i < g_text_record_count; i++) {
         QuadTextRecord* rec = &g_text_records[i];
         float view_y = rec->doc_y - g_scroll_y;
@@ -1077,9 +1097,13 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             g_mouse_pos.x >= rec->x && g_mouse_pos.x <= rec->x + rec->w &&
             g_mouse_pos.y >= view_y && g_mouse_pos.y <= view_y + rec->h) {
             over_link = YES;
+            // Unified link hover (#101): the whole URL highlights, not
+            // just the word under the cursor.
+            hover_hash = link_url_hash(rec->link_url, (int)strlen(rec->link_url));
             break;
         }
     }
+    g_hover_link_hash = hover_hash;
 
     BOOL over_code_btn = NO;
     for (int b_idx = 0; b_idx < g_code_block_count; b_idx++) {
@@ -1120,8 +1144,12 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     // mouse motion never redraws. A link-highlight flip re-arms one gated
     // full redraw (no exact record handy); copy-button-only flips stay
     // rect-precise below.
-    if (g_text_record_count > 0 && over_link != g_last_link_hover) {
+    static uint64_t prev_hover_hash = 0;
+    if (g_text_record_count > 0 &&
+        (over_link != g_last_link_hover ||
+         (over_link && hover_hash != prev_hover_hash))) {
         g_last_link_hover = over_link;
+        prev_hover_hash = hover_hash;
 #ifdef TEST_HOOKS
         DBGLOG("EV hover_flip link=%d", over_link ? 1 : 0);
 #endif
@@ -1150,6 +1178,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     if (g_last_link_hover || g_last_code_btn_hover) {
         g_last_link_hover = NO;
         g_last_code_btn_hover = NO;
+        g_hover_link_hash = 0;
         [[NSCursor IBeamCursor] set];
 #ifdef TEST_HOOKS
         DBGLOG("EV mouseexit_full");
@@ -2155,6 +2184,10 @@ void platform_sync_overshoot(float overshoot) {
 }
 
 void platform_sync_scroll(float scroll_y) {
+    // A scroll without mouse motion leaves the hover URL stale (#101):
+    // drop it; the draw-time box check re-highlights correctly this same
+    // frame and mouseMoved re-establishes URL hover on the next move.
+    if (scroll_y != g_scroll_y) g_hover_link_hash = 0;
     g_scroll_y = scroll_y;
 }
 
@@ -2308,12 +2341,21 @@ void platform_register_text_run(const char* text, int len, float x, float y, flo
     // Measure-only: a miss shapes exactly once (cached thereafter), so the
     // recorded width matches the draw path's shaped width in all cases.
     ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading, 0);
+    float rec_w = w, rec_h = h;
     if (e && e->line) {
-        record_text_quad(text, len, x, y, e->w, e->h, font_size,
-                         is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+        rec_w = e->w;
+        rec_h = e->h;
+    }
+    record_text_quad(text, len, x, y, rec_w, rec_h, font_size,
+                     is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+    // Culled link runs draw no pixels but must advance the underline
+    // continuation (#101) with the same shaped width, so a partial-damage
+    // draw bridges its visible words exactly like a full draw.
+    if (link_url && link_url_len > 0) {
+        link_underline_track(link_url, link_url_len, x, y, rec_w, font_size,
+                             link_run_hovered(x, y, rec_w, rec_h));
     } else {
-        record_text_quad(text, len, x, y, w, h, font_size,
-                         is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+        g_last_ul.valid = NO;
     }
 }
 
@@ -2357,14 +2399,48 @@ static inline BOOL link_run_hovered(float x, float y, float w, float h) {
            g_mouse_pos.y >= y && g_mouse_pos.y <= y + h;
 }
 
+// Continuous link underline (issue #101): words of one link arrive as
+// separate runs, which used to underline per-word with a gap over every
+// space. Consecutive runs of the same URL on the same baseline extend one
+// shared rule across the gap; hovering any word highlights the whole link
+// (g_hover_link_url, set by mouseMoved) at a uniform thickness.
+// Continuation test shared by the draw and register paths: returns the
+// previous rule's right edge when the gap [prev_end, x) belongs to the
+// same rule, else -1. Unifies hover first (any word hovered => whole URL
+// hovered, read back from g_last_ul.hovered by the draw path), then
+// advances the continuation state, so culled (register-only) runs keep
+// partial-damage draws bridged identically.
+static float link_underline_track(const char* url, int url_len, float x, float y, float w, float font_size, BOOL hovered) {
+    uint64_t h = (url && url_len > 0) ? link_url_hash(url, url_len) : 0;
+    hovered = hovered || (h != 0 && h == g_hover_link_hash);
+    float gap_from = -1.0f;
+    if (h != 0 && g_last_ul.valid && h == g_last_ul.hash &&
+        g_last_ul.font_size == font_size && fabsf(y - g_last_ul.y) < 0.5f &&
+        x >= g_last_ul.x_end && x - g_last_ul.x_end < font_size * 1.0f) {
+        gap_from = g_last_ul.x_end;
+        hovered = hovered || g_last_ul.hovered;
+    }
+    g_last_ul.hash = h;
+    g_last_ul.y = y;
+    g_last_ul.x_end = x + w;
+    g_last_ul.font_size = font_size;
+    g_last_ul.hovered = hovered;
+    g_last_ul.valid = (h != 0);
+    return gap_from;
+}
+
 // Link underline (issue #25): a rule just below the baseline in the run's
 // own color (visited substitution is already applied by the caller), 2px
 // while hovered. Font-size-relative geometry matches on 1x, 2x, and
 // headless captures without extra CoreText queries.
-static void draw_link_underline(CGContextRef ctx, float x, float y, float w, float font_size, BOOL hovered) {
+static void draw_link_underline(CGContextRef ctx, float x, float y, float w, float font_size, BOOL hovered, const char* url, int url_len) {
     if (w <= 0.0f || font_size <= 0.0f) return;
+    float gap_from = link_underline_track(url, url_len, x, y, w, font_size, hovered);
+    hovered = g_last_ul.hovered; // unified hover: whole link, one thickness
     float uy = y + font_size * 0.85f + fmaxf(1.5f, font_size * 0.10f);
     float th = hovered ? 2.0f : 1.0f;
+    if (gap_from >= 0.0f && gap_from < x)
+        CGContextFillRect(ctx, CGRectMake(gap_from, uy, x - gap_from, th));
     CGContextFillRect(ctx, CGRectMake(x, uy, w, th));
 }
 
@@ -2404,7 +2480,7 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
         // draws its own from cache dims, so do_record=0 stays quiet).
         if (ul_w >= 0.0f && link_url && link_url_len > 0) {
             CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
-            draw_link_underline(ctx, x, y, ul_w, font_size, link_run_hovered(x, y, ul_w, ul_h));
+            draw_link_underline(ctx, x, y, ul_w, font_size, link_run_hovered(x, y, ul_w, ul_h), link_url, link_url_len);
         }
         CFRelease(ctLine);
     }
@@ -2415,6 +2491,9 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
     if (!g_current_cg_context || len <= 0 || !text) return;
     CGContextRef ctx = g_current_cg_context;
+    // A non-link run breaks link-underline continuation (#101): without
+    // this a link resuming after an intervening word would bridge over it.
+    if (!link_url || link_url_len <= 0) g_last_ul.valid = NO;
 
     // Shaping economy: shape once per unique run (cached thereafter). Only
     // rasterize when this destination will actually blit (2x); on 1x the
@@ -2452,7 +2531,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             // path below is covered inside draw_text_legacy instead.
             if (link_url && link_url_len > 0) {
                 CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
-                draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h));
+                draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h), link_url, link_url_len);
             }
             return; // textured quad done: no shaping, no CPU compositing
         }
@@ -2466,7 +2545,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
                          r, g, b, a, 0, link_url, link_url_len);
         if (link_url && link_url_len > 0) {
             CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
-            draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h));
+            draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h), link_url, link_url_len);
         }
         return;
     }
@@ -3048,6 +3127,7 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     g_text_record_count = 0;
     g_code_block_count = 0;
     g_scrollable_block_count = 0;
+    g_last_ul.valid = NO; // link-underline continuation is per-render (#101)
     g_current_cg_context = ctx;
 #ifdef TEST_HOOKS
     g_test_image_draws = 0;
