@@ -118,6 +118,7 @@ pub fn build(b: *std.Build) void {
             hot2: *std.Build.Module,
             opts2: *std.Build.Step.Options,
             unwind: ?std.builtin.UnwindTables,
+            single_threaded: ?bool,
         ) *std.Build.Module {
             // App shell (binary diet): event-driven UI code clears every
             // strict gate Small-tested, so it builds Small in every profile
@@ -128,6 +129,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b2.path("src/main.zig"),
                 .target = target2,
                 .optimize = .ReleaseSmall,
+                .single_threaded = single_threaded,
                 .unwind_tables = unwind,
                 // main.zig uses std.c (write/exit/nanosleep): same explicit
                 // libc edge as the read module, required for the Linux CI build.
@@ -140,12 +142,17 @@ pub fn build(b: *std.Build) void {
             });
         }
     }.make;
-    const exe_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, null);
+    const exe_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, null, null);
     // Ship module: identical sources, unwind tables off. Unwind data is
     // metadata only — no instruction changes — so screenshots, benchmarks,
     // and scroll behavior are unaffected; only crash-report backtraces
     // degrade (already address-only post-strip).
-    const ship_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, .none);
+    // Single-threaded (issue #117): the app is main-thread-only by AppKit
+    // design (no std.Thread in-tree), so thread-safety codegen is dead
+    // weight in ship. Measured 2026-09 on main: 177848 -> 177784 bytes
+    // (-64B file, -160B __TEXT, +160B page headroom). Test modules keep
+    // null so test codegen is unaffected.
+    const ship_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, .none, true);
     const exe = b.addExecutable(.{
         .name = "read",
         .root_module = ship_mod,
