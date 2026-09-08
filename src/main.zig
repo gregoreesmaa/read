@@ -510,19 +510,15 @@ fn measureConfig() layout.ViewportConfig {
     };
 }
 
-/// Open a sibling `.md` document in the same window (#46): swap the mmap,
-/// rescan, reset viewport state, optionally land on `#frag`. Any failure
-/// (missing file, overlong path) is a silent no-op — never an error dialog.
-fn openDocumentInPlace(link_path: []const u8, frag: []const u8) void {
-    var abs_buf: [2048]u8 = undefined;
-    const abs = resolveDocPath(link_path, &abs_buf) orelse return;
-    const mapped = mmap.MappedFile.open(abs) catch return;
-    // Swap only after the new mapping opens: a missing file keeps the
-    // current document untouched.
+/// Activate an already-opened mapping: rescan, reset per-document state,
+/// re-derive metrics, redraw. Shared by in-place opens (#46), the open
+/// panel / drops (#43), and external-change reloads (#44): the swap is
+/// open-new-then-replace, so the view is always a complete consistent
+/// render — never torn, never a crash on truncation.
+fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     if (g_app.mapped_file) |*m| m.close();
     g_app.mapped_file = mapped;
     g_app.bytes = mapped.bytes;
-    setDocDir(abs);
     var in_fence: simd.FenceState = .{};
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
     g_app.lines = g_lines_buffer[0..g_app.line_count];
@@ -533,12 +529,61 @@ fn openDocumentInPlace(link_path: []const u8, frag: []const u8) void {
     // the first redraw of the new document highlights nothing stale.
     bridge.platform_clear_selection();
     updateDocumentMetrics();
-    snapScroll(0.0);
+    if (reset_scroll) snapScroll(0.0) else snapScroll(g_app.scroll_y);
+    bridge.platform_request_redraw();
+}
+
+/// Open a sibling `.md` document in the same window (#46): swap the mmap,
+/// rescan, reset viewport state, optionally land on `#frag`. Any failure
+/// (missing file, overlong path) is a silent no-op — never an error dialog.
+/// Reports success so callers can re-anchor path-dependent state (#44).
+fn openDocumentInPlace(link_path: []const u8, frag: []const u8) bool {
+    var abs_buf: [2048]u8 = undefined;
+    const abs = resolveDocPath(link_path, &abs_buf) orelse return false;
+    const mapped = mmap.MappedFile.open(abs) catch return false;
+    // Swap only after the new mapping opens: a missing file keeps the
+    // current document untouched.
+    setDocDir(abs);
+    activateMappedFile(mapped, true);
     if (frag.len > 0) {
         // `doc.md#sec`: land on the section (missing anchor stays on top).
         if (anchorTargetY(frag)) |target| snapScroll(target);
     }
     bridge.platform_request_redraw();
+    return true;
+}
+
+// Current document's filesystem path for external-change reloads (#44).
+// Empty for the built-in doc and stdin spools (unlinked): unwatched.
+var g_doc_path_buf: [2048]u8 = undefined;
+var g_doc_path: []const u8 = "";
+
+fn setDocPath(path: []const u8) void {
+    const take = @min(path.len, g_doc_path_buf.len);
+    @memcpy(g_doc_path_buf[0..take], path[0..take]);
+    g_doc_path = g_doc_path_buf[0..take];
+}
+
+/// (Re)arm the external-change watcher on the current document (#44).
+/// No path (built-in/spool) or a vanished path simply disarms: the next
+/// successful open re-arms. Cold path only.
+fn watchCurrentDocument() void {
+    if (g_doc_path.len == 0) {
+        bridge.platform_unwatch_file();
+        return;
+    }
+    bridge.platform_watch_file(g_doc_path.ptr, @intCast(g_doc_path.len));
+}
+
+/// External file change (platform vnode event, #44): re-arm first
+/// (editors replace files, killing the watched fd), then reload with
+/// scroll preserved and clamped. A vanished or momentarily unreadable
+/// file keeps the old document; the next event converges.
+fn onFileChanged() callconv(.c) void {
+    watchCurrentDocument();
+    if (g_doc_path.len == 0) return;
+    const mapped = mmap.MappedFile.open(g_doc_path) catch return;
+    activateMappedFile(mapped, false);
 }
 
 // Cheat-sheet overlay visibility (issue #54), toggled by `?`.
@@ -557,7 +602,11 @@ var g_show_help: bool = false;
 fn onOpenFile(path_ptr: [*]const u8, path_len: c_int) callconv(.c) void {
     if (path_len <= 0) return;
     const path = path_ptr[0..@as(usize, @intCast(path_len))];
-    openDocumentInPlace(path, "");
+    if (openDocumentInPlace(path, "")) {
+        // The panel/drop hands absolute paths: anchor reloads (#44) here.
+        setDocPath(path);
+        watchCurrentDocument();
+    }
 }
 
 fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
@@ -575,7 +624,14 @@ fn onLink(url_ptr: [*]const u8, url_len: c_int) callconv(.c) void {
             // Relative `.md` links open in the same window, replacing the
             // document (history/back navigation is out of scope).
             const tgt = splitLinkTarget(url);
-            openDocumentInPlace(tgt.path, tgt.frag);
+            if (openDocumentInPlace(tgt.path, tgt.frag)) {
+                // Follow the new file for external-change reloads (#44).
+                var abs_buf: [2048]u8 = undefined;
+                if (resolveDocPath(tgt.path, &abs_buf)) |abs| {
+                    setDocPath(abs);
+                    watchCurrentDocument();
+                }
+            }
         },
         .external => {
             // http(s), other schemes, non-md locals: unchanged behavior —
@@ -1466,6 +1522,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (stdin_tmp_c) |cpath| _ = std.c.unlink(cpath);
         // Anchor relative `.md` links (and image paths) to this file's dir.
         setDocDir(path);
+        // Anchor external-change reloads (#44), unless this is an
+        // already-unlinked stdin spool (nothing to watch).
+        if (stdin_tmp_c == null) {
+            setDocPath(path);
+            watchCurrentDocument();
+        }
         // Document directory for relative image paths (#45). The platform
         // takes the full path and keeps the dirname; empty clears it.
         bridge.platform_set_document_dir(path.ptr, @intCast(path.len));
@@ -1589,6 +1651,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_display = onDisplay,
         .on_pinch = onPinch,
         .on_open_file = onOpenFile,
+        .on_file_changed = onFileChanged,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);
@@ -2026,6 +2089,85 @@ test "open file swaps document and resets viewport, restores cleanly (#43)" {
         try t.expectEqual(@as(usize, 3), g_app.line_count);
         try t.expectEqual(@as(f32, 0.0), g_app.scroll_y);
         try t.expectEqualStrings("", g_doc_dir);
+    }
+}
+
+test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
+    // Drives the real onFileChanged against a temp current-document, with
+    // the same save/restore discipline as the open test. Watcher arm and
+    // disarm go through the platform probe (armless firing needs a run
+    // loop, so only arm state is asserted headless).
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const tmp_name = "read_reload_test.md";
+        const v1 = "# One\n";
+        var v2_buf: [2048]u8 = undefined;
+        var v2_len: usize = 0;
+        var li: usize = 0;
+        while (li < 200) : (li += 1) {
+            const line = "# Line\n";
+            @memcpy(v2_buf[v2_len..][0..line.len], line);
+            v2_len += line.len;
+        }
+        const v2 = v2_buf[0..v2_len];
+        const wfd = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            tmp_name,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            0o644,
+        );
+        _ = std.c.write(wfd, v1.ptr, v1.len);
+        _ = std.c.close(wfd);
+        const s_bytes = g_app.bytes;
+        const s_mapped = g_app.mapped_file;
+        var s_path: [2048]u8 = undefined;
+        @memcpy(s_path[0..g_doc_path.len], g_doc_path);
+        const s_path_len = g_doc_path.len;
+        const s_scroll = g_app.scroll_y;
+        const s_target = g_smooth.target;
+        const s_current = g_smooth.current;
+        defer {
+            bridge.platform_unwatch_file();
+            if (g_app.mapped_file) |*m| m.close();
+            g_app.mapped_file = s_mapped;
+            g_app.bytes = s_bytes;
+            var in_fence: simd.FenceState = .{};
+            g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
+            g_app.lines = g_lines_buffer[0..g_app.line_count];
+            g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
+            @memcpy(g_doc_path_buf[0..s_path_len], s_path[0..s_path_len]);
+            g_doc_path = g_doc_path_buf[0..s_path_len];
+            g_app.scroll_y = s_scroll;
+            g_smooth.target = s_target;
+            g_smooth.current = s_current;
+            updateDocumentMetrics();
+            _ = std.c.unlink(tmp_name);
+        }
+        setDocPath(tmp_name);
+        watchCurrentDocument();
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_watch_active());
+        // External modify: content swaps, scroll offset is preserved.
+        const afd = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            tmp_name,
+            .{ .ACCMODE = .WRONLY, .TRUNC = true },
+            0o644,
+        );
+        _ = std.c.write(afd, v2.ptr, v2.len);
+        _ = std.c.close(afd);
+        g_app.scroll_y = 40.0;
+        onFileChanged();
+        try t.expectEqualStrings(v2, g_app.bytes);
+        try t.expectEqual(@as(usize, 200), g_app.line_count);
+        try t.expectEqual(@as(f32, 40.0), g_app.scroll_y);
+        // Vanished file: the last good document stays, no crash.
+        _ = std.c.unlink(tmp_name);
+        onFileChanged();
+        try t.expectEqualStrings(v2, g_app.bytes);
+        // Empty path disarms.
+        setDocPath("");
+        watchCurrentDocument();
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_watch_active());
     }
 }
 

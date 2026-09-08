@@ -1,6 +1,8 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
 #include <Carbon/Carbon.h> // IsSecureEventInputEnabled for Copy validation
+#import <dispatch/dispatch.h> // vnode watcher (libSystem, no new framework)
+#include <fcntl.h> // O_EVTONLY for the watcher (libSystem)
 #include "platform.h"
 
 static PlatformCallbacks g_callbacks = {0};
@@ -3812,5 +3814,52 @@ int platform_test_markdown_ext(const char* path, int path_len) {
     NSString* s = [[NSString alloc] initWithBytes:path length:(NSUInteger)path_len encoding:NSUTF8StringEncoding];
     if (!s) return 0;
     return read_url_is_markdown([NSURL fileURLWithPath:s]) ? 1 : 0;
+}
+#endif
+
+// External-change watcher (issue #44): a GCD vnode dispatch source on the
+// document. Event-driven on the main queue — no polling thread, no timer,
+// zero idle cost — exactly what the issue prescribes (VISION.md forbids
+// concurrency without a proven win; this is a main-queue event, not a hot
+// thread). Kept at end-of-file per the SIZE NOTE.
+static dispatch_source_t g_file_source = NULL;
+
+void platform_unwatch_file(void) {
+    // The cancel handler closes the fd; dropping our reference here is
+    // enough (re-watch opens a fresh fd, so nothing double-closes).
+    if (g_file_source) {
+        dispatch_source_cancel(g_file_source);
+        g_file_source = NULL;
+    }
+}
+
+void platform_watch_file(const char* path, int path_len) {
+    platform_unwatch_file();
+    if (!path || path_len <= 0 || path_len >= 2048) return;
+    char buf[2048];
+    memcpy(buf, path, (size_t)path_len);
+    buf[path_len] = '\0';
+    int fd = open(buf, O_EVTONLY);
+    if (fd < 0) return;
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE,
+        (uintptr_t)fd,
+        DISPATCH_VNODE_WRITE | DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_REVOKE,
+        dispatch_get_main_queue());
+    if (!src) { close(fd); return; }
+    g_file_source = src;
+    dispatch_source_set_event_handler(src, ^{
+        if (g_callbacks.on_file_changed) g_callbacks.on_file_changed();
+    });
+    dispatch_source_set_cancel_handler(src, ^{
+        close(fd);
+    });
+    dispatch_resume(src);
+}
+
+#ifdef TEST_HOOKS
+// Watcher-arm probe (issue #44): 1 while a vnode source is armed.
+// Headless-safe: firing needs a run loop, but arming does not.
+int platform_test_watch_active(void) {
+    return g_file_source ? 1 : 0;
 }
 #endif

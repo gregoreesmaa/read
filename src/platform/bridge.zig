@@ -38,6 +38,9 @@ pub const PlatformCallbacks = extern struct {
     /// absolute filesystem path, UTF-8. Appended last for the same
     /// FFI stability reason.
     on_open_file: ?*const fn (path: [*]const u8, path_len: c_int) callconv(.c) void = null,
+    /// External file change (vnode event, #44). Appended last for the
+    /// same FFI stability reason.
+    on_file_changed: ?*const fn () callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_outline_add(level: c_int, y: f32, text: [*]const u8, text_len: c_int) void;
@@ -211,6 +214,10 @@ pub extern "c" fn platform_test_key_plain(flags: c_ulong) c_int;
 /// Drop the selection/highlight model (issue #43): called after swapping
 /// the document, before redraw.
 pub extern "c" fn platform_clear_selection() void;
+/// External-change watcher (issue #44): event-driven vnode source.
+pub extern "c" fn platform_watch_file(path: [*]const u8, path_len: c_int) void;
+pub extern "c" fn platform_unwatch_file() void;
+pub extern "c" fn platform_test_watch_active() c_int;
 /// Extension-gate probe (issue #43): 1 when the path passes the Markdown
 /// filter. Test-hooks builds only.
 pub extern "c" fn platform_test_markdown_ext(path: [*]const u8, path_len: c_int) c_int;
