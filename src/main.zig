@@ -1902,6 +1902,31 @@ test "overscroll strip tracks app theme, not system (#104)" {
     }
 }
 
+test "plain keys never hijack modified combos (#32)" {
+    // The platform modifier gate (macos.m key_combo_plain) decides what
+    // reaches on_key. AppKit NSEventModifierFlags, stable documented
+    // values; the probe is pure and headless-safe.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const shift: c_ulong = 1 << 17;
+        const control: c_ulong = 1 << 18;
+        const option: c_ulong = 1 << 19;
+        const command: c_ulong = 1 << 20;
+        const caps: c_ulong = 1 << 16;
+        const numpad: c_ulong = 1 << 21;
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_key_plain(0));
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_key_plain(shift));
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_key_plain(caps));
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_key_plain(numpad));
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_key_plain(shift | caps));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(command));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(control));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(option));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(command | shift));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_key_plain(control | option));
+    }
+}
+
 test "cheatsheet overlay: ? toggles, Esc dismisses, unknown keys no-op" {
     // Drives the real onKey dispatch (same table the overlay lists), but
     // only through side-effect-free actions: no scroll (needs the platform
