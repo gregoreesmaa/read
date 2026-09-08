@@ -771,7 +771,12 @@ pub const FlowCtx = struct {
 pub const inline_code_scale: f32 = 0.88;
 pub const inline_code_pad_x: f32 = 3.0;
 pub const inline_code_radius: f32 = 5.0;
-pub const inline_code_pill_h_em: f32 = 1.4;
+/// Pill height in code-em (issue #103): 1.25 hugs the glyphs; the old 1.4
+/// centered on the 1.75em line box hung most of the fill below the text.
+pub const inline_code_pill_h_em: f32 = 1.25;
+/// How far the pill extends below the code baseline, in code-em (issue
+/// #103): covers descenders/underscore with a hair of air.
+pub const inline_code_pill_below_em: f32 = 0.32;
 /// Raw-HTML fallback line start (issue #26): offset of `<` when a paragraph
 /// line opens with an HTML tag/close/declaration/PI (`<div>`, `</div>`,
 /// `<!…>`, `<?…>`; up to 3 leading spaces, the CommonMark HTML-block
@@ -976,7 +981,11 @@ fn flowCodeSpan(
         total += measureTextEx(span_text[w_start..i], fs, style.bold, style.italic, true, style.heading);
     }
 
-    if (pen.x + total > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
+    // The trailing pad reserves space (issue #103): without it the pill's
+    // right pad always overlapped the next run (punctuation printed on
+    // gray). The box (text + both pads) wraps atomically, CSS-like.
+    const box_w = total + inline_code_pad_x * 2.0;
+    if (pen.x + box_w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
         pen.y += ctx.line_h;
         pen.x = ctx.start_x;
     }
@@ -985,12 +994,16 @@ fn flowCodeSpan(
         ctx.cmd_count.* < ctx.commands_out.len;
     if (can_emit) {
         const pill_h = @min(fs * inline_code_pill_h_em, ctx.line_h);
+        // Baseline-anchored (issue #103): the text renders at
+        // pen.y + fs*0.85, so the pill hangs pill_below_em under that
+        // line instead of centering on the tall line box.
+        const baseline = pen.y + fs * 0.85;
         ctx.commands_out[ctx.cmd_count.*] = .{
             .kind = .inline_code_bg,
             .rect = .{
                 .x = pen.x - inline_code_pad_x,
-                .y = pen.y + (ctx.line_h - pill_h) * 0.5,
-                .w = total + inline_code_pad_x * 2.0,
+                .y = baseline + fs * inline_code_pill_below_em - pill_h,
+                .w = box_w,
                 .h = pill_h,
             },
             .color = ctx.code_bg,
@@ -1026,6 +1039,9 @@ fn flowCodeSpan(
         }
         pen.x += word_w;
     }
+    // Trailing pad reserves the pill's right pad in the pen (issue #103):
+    // unconditional, so measure and render passes agree bit-for-bit.
+    pen.x += inline_code_pad_x;
 }
 
 test "design #23: inline code pill geometry + atomic wrap" {
@@ -1065,11 +1081,18 @@ test "design #23: inline code pill geometry + atomic wrap" {
     try std.testing.expectEqual(Theme.dark.code_bg, cmds[0].color);
     try std.testing.expectApproxEqAbs(cmds[0].rect.x, 0.0 - inline_code_pad_x, 0.01);
     try std.testing.expectApproxEqAbs(cmds[0].rect.w, total + inline_code_pad_x * 2.0, 0.01);
+    // Baseline-anchored (#103): the pill hugs the code baseline instead of
+    // the tall line box, and the pen reserves the trailing pad so the next
+    // run never prints on the pill's right pad.
+    const pill_h = fs * inline_code_pill_h_em;
+    try std.testing.expectApproxEqAbs(cmds[0].rect.h, pill_h, 0.01);
+    try std.testing.expectApproxEqAbs(cmds[0].rect.y, fs * 0.85 + fs * inline_code_pill_below_em - pill_h, 0.01);
+    try std.testing.expect(cmds[0].rect.y > -fs * 0.2 and cmds[0].rect.y + pill_h < 29.75);
     try std.testing.expectEqual(DrawCommandKind.text_run, cmds[1].kind);
     try std.testing.expectApproxEqAbs(cmds[1].font_size, fs, 0.001);
     try std.testing.expectApproxEqAbs(cmds[1].rect.w, word_w, 0.01);
     try std.testing.expectApproxEqAbs(cmds[2].rect.x, word_w + fs * 0.60, 0.01);
-    try std.testing.expectApproxEqAbs(pen.x, total, 0.01);
+    try std.testing.expectApproxEqAbs(pen.x, total + inline_code_pad_x, 0.01);
     try std.testing.expectApproxEqAbs(pen.y, 0.0, 0.001);
 
     // Measurement passes (empty buffer) advance the pen identically.
@@ -1080,7 +1103,7 @@ test "design #23: inline code pill geometry + atomic wrap" {
     zctx.cmd_count = &zn;
     flowSpans("foo bar", .{ .code = true }, null, &zpen, zctx, false);
     try std.testing.expectEqual(@as(usize, 0), zn);
-    try std.testing.expectApproxEqAbs(zpen.x, total, 0.001);
+    try std.testing.expectApproxEqAbs(zpen.x, total + inline_code_pad_x, 0.001);
     try std.testing.expectApproxEqAbs(zpen.y, 0.0, 0.001);
 
     // Atomic wrap: a span wider than the remaining row moves whole.
@@ -1092,7 +1115,7 @@ test "design #23: inline code pill geometry + atomic wrap" {
     ctx2.cmd_count = &n2;
     flowSpans("foo bar", .{ .code = true }, null, &pen2, ctx2, false);
     try std.testing.expectApproxEqAbs(pen2.y, 29.75, 0.001);
-    try std.testing.expectApproxEqAbs(pen2.x, total, 0.01);
+    try std.testing.expectApproxEqAbs(pen2.x, total + inline_code_pad_x, 0.01);
     try std.testing.expectEqual(DrawCommandKind.inline_code_bg, cmds2[0].kind);
     try std.testing.expectApproxEqAbs(cmds2[0].rect.x, 0.0 - inline_code_pad_x, 0.01);
 
