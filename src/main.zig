@@ -106,6 +106,12 @@ fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) ca
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
+// Gesture conditioning (#31): precise 1:1 untouched, wheel jitter
+// quantized. Edge rubber-band overshoot, pinch accumulation, and the
+// standalone pinch zoom factor (see onPinch for the #30 overlap note).
+var g_gesture_filter: layout.GestureFilter = .{};
+var g_edge: layout.EdgeSpring = .{};
+var g_pinch: layout.PinchState = .{};
 // Smooth-scroll animation state: inputs retarget, a 120Hz platform tick
 // eases g_app.scroll_y (displayed) toward the target. Anchor jumps and
 // resizes snap both so they stay 1:1.
@@ -220,7 +226,15 @@ fn onScrollTo(scroll_y: f32) callconv(.c) void {
 
 fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void {
     const now_ms = getTimestampMs();
-    const locked = g_scroll_lock.processScroll(delta_x, delta_y, hovered_block_id, now_ms);
+    // Gesture conditioning first: precise deltas pass bit-exact (1:1
+    // sync preserved); absorbed wheel jitter feeds the lock a zero so a
+    // lifted gesture still resets cleanly, then returns (nothing moved).
+    const cond = g_gesture_filter.filter(delta_x, delta_y, precise != 0);
+    if (cond.dx == 0.0 and cond.dy == 0.0) {
+        _ = g_scroll_lock.processScroll(0.0, 0.0, hovered_block_id, now_ms);
+        return;
+    }
+    const locked = g_scroll_lock.processScroll(cond.dx, cond.dy, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
         // Routing (precise 1:1 vs eased wheel) lives in
@@ -228,6 +242,8 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
         // rationale is documented there. Reduce Motion snaps here, so no
         // timer is armed. Sync the displayed offset, then arm the tick
         // while unsettled (snaps settle synchronously, no timer).
+        const target_before = g_smooth.target;
+        const current_before = g_smooth.current;
         g_smooth = layout.MotionPolicy.applyVertical(
             g_smooth.target,
             g_smooth.current,
@@ -236,6 +252,16 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
             g_app.max_scroll_y,
             g_reduce_motion,
         );
+        // Bound residual becomes rubber-band overshoot (capped, decaying):
+        // desired minus actual, in scroll coords. Also arm the tick so the
+        // spring decay runs even when the scroll itself already settled.
+        const desired = if (precise != 0) current_before - locked.dy else target_before - locked.dy;
+        const actual = if (precise != 0) g_smooth.current else g_smooth.target;
+        const over = desired - actual;
+        if (over != 0.0) {
+            g_edge.absorb(over);
+            bridge.platform_smooth_kick();
+        }
         g_app.scroll_y = g_smooth.current;
         if (!g_smooth.settled()) bridge.platform_smooth_kick();
     }
@@ -262,6 +288,12 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
     g_app.scroll_y = g_smooth.current;
+    // Rubber-band decay keeps the timer alive past scroll settle (full
+    // redraws: the translate moves every pixel) and parks exactly at zero.
+    if (!g_edge.tick(dt_ms / 1000.0)) {
+        bridge.platform_request_redraw();
+        return 1;
+    }
     return if (settled) 0 else 1;
 }
 
@@ -280,6 +312,25 @@ fn onDisplay(category_class: c_int, zoom_percent: c_int, reduce_motion: c_int) c
     } else {
         snapScroll(g_app.scroll_y);
     }
+}
+
+/// Pinch-to-zoom: per-event magnification accumulates into x1.25 tiers
+/// (see PinchState); exact-0.0 is the double-tap smart-magnify toggle
+/// between 100% and 150% (the platform never sends 0.0 for real pinches).
+/// Tiers route through #30's class-aware TextScale (no standalone factor).
+fn onPinch(magnification: f32) callconv(.c) void {
+    if (magnification == 0.0) {
+        g_text_scale.setZoomPercent(if (g_text_scale.zoomPercent() == 150) 100 else 150);
+        g_pinch.reset();
+    } else {
+        const steps = g_pinch.accumulate(magnification);
+        var i: c_int = 0;
+        while (i < steps) : (i += 1) g_text_scale.zoomIn();
+        while (i > steps) : (i -= 1) g_text_scale.zoomOut();
+        if (steps == 0) return;
+    }
+    updateDocumentMetrics();
+    snapScroll(g_app.scroll_y);
     bridge.platform_request_redraw();
 }
 
@@ -662,6 +713,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     }
 
     bridge.platform_sync_scroll(g_app.scroll_y);
+    bridge.platform_sync_overshoot(g_edge.overshoot);
     bridge.platform_set_scroll_info(g_app.scroll_y, g_app.max_scroll_y, g_app.window_height);
 
     // Damage tracking: AppKit reports the dirty rect for this draw.
@@ -1510,6 +1562,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_appearance = onAppearance,
         .on_outline_open = onOutlineOpen,
         .on_display = onDisplay,
+        .on_pinch = onPinch,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);

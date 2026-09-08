@@ -8,6 +8,8 @@ static NSWindow* g_window = nil;
 static NSView*   g_main_view = nil;   // set in platform_init for async image → setNeedsDisplay
 static CGContextRef g_current_cg_context = NULL;
 static float g_scroll_y = 0.0f;
+// Rubber-band overshoot (#31): visual translate, positive = content down.
+static float g_overshoot = 0.0f;
 static NSPoint g_mouse_pos = {-9999.0f, -9999.0f};
 
 // Ambient scrollbar drag model (mirrors scrollbarThumbY/scrollbarScrollFromY
@@ -1081,6 +1083,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     CGContextSetShouldAntialias(ctx, true);
     CGContextSetShouldSmoothFonts(ctx, true);
     CGContextSetAllowsFontSmoothing(ctx, true);
+    // Rubber-band overshoot (#31): translate the whole frame by the live
+    // spring value. Transient (decays in ~200ms, full redraws while
+    // active); hit-testing uses the unshifted offset, off by at most
+    // 48px mid-gesture. The uncovered strip shows the window background.
+    if (g_overshoot != 0.0f) CGContextTranslateCTM(ctx, 0.0, g_overshoot);
     g_draw_seq++;
 #ifdef TEST_HOOKS
     uint64_t draw_t0 = dbg_now_ns();
@@ -1911,6 +1918,27 @@ static NSString* selected_text_string(void) {
     [self setNeedsDisplay:YES];
 }
 
+// Pinch-to-zoom (#31): forward per-event magnification; the Zig
+// PinchState tiers it into x1.25 steps. Exact-0.0 events carry no
+// information and are skipped so 0.0 stays reserved for the smart-toggle.
+- (void)magnifyWithEvent:(NSEvent *)event {
+    float m = (float)[event magnification];
+    if (m == 0.0f) return;
+    if (g_callbacks.on_pinch) {
+        g_callbacks.on_pinch(m);
+    }
+    [self setNeedsDisplay:YES];
+}
+
+// Double-tap smart magnify: toggle 100% <-> 150% via the reserved 0.0.
+- (void)smartMagnifyWithEvent:(NSEvent *)event {
+    (void)event;
+    if (g_callbacks.on_pinch) {
+        g_callbacks.on_pinch(0.0f);
+    }
+    [self setNeedsDisplay:YES];
+}
+
 - (void)keyDown:(NSEvent *)event {
     NSUInteger flags = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
     NSString* chars = [event charactersIgnoringModifiers];
@@ -2311,6 +2339,10 @@ int platform_get_pending_damage(float* x, float* y, float* w, float* h) {
     if (w) *w = g_pending_dirty.size.width;
     if (h) *h = g_pending_dirty.size.height;
     return 1;
+}
+
+void platform_sync_overshoot(float overshoot) {
+    g_overshoot = overshoot;
 }
 
 void platform_sync_scroll(float scroll_y) {

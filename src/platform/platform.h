@@ -17,6 +17,7 @@ typedef struct {
     void (*on_appearance)(int is_dark);
     void (*on_outline_open)(void);
     void (*on_display)(int category_class, int zoom_percent, int reduce_motion);
+    void (*on_pinch)(float magnification);
 } PlatformCallbacks;
 
 void platform_outline_add(int level, float y, const char* text, int text_len);
@@ -28,6 +29,7 @@ void platform_request_redraw(void);
 void platform_request_redraw_rect(float x, float y, float w, float h);
 int platform_get_pending_damage(float* x, float* y, float* w, float* h);
 void platform_sync_scroll(float scroll_y);
+void platform_sync_overshoot(float overshoot);
 void platform_smooth_kick(void);
 void platform_set_scroll_info(float scroll_y, float max_scroll_y, float view_h);
 
