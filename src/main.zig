@@ -722,7 +722,7 @@ fn clearFind() void {
 /// exactly (direction-proof); partial matches measure the byte prefix
 /// with the same estimator layout used. Culled runs never reach here,
 /// so partial-damage draws stay pixel-identical to full draws.
-fn paintFindHighlights(cmd: layout.DrawCommand, theme: layout.Theme) void {
+fn paintFindHighlights(cmd: *const layout.DrawCommand, find_bg: *const layout.Color, find_current: *const layout.Color) void {
     const bytes = g_app.bytes;
     if (bytes.len == 0 or g_find_count == 0) return;
     const base = @intFromPtr(bytes.ptr);
@@ -744,7 +744,7 @@ fn paintFindHighlights(cmd: layout.DrawCommand, theme: layout.Theme) void {
         const ms = @max(m.start, rs);
         const me = @min(m.start + m.len, re);
         if (me <= ms) continue;
-        const col = if (mi == g_find_current) theme.find_current else theme.find_bg;
+        const col = if (mi == g_find_current) find_current.* else find_bg.*;
         if (mi == g_find_current) g_find_painted = true;
         var hx: f32 = cmd.rect.x;
         var hw: f32 = cmd.rect.w;
@@ -1158,10 +1158,12 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                             layout.Theme.light.link_visited;
                     }
                 }
-                // Find washes paint first, glyphs over them (#42).
+                // Find washes paint first, glyphs over them (#42). Theme
+                // taken by pointer so the per-run call moves 24 bytes,
+                // not a whole Theme struct.
                 if (g_find_count > 0) {
-                    const th = if (g_app.is_dark_theme) layout.Theme.dark else layout.Theme.light;
-                    paintFindHighlights(cmd, th);
+                    const th = if (g_app.is_dark_theme) &layout.Theme.dark else &layout.Theme.light;
+                    paintFindHighlights(&cmd, &th.find_bg, &th.find_current);
                 }
                 bridge.platform_draw_text(
                     cmd.text.ptr,
