@@ -193,6 +193,7 @@ pub extern "c" fn platform_register_scrollable_block(
     w: f32,
     h: f32,
     max_scroll_x: f32,
+    scroll_x: f32,
 ) void;
 
 pub extern "c" fn platform_begin_clip(

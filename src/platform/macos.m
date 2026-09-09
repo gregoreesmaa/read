@@ -124,6 +124,8 @@ typedef struct {
     int id;
     float x, y, w, h;
     float max_scroll_x;
+    // #314: live per-frame offset, pushed by Zig on every draw.
+    float scroll_x;
 } ScrollableBlockRecord;
 
 #define MAX_SCROLLABLE_BLOCKS 128
@@ -135,7 +137,66 @@ static int g_selection_mode = 0; // 0 = none, 1 = range, 2 = word, 3 = line, 4 =
 static NSPoint g_select_start = {0, 0}; // Stored in document coordinates
 static NSPoint g_select_end = {0, 0};   // Stored in document coordinates
 static NSPoint g_select_anchor = {0, 0}; // Fixed end for word/line drag extension
+// #314: y was always true document space, but x was view-x-at-capture while
+// records rebuild in view-x-now, so h-scrolling a code/table block left the
+// highlight (and copy) behind. Endpoints are now true document x (view +
+// owning block's offset at capture); readers map back to view space with
+// the owning block's LIVE offset, resolved per read from the document
+// point, so no capture-time block state can go stale across frames.
 static BOOL g_select_all = NO;
+
+// #314: scrollable block whose container frame holds a VIEW point, or -1
+// (same convention as the wheel-hover lookup: the draw space is viewport-
+// relative; records add g_scroll_y to reach document y). Container frames
+// never scroll horizontally, so the raw view point is exact.
+static int scroll_block_at_point(float x, float y) {
+    for (int i = 0; i < g_scrollable_block_count; i++) {
+        ScrollableBlockRecord* b = &g_scrollable_blocks[i];
+        if (x >= b->x && x <= b->x + b->w && y >= b->y && y <= b->y + b->h) return b->id;
+    }
+    return -1;
+}
+
+// #314: scrollable block owning a DOCUMENT point, or -1. The container's
+// document frame is its view frame shifted by (+live offset, +g_scroll_y);
+// the lookup band covers every legal offset (0..max), and the y band
+// (blocks are stacked, y-unambiguous) is the primary key. Reads resolve
+// the owner live, so a scrolled-then-vertically-culled block simply
+// reports unknown.
+static int scroll_block_at_doc(float doc_x, float doc_y) {
+    for (int i = 0; i < g_scrollable_block_count; i++) {
+        ScrollableBlockRecord* b = &g_scrollable_blocks[i];
+        float top = b->y + g_scroll_y;
+        if (doc_y < top || doc_y > top + b->h) continue;
+        if (doc_x >= b->x - 1.0f && doc_x <= b->x + b->w + 2.0f * b->max_scroll_x + 1.0f) return b->id;
+    }
+    return -1;
+}
+
+// #314: live horizontal offset for a block id. *known distinguishes a
+// registered-at-zero block from an unregistered (vertically culled) one:
+// unknown blocks must not silently shift coordinates.
+static float scroll_block_offset(int id, BOOL* known) {
+    if (id >= 0) {
+        for (int i = 0; i < g_scrollable_block_count; i++) {
+            if (g_scrollable_blocks[i].id == id) {
+                if (known) *known = YES;
+                return g_scrollable_blocks[i].scroll_x;
+            }
+        }
+    }
+    if (known) *known = (id < 0) ? YES : NO;
+    return 0.0f;
+}
+
+// #314: view-space x for a document-space selection endpoint. Unknown
+// owners (culled blocks, body text) map to offset 0, which is exact in
+// both cases: body text never shifts, and a culled block's rows have no
+// records, so paint/copy loops over the endpoint's rows are no-ops. Only
+// damage needs the known flag (a wrong box under-invalidates -> residue).
+static float scroll_doc_to_view(float doc_x, float doc_y, BOOL* known) {
+    return doc_x - scroll_block_offset(scroll_block_at_doc(doc_x, doc_y), known);
+}
 
 // ---------------------------------------------------------------------------
 // Damage tracking (dirty rectangles): submit only the changed region to the
@@ -216,8 +277,14 @@ static NSRect selection_bounds_expanded(float pad) {
         return NSInsetRect([v bounds], -pad, -pad);
     }
     if (!g_has_selection) return NSZeroRect;
-    float x1 = fminf(g_select_start.x, g_select_end.x);
-    float x2 = fmaxf(g_select_start.x, g_select_end.x);
+    // #314: endpoints are document x; damage is view space. An endpoint
+    // whose block is vertically culled (unregistered) falls back to a
+    // full-width box: safe over-invalidation, never residue.
+    BOOL k1 = NO, k2 = NO;
+    float s1v = scroll_doc_to_view(g_select_start.x, g_select_start.y, &k1);
+    float s2v = scroll_doc_to_view(g_select_end.x, g_select_end.y, &k2);
+    float x1, x2;
+    if (!k1 || !k2) { x1 = -1e4f; x2 = 1e4f; } else { x1 = fminf(s1v, s2v); x2 = fmaxf(s1v, s2v); }
     float y1 = fminf(g_select_start.y, g_select_end.y) - g_scroll_y;
     float y2 = fmaxf(g_select_start.y, g_select_end.y) - g_scroll_y;
     // Vertical pad covers a full max-height record (46px, measured) past an
@@ -831,6 +898,12 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         float min_y = top_pt.y;
         float max_y = bot_pt.y;
 
+        // #314: endpoints are document x but records store translated
+        // (view-now) x: map each endpoint through its owning block's LIVE
+        // offset, resolved from the document point itself.
+        float top_vx = scroll_doc_to_view(top_pt.x, top_pt.y, NULL);
+        float bot_vx = scroll_doc_to_view(bot_pt.x, bot_pt.y, NULL);
+
         // Snap endpoints that land in an inter-line gap to the nearest
         // record edge — but ONLY within the same 4px slop the band check
         // below tolerates. The record mirror is virtualized (visible rows
@@ -929,12 +1002,12 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             // covered gap dark (2026-09: holes around 1-char code spans).
             float span_lo, span_hi;
             if (is_first_line && is_last_line) {
-                span_lo = fminf(top_pt.x, bot_pt.x);
-                span_hi = fmaxf(top_pt.x, bot_pt.x);
+                span_lo = fminf(top_vx, bot_vx);
+                span_hi = fmaxf(top_vx, bot_vx);
             } else if (is_first_line) {
-                span_lo = top_pt.x; span_hi = 1e30f;
+                span_lo = top_vx; span_hi = 1e30f;
             } else if (is_last_line) {
-                span_lo = -1e30f; span_hi = bot_pt.x;
+                span_lo = -1e30f; span_hi = bot_vx;
             } else {
                 span_lo = -1e30f; span_hi = 1e30f;
             }
@@ -949,8 +1022,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
 
             if (is_first_line && is_last_line) {
-                float left_x = fminf(top_pt.x, bot_pt.x);
-                float right_x = fmaxf(top_pt.x, bot_pt.x);
+                float left_x = fminf(top_vx, bot_vx);
+                float right_x = fmaxf(top_vx, bot_vx);
                 if (rec->x + rec->w < left_x || rec->x > right_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
@@ -961,7 +1034,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 c_start = get_char_index_at_x(rec, left_x - rec->x);
                 c_end = get_char_index_at_x(rec, right_x - rec->x);
             } else if (is_first_line) {
-                float start_x = top_pt.x;
+                float start_x = top_vx;
                 if (rec->x + rec->w < start_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
@@ -972,7 +1045,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 c_start = get_char_index_at_x(rec, start_x - rec->x);
                 c_end = rec->len;
             } else if (is_last_line) {
-                float end_x = bot_pt.x;
+                float end_x = bot_vx;
                 if (rec->x > end_x) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
@@ -1241,7 +1314,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
     g_select_all = NO;
     g_has_selection = YES;
-    g_select_start = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
+    // #314: hit-testing runs in view space (records store translated x);
+    // stored endpoints are document x (view + owning block's offset).
+    float down_doc_y = view_pt.y + g_scroll_y;
+    float click_off = scroll_block_offset(scroll_block_at_point(view_pt.x, view_pt.y), NULL);
+    g_select_start = NSMakePoint(view_pt.x + click_off, down_doc_y);
     g_select_end = g_select_start;
     g_select_anchor = g_select_start;
 
@@ -1251,21 +1328,27 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         g_selection_mode = 2;
         for (int q = 0; q < g_text_record_count; q++) {
             QuadTextRecord* rec = &g_text_records[q];
-            if (g_select_start.x >= rec->x && g_select_start.x <= rec->x + rec->w &&
+            if (view_pt.x >= rec->x && view_pt.x <= rec->x + rec->w &&
                 g_select_start.y >= rec->doc_y && g_select_start.y <= rec->doc_y + rec->h)
             {
                 float mid_y = rec->doc_y + rec->h * 0.5f;
-                int u16 = get_char_index_at_x(rec, g_select_start.x - rec->x);
+                int u16 = get_char_index_at_x(rec, view_pt.x - rec->x);
                 int b = utf16_to_utf8(rec->text, rec->len, u16);
                 int ws = word_start_in_bytes(rec->text, rec->len, b);
                 int we = word_end_in_bytes(rec->text, rec->len, b);
+                // #314: snapped points are view-space; store document x.
+                // The owner resolves at the snapped view point itself.
+                float svx0, svx1;
                 if (we > ws) {
-                    g_select_start = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, ws)), mid_y);
-                    g_select_end = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, we)), mid_y);
+                    svx0 = rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, ws));
+                    svx1 = rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, we));
                 } else {
-                    g_select_start = NSMakePoint(rec->x, mid_y);
-                    g_select_end = NSMakePoint(rec->x + rec->w, mid_y);
+                    svx0 = rec->x;
+                    svx1 = rec->x + rec->w;
                 }
+                float snap_off = scroll_block_offset(scroll_block_at_point(svx0, view_pt.y), NULL);
+                g_select_start = NSMakePoint(svx0 + snap_off, mid_y);
+                g_select_end = NSMakePoint(svx1 + snap_off, mid_y);
                 g_select_anchor = g_select_start;
                 break;
             }
@@ -1285,8 +1368,12 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
         }
         if (line_max_x > line_min_x) {
-            g_select_start = NSMakePoint(line_min_x, click_doc_y);
-            g_select_end = NSMakePoint(line_max_x, click_doc_y);
+            // #314: band edges are view-space; store document x, each end
+            // through the block under its own view point.
+            float lo_off = scroll_block_offset(scroll_block_at_point(line_min_x, view_pt.y), NULL);
+            float hi_off = scroll_block_offset(scroll_block_at_point(line_max_x, view_pt.y), NULL);
+            g_select_start = NSMakePoint(line_min_x + lo_off, click_doc_y);
+            g_select_end = NSMakePoint(line_max_x + hi_off, click_doc_y);
         }
     } else {
         g_selection_mode = 1;
@@ -1310,6 +1397,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     }
     NSPoint drag_view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
     NSPoint drag_doc = NSMakePoint(drag_view_pt.x, drag_view_pt.y + g_scroll_y);
+    // #314: the drag point is view space; the anchor is document x.
+    float drag_doc_x = drag_view_pt.x + scroll_block_offset(
+        scroll_block_at_point(drag_view_pt.x, drag_view_pt.y), NULL);
     if (g_selection_mode == 2) {
         // Word-wise extension: the anchor never moves; the free end snaps
         // to the word boundary under the cursor (word start when dragging
@@ -1323,14 +1413,16 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 float mid_y = rec->doc_y + rec->h * 0.5f;
                 int u16 = get_char_index_at_x(rec, drag_doc.x - rec->x);
                 int b = utf16_to_utf8(rec->text, rec->len, u16);
-                if (drag_doc.x < g_select_anchor.x) {
+                if (drag_doc_x < g_select_anchor.x) {
                     int ws = word_start_in_bytes(rec->text, rec->len, b);
-                    g_select_end = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, ws)), mid_y);
+                    float svx = rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, ws));
+                    g_select_end = NSMakePoint(svx + scroll_block_offset(scroll_block_at_point(svx, drag_view_pt.y), NULL), mid_y);
                 } else {
                     int ws = word_start_in_bytes(rec->text, rec->len, b);
                     int we = word_end_in_bytes(rec->text, rec->len, b);
                     if (we > ws) {
-                        g_select_end = NSMakePoint(rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, we)), mid_y);
+                        float svx = rec->x + get_x_for_char_index(rec, utf8_to_utf16(rec->text, we));
+                        g_select_end = NSMakePoint(svx + scroll_block_offset(scroll_block_at_point(svx, drag_view_pt.y), NULL), mid_y);
                     }
                 }
                 break;
@@ -1355,10 +1447,14 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             }
         }
         if (band_max > band_min) {
+            // #314: band edges are view-space; store document x, each end
+            // through the block under its own view point.
             if (drag_doc.y < g_select_anchor.y) {
-                g_select_start = NSMakePoint(band_min, drag_doc.y);
+                float lo_off = scroll_block_offset(scroll_block_at_point(band_min, drag_view_pt.y), NULL);
+                g_select_start = NSMakePoint(band_min + lo_off, drag_doc.y);
             } else {
-                g_select_end = NSMakePoint(band_max, drag_doc.y);
+                float hi_off = scroll_block_offset(scroll_block_at_point(band_max, drag_view_pt.y), NULL);
+                g_select_end = NSMakePoint(band_max + hi_off, drag_doc.y);
             }
         }
         invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
@@ -1377,7 +1473,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
         NSPoint prev_end = g_select_end;
 #endif
-        g_select_end = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
+        // #314: store document x (view + owning block's offset).
+        float drag_end_doc_y = view_pt.y + g_scroll_y;
+        float drag_end_off = scroll_block_offset(scroll_block_at_point(view_pt.x, view_pt.y), NULL);
+        g_select_end = NSMakePoint(view_pt.x + drag_end_off, drag_end_doc_y);
         invalidate_rect(union_rect(old_sel, selection_bounds_expanded(24.0f)));
 #ifdef TEST_HOOKS
         DBGLOG("EV mousedrag mode=%d end=%.0f,%.0f->%.0f,%.0f dmg=%.0f,%.0f,%.0fx%.0f",
@@ -1415,7 +1514,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     NSRect old_sel = selection_bounds_expanded(24.0f);
 
     NSPoint view_pt = [self convertPoint:[event locationInWindow] fromView:nil];
-    NSPoint end_doc = NSMakePoint(view_pt.x, view_pt.y + g_scroll_y);
+    // #314: release point is view space; the stored end is document x.
+    // Link hit-testing below keeps the raw view point (records are view).
+    float up_doc_y = view_pt.y + g_scroll_y;
+    float up_off = scroll_block_offset(scroll_block_at_point(view_pt.x, view_pt.y), NULL);
+    NSPoint end_doc = NSMakePoint(view_pt.x + up_off, up_doc_y);
 
     // If simple click without drag:
     if (fabs(end_doc.y - g_select_start.y) < 4.0f && fabs(end_doc.x - g_select_start.x) < 4.0f) {
@@ -1427,7 +1530,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             for (int i = 0; i < g_text_record_count; i++) {
                 QuadTextRecord* rec = &g_text_records[i];
                 if (rec->link_url[0] != '\0' &&
-                    end_doc.x >= rec->x && end_doc.x <= rec->x + rec->w &&
+                    view_pt.x >= rec->x && view_pt.x <= rec->x + rec->w &&
                     end_doc.y >= rec->doc_y && end_doc.y <= rec->doc_y + rec->h) {
                     // In-app navigation (#46): section links always route to
                     // Zig, as does every other non-http(s) link, so relative
@@ -1685,6 +1788,11 @@ static NSString* selected_text_string(void) {
         float min_y = top_pt.y;
         float max_y = bot_pt.y;
 
+        // #314: same document-to-view mapping as the highlight painter:
+        // copy must read the characters under the painted wash.
+        float top_vx = scroll_doc_to_view(top_pt.x, top_pt.y, NULL);
+        float bot_vx = scroll_doc_to_view(bot_pt.x, bot_pt.y, NULL);
+
         float last_doc_y = -9999.0f;
 
         for (int q = 0; q < g_text_record_count; q++) {
@@ -1701,18 +1809,18 @@ static NSString* selected_text_string(void) {
             BOOL is_last_line = (max_y >= r_top && max_y <= r_bot);
 
             if (is_first_line && is_last_line) {
-                float left_x = fminf(top_pt.x, bot_pt.x);
-                float right_x = fmaxf(top_pt.x, bot_pt.x);
+                float left_x = fminf(top_vx, bot_vx);
+                float right_x = fmaxf(top_vx, bot_vx);
                 if (rec->x + rec->w < left_x || rec->x > right_x) continue;
                 c_start = get_char_index_at_x(rec, left_x - rec->x);
                 c_end = get_char_index_at_x(rec, right_x - rec->x);
             } else if (is_first_line) {
-                float start_x = top_pt.x;
+                float start_x = top_vx;
                 if (rec->x + rec->w < start_x) continue;
                 c_start = get_char_index_at_x(rec, start_x - rec->x);
                 c_end = rec->len;
             } else if (is_last_line) {
-                float end_x = bot_pt.x;
+                float end_x = bot_vx;
                 if (rec->x > end_x) continue;
                 c_start = 0;
                 c_end = get_char_index_at_x(rec, end_x - rec->x);
@@ -2260,8 +2368,12 @@ unsigned long platform_test_image_draws(void) { return g_test_image_draws; }
 static float g_test_scale = 0.0f;
 void platform_set_test_scale(float s) { g_test_scale = s; }
 void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
+    // Doc-space endpoints (issue #55 pin: --select takes document coords);
+    // #314 readers resolve the owning block live per read, so the hook
+    // stores raw coordinates with nothing to go stale.
     g_select_start = NSMakePoint(x1, y1);
     g_select_end = NSMakePoint(x2, y2);
+    g_select_anchor = g_select_start;
     g_has_selection = enable ? YES : NO;
     g_selection_mode = enable ? 1 : 0;
     g_select_all = NO;
@@ -2386,7 +2498,7 @@ void platform_register_code_block(float x, float y, float w, float h, const char
     }
 }
 
-void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x) {
+void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x, float scroll_x) {
     if (g_scrollable_block_count >= MAX_SCROLLABLE_BLOCKS) return;
     g_scrollable_blocks[g_scrollable_block_count++] = (ScrollableBlockRecord){
         .id = block_id,
@@ -2395,6 +2507,7 @@ void platform_register_scrollable_block(int block_id, float x, float y, float w,
         .w = w,
         .h = h,
         .max_scroll_x = max_scroll_x,
+        .scroll_x = scroll_x,
     };
 }
 
