@@ -7,6 +7,10 @@ on:
   push:
     tags:
       - "v*"
+    # Belt-and-braces: branch pushes must never queue this workflow
+    # (scheduler created jobless failing runs for every branch push).
+    branches-ignore:
+      - "**"
 
 permissions:
   contents: write
@@ -14,8 +18,15 @@ permissions:
 jobs:
   release-macos:
     runs-on: macos-latest
+    # Defense in depth: tags-only trigger above plus this guard, so a
+    # branch push can never execute (or publish) a release.
+    if: startsWith(github.ref, 'refs/tags/')
     env:
       TAG: ${{ github.ref_name }}
+      # secrets are not allowed in step `if:` (queue-time validation
+      # failure); hoist to env booleans once, compare in steps.
+      HAS_SIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY != '' }}
+      HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,7 +59,7 @@ jobs:
           sh scripts/check_app_bundle.sh zig-out/Read.app
 
       - name: Codesign (Developer ID, when secrets exist)
-        if: ${{ secrets.APPLE_DEVELOPER_IDENTITY != '' }}
+        if: env.HAS_SIGN_IDENTITY == 'true'
         run: |
           codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
             --options runtime --timestamp -v zig-out/bin/read
@@ -57,7 +68,7 @@ jobs:
           codesign -vv zig-out/bin/read zig-out/Read.app
 
       - name: Notarize (Apple notarytool, when secrets exist)
-        if: ${{ secrets.APPLE_ID != '' }}
+        if: env.HAS_APPLE_ID == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
@@ -96,7 +107,7 @@ jobs:
             echo
             echo "Checksum (sha256):"
             cat "dist/$DIST.tar.gz.sha256"
-            if [ -z "${{ secrets.APPLE_ID }}" ]; then
+            if [ "$HAS_APPLE_ID" != 'true' ]; then
               echo
               echo "Note: built without Apple signing secrets, so this artifact is"
               echo "unsigned (Gatekeeper will block it on other Macs until a signed"
