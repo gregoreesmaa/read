@@ -313,6 +313,18 @@ static NSRect copy_button_rect_for_block(CodeBlockRecord* b) {
     return NSMakeRect(b->x + b->w - 64.0f - 8.0f, b->y + 8.0f, 64.0f, 24.0f);
 }
 
+// Damage rect for the hover button. The 1px stroke is centered on the
+// pill edge, so 0.5px of ink plus antialiasing fall OUTSIDE the button
+// rect; invalidating the exact rect leaves a 1px ghost outline when the
+// button disappears (and drops the fringe when it appears). 2px covers
+// every fractional alignment at 1x and 2x. Hit-testing keeps the exact
+// rect above.
+static NSRect copy_button_damage_rect(CodeBlockRecord* b) {
+    return NSInsetRect(copy_button_rect_for_block(b), -2.0f, -2.0f);
+}
+
+static void paint_copy_button(CGContextRef ctx);
+
 static void register_app_fonts(void) {
     static BOOL registered = NO;
     if (registered) return;
@@ -1113,7 +1125,17 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
 #endif
 
-    // Draw visible-on-hover Copy Button for Code Blocks
+    paint_copy_button(ctx);
+
+    g_current_cg_context = NULL;
+    g_pending_dirty_valid = NO;
+}
+
+// Visible-on-hover Copy Button for Code Blocks. Shared by live draws and
+// the headless screenshot engine so --hover screenshots exercise the same
+// paint (and the damage-rect contract the test pins actually covers it).
+static void paint_copy_button(CGContextRef ctx) {
+    (void)ctx;
     double now = [NSDate timeIntervalSinceReferenceDate];
     for (int b_idx = 0; b_idx < g_code_block_count; b_idx++) {
         CodeBlockRecord* b = &g_code_blocks[b_idx];
@@ -1150,9 +1172,6 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             [label drawAtPoint:NSMakePoint(text_x, text_y) withAttributes:attrs];
         }
     }
-
-    g_current_cg_context = NULL;
-    g_pending_dirty_valid = NO;
 }
 
 - (void)mouseMoved:(NSEvent *)event {
@@ -1200,13 +1219,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     // Damage: cursor changes need no repaint. Only the hover Copy button
     // changing visibility dirties pixels: invalidate old + new button rects.
     int new_hover_btn = -1;
-    NSRect new_btn_rect = NSZeroRect;
     for (int b_idx = 0; b_idx < g_code_block_count; b_idx++) {
         CodeBlockRecord* b = &g_code_blocks[b_idx];
         if (g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
             g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
             new_hover_btn = b_idx;
-            new_btn_rect = copy_button_rect_for_block(b);
             break;
         }
     }
@@ -1228,10 +1245,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
     g_last_code_btn_hover = over_code_btn;
     if (new_hover_btn != g_hovered_code_btn) {
         if (g_hovered_code_btn >= 0 && g_hovered_code_btn < g_code_block_count) {
-            invalidate_rect(copy_button_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
+            invalidate_rect(copy_button_damage_rect(&g_code_blocks[g_hovered_code_btn]));
         }
         if (new_hover_btn >= 0) {
-            invalidate_rect(new_btn_rect);
+            invalidate_rect(copy_button_damage_rect(&g_code_blocks[new_hover_btn]));
         }
         g_hovered_code_btn = new_hover_btn;
     }
@@ -1240,9 +1257,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 - (void)mouseExited:(NSEvent *)event {
     (void)event;
     g_mouse_pos = NSMakePoint(-9999.0f, -9999.0f);
-    // Clear button hover with its exact rect; link hover via one gated redraw.
+    // Clear button hover with its padded damage rect; link hover via one gated redraw.
     if (g_hovered_code_btn >= 0 && g_hovered_code_btn < g_code_block_count) {
-        invalidate_rect(copy_button_rect_for_block(&g_code_blocks[g_hovered_code_btn]));
+        invalidate_rect(copy_button_damage_rect(&g_code_blocks[g_hovered_code_btn]));
         g_hovered_code_btn = -1;
     }
     if (g_last_link_hover || g_last_code_btn_hover) {
@@ -1287,7 +1304,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             g_copied_block_idx = b_idx;
             g_copied_timestamp = [NSDate timeIntervalSinceReferenceDate];
             // Damage: only the button label flips to "Copied!".
-            invalidate_rect(btn);
+            invalidate_rect(copy_button_damage_rect(b));
             return;
         }
     }
@@ -2329,6 +2346,27 @@ void platform_set_test_selection(float x1, float y1, float x2, float y2, int ena
     g_selection_mode = enable ? 1 : 0;
     g_select_all = NO;
 }
+
+// Copy-button ghost probe: park the hover point headlessly so the button
+// paints in screenshots (mouseMoved never fires headless).
+void platform_set_test_hover(float x, float y) {
+    g_mouse_pos = NSMakePoint(x, y);
+}
+
+// Damage-contract query: the rect a visibility flip would invalidate for
+// a block frame (bx,by,bw,bh). Stateless (no registered blocks needed),
+// so headless probes can assert it pre-render; stdout carries it out.
+void platform_test_button_damage(float bx, float by, float bw, float bh,
+                                 float* ox, float* oy, float* ow, float* oh) {
+    CodeBlockRecord tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.x = bx; tmp.y = by; tmp.w = bw; tmp.h = bh;
+    NSRect d = copy_button_damage_rect(&tmp);
+    if (ox) *ox = d.origin.x;
+    if (oy) *oy = d.origin.y;
+    if (ow) *ow = d.size.width;
+    if (oh) *oh = d.size.height;
+}
 #endif
 
 // Returns the dirty rect AppKit reported for the in-progress draw, for
@@ -3320,6 +3358,15 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     // Headless selection captures paint the same highlight as live draws.
     if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
+    // Same for the hover copy button (--hover): headless screenshots
+    // exercise the live paint, fringe stroke included. NSBezierPath and
+    // NSString draw into the AppKit context stack (nil headlessly), not
+    // g_current_cg_context, so push a flipped wrapper for the call.
+    NSGraphicsContext* btn_gc = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:btn_gc];
+    paint_copy_button(ctx);
+    [NSGraphicsContext restoreGraphicsState];
 
 #ifdef TEST_HOOKS
     // Headless pixel probe: print bitmap values at requested image coords

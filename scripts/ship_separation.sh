@@ -27,6 +27,7 @@ deny() { echo "FAIL: $1"; fail=1; }
 rm -f /tmp/ship_sep_probe.png
 for flag in --screenshot --scroll --scroll-x-end --scroll-sweep --damage \
     --dump-records --dump-commands --settle-images --select --select-drag \
+    --hover --button-damage \
     --force-scale "--probe-px=1,1"; do
     # Never pass a document path: a bare doc would launch the GUI.
     if "$SHIP" "$flag" /tmp/ship_sep_probe.png >/dev/null 2>&1; then
@@ -41,7 +42,8 @@ rm -f /tmp/ship_sep_probe.png
 
 # 2. No hook flag literal in the ship bytes (comptime gate stripped them).
 for lit in --screenshot --scroll-sweep --dump-records --dump-commands \
-    --settle-images --probe-px= --select-drag --force-scale --scroll-x-end; do
+    --settle-images --probe-px= --select-drag --force-scale --scroll-x-end \
+    --hover --button-damage; do
     if grep -q -a -F -- "$lit" "$SHIP"; then
         deny "ship binary contains hook literal $lit"
     fi

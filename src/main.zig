@@ -1623,6 +1623,31 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         const y2 = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
                         bridge.platform_set_test_selection(x1, y1, x2, y2, 1);
                     }
+                } else if (std.mem.eql(u8, arg, "--hover")) {
+                    // Copy-button ghost probe: park the hover point (view
+                    // space x,y) so the button paints headlessly.
+                    if (args_it.next()) |hov_str| {
+                        var it = std.mem.splitScalar(u8, hov_str, ',');
+                        const hx = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const hy = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        bridge.platform_set_test_hover(hx, hy);
+                    }
+                } else if (std.mem.eql(u8, arg, "--button-damage")) {
+                    // Damage-contract query: print the rect a button
+                    // visibility flip invalidates for block bx,by,bw,bh.
+                    if (args_it.next()) |bd_str| {
+                        var it = std.mem.splitScalar(u8, bd_str, ',');
+                        const bx = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const by = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const bw = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        const bh = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                        var ox: f32 = 0;
+                        var oy: f32 = 0;
+                        var ow: f32 = 0;
+                        var oh: f32 = 0;
+                        bridge.platform_test_button_damage(bx, by, bw, bh, &ox, &oy, &ow, &oh);
+                        std.debug.print("BTNDMG={d:.1},{d:.1},{d:.1},{d:.1}\n", .{ ox, oy, ow, oh });
+                    }
                 } else if (std.mem.eql(u8, arg, "--force-scale")) {
                     // Force the headless output scale (e.g. 2 for the live
                     // Retina atlas path) to diff per-frame pixels.
