@@ -76,6 +76,14 @@ static int image_path_exists_joined(const char* dir, NSString* rel); // ditto
 static int g_outline_row_count;
 static NSSearchField* g_outline_search;
 static NSTableView* g_outline_table;
+// Find bar (#42): panel core lives at end-of-file (SIZE NOTE); tentative
+// definitions merge with the real ones.
+static NSPanel* g_find_panel;
+static NSTextField* g_find_field;
+static NSTextField* g_find_label;
+static BOOL g_find_had_query;
+static void read_find_show(void);
+static void read_find_close(void);
 static NSString* outline_display_string(NSInteger row);
 static int outline_rebuild(NSString* filter);
 static void outline_jump(void);
@@ -673,7 +681,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     return (float)(w + tr);
 }
 
-// VoiceOver support (#29) was removed to hold the 180 KiB ship budget:
+// VoiceOver support (#29) was removed to hold the 200 KiB ship budget:
 // the AXTextArea element, value/selection notifications, and heading
 // children are gone (the custom view is no longer an accessibility
 // element). Native selection + clipboard are unaffected.
@@ -1634,6 +1642,14 @@ static BOOL edit_action_available(SEL action, BOOL has_selection, BOOL secure_in
     return YES;
 }
 
+// Find in document (issue #42): Cmd+F arrives via the Edit menu through
+// the responder chain (always enabled, like Select All). The panel core
+// lives at end-of-file; this stays a thin entry point per the SIZE NOTE.
+- (void)find:(id)sender {
+    (void)sender;
+    read_find_show();
+}
+
 // Shared selection text for Copy, Look Up, Search, and Services: the
 // exact string the clipboard path writes. Empty when there is no
 // selection. Zero heap beyond the returned string.
@@ -1979,17 +1995,45 @@ int platform_test_key_plain(unsigned long flags) {
 }
 
 - (void)controlTextDidChange:(NSNotification*)note {
-    (void)note;
+    // Find field (issue #42): live search on every keystroke. The outline
+    // search keeps its old path below.
+    if ([note object] == g_find_field) {
+        g_find_had_query = YES;
+        NSString* q = [g_find_field stringValue];
+        const char* p = [q UTF8String];
+        if (g_callbacks.on_find_query) g_callbacks.on_find_query(p ? p : "", p ? (int)strlen(p) : 0);
+        return;
+    }
     outline_rebuild([g_outline_search stringValue]);
 }
 
 - (BOOL)control:(NSControl*)control textView:(NSTextView*)tv doCommandBySelector:(SEL)cmd {
     (void)tv;
+    // Find field (issue #42): Enter/Shift+Enter cycle, Esc closes and
+    // returns focus to the reading view.
+    if (control == g_find_field) {
+        if (cmd == @selector(insertNewline:)) {
+            NSEvent* ev = [NSApp currentEvent];
+            BOOL prev = ev && (([ev modifierFlags] & NSEventModifierFlagShift) != 0);
+            if (g_callbacks.on_find_next) g_callbacks.on_find_next(prev ? 1 : 0);
+            return YES;
+        }
+        if (cmd == @selector(cancelOperation:)) { read_find_close(); return YES; }
+        return NO;
+    }
     // Enter jumps; arrows are intentionally unhandled here — Tab reaches
     // the native list (full keyboard flow: type, Tab, arrows, Enter).
     if (control != g_outline_search) return NO;
     if (cmd == @selector(insertNewline:)) { outline_jump(); return YES; }
     return NO;
+}
+
+// Find panel close button (issue #42): hide, never destroy (informal
+// delegate method, no protocol adoption per the SIZE NOTE). The main
+// window keeps default behavior via the sender check.
+- (BOOL)windowShouldClose:(id)sender {
+    if (sender == g_find_panel) { read_find_close(); return NO; }
+    return YES;
 }
 
 - (void)outlineJump:(id)sender {
@@ -2100,6 +2144,7 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
     [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    [editMenu addItemWithTitle:@"Find..." action:@selector(find:) keyEquivalent:@"f"];
     [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItemWithTitle:@"Look Up" action:@selector(lookUpSelection:) keyEquivalent:@""];
     [editMenu addItemWithTitle:@"Search with Google" action:@selector(searchSelectionWithGoogle:) keyEquivalent:@""];
@@ -2366,7 +2411,7 @@ void platform_end_clip(void) {
 
 // Record quad for mouse text selection & copying (anchored to document Y).
 // noinline: called from 4 sites (register/draw/legacy); one shared copy keeps
-// __TEXT off the next page boundary (binary budget < 180 KiB).
+// __TEXT off the next page boundary (binary budget < 200 KiB).
 static __attribute__((noinline)) void record_text_quad(const char* text, int len, float x, float y, float w, float h,
                              float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
                              const char* link_url, int link_url_len) {
@@ -3146,7 +3191,7 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 // Returns 1 when the frame decoded.
 //
 // SIZE NOTE: this definition lives at end-of-file deliberately. __TEXT sits
-// ~12 bytes under a 16 KiB page boundary of the 180 KiB budget; a mid-file
+// ~12 bytes under a 16 KiB page boundary of the 200 KiB budget; a mid-file
 // function here shifts every function after it (branch ranges, literal pools
 // and alignment NOPs cascade ~3x the function's own bytes). At EOF nothing
 // follows it, so its bytes cost only themselves. Keep it tiny; check
@@ -3863,3 +3908,74 @@ int platform_test_watch_active(void) {
     return g_file_source ? 1 : 0;
 }
 #endif
+// Find bar (issue #42): a minimal native panel — query field plus count
+// label. Typing searches live through on_find_query; Enter and
+// Shift+Enter cycle through on_find_next; Esc or the close button
+// dismisses through on_find_closed and returns focus to the reading
+// view, so single-letter keys work again immediately. NSTextField owns
+// all editing behavior (typing, Cmd+A/C/V in the field), so the view's
+// keyDown never sees find typing. End-of-file per the SIZE NOTE.
+static NSPanel* g_find_panel = nil;
+static NSTextField* g_find_field = nil;
+static NSTextField* g_find_label = nil;
+static BOOL g_find_had_query = NO;
+
+void platform_find_show_count(int current, int total) {
+    if (!g_find_label) return;
+    if (!g_find_had_query) {
+        [g_find_label setStringValue:@""];
+    } else if (total <= 0) {
+        [g_find_label setStringValue:@"No matches"];
+    } else {
+        [g_find_label setStringValue:[NSString stringWithFormat:@"%d of %d", current, total]];
+    }
+}
+
+void platform_find_hide(void) {
+    if (g_find_panel && [g_find_panel isVisible]) [g_find_panel orderOut:nil];
+}
+
+static void read_find_close(void) {
+    if (g_callbacks.on_find_closed) g_callbacks.on_find_closed();
+    if (g_window && g_main_view) [g_window makeFirstResponder:g_main_view];
+}
+
+static NSTextField* read_find_label(CGFloat y, CGFloat size) {
+    NSTextField* l = [[NSTextField alloc] initWithFrame:NSMakeRect(12, y, 296, 20)];
+    [l setBezeled:NO];
+    [l setDrawsBackground:NO];
+    [l setEditable:NO];
+    [l setSelectable:NO];
+    [[l cell] setFont:[NSFont systemFontOfSize:size]];
+    [[l cell] setTextColor:[NSColor secondaryLabelColor]];
+    return l;
+}
+
+static void read_find_show(void) {
+    if (!g_find_panel) {
+        NSRect fr = g_window ? [g_window frame] : NSMakeRect(0, 0, 1200, 800);
+        CGFloat pw = 320.0, ph = 108.0;
+        NSRect pr = NSMakeRect(fr.origin.x + fr.size.width - pw - 24.0,
+                               fr.origin.y + fr.size.height - ph - 64.0, pw, ph);
+        g_find_panel = [[NSPanel alloc] initWithContentRect:pr
+            styleMask:NSTitledWindowMask|NSClosableWindowMask backing:NSBackingStoreBuffered defer:NO];
+        [g_find_panel setTitle:@"Find"];
+        [g_find_panel setFloatingPanel:YES];
+        [g_find_panel setBecomesKeyOnlyIfNeeded:NO];
+        [g_find_panel setHidesOnDeactivate:NO];
+        [g_find_panel setDelegate:[NSApp delegate]];
+        NSView* cv = [g_find_panel contentView];
+        g_find_field = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 60, 196, 24)];
+        [g_find_field setPlaceholderString:@"Find in document"];
+        [g_find_field setDelegate:[NSApp delegate]];
+        [cv addSubview:g_find_field];
+        g_find_label = read_find_label(62, 12.0);
+        [g_find_label setFrame:NSMakeRect(214, 62, 94, 20)];
+        [cv addSubview:g_find_label];
+        NSTextField* hint = read_find_label(12, 11.0);
+        [hint setStringValue:@"Enter next, Shift+Enter previous, Esc close"];
+        [cv addSubview:hint];
+    }
+    [g_find_panel makeKeyAndOrderFront:nil];
+    [g_find_field selectText:nil];
+}

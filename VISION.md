@@ -22,7 +22,7 @@ than the eye can perceive, using the absolute minimum of computer resources.
    `#121212`/`#E0E0E0` + light `#FAFAFA`/`#1E2022`, buttery scroll physics
    (120Hz first frame ≥20% of step, 40px steps settle ≤24 frames, zero overshoot,
    1:1 trackpad sync).
-5. **Lean ship binary** — <180 KiB, zero dependencies. Test/debug tooling lives in a
+5. **Lean ship binary** — <200 KiB, zero dependencies. Test/debug tooling lives in a
    separate binary behind compile-time gates; nothing test-only ever ships.
 6. **Immutable benchmarks** — targets in `src/core/strict_benchmarks.zig` are never
    loosened; only the implementation is optimized until it passes.

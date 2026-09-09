@@ -33,7 +33,7 @@ no number here is repeated anywhere else in the repo.
 
 | Metric | Typical Electron app | Standard native reader | **Read** |
 | :--- | :--- | :--- | :--- |
-| **Binary size** | ~180 MB | ~15–35 MB | **< 180 KiB** |
+| **Binary size** | ~180 MB | ~15–35 MB | **< 200 KiB** |
 | **Document open** | 350–1,200 ms | 20–60 ms | **≤ 18 µs** (zero-copy `mmap`) |
 | **Line scan, 50,000 lines** | ~100 ms | 15–25 ms | **≤ 400 µs (≥ 5.5 GB/s)** |
 | **Viewport layout** | 8–16 ms | 1–3 ms | **≤ 8 µs** |

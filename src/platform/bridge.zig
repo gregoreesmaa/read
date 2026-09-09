@@ -41,6 +41,11 @@ pub const PlatformCallbacks = extern struct {
     /// External file change (vnode event, #44). Appended last for the
     /// same FFI stability reason.
     on_file_changed: ?*const fn () callconv(.c) void = null,
+    /// Find bar (issue #42): query text, cycle direction (prev != 0),
+    /// bar dismissed. Appended last for the same FFI stability reason.
+    on_find_query: ?*const fn (text: [*]const u8, text_len: c_int) callconv(.c) void = null,
+    on_find_next: ?*const fn (prev: c_int) callconv(.c) void = null,
+    on_find_closed: ?*const fn () callconv(.c) void = null,
 };
 
 pub extern "c" fn platform_outline_add(level: c_int, y: f32, text: [*]const u8, text_len: c_int) void;
@@ -221,6 +226,10 @@ pub extern "c" fn platform_test_watch_active() c_int;
 /// Extension-gate probe (issue #43): 1 when the path passes the Markdown
 /// filter. Test-hooks builds only.
 pub extern "c" fn platform_test_markdown_ext(path: [*]const u8, path_len: c_int) c_int;
+/// Find bar push (issue #42): 1-based current match + total for the
+/// count label; hide on document switch.
+pub extern "c" fn platform_find_show_count(current: c_int, total: c_int) void;
+pub extern "c" fn platform_find_hide() void;
 pub extern "c" fn platform_open_url_external(url: [*]const u8, url_len: c_int) void;
 pub extern "c" fn platform_test_image_primed(total_frames: *c_ulong, primed_frames: *c_ulong) void;
 pub extern "c" fn platform_set_test_scale(s: f32) void;

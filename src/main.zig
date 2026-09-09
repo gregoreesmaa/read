@@ -528,6 +528,9 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     // The old selection belongs to the old text model (#43): drop it so
     // the first redraw of the new document highlights nothing stale.
     bridge.platform_clear_selection();
+    // A new document ends any find session (issue #42): matches belong
+    // to the old bytes. (External reloads keep the query; see #44.)
+    clearFind();
     updateDocumentMetrics();
     if (reset_scroll) snapScroll(0.0) else snapScroll(g_app.scroll_y);
     bridge.platform_request_redraw();
@@ -606,6 +609,166 @@ fn onOpenFile(path_ptr: [*]const u8, path_len: c_int) callconv(.c) void {
         // The panel/drop hands absolute paths: anchor reloads (#44) here.
         setDocPath(path);
         watchCurrentDocument();
+    }
+}
+
+/// Find in document (issue #42): case-insensitive matches over the mmap'd
+/// source, painted as washes under text runs in the draw pass. State is
+/// static BSS (zero allocations on every path, including per-keystroke
+/// research); the search itself is the cold pure `layout.findAll`.
+const FIND_MAX_MATCHES = 4096;
+const FIND_QUERY_MAX = 256;
+var g_find_matches: [FIND_MAX_MATCHES]layout.FindMatch = undefined;
+var g_find_query: [FIND_QUERY_MAX]u8 = undefined;
+var g_find_folded: [FIND_QUERY_MAX]u8 = undefined;
+var g_find_count: usize = 0;
+var g_find_current: usize = 0;
+var g_find_query_len: usize = 0;
+// Chase state (issue #42): findOffsetY lands block-exact; when wrapping
+// pushes the match below the viewport, up to 4 viewport-steps follow the
+// painted wash. painted is set by the highlight pass when the current
+// match draws any rect this frame.
+var g_find_chase_armed: bool = false;
+var g_find_chase_left: u8 = 0;
+var g_find_painted: bool = false;
+
+fn pushFindCount() void {
+    const shown: c_int = if (g_find_count == 0) 0 else @intCast(g_find_current + 1);
+    bridge.platform_find_show_count(shown, @intCast(g_find_count));
+}
+
+fn applyFindQuery(raw: []const u8) void {
+    // Single-line field: truncate at the first newline, then at the cap.
+    var len: usize = @min(raw.len, FIND_QUERY_MAX);
+    for (raw[0..len], 0..) |c, i| {
+        if (c == '\n' or c == '\r') {
+            len = i;
+            break;
+        }
+    }
+    @memcpy(g_find_query[0..len], raw[0..len]);
+    g_find_query_len = len;
+    const folded_len = layout.foldAscii(&g_find_folded, g_find_query[0..len]);
+    g_find_count = layout.findAll(g_app.bytes, g_find_folded[0..folded_len], &g_find_matches);
+    g_find_current = 0;
+    pushFindCount();
+    if (g_find_count > 0) scrollFindTo(g_find_current);
+}
+
+/// Exact document y for a match offset (issue #42): the same block walk
+/// the metrics pass uses, so cycling lands precisely even for wrapped
+/// lines and tall blocks. Cold path (per cycle/Enter press only).
+fn findMatchY(offset: usize) ?f32 {
+    const vp_config = layout.ViewportConfig{
+        .window_width = g_app.window_width,
+        .window_height = g_app.window_height,
+        .scroll_y = 0.0,
+        .base_font_size = g_text_scale.effectiveBase(),
+        .image_size_fn = gatedImageSize,
+        .ref_defs = g_refdefs[0..g_refdef_count],
+        .entities = &g_entities,
+        .join_buf = &g_joinbuf,
+    };
+    return layout.findOffsetY(g_app.bytes, g_app.lines, vp_config, offset);
+}
+
+fn scrollFindTo(idx: usize) void {
+    if (idx >= g_find_count) return;
+    if (findMatchY(g_find_matches[idx].start)) |y| {
+        // Coarse landing on the match's block top; the draw pass refines
+        // (see the chase below) when wrapping puts the match lower.
+        g_find_chase_armed = true;
+        g_find_chase_left = 4;
+        g_find_painted = false;
+        snapScroll(@max(0.0, y - g_app.window_height / 3.0));
+    }
+}
+
+fn onFindQuery(path_ptr: [*]const u8, path_len: c_int) callconv(.c) void {
+    if (path_len < 0) return;
+    applyFindQuery(path_ptr[0..@as(usize, @intCast(path_len))]);
+    bridge.platform_request_redraw();
+}
+
+fn onFindNext(prev: c_int) callconv(.c) void {
+    if (g_find_count == 0) return;
+    g_find_current = if (prev != 0)
+        (g_find_current + g_find_count - 1) % g_find_count
+    else
+        (g_find_current + 1) % g_find_count;
+    pushFindCount();
+    scrollFindTo(g_find_current);
+    bridge.platform_request_redraw();
+}
+
+fn onFindClosed() callconv(.c) void {
+    clearFind();
+}
+
+fn clearFind() void {
+    g_find_count = 0;
+    g_find_current = 0;
+    g_find_query_len = 0;
+    g_find_chase_armed = false;
+    g_find_chase_left = 0;
+    g_find_painted = false;
+    bridge.platform_find_hide();
+    bridge.platform_request_redraw();
+}
+
+/// Find highlight wash (issue #42): intersects one text run's source
+/// range with the match list and paints theme washes UNDER the glyphs
+/// (call before platform_draw_text). Whole-run matches use the run rect
+/// exactly (direction-proof); partial matches measure the byte prefix
+/// with the same estimator layout used. Culled runs never reach here,
+/// so partial-damage draws stay pixel-identical to full draws.
+fn paintFindHighlights(cmd: *const layout.DrawCommand, find_bg: *const layout.Color, find_current: *const layout.Color) void {
+    const bytes = g_app.bytes;
+    if (bytes.len == 0 or g_find_count == 0) return;
+    const base = @intFromPtr(bytes.ptr);
+    const rp = @intFromPtr(cmd.text.ptr);
+    if (rp < base or rp - base + cmd.text.len > bytes.len) return;
+    const rs = rp - base;
+    const re = rs + cmd.text.len;
+    // Matches are offset-ordered and disjoint: binary search the first
+    // one ending past the run start, then walk while overlapping.
+    var lo: usize = 0;
+    var hi: usize = g_find_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (g_find_matches[mid].start + g_find_matches[mid].len > rs) hi = mid else lo = mid + 1;
+    }
+    var mi = lo;
+    while (mi < g_find_count and g_find_matches[mi].start < re) : (mi += 1) {
+        const m = g_find_matches[mi];
+        const ms = @max(m.start, rs);
+        const me = @min(m.start + m.len, re);
+        if (me <= ms) continue;
+        const col = if (mi == g_find_current) find_current.* else find_bg.*;
+        if (mi == g_find_current) g_find_painted = true;
+        var hx: f32 = cmd.rect.x;
+        var hw: f32 = cmd.rect.w;
+        if (ms != rs or me != re) {
+            hx = cmd.rect.x + layout.measureTextEx(
+                cmd.text[0 .. ms - rs],
+                cmd.font_size,
+                cmd.style.bold,
+                cmd.style.italic,
+                cmd.style.code,
+                cmd.style.heading,
+            );
+            hw = layout.measureTextEx(
+                cmd.text[ms - rs .. me - rs],
+                cmd.font_size,
+                cmd.style.bold,
+                cmd.style.italic,
+                cmd.style.code,
+                cmd.style.heading,
+            );
+        }
+        // Same wash geometry as mark (2px line-box insets): one coherent
+        // highlighter language instead of two competing ones.
+        bridge.platform_draw_rect(hx, cmd.rect.y + 2.0, hw, cmd.rect.h - 4.0, col.r, col.g, col.b, col.a);
     }
 }
 
@@ -995,6 +1158,13 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                             layout.Theme.light.link_visited;
                     }
                 }
+                // Find washes paint first, glyphs over them (#42). Theme
+                // taken by pointer so the per-run call moves 24 bytes,
+                // not a whole Theme struct.
+                if (g_find_count > 0) {
+                    const th = if (g_app.is_dark_theme) &layout.Theme.dark else &layout.Theme.light;
+                    paintFindHighlights(&cmd, &th.find_bg, &th.find_current);
+                }
                 bridge.platform_draw_text(
                     cmd.text.ptr,
                     @intCast(cmd.text.len),
@@ -1090,6 +1260,19 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     }
     if (clipped_pass) {
         bridge.platform_end_clip();
+    }
+
+    // Find chase (issue #42): the cycle scrolled to the match's block
+    // top; if wrapping kept the current wash off-viewport (nothing
+    // painted this frame), step down and redraw — bounded, then rest.
+    if (g_find_chase_armed) {
+        if (g_find_painted or g_find_chase_left == 0) {
+            g_find_chase_armed = false;
+        } else {
+            g_find_chase_left -= 1;
+            snapScroll(g_app.scroll_y + g_app.window_height * 0.8);
+            bridge.platform_request_redraw();
+        }
     }
 
     // Modal cheat sheet paints above everything, unclipped (see
@@ -1328,6 +1511,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var args_it = std.process.Args.Iterator.init(init.args);
     _ = args_it.next(); // skip exe name
     var screenshot_path: ?[*:0]const u8 = null;
+    var find_cli_query: ?[]const u8 = null;
     var dump_records = false;
     var settle_images_ms: i64 = 0;
 
@@ -1439,6 +1623,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     const qx = std.fmt.parseInt(c_int, it.next() orelse "0", 10) catch 0;
                     const qy = std.fmt.parseInt(c_int, it.next() orelse "0", 10) catch 0;
                     bridge.platform_probe_px_add(qx, qy);
+                } else if (std.mem.startsWith(u8, arg, "--find=")) {
+                    // Find screenshot: apply the query post-load (needs
+                    // bytes + metrics), driving the same path as the bar.
+                    find_cli_query = arg["--find=".len..];
                 } else if (std.mem.eql(u8, arg, "--select")) {
                     // Selection screenshot: doc-space endpoints x1,y1,x2,y2.
                     if (args_it.next()) |sel_str| {
@@ -1554,6 +1742,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         g_app.window_width = 1200.0;
         g_app.window_height = 900.0;
         updateDocumentMetrics();
+        // Find screenshot hook (see --find= above): same entry point the
+        // panel drives, after bytes + metrics exist.
+        if (find_cli_query) |fq| applyFindQuery(fq);
         // Let async image decodes finish, then relayout with real sizes.
         // TEST_HOOKS only; ship screenshots render immediately.
         if (build_options.test_hooks and settle_images_ms > 0) {
@@ -1652,6 +1843,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_pinch = onPinch,
         .on_open_file = onOpenFile,
         .on_file_changed = onFileChanged,
+        .on_find_query = onFindQuery,
+        .on_find_next = onFindNext,
+        .on_find_closed = onFindClosed,
     };
 
     _ = bridge.platform_init("Read", 1000, 750, callbacks);
@@ -2168,6 +2362,79 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
         setDocPath("");
         watchCurrentDocument();
         try t.expectEqual(@as(c_int, 0), bridge.platform_test_watch_active());
+    }
+}
+
+test "find: query, cycle, close state machine (#42)" {
+    // Drives the real callbacks against a static doc (save/restore keeps
+    // other tests hermetic). Scroll assertions stay coarse: exact landing
+    // is pinned headless by the --find probes and by findOffsetY below.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const doc = "foo bar foo\nbaz foo\n";
+        const s_bytes = g_app.bytes;
+        const s_mapped = g_app.mapped_file;
+        defer {
+            if (g_app.mapped_file) |*m| m.close();
+            g_app.mapped_file = s_mapped;
+            g_app.bytes = s_bytes;
+            var in_fence: simd.FenceState = .{};
+            g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
+            g_app.lines = g_lines_buffer[0..g_app.line_count];
+            g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
+            updateDocumentMetrics();
+            clearFind();
+        }
+        g_app.mapped_file = null;
+        g_app.bytes = doc;
+        var in_fence: simd.FenceState = .{};
+        g_app.line_count = simd.scanLines(doc, &g_lines_buffer, &in_fence);
+        g_app.lines = g_lines_buffer[0..g_app.line_count];
+        g_refdef_count = 0;
+        updateDocumentMetrics();
+        onFindQuery("foo", 3);
+        try t.expectEqual(@as(usize, 3), g_find_count);
+        try t.expectEqual(@as(usize, 0), g_find_current);
+        try t.expectEqualStrings("foo", g_find_query[0..g_find_query_len]);
+        onFindNext(0);
+        try t.expectEqual(@as(usize, 1), g_find_current);
+        onFindNext(0);
+        try t.expectEqual(@as(usize, 2), g_find_current);
+        onFindNext(0); // wraps to first
+        try t.expectEqual(@as(usize, 0), g_find_current);
+        onFindNext(1); // previous wraps to last
+        try t.expectEqual(@as(usize, 2), g_find_current);
+        onFindNext(0);
+        try t.expectEqual(@as(usize, 0), g_find_current);
+        // Empty query and misses clear the match list, never crash.
+        onFindQuery("", 0);
+        try t.expectEqual(@as(usize, 0), g_find_count);
+        onFindNext(0);
+        try t.expectEqual(@as(usize, 0), g_find_current);
+        onFindQuery("zzz", 3);
+        try t.expectEqual(@as(usize, 0), g_find_count);
+        // Newlines truncate (single-line field); overlay lists Cmd+F.
+        onFindQuery("foo\nbar", 7);
+        try t.expectEqual(@as(usize, 3), g_find_count);
+        var listed = false;
+        for (help_overlay.BINDINGS) |b| {
+            if (b.key == null and std.mem.eql(u8, b.label, "Cmd+F")) listed = true;
+        }
+        try t.expect(listed);
+        onFindClosed();
+        try t.expectEqual(@as(usize, 0), g_find_count);
+        try t.expectEqual(@as(usize, 0), g_find_query_len);
+    }
+}
+
+test "find washes differ per theme and from mark (#42)" {
+    const t = std.testing;
+    for ([2]layout.Theme{ layout.Theme.dark, layout.Theme.light }) |th| {
+        try t.expect(!std.meta.eql(th.find_bg, th.bg));
+        try t.expect(!std.meta.eql(th.find_current, th.bg));
+        try t.expect(!std.meta.eql(th.find_current, th.find_bg));
+        try t.expect(!std.meta.eql(th.find_bg, th.mark_bg));
+        try t.expect(!std.meta.eql(th.find_current, th.mark_bg));
     }
 }
 

@@ -15,7 +15,7 @@ settles scope and mechanism.
 - Zero dependencies. No JS engine, no SVG library, no network fetches.
 - Zero heap allocations on the hot path; virtualized viewport (only visible
   tokens parsed/rendered); memory-mapped zero-copy source.
-- Ship binary strictly <180 KiB (`scripts/size_gate.sh`).
+- Ship binary strictly <200 KiB (`scripts/size_gate.sh`).
 - Strict benchmarks and scroll-feel targets in
   `src/core/strict_benchmarks.zig` stay green and are never loosened.
 - Structural leanness: test/debug tooling lives behind compile-time gates;

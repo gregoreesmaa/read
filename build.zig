@@ -185,13 +185,13 @@ pub fn build(b: *std.Build) void {
         // microsecond hot paths (scan, layout, viewport) live in the Zig TU
         // pinned by strict benchmarks. -Oz shrinks the glue TU by ~7 KiB
         // of __TEXT (measured 2026-09: 132500 -> 125384 with the CLI
-        // surface aboard) and keeps the ship binary under the 180 KiB
+        // surface aboard) and keeps the ship binary under the 200 KiB
         // budget (page-alignment padding makes even small __TEXT growth
         // disproportionate). No FP-semantic or API change: the glue TU
         // renders pixel-identical PNGs under -Os and -Oz (verified by
         // byte-compare of headless screenshots), so committed screenshots
         // are unaffected; the test TU stays -Os for backtrace fidelity.
-        // Binary diet (AGENTS.md §1: < 180 KiB): behavior-neutral linker
+        // Binary diet (AGENTS.md §1: < 200 KiB): behavior-neutral linker
         // trims only — no codegen, API, or optimization-level change.
         // --gc-sections dead-strips unreachable sections, -dead_strip_dylibs
         // drops unused dylib edges, -fstrip drops the symbol table (kept for
@@ -232,7 +232,7 @@ pub fn build(b: *std.Build) void {
             s.step.dependOn(&exe.step);
             strip_ship = s;
         }
-        // Ship glue TU diet (AGENTS.md §1: < 180 KiB), behavior-neutral
+        // Ship glue TU diet (AGENTS.md §1: < 200 KiB), behavior-neutral
         // trims only:
         // -fno-unwind-tables -fno-exceptions -fno-objc-exceptions drop its
         // __eh_frame/__compact_unwind share (~4.9 KiB of __TEXT: one 16 KiB

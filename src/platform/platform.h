@@ -20,6 +20,9 @@ typedef struct {
     void (*on_pinch)(float magnification);
     void (*on_open_file)(const char* path, int path_len);
     void (*on_file_changed)(void);
+    void (*on_find_query)(const char* text, int text_len);
+    void (*on_find_next)(int prev);
+    void (*on_find_closed)(void);
 } PlatformCallbacks;
 
 void platform_outline_add(int level, float y, const char* text, int text_len);
