@@ -107,17 +107,15 @@ var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 var g_scroll_lock: layout.ScrollLockState = .{};
 // Gesture conditioning (#31): precise 1:1 untouched, wheel jitter
-// quantized. Edge rubber-band overshoot, pinch accumulation, and the
-// standalone pinch zoom factor (see onPinch for the #30 overlap note).
+// quantized. Edge rubber-band overshoot.
 var g_gesture_filter: layout.GestureFilter = .{};
 var g_edge: layout.EdgeSpring = .{};
-var g_pinch: layout.PinchState = .{};
 // Smooth-scroll animation state: inputs retarget, a 120Hz platform tick
 // eases g_app.scroll_y (displayed) toward the target. Anchor jumps and
 // resizes snap both so they stay 1:1.
 var g_smooth: layout.SmoothScroll = .{};
-// Display text scaling (system size class x user zoom) and the OS Reduce
-// Motion switch, both pushed by the platform via onDisplay.
+// Display text scaling (system size class) and the OS Reduce Motion
+// switch, both pushed by the platform via onDisplay.
 var g_text_scale: layout.TextScale = .{};
 var g_reduce_motion: bool = false;
 
@@ -297,13 +295,12 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
     return if (settled) 0 else 1;
 }
 
-/// Display preferences pushed by the platform (launch, zoom keys, Reduce
-/// Motion flips, re-activation): size class, persisted zoom percent,
-/// motion flag. Re-wraps via the metrics walk and clamps the offset;
+/// Display preferences pushed by the platform (launch, Reduce Motion
+/// flips, re-activation): size class and motion flag (issue #315 removed
+/// user zoom). Re-wraps via the metrics walk and clamps the offset;
 /// enabling Reduce Motion also lands any in-flight glide instantly.
-fn onDisplay(category_class: c_int, zoom_percent: c_int, reduce_motion: c_int) callconv(.c) void {
+fn onDisplay(category_class: c_int, reduce_motion: c_int) callconv(.c) void {
     g_text_scale.class = @intCast(std.math.clamp(category_class, 0, 4));
-    g_text_scale.setZoomPercent(zoom_percent);
     const was_reduced = g_reduce_motion;
     g_reduce_motion = reduce_motion != 0;
     updateDocumentMetrics();
@@ -314,32 +311,12 @@ fn onDisplay(category_class: c_int, zoom_percent: c_int, reduce_motion: c_int) c
     }
 }
 
-/// Pinch-to-zoom: per-event magnification accumulates into x1.25 tiers
-/// (see PinchState); exact-0.0 is the double-tap smart-magnify toggle
-/// between 100% and 150% (the platform never sends 0.0 for real pinches).
-/// Tiers route through #30's class-aware TextScale (no standalone factor).
-fn onPinch(magnification: f32) callconv(.c) void {
-    if (magnification == 0.0) {
-        g_text_scale.setZoomPercent(if (g_text_scale.zoomPercent() == 150) 100 else 150);
-        g_pinch.reset();
-    } else {
-        const steps = g_pinch.accumulate(magnification);
-        var i: c_int = 0;
-        while (i < steps) : (i += 1) g_text_scale.zoomIn();
-        while (i > steps) : (i -= 1) g_text_scale.zoomOut();
-        if (steps == 0) return;
-    }
-    updateDocumentMetrics();
-    snapScroll(g_app.scroll_y);
-    bridge.platform_request_redraw();
-}
-
 fn updateDocumentMetrics() void {
     const vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
-        // Zoom + size class re-wrap here (metrics) and in onDraw below.
+        // Size-class re-wrap here (metrics) and in onDraw below.
         .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
         .ref_defs = g_refdefs[0..g_refdef_count],
@@ -1849,7 +1826,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .on_appearance = onAppearance,
         .on_outline_open = onOutlineOpen,
         .on_display = onDisplay,
-        .on_pinch = onPinch,
         .on_open_file = onOpenFile,
         .on_file_changed = onFileChanged,
         .on_find_query = onFindQuery,

@@ -415,12 +415,11 @@ test "controls: editing validation disables copy without selection or under secu
     try std.testing.expect(EditPolicy.selectAllEnabled());
 }
 
-test "controls: text scale classes, zoom steps, and persistence round-trip" {
-    // Identity: default class + 100% == the historical 17pt base, so
-    // screenshots stay pixel-identical until the user zooms.
+test "controls: text scale classes (issue #315: user zoom removed)" {
+    // Identity: default class == the historical 17pt base, so screenshots
+    // stay pixel-identical; with no user zoom there is nothing to persist.
     var ts = layout.TextScale{};
     try std.testing.expectEqual(@as(f32, 17.0), ts.effectiveBase());
-    try std.testing.expectEqual(@as(c_int, 100), ts.zoomPercent());
 
     // System-size ratio snaps to discrete classes.
     try std.testing.expectEqual(@as(u3, 1), layout.TextScale.classForRatio(1.0));
@@ -429,32 +428,12 @@ test "controls: text scale classes, zoom steps, and persistence round-trip" {
     try std.testing.expectEqual(@as(u3, 4), layout.TextScale.classForRatio(2.0));
     ts.class = 2;
     try std.testing.expectEqual(@as(f32, 17.0 * 1.15), ts.effectiveBase());
-
-    // Geometric zoom steps with clamps.
-    ts.class = 1;
-    ts.zoomIn();
-    try std.testing.expectEqual(@as(f32, 1.25), ts.zoom);
-    ts.zoomOut();
-    ts.zoomOut();
-    try std.testing.expectEqual(@as(f32, 0.8), ts.zoom);
-    ts.zoomReset();
-    try std.testing.expectEqual(@as(f32, 1.0), ts.zoom);
-    for (0..20) |_| ts.zoomIn();
-    try std.testing.expectEqual(@as(f32, 3.0), ts.zoom);
-    for (0..40) |_| ts.zoomOut();
-    try std.testing.expectEqual(@as(f32, 0.5), ts.zoom);
-
-    // Persistence round-trip: percent out, clamp on restore.
-    ts.zoomReset();
-    ts.zoomIn();
-    try std.testing.expectEqual(@as(c_int, 125), ts.zoomPercent());
-    var restored = layout.TextScale{};
-    restored.setZoomPercent(ts.zoomPercent());
-    try std.testing.expectEqual(ts.zoom, restored.zoom);
-    restored.setZoomPercent(9999);
-    try std.testing.expectEqual(@as(f32, 3.0), restored.zoom);
-    restored.setZoomPercent(-50);
-    try std.testing.expectEqual(@as(f32, 0.5), restored.zoom);
+    // Remaining multipliers in f32 epsilon: the comptime product rounds
+    // differently than the runtime f32 multiply in the last ulp.
+    ts.class = 0;
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0 * 0.85), ts.effectiveBase(), 1e-4);
+    ts.class = 4;
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0 * 1.50), ts.effectiveBase(), 1e-4);
 }
 
 test "controls: reduced motion lands scroll inputs synchronously" {
@@ -545,20 +524,15 @@ test "controls: edge spring absorbs bound residual and decays without overshoot"
     try std.testing.expect(e.tick(1.0 / 120.0));
 }
 
-test "controls: pinch tiers emit one zoom step per x1.25 crossing" {
-    var p = layout.PinchState{};
-
-    // Sub-tier jitter: no step, kept as residue.
-    try std.testing.expectEqual(@as(c_int, 0), p.accumulate(0.05));
-    try std.testing.expectEqual(@as(c_int, 0), p.accumulate(0.05));
-    // Crossing the first tier (0.10 + 0.15 = 0.25 > ln(1.25)): one step.
-    try std.testing.expectEqual(@as(c_int, 1), p.accumulate(0.15));
-    // Remainder kept: a -0.5 pull crosses back twice with residue.
-    try std.testing.expectEqual(@as(c_int, -2), p.accumulate(-0.5));
-    // Exact tier: single step, empty residue.
-    p.reset();
-    try std.testing.expectEqual(@as(c_int, 1), p.accumulate(layout.PinchState.TIER_LN));
-    try std.testing.expectEqual(@as(f32, 0.0), p.acc);
+test "controls: no zoom affordance remains (issue #315)" {
+    // PinchState is gone: pinch input has nowhere to accumulate, so the
+    // declaration itself must not resolve. TextScale carries no zoom
+    // factor: only the five discrete size classes scale the base.
+    try std.testing.expect(!@hasDecl(layout, "PinchState"));
+    try std.testing.expect(!@hasField(layout.TextScale, "zoom"));
+    var ts = layout.TextScale{};
+    ts.class = 3;
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0 * 1.30), ts.effectiveBase(), 1e-4);
 }
 
 test "controls: keybindings j, k, space, t navigation" {
