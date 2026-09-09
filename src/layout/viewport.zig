@@ -623,19 +623,14 @@ pub const SmoothScroll = struct {
     }
 };
 
-/// Display text scaling: system size class x user zoom. Size classes are
-/// discrete so layout stays stable (re-wrap only on class change, never
-/// on fractional drift); zoom steps multiply geometrically and persist
-/// (integer percent) in the platform defaults store (see macos.m).
-/// Pure value type, zero heap.
+/// Display text scaling from the system size class (issue #315 removed
+/// user zoom: no pinch, keys, toggle, or persisted percent). Size classes
+/// are discrete so layout stays stable (re-wrap only on class change,
+/// never on fractional drift). Pure value type, zero heap.
 pub const TextScale = struct {
     class: u3 = 1, // 0..4, 1 == system default
-    zoom: f32 = 1.0,
 
     pub const BASE_FONT_SIZE: f32 = 17.0;
-    pub const ZOOM_MIN: f32 = 0.5;
-    pub const ZOOM_MAX: f32 = 3.0;
-    pub const ZOOM_STEP: f32 = 1.25;
 
     pub fn classMult(class: u3) f32 {
         return switch (class) {
@@ -659,34 +654,8 @@ pub const TextScale = struct {
         return 4;
     }
 
-    pub fn zoomIn(self: *TextScale) void {
-        self.zoom = @min(ZOOM_MAX, self.zoom * ZOOM_STEP);
-    }
-
-    pub fn zoomOut(self: *TextScale) void {
-        self.zoom = @max(ZOOM_MIN, self.zoom / ZOOM_STEP);
-    }
-
-    pub fn zoomReset(self: *TextScale) void {
-        self.zoom = 1.0;
-    }
-
-    /// Persisted form: integer percent in 50..300. Clamp on restore so a
-    /// corrupt default can never break layout.
-    pub fn zoomPercent(self: *const TextScale) c_int {
-        return @intFromFloat(@round(self.zoom * 100.0));
-    }
-
-    pub fn setZoomPercent(self: *TextScale, pct: c_int) void {
-        self.zoom = std.math.clamp(
-            @as(f32, @floatFromInt(pct)) / 100.0,
-            ZOOM_MIN,
-            ZOOM_MAX,
-        );
-    }
-
     pub fn effectiveBase(self: *const TextScale) f32 {
-        return BASE_FONT_SIZE * classMult(self.class) * self.zoom;
+        return BASE_FONT_SIZE * classMult(self.class);
     }
 };
 
@@ -777,28 +746,6 @@ pub const EdgeSpring = struct {
             self.overshoot = @min(next, 0.0);
         }
         return self.overshoot == 0.0;
-    }
-};
-
-/// Pinch-tier detection: accumulate per-event magnification deltas and
-/// emit a zoom step each time a x1.25 tier boundary is crossed
-/// (magnification sums in log space: total scale ~= e^sum). Debounced by
-/// construction — one step per crossing, jitter below a tier is kept as
-/// residue, never lost. Pure, zero heap.
-pub const PinchState = struct {
-    acc: f32 = 0.0,
-
-    pub const TIER_LN: f32 = 0.22314355; // ln(1.25)
-
-    pub fn accumulate(self: *PinchState, m: f32) c_int {
-        self.acc += m;
-        const steps: c_int = @intFromFloat(std.math.trunc(self.acc / TIER_LN));
-        self.acc -= @as(f32, @floatFromInt(steps)) * TIER_LN;
-        return steps;
-    }
-
-    pub fn reset(self: *PinchState) void {
-        self.acc = 0.0;
     }
 };
 

@@ -24,16 +24,11 @@ pub const PlatformCallbacks = extern struct {
     on_appearance: ?*const fn (is_dark: c_int) callconv(.c) void = null,
     /// Cmd+J outline picker key. Appended last for the same FFI reason.
     on_outline_open: ?*const fn () callconv(.c) void = null,
-    /// Display preferences: system size class (0..4), persisted zoom
-    /// percent (50..300), Reduce Motion flag. Pushed at launch, on zoom
-    /// keys, on motion flips, and on re-activation. Appended last for the
-    /// same FFI stability reason.
-    on_display: ?*const fn (category_class: c_int, zoom_percent: c_int, reduce_motion: c_int) callconv(.c) void = null,
-    /// Pinch-to-zoom: per-event magnification delta (sums in log space on
-    /// the Zig side into x1.25 tiers); exact 0.0 is the double-tap
-    /// smart-magnify toggle. Appended last for the same FFI stability
-    /// reason.
-    on_pinch: ?*const fn (magnification: f32) callconv(.c) void = null,
+    /// Display preferences: system size class (0..4) and Reduce Motion
+    /// flag (issue #315 removed user zoom). Pushed at launch, on motion
+    /// flips, and on re-activation. Appended last for the same FFI
+    /// stability reason.
+    on_display: ?*const fn (category_class: c_int, reduce_motion: c_int) callconv(.c) void = null,
     /// Open-file pick (Cmd+O panel, window or Dock-icon drop, #43):
     /// absolute filesystem path, UTF-8. Appended last for the same
     /// FFI stability reason.

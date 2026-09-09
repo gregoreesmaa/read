@@ -729,15 +729,10 @@ static int utf8_to_utf16(const char* text, int bidx) {
     }
     return u;
 }
-// Display preferences (#30): system size class x persisted zoom, plus the
-// OS Reduce Motion switch. The Zig TextScale owns the clamp math; this
-// percent mirror stays in 50..300 by the same x/1.25 step construction
-// (integer-rounded, so both sides agree on every pushed value).
+// Display preferences (#30): system size class plus the OS Reduce Motion
+// switch (issue #315 removed user zoom: no persisted percent, no steps).
 // ---------------------------------------------------------------------------
-#define READ_ZOOM_DEFAULTS_KEY @"ReadZoomPercent"
-static int g_zoom_percent = 100;
 static int g_last_pushed_class = -1;
-static int g_last_pushed_zoom = -1;
 static int g_last_pushed_rm = -1;
 
 static int display_size_class(void) {
@@ -755,27 +750,16 @@ static int display_reduce_motion(void) {
     return [[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion] ? 1 : 0;
 }
 
-// Push the triple to Zig; skip redundant pushes (no metrics walk) unless
+// Push the pair to Zig; skip redundant pushes (no metrics walk) unless
 // forced. The Zig onDisplay re-wraps and clamps; full repaint follows.
 static void display_push(int force) {
     if (!g_callbacks.on_display) return;
     int cls = display_size_class();
     int rm = display_reduce_motion();
-    if (!force && cls == g_last_pushed_class && g_zoom_percent == g_last_pushed_zoom && rm == g_last_pushed_rm) return;
+    if (!force && cls == g_last_pushed_class && rm == g_last_pushed_rm) return;
     g_last_pushed_class = cls;
-    g_last_pushed_zoom = g_zoom_percent;
     g_last_pushed_rm = rm;
-    g_callbacks.on_display(cls, g_zoom_percent, rm);
-}
-
-static void display_zoom_step(int dir) { // +1 in, -1 out, 0 reset
-    if (dir == 0) g_zoom_percent = 100;
-    else if (dir > 0) g_zoom_percent = (int)((g_zoom_percent * 125 + 50) / 100);
-    else g_zoom_percent = (int)((g_zoom_percent * 100 + 62) / 125);
-    if (g_zoom_percent < 50) g_zoom_percent = 50;
-    if (g_zoom_percent > 300) g_zoom_percent = 300;
-    [[NSUserDefaults standardUserDefaults] setInteger:g_zoom_percent forKey:READ_ZOOM_DEFAULTS_KEY];
-    display_push(0);
+    g_callbacks.on_display(cls, rm);
 }
 
 @interface ReadView : NSView
@@ -1796,26 +1780,9 @@ static NSString* selected_text_string(void) {
     [self setNeedsDisplay:YES];
 }
 
-// Pinch-to-zoom (#31): forward per-event magnification; the Zig
-// PinchState tiers it into x1.25 steps. Exact-0.0 events carry no
-// information and are skipped so 0.0 stays reserved for the smart-toggle.
-- (void)magnifyWithEvent:(NSEvent *)event {
-    float m = (float)[event magnification];
-    if (m == 0.0f) return;
-    if (g_callbacks.on_pinch) {
-        g_callbacks.on_pinch(m);
-    }
-    [self setNeedsDisplay:YES];
-}
-
-// Double-tap smart magnify: toggle 100% <-> 150% via the reserved 0.0.
-- (void)smartMagnifyWithEvent:(NSEvent *)event {
-    (void)event;
-    if (g_callbacks.on_pinch) {
-        g_callbacks.on_pinch(0.0f);
-    }
-    [self setNeedsDisplay:YES];
-}
+// Issue #315 removed zoom: pinch and double-tap smart magnify are gone.
+// The view deliberately implements no magnify handlers, so the events
+// fall through to the system default (nothing) instead of scaling text.
 
 // Plain-letter bindings (#32) must never hijack modified combos: only
 // bare keys reach on_key (Shift allowed: '?' needs it on US layouts;
@@ -1851,21 +1818,8 @@ int platform_test_key_plain(unsigned long flags) {
             [self selectAllDocument];
             return;
         }
-        // Zoom: Cmd+Plus/Equals in, Cmd+Minus out, Cmd+0 reset. Persisted;
-        // the Zig onDisplay re-wraps via the viewport code. Other Cmd
-        // combos keep their existing routing below.
-        if ([chars isEqualToString:@"+"] || [chars isEqualToString:@"="]) {
-            display_zoom_step(+1);
-            return;
-        }
-        if ([chars isEqualToString:@"-"]) {
-            display_zoom_step(-1);
-            return;
-        }
-        if ([chars isEqualToString:@"0"]) {
-            display_zoom_step(0);
-            return;
-        }
+        // Issue #315 removed zoom: Cmd+Plus/Minus/0 fall through to the
+        // routing below like any other unbound Cmd combo (dropped).
     }
 
     // Modified combos never reach plain bindings (#32): Cmd combos returned
@@ -2162,13 +2116,10 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:view];
 
-    // Display prefs (#30): restore persisted zoom, push the initial triple
-    // (the size class may already differ from default), and observe Reduce
-    // Motion flips + re-activation (system size changes land live).
-    {
-        long saved = [[NSUserDefaults standardUserDefaults] integerForKey:READ_ZOOM_DEFAULTS_KEY];
-        if (saved >= 50 && saved <= 300) g_zoom_percent = (int)saved;
-    }
+    // Display prefs (#30): push the initial pair (the size class may
+    // already differ from default), and observe Reduce Motion flips +
+    // re-activation (system size changes land live). A stale ReadZoomPercent
+    // default from older builds is never read (issue #315).
     display_push(1);
     [[NSWorkspace sharedWorkspace].notificationCenter addObserver:delegate
                                                          selector:@selector(displayPrefsChanged:)

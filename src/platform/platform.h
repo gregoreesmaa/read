@@ -16,8 +16,7 @@ typedef struct {
     void (*on_images_changed)(float delta_above);
     void (*on_appearance)(int is_dark);
     void (*on_outline_open)(void);
-    void (*on_display)(int category_class, int zoom_percent, int reduce_motion);
-    void (*on_pinch)(float magnification);
+    void (*on_display)(int category_class, int reduce_motion);
     void (*on_open_file)(const char* path, int path_len);
     void (*on_file_changed)(void);
     void (*on_find_query)(const char* text, int text_len);
