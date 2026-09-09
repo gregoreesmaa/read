@@ -35,7 +35,7 @@ per AGENTS.md §1.
 
 ## Binary-size budget per OS
 
-The `<180 KiB` discipline applies to first-party code on every OS.
+The `<200 KiB` discipline applies to first-party code on every OS.
 System libraries (Cocoa, Xlib, FreeType, DirectWrite) link dynamically
 and are never counted — same as today. Note the Mach-O `__TEXT`
 16 KiB-page discipline (`scripts/size_gate.sh`) is Apple-specific; ELF

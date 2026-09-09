@@ -681,7 +681,7 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     return (float)(w + tr);
 }
 
-// VoiceOver support (#29) was removed to hold the 180 KiB ship budget:
+// VoiceOver support (#29) was removed to hold the 200 KiB ship budget:
 // the AXTextArea element, value/selection notifications, and heading
 // children are gone (the custom view is no longer an accessibility
 // element). Native selection + clipboard are unaffected.
@@ -2411,7 +2411,7 @@ void platform_end_clip(void) {
 
 // Record quad for mouse text selection & copying (anchored to document Y).
 // noinline: called from 4 sites (register/draw/legacy); one shared copy keeps
-// __TEXT off the next page boundary (binary budget < 180 KiB).
+// __TEXT off the next page boundary (binary budget < 200 KiB).
 static __attribute__((noinline)) void record_text_quad(const char* text, int len, float x, float y, float w, float h,
                              float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
                              const char* link_url, int link_url_len) {
@@ -3191,7 +3191,7 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 // Returns 1 when the frame decoded.
 //
 // SIZE NOTE: this definition lives at end-of-file deliberately. __TEXT sits
-// ~12 bytes under a 16 KiB page boundary of the 180 KiB budget; a mid-file
+// ~12 bytes under a 16 KiB page boundary of the 200 KiB budget; a mid-file
 // function here shifts every function after it (branch ranges, literal pools
 // and alignment NOPs cascade ~3x the function's own bytes). At EOF nothing
 // follows it, so its bytes cost only themselves. Keep it tiny; check

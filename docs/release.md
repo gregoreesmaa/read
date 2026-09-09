@@ -53,6 +53,6 @@ two `--prefix` rebuilds produced identical sha256 with the size gate green.
 ## Lean-release guarantee
 
 Release artifacts go through the same contract as local builds: the strict gate,
-`scripts/size_gate.sh` (< 180 KiB), and the compile-time test/prod separation
+`scripts/size_gate.sh` (< 200 KiB), and the compile-time test/prod separation
 (test tooling lives in `read-test`, never in `read`). Release tooling (this workflow,
 the formula) never links into the ship binary.

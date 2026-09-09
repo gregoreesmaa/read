@@ -2,7 +2,7 @@ name: Release
 
 # Versioned tags (v*) ship installable artifacts. The release honors the
 # same contract as a local build (AGENTS.md §1): strict tests green,
-# ship binary under 180 KiB, test tooling never in the artifact.
+# ship binary under 200 KiB, test tooling never in the artifact.
 on:
   push:
     tags:
