@@ -1008,7 +1008,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
             const kept: u8 = if (dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) 1 else 0;
             const tlen: usize = @min(cmd.text.len, 48);
             const showlen: usize = if (cmd.text.len > 100000) 0 else tlen;
-            std.debug.print("CMD {s} {d:.1} {d:.1} {d:.1} {d:.1} kept={d} rgb={d},{d},{d} len={d} fs={d:.1} txt='{s}'\n", .{
+            std.debug.print("CMD {s} {d:.1} {d:.1} {d:.1} {d:.1} kept={d} rgb={d},{d},{d} len={d} fs={d:.1} txt='{s}' sid={d} max={d:.1}\n", .{
                 @tagName(cmd.kind),
                 cmd.rect.x,
                 cmd.rect.y,
@@ -1021,6 +1021,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 cmd.text.len,
                 cmd.font_size,
                 cmd.text[0..showlen],
+                cmd.scrollable_id,
+                cmd.max_scroll_x,
             });
         }
     }
@@ -1075,6 +1077,12 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 );
             },
             .register_scrollable_block => {
+                // #314: push the live offset so ObjC maps document-space
+                // selection endpoints back to view space after h-scroll.
+                const live_off: f32 = if (cmd.scrollable_id >= 0 and cmd.scrollable_id < MAX_SCROLLABLE_BLOCKS)
+                    std.math.clamp(g_app.block_scroll_x[@intCast(cmd.scrollable_id)], 0.0, cmd.max_scroll_x)
+                else
+                    0.0;
                 bridge.platform_register_scrollable_block(
                     cmd.scrollable_id,
                     cmd.rect.x,
@@ -1082,6 +1090,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.rect.w,
                     cmd.rect.h,
                     cmd.max_scroll_x,
+                    live_off,
                 );
                 if (cmd.scrollable_id >= 0 and cmd.scrollable_id < MAX_SCROLLABLE_BLOCKS) {
                     const id: usize = @intCast(cmd.scrollable_id);

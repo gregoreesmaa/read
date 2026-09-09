@@ -54,7 +54,7 @@ void platform_set_document_dir(const char* path, int path_len);
 void platform_get_image_size(const char* url, int url_len, float* out_w, float* out_h);
 void platform_arm_images(void);
 void platform_register_code_block(float x, float y, float w, float h, const char* code_text, int code_len);
-void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x);
+void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x, float scroll_x);
 void platform_begin_clip(float x, float y, float w, float h);
 void platform_end_clip(void);
 void platform_glyph_cache_stats(unsigned long long* hits, unsigned long long* misses, unsigned long long* flushes);
