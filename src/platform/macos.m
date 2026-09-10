@@ -973,8 +973,16 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             // still take the full branch below. Members of an endpoint row
             // (row lookup above) are exempt: the endpoint is inside their
             // row even when outside their own shorter band.
-            BOOL in_min_row = min_row_found && fabsf(rec->doc_y - min_row_y) < 1.0f;
-            BOOL in_max_row = max_row_found && fabsf(rec->doc_y - max_row_y) < 1.0f;
+            //
+            // Row identity is half-height overlap, not doc_y equality: the
+            // #316 baseline sink offsets code runs 0.102em below their
+            // row's doc_y (1.7px at body size, more in headings), so a
+            // 1px epsilon orphaned them into the paint-everything middle
+            // branch — selecting anything on the row washed the whole
+            // pill. Same-line-box runs always agree within half a line
+            // height; stacked rows differ by a full line height or more.
+            BOOL in_min_row = min_row_found && fabsf(rec->doc_y - min_row_y) < rec->h * 0.5f;
+            BOOL in_max_row = max_row_found && fabsf(rec->doc_y - max_row_y) < rec->h * 0.5f;
             if (!in_min_row && !in_max_row && (min_y > r_bot || max_y < r_top)) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
