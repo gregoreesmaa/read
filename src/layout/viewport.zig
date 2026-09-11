@@ -4920,6 +4920,39 @@ test "admonition alert: label carries half-line above, quarter-line below" {
     try std.testing.expectApproxEqAbs(same_label_y.? + lh * 1.25, same_body_y.?, 0.01);
 }
 
+test "frontmatter hides at layout: metadata emits no commands" {
+    const test_doc =
+        \\---
+        \\title: Hidden Doc
+        \\tags: [a, b]
+        \\---
+        \\# Visible
+    ;
+
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var cmds: [128]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    var saw_visible = false;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run) {
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "title:") == null);
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "Hidden Doc") == null);
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "tags:") == null);
+            if (std.mem.eql(u8, c.text, "Visible")) saw_visible = true;
+        }
+    }
+    try std.testing.expect(saw_visible);
+}
+
 /// Counts scroll-shadow strips (`fill_rect`s of shadow-strip width in the
 /// theme's overlay shade `sh`: 255 dark mode, 0 light mode) hugging the
 /// left (`at_left = true`) or right edge of a block rect.

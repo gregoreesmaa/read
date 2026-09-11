@@ -184,6 +184,10 @@ pub fn scanLines(
     // runs when a `|` exists, so pipe-free documents (the common case and
     // every strict benchmark doc) pay no second byte pass at all.
     var saw_pipe = false;
+    // YAML frontmatter (issue #334): hidden span at byte 0, if any. The
+    // helper returns null for every doc that does not open with `---`
+    // (every strict benchmark doc), so the common path pays one branch.
+    const fm_end = frontmatterEnd(bytes) orelse 0;
 
     const nl_vec: ByteVec = @splat('\n');
     const pipe_vec: ByteVec = @splat('|');
@@ -278,6 +282,17 @@ pub fn scanLines(
         line_count += 1;
     }
 
+    // Frontmatter lines hide (zero-height, like html_hidden details tags).
+    // The span ends on a line boundary, so every line starting inside it
+    // lies fully inside it; lines arrive in offset order, hence the break.
+    // Runs before table resolution so metadata pipes never form tables.
+    if (fm_end > 0) {
+        for (lines_out[0..line_count]) |*ln| {
+            if (ln.offset >= fm_end) break;
+            ln.block_type = .html_hidden;
+        }
+    }
+
     // GFM table structure needs header+delimiter adjacency, which only
     // exists once every line is classified. Gated on the fused pipe census
     // above: pipe-free documents skip the Line-array pass entirely.
@@ -299,6 +314,84 @@ fn isSpacedHr(trimmed: []const u8, marker: u8) bool {
         }
     }
     return count >= 3;
+}
+
+/// End offset (line boundary past the closing delimiter) of a leading YAML
+/// frontmatter block (issue #334), or null when the document does not open
+/// with one. The opening line must be exactly `---` (+ trailing whitespace);
+/// the closing line `---` or `...`. Unclosed runs render as today (hr +
+/// paragraphs), as does any `---` past byte 0.
+///
+/// A span line that could toggle scanner state (a fence-starter run or a
+/// `<`-led line, which opens the HTML/comment arms) vetoes the block: the
+/// whole span then classifies exactly as today instead of risking a state
+/// the hidden override could not undo.
+///
+/// The span must also hold at least one YAML pair line (`key: value`): that
+/// is what separates metadata from CommonMark prose, keeping spec examples
+/// 96 (`---`/`Foo`/`---` setext) and 98 (empty `---`/`---` hrs) rendering
+/// exactly as the pinned 562/562 suite demands. A pair line needs a
+/// non-space byte before the colon and whitespace/EOL after it, so URLs
+/// (`http://x`) and times (`12:30`) never qualify. Cold path: the opener
+/// gate is a few byte compares, so documents that do not open with `---`
+/// (every strict benchmark doc) pay one predictable branch.
+fn frontmatterEnd(bytes: []const u8) ?usize {
+    if (bytes.len < 3 or bytes[0] != '-' or bytes[1] != '-' or bytes[2] != '-') return null;
+    var p: usize = 3;
+    while (p < bytes.len and (bytes[p] == ' ' or bytes[p] == '\t')) : (p += 1) {}
+    if (p < bytes.len and bytes[p] == '\r') p += 1;
+    if (p >= bytes.len or bytes[p] != '\n') return null;
+    p += 1;
+    var saw_pair = false;
+    while (p < bytes.len) {
+        var q = p;
+        while (q < bytes.len and (bytes[q] == ' ' or bytes[q] == '\t')) : (q += 1) {}
+        if (q + 3 <= bytes.len) {
+            const is_dash = bytes[q] == '-' and bytes[q + 1] == '-' and bytes[q + 2] == '-';
+            const is_dots = bytes[q] == '.' and bytes[q + 1] == '.' and bytes[q + 2] == '.';
+            if (is_dash or is_dots) {
+                var r = q + 3;
+                while (r < bytes.len and (bytes[r] == ' ' or bytes[r] == '\t')) : (r += 1) {}
+                if (r < bytes.len and bytes[r] == '\r') r += 1;
+                if (r >= bytes.len or bytes[r] == '\n') {
+                    // The first candidate block decides: no pair so far
+                    // means setext/hr prose (spec ex 96/98), never metadata.
+                    if (!saw_pair) return null;
+                    return if (r < bytes.len) r + 1 else bytes.len;
+                }
+            }
+            // A fence-starter run or `<`-led line would toggle scanner
+            // state mid-span; veto the block so it renders as today.
+            const is_fence_run = (bytes[q] == '`' or bytes[q] == '~') and
+                q + 2 < bytes.len and bytes[q + 1] == bytes[q] and bytes[q + 2] == bytes[q];
+            if (is_fence_run or bytes[q] == '<') return null;
+        }
+        if (!saw_pair) {
+            var e = p;
+            while (e < bytes.len and bytes[e] != '\n') : (e += 1) {}
+            saw_pair = isPairLine(bytes[p..e]);
+        }
+        while (p < bytes.len and bytes[p] != '\n') : (p += 1) {}
+        if (p < bytes.len) p += 1;
+    }
+    return null;
+}
+
+/// True when a raw source line (no trailing newline) holds a YAML pair
+/// (`key: value` or bare `key:`): some colon with a non-space byte before
+/// it and whitespace (or nothing) after it. URLs (`http://x`) and times
+/// (`12:30`) never qualify: their colons sit against non-space bytes.
+fn isPairLine(line: []const u8) bool {
+    var end = line.len;
+    while (end > 0 and (line[end - 1] == ' ' or line[end - 1] == '\t' or line[end - 1] == '\r')) : (end -= 1) {}
+    var i: usize = 0;
+    while (i < end and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    var j = i;
+    while (j < end) : (j += 1) {
+        if (line[j] != ':') continue;
+        if (j > i and (j + 1 >= end or line[j + 1] == ' ' or line[j + 1] == '\t')) return true;
+    }
+    return false;
 }
 
 /// One link reference definition (`[label]: /url "title"`). Slices borrow
@@ -1962,6 +2055,72 @@ test "classify: issue 40 html blocks, hidden tags, and paragraph keeps" {
     try std.testing.expectEqual(BlockType.paragraph, classifyOne("a < b"));
     try std.testing.expectEqual(BlockType.paragraph, classifyOne("    <div>"));
     try std.testing.expectEqual(BlockType.paragraph, classifyOne("<div"));
+}
+
+test "frontmatter: leading YAML block hides, later hrs stay" {
+    var t: [8]BlockType = undefined;
+    // Leading `---` … `---` is metadata: hidden, renders nothing.
+    var n = scanTypes("---\ntitle: Hi\n---\n\n# Doc\n", &t);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqual(BlockType.html_hidden, t[0]);
+    try std.testing.expectEqual(BlockType.html_hidden, t[1]);
+    try std.testing.expectEqual(BlockType.html_hidden, t[2]);
+    try std.testing.expectEqual(BlockType.blank, t[3]);
+    try std.testing.expectEqual(BlockType.heading1, t[4]);
+    // A `---` later in the document is still an hr, never frontmatter.
+    n = scanTypes("# T\n---\n", &t);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(BlockType.heading1, t[0]);
+    try std.testing.expectEqual(BlockType.hr, t[1]);
+    // Unclosed leading `---` renders exactly as today (hr + paragraph).
+    n = scanTypes("---\ntitle: Hi\n", &t);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(BlockType.hr, t[0]);
+    try std.testing.expectEqual(BlockType.paragraph, t[1]);
+    // No `key: value` line means CommonMark prose, not metadata: the
+    // delimited block stays literal (spec ex 96/98 shapes).
+    n = scanTypes("---\nFoo\n---\n", &t);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(BlockType.hr, t[0]);
+    try std.testing.expectEqual(BlockType.paragraph, t[1]);
+    try std.testing.expectEqual(BlockType.hr, t[2]);
+    n = scanTypes("---\n---\n", &t);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(BlockType.hr, t[0]);
+    try std.testing.expectEqual(BlockType.hr, t[1]);
+}
+
+test "frontmatter: dot closer, CRLF, and state-veto stay literal" {
+    var t: [8]BlockType = undefined;
+    // A `...` line also closes the block.
+    var n = scanTypes("---\ntitle: Hi\n...\n# Doc\n", &t);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(BlockType.html_hidden, t[0]);
+    try std.testing.expectEqual(BlockType.html_hidden, t[1]);
+    try std.testing.expectEqual(BlockType.html_hidden, t[2]);
+    try std.testing.expectEqual(BlockType.heading1, t[3]);
+    // CRLF line endings hide all the same.
+    n = scanTypes("---\r\ntitle: Hi\r\n---\r\n# Doc\r\n", &t);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(BlockType.html_hidden, t[0]);
+    try std.testing.expectEqual(BlockType.html_hidden, t[1]);
+    try std.testing.expectEqual(BlockType.html_hidden, t[2]);
+    try std.testing.expectEqual(BlockType.heading1, t[3]);
+    // A fence-starter inside the span vetoes: renders as today, so the
+    // fence the vetoed span opens still swallows what follows it.
+    n = scanTypes("---\n```\n---\n# Doc\n", &t);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(BlockType.hr, t[0]);
+    try std.testing.expectEqual(BlockType.code_fence_start, t[1]);
+    try std.testing.expectEqual(BlockType.code_line, t[2]);
+    try std.testing.expectEqual(BlockType.code_line, t[3]);
+    // A `<`-led line vetoes the same way (HTML/comment arms stay shut).
+    n = scanTypes("---\n<div>\n---\n# Doc\n", &t);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(BlockType.hr, t[0]);
+    try std.testing.expectEqual(BlockType.html_block, t[1]);
+    try std.testing.expectEqual(BlockType.hr, t[2]);
+    try std.testing.expectEqual(BlockType.heading1, t[3]);
 }
 
 fn recordBlockRun(bytes_inner: []const u8, nl_pos: usize, out: []u32, n: *usize) void {
