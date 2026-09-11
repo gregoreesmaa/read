@@ -17,7 +17,7 @@ HTML rendering is intentionally unsupported. Numbers for speed and size live onl
 ## Inlines
 
 - Code spans, emphasis (`*`, `_`), strong (`**`, `__`), triple (`***`, `___`)
-- Strikethrough (`~~`), inline links (`[text](url)`), autolinks (`<https://…>`, `<email>`), images
+- Strikethrough (`~~`), inline links (`[text](url)`), autolinks (`<https://…>`, `<email>`), bare `http(s)://` URLs (GFM), images
 - Backslash escapes (`\*`, `\_`, …)
 
 ## Heavy features

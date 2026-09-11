@@ -1302,18 +1302,22 @@ pub fn flowSourceLine(
 
 /// True when `text` holds a byte that can open an inline construct:
 /// code span (`` ` ``), emphasis (`*`, `_`), link/image/ref (`[`),
-/// autolink (`<`), entity (`&`), escape (`\`), strikethrough (`~`).
+/// autolink (`<`), entity (`&`), escape (`\`), strikethrough (`~`), or a
+/// GFM bare URL (`http://`, `https://` at a non-alphanumeric boundary).
 /// Every construct needs one of these openers, so text without any of them
 /// always parses to a single default-style span and flowSourceLine can skip
 /// the full inline parser. closers alone (`]`, `)`) fall back only when an
 /// opener is present; block-level markers (`>`, `#`, `-`, `|`) are literal
 /// in text or stripped upstream, so they never force the slow path.
 fn hasInlineMarkup(text: []const u8) bool {
+    var k: usize = 0;
     for (text) |c| {
         switch (c) {
             '`', '*', '_', '[', '<', '&', '\\', '~' => return true,
+            'h' => if (parser.linkifyAt(text, k) != null) return true,
             else => {},
         }
+        k += 1;
     }
     return false;
 }
