@@ -123,7 +123,9 @@ Three layers, one direction of knowledge:
 ## 5. Failure semantics
 
 - Probe says absent → `naive`: no job, no indicator, no retry this
-  session; re-probed at next open.
+  session. Probe verdicts are cached ONCE per session (process
+  lifetime): installing a renderer mid-process lights up only after
+  restart; re-probed at next open.
 - Nonzero exit / no PNG after exit / PNG undecodable: `failed` →
   code card, indicator cleared, no retry this session.
 - Cache write races (two readers): content-addressed bytes are

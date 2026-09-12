@@ -40,6 +40,10 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # as plain code blocks, source intact.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_fallback.png" test_cases/plugin_fallback.md
 
+# Case 4e: Mermaid skeleton (issue #323) — job never launches in
+# read-test, so the fence renders its code card deterministically.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid.png" test_cases/plugin_mermaid.md
+
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
 
