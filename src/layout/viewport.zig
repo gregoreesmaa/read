@@ -2866,7 +2866,10 @@ fn itemContentX(marker: simd.Line, content_x: f32) f32 {
     if (indent_level > 32) indent_level = 32;
     // PR #324 review: 30px gutter per level (8px pad each side of the
     // marker), matching layoutListUnit so GitHub-like columns agree.
-    return content_x + indent_level * 10.0 + 30.0;
+    // Each source indent column maps to 18px, so a 2-space nested level
+    // steps 36px: its dot lands ~14px right of the parent text column,
+    // like GitHub, never flush under it.
+    return content_x + indent_level * 18.0 + 30.0;
 }
 
 /// Owns paragraph line `j`: the list-item marker whose unit contains it, or
@@ -3635,8 +3638,10 @@ test "list bullets: centered dots with equal side spacing; card flush with text"
     try std.testing.expectEqual(@as(f32, 108.0), dots[0]);
     try std.testing.expectEqual(@as(f32, 130.0), lead_x.?);
     try std.testing.expectEqual(dots[0] - 100.0, lead_x.? - (dots[0] + 14.0));
-    // Nested dot at its own indent, same symmetric cell.
-    try std.testing.expectEqual(@as(f32, 128.0), dots[1]);
+    // Nested dot padded right of the parent text column (GitHub-like),
+    // never flush under it: 2-space step lands 36px over, ~14px past lead.
+    try std.testing.expectEqual(@as(f32, 144.0), dots[1]);
+    try std.testing.expect(dots[1] > lead_x.?);
     // Cards flush on the same-indent text column, code 12px inside:
     // top card under the plain comparison paragraph, in-item card under
     // the level-0 lead text.
@@ -3911,8 +3916,9 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         if (indent_level > 32) indent_level = 32;
         // PR #324 review: the 14px bullet glyph sits centered in its 30px
         // gutter (8px each side), so the dot has equal spacing left/right
-        // with airy GitHub-like padding.
-        bullet_x = ux.content_x + indent_level * 10.0 + 8.0;
+        // with airy GitHub-like padding. 18px per source column (see
+        // itemContentX) keeps nested dots padded right of parent text.
+        bullet_x = ux.content_x + indent_level * 18.0 + 8.0;
         var text_start: usize = 1; // past the marker; skip all padding
         text_start += skipSpaces(text_slice[@min(text_start, text_slice.len)..]);
         item_text = text_slice[@min(text_start, text_slice.len)..];
@@ -3930,10 +3936,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         ux.ord_active = false;
     } else {
         // Ordered item: parse marker, resolve corrected number. Same +8
-        // origin as bullets so both flavors share one text column.
+        // origin and 18px columns as bullets so both flavors agree.
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        bullet_x = ux.content_x + indent_level * 10.0 + 8.0;
+        bullet_x = ux.content_x + indent_level * 18.0 + 8.0;
         var prefix_len: usize = 0;
         while (prefix_len < text_slice.len and text_slice[prefix_len] != ' ' and text_slice[prefix_len] != '\t') : (prefix_len += 1) {}
         if (prefix_len < text_slice.len) prefix_len += 1;
