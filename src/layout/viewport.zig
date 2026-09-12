@@ -4356,8 +4356,12 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
         \\const n = 42;
         \\```
         \\
-        \\```rust
+        \\```haskell
         \\const r = 7;
+        \\```
+        \\
+        \\```rust
+        \\fn hi() {}
         \\```
     ;
 
@@ -4377,8 +4381,9 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
     var saw_string = false;
     var saw_comment = false;
     var saw_number = false;
-    var rust_runs: usize = 0;
-    var rust_plain = false;
+    var saw_rust_fn = false;
+    var plain_runs: usize = 0;
+    var plain_color = false;
     for (cmds[0..count]) |c| {
         if (c.kind != .text_run or !c.style.code) continue;
         if (std.mem.eql(u8, c.text, "const") and c.color.r == Theme.dark.code_keyword.r and
@@ -4389,9 +4394,14 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
         if (std.mem.eql(u8, c.text, "\"hi\"") and c.color.r == Theme.dark.code_string.r) saw_string = true;
         if (std.mem.eql(u8, c.text, "// set s") and c.color.r == Theme.dark.code_comment.r) saw_comment = true;
         if (std.mem.eql(u8, c.text, "42") and c.color.r == Theme.dark.code_number.r) saw_number = true;
+        if (std.mem.eql(u8, c.text, "fn") and c.color.r == Theme.dark.code_keyword.r and
+            c.color.g == Theme.dark.code_keyword.g and c.color.b == Theme.dark.code_keyword.b)
+        {
+            saw_rust_fn = true;
+        }
         if (std.mem.eql(u8, c.text, "const r = 7;")) {
-            rust_runs += 1;
-            rust_plain = c.color.r == Theme.dark.text.r and c.color.g == Theme.dark.text.g and
+            plain_runs += 1;
+            plain_color = c.color.r == Theme.dark.text.r and c.color.g == Theme.dark.text.g and
                 c.color.b == Theme.dark.text.b;
         }
     }
@@ -4399,9 +4409,10 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
     try std.testing.expect(saw_string);
     try std.testing.expect(saw_comment);
     try std.testing.expect(saw_number);
+    try std.testing.expect(saw_rust_fn);
     // Unknown info string: exactly one run, body-text color, as before.
-    try std.testing.expectEqual(@as(usize, 1), rust_runs);
-    try std.testing.expect(rust_plain);
+    try std.testing.expectEqual(@as(usize, 1), plain_runs);
+    try std.testing.expect(plain_color);
 }
 
 test "plugin fence: ready job emits image box, rendering shows indicator (#323 PR-1 Task 4)" {

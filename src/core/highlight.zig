@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Table-driven syntax tinting for fenced code blocks (issue #39).
+/// Table-driven syntax tinting for fenced code blocks (issues #39, #333).
 ///
 /// Zero-dependency, zero-heap: the caller passes a stack buffer; tokenize
 /// returns segments (byte ranges + class) into it. Single left-to-right
@@ -8,16 +8,19 @@ const std = @import("std");
 /// renderer, preserving virtualized rendering.
 ///
 /// Minimal cut, documented limits:
-/// - Showcase languages only (zig, c, python, js, bash, diff), exact
+/// - Top-20 families (below) plus a few common aliases, exact
 ///   case-sensitive match on the first info-string token. Anything else
 ///   (including missing info string) returns null and renders exactly as
 ///   today (single mono run).
-/// - Per-line tokenization: a `/*` opened but not closed on the same line
-///   tints to end-of-line; the next line starts fresh.
+/// - Per-line tokenization: a `/*` (or `<!--`) opened but not closed on
+///   the same line tints to end-of-line; the next line starts fresh.
 /// - Lines containing tabs or non-ASCII bytes return null (mono advance
 ///   math is byte-exact only for ASCII without tabs), rendering as today.
 /// - More than MAX_SEGMENTS tokens on one line returns null (plain run),
 ///   bounding draw-command growth.
+/// - Family approximations, not grammars: SQL keywords ship in both
+///   cases; Lua `--[[ ]]` long comments tint only to end-of-line; HTML
+///   tag names tint as keywords with no attribute awareness.
 
 pub const Lang = enum {
     none,
@@ -27,6 +30,20 @@ pub const Lang = enum {
     js,
     bash,
     diff,
+    ts,
+    rust,
+    go,
+    java,
+    ruby,
+    swift,
+    kotlin,
+    php,
+    cpp,
+    csharp,
+    html,
+    css,
+    sql,
+    lua,
 };
 
 pub const Class = enum {
@@ -65,9 +82,23 @@ pub fn langFromFenceLine(line: []const u8) Lang {
     if (std.mem.eql(u8, token, "zig")) return .zig;
     if (std.mem.eql(u8, token, "c")) return .c;
     if (std.mem.eql(u8, token, "python")) return .python;
-    if (std.mem.eql(u8, token, "js")) return .js;
-    if (std.mem.eql(u8, token, "bash")) return .bash;
+    if (std.mem.eql(u8, token, "js") or std.mem.eql(u8, token, "javascript")) return .js;
+    if (std.mem.eql(u8, token, "bash") or std.mem.eql(u8, token, "sh") or std.mem.eql(u8, token, "shell")) return .bash;
     if (std.mem.eql(u8, token, "diff")) return .diff;
+    if (std.mem.eql(u8, token, "ts") or std.mem.eql(u8, token, "typescript")) return .ts;
+    if (std.mem.eql(u8, token, "rust")) return .rust;
+    if (std.mem.eql(u8, token, "go")) return .go;
+    if (std.mem.eql(u8, token, "java")) return .java;
+    if (std.mem.eql(u8, token, "ruby")) return .ruby;
+    if (std.mem.eql(u8, token, "swift")) return .swift;
+    if (std.mem.eql(u8, token, "kotlin")) return .kotlin;
+    if (std.mem.eql(u8, token, "php")) return .php;
+    if (std.mem.eql(u8, token, "cpp") or std.mem.eql(u8, token, "c++")) return .cpp;
+    if (std.mem.eql(u8, token, "csharp") or std.mem.eql(u8, token, "c#")) return .csharp;
+    if (std.mem.eql(u8, token, "html")) return .html;
+    if (std.mem.eql(u8, token, "css")) return .css;
+    if (std.mem.eql(u8, token, "sql")) return .sql;
+    if (std.mem.eql(u8, token, "lua")) return .lua;
     return .none;
 }
 
@@ -81,6 +112,34 @@ const js_keywords = "const let var function return if else while for do switch c
 
 const bash_keywords = "if then else elif fi for while until do done case esac in function select time echo exit return local export true false";
 
+const ts_keywords = "const let var function return if else while for do switch case default break continue new delete typeof instanceof in of try catch finally throw class extends import export from default async await this null true false undefined interface type enum namespace abstract implements readonly declare keyof infer satisfies";
+
+const rust_keywords = "fn let mut pub return if else while for loop in match struct enum impl trait use mod const static ref move async await dyn crate self Self true false None Some Ok Err";
+
+const go_keywords = "package import func return if else for range switch case default break continue struct interface map chan const var type go defer select fallthrough true false nil";
+
+const java_keywords = "public private protected class interface enum extends implements static final void int long double boolean return if else while for new try catch finally throw throws import package this super null true false";
+
+const ruby_keywords = "def end return if elsif else unless while until for in do class module require include yield self nil true false and or not";
+
+const swift_keywords = "func return if else guard while for in switch case default break continue class struct enum protocol extension import let var self nil true false do try catch throw";
+
+const kotlin_keywords = "fun return if else when while for in do class object interface data val var import package null true false this super try catch finally throw";
+
+const php_keywords = "function return if else elseif while for foreach as class public private protected static new echo print require include namespace use true false null this";
+
+const cpp_keywords = "int char float double void bool long short signed unsigned const static extern volatile register auto return if else while for do switch case default break continue goto sizeof typedef struct union enum class namespace template typename public private protected virtual override new delete try catch throw using true false nullptr NULL";
+
+const csharp_keywords = "using namespace public private protected class interface enum struct return if else while for foreach in new var string void int bool true false null this base try catch finally";
+
+const html_keywords = "html head body title div span p a img ul ol li table tr td th form input button script style link meta header footer nav section article h1 h2 h3 h4 h5 h6";
+
+const css_keywords = "color background margin padding border font display position width height flex grid align justify text decoration transition transform opacity cursor content top left right bottom";
+
+const sql_keywords = "SELECT select FROM from WHERE where AND and OR or NOT not INSERT insert INTO into UPDATE update DELETE delete CREATE create TABLE table JOIN join ON on GROUP group BY by ORDER order LIMIT limit OFFSET offset AS as DISTINCT distinct NULL null TRUE true FALSE false";
+
+const lua_keywords = "function end return if then else elseif while for in do local nil true false and or not break";
+
 fn blobFor(lang: Lang) []const u8 {
     return switch (lang) {
         .zig => zig_keywords,
@@ -88,6 +147,20 @@ fn blobFor(lang: Lang) []const u8 {
         .python => python_keywords,
         .js => js_keywords,
         .bash => bash_keywords,
+        .ts => ts_keywords,
+        .rust => rust_keywords,
+        .go => go_keywords,
+        .java => java_keywords,
+        .ruby => ruby_keywords,
+        .swift => swift_keywords,
+        .kotlin => kotlin_keywords,
+        .php => php_keywords,
+        .cpp => cpp_keywords,
+        .csharp => csharp_keywords,
+        .html => html_keywords,
+        .css => css_keywords,
+        .sql => sql_keywords,
+        .lua => lua_keywords,
         .none, .diff => "",
     };
 }
@@ -172,10 +245,15 @@ pub fn tokenize(lang: Lang, line: []const u8, out: []Segment) ?[]Segment {
     }
     if (lang == .diff) return tokenizeDiff(line, out);
 
-    const line_comment_slash = lang == .zig or lang == .c or lang == .js;
-    const line_comment_hash = lang == .python or lang == .bash;
-    const block_comment = lang == .zig or lang == .c or lang == .js;
-    const backtick = lang == .js;
+    const c_like = lang == .zig or lang == .c or lang == .js or lang == .ts or
+        lang == .rust or lang == .go or lang == .java or lang == .swift or
+        lang == .kotlin or lang == .php or lang == .cpp or lang == .csharp;
+    const line_comment_slash = c_like;
+    const line_comment_hash = lang == .python or lang == .bash or lang == .ruby;
+    const line_comment_dash = lang == .sql or lang == .lua;
+    const block_comment = c_like or lang == .css or lang == .sql;
+    const block_html = lang == .html;
+    const backtick = lang == .js or lang == .ts;
 
     var t = Tokenizer{ .line = line, .out = out };
     var p: usize = 0;
@@ -200,6 +278,12 @@ pub fn tokenize(lang: Lang, line: []const u8, out: []Segment) ?[]Segment {
                 break;
             }
         }
+        if (line_comment_dash and c == '-' and p + 1 < line.len and line[p + 1] == '-') {
+            if (!t.pushRun(p, .comment)) return null;
+            t.seg_class = .comment;
+            p = line.len;
+            break;
+        }
         // Block comments (same-line close; unclosed tints to end-of-line).
         if (block_comment and c == '/' and p + 1 < line.len and line[p + 1] == '*') {
             if (!t.pushRun(p, .comment)) return null;
@@ -210,6 +294,30 @@ pub fn tokenize(lang: Lang, line: []const u8, out: []Segment) ?[]Segment {
                 if (line[q] == '*' and line[q + 1] == '/') {
                     closed = true;
                     q += 2;
+                    break;
+                }
+            }
+            if (!t.pushRun(if (closed) q else line.len, .plain)) return null;
+            t.seg_class = .plain;
+            if (!closed) {
+                p = line.len;
+                break;
+            }
+            p = q;
+            continue;
+        }
+        // HTML comments (`<!--` … `-->`); same single-line semantics.
+        if (block_html and c == '<' and p + 3 < line.len and line[p + 1] == '!' and
+            line[p + 2] == '-' and line[p + 3] == '-')
+        {
+            if (!t.pushRun(p, .comment)) return null;
+            t.seg_class = .comment;
+            var q = p + 4;
+            var closed = false;
+            while (q + 2 < line.len) : (q += 1) {
+                if (line[q] == '-' and line[q + 1] == '-' and line[q + 2] == '>') {
+                    closed = true;
+                    q += 3;
                     break;
                 }
             }
@@ -315,10 +423,36 @@ test "fence info string language detection" {
     try std.testing.expectEqual(Lang.c, langFromFenceLine("```c"));
     try std.testing.expectEqual(Lang.diff, langFromFenceLine("```diff"));
     try std.testing.expectEqual(Lang.none, langFromFenceLine("```"));
-    try std.testing.expectEqual(Lang.none, langFromFenceLine("```rust"));
     try std.testing.expectEqual(Lang.none, langFromFenceLine("```ZIG"));
     try std.testing.expectEqual(Lang.none, langFromFenceLine("not a fence"));
-    try std.testing.expectEqual(Lang.none, langFromFenceLine("```javascript"));
+}
+
+test "fence info string top-20 detection and aliases" {
+    // New families (issue #333); every one resolved .none before.
+    try std.testing.expectEqual(Lang.ts, langFromFenceLine("```ts"));
+    try std.testing.expectEqual(Lang.rust, langFromFenceLine("```rust"));
+    try std.testing.expectEqual(Lang.go, langFromFenceLine("```go"));
+    try std.testing.expectEqual(Lang.java, langFromFenceLine("```java"));
+    try std.testing.expectEqual(Lang.ruby, langFromFenceLine("```ruby"));
+    try std.testing.expectEqual(Lang.swift, langFromFenceLine("```swift"));
+    try std.testing.expectEqual(Lang.kotlin, langFromFenceLine("```kotlin"));
+    try std.testing.expectEqual(Lang.php, langFromFenceLine("```php"));
+    try std.testing.expectEqual(Lang.cpp, langFromFenceLine("```cpp"));
+    try std.testing.expectEqual(Lang.csharp, langFromFenceLine("```csharp"));
+    try std.testing.expectEqual(Lang.html, langFromFenceLine("```html"));
+    try std.testing.expectEqual(Lang.css, langFromFenceLine("```css"));
+    try std.testing.expectEqual(Lang.sql, langFromFenceLine("```sql"));
+    try std.testing.expectEqual(Lang.lua, langFromFenceLine("```lua"));
+    // Common aliases resolve to their canonical family.
+    try std.testing.expectEqual(Lang.js, langFromFenceLine("```javascript"));
+    try std.testing.expectEqual(Lang.ts, langFromFenceLine("```typescript"));
+    try std.testing.expectEqual(Lang.bash, langFromFenceLine("```sh"));
+    try std.testing.expectEqual(Lang.bash, langFromFenceLine("```shell"));
+    try std.testing.expectEqual(Lang.cpp, langFromFenceLine("```c++"));
+    try std.testing.expectEqual(Lang.csharp, langFromFenceLine("```c#"));
+    // Unknown languages still fall back to the plain run.
+    try std.testing.expectEqual(Lang.none, langFromFenceLine("```haskell"));
+    try std.testing.expectEqual(Lang.none, langFromFenceLine("```RUST"));
 }
 
 fn classAt(segs: []Segment, idx: usize) Class {
@@ -435,6 +569,53 @@ test "js backtick strings and diff lines" {
         try std.testing.expectEqual(Class.comment, classAt(header, 0));
         const ctx = tokenize(.diff, " context", &buf).?;
         try std.testing.expectEqual(Class.plain, classAt(ctx, 0));
+    }
+}
+
+test "new families: dash comments, html comments, keywords" {
+    var buf: [MAX_SEGMENTS]Segment = undefined;
+    // SQL `--` comment tints to end-of-line; SELECT matches either case.
+    {
+        const line = "SELECT a FROM t -- fetch all";
+        const segs = tokenize(.sql, line, &buf).?;
+        try std.testing.expectEqual(Class.keyword, segs[0].class);
+        try std.testing.expectEqualStrings("SELECT", line[segs[0].start..segs[0].end]);
+        try std.testing.expectEqual(Class.comment, segs[segs.len - 1].class);
+        const low = tokenize(.sql, "select 1", &buf).?;
+        try std.testing.expectEqual(Class.keyword, low[0].class);
+    }
+    // Lua `--` comment; `function`/`end` keywords.
+    {
+        const line = "function f() -- maker";
+        const segs = tokenize(.lua, line, &buf).?;
+        try std.testing.expectEqual(Class.keyword, segs[0].class);
+        try std.testing.expectEqualStrings("function", line[segs[0].start..segs[0].end]);
+        try std.testing.expectEqual(Class.comment, segs[segs.len - 1].class);
+    }
+    // HTML `<!-- -->` comment; tag names tint as keywords.
+    {
+        const line = "<div><!-- note --></div>";
+        const segs = tokenize(.html, line, &buf).?;
+        var saw_tag = false;
+        var saw_comment = false;
+        for (segs) |sg| {
+            const t = line[sg.start..sg.end];
+            if (std.mem.eql(u8, t, "div")) saw_tag = sg.class == .keyword;
+            if (std.mem.eql(u8, t, "<!-- note -->")) saw_comment = sg.class == .comment;
+        }
+        try std.testing.expect(saw_tag);
+        try std.testing.expect(saw_comment);
+    }
+    // C-family keyword in a new member (rust `fn`, ts backtick string).
+    {
+        const r = tokenize(.rust, "fn main() {", &buf).?;
+        try std.testing.expectEqual(Class.keyword, r[0].class);
+        const t = tokenize(.ts, "const s = `hi`;", &buf).?;
+        var saw_tick = false;
+        for (t) |sg| {
+            if (std.mem.eql(u8, textOf("const s = `hi`;", sg), "`hi`")) saw_tick = sg.class == .string;
+        }
+        try std.testing.expect(saw_tick);
     }
 }
 
