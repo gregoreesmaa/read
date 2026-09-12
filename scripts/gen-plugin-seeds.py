@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Regenerate plugin seed PNGs (issues #330/#329/#328/#326/#327).
 
-Each seed is a faithful static mimic of a real renderer output for its
-test_cases/plugin_*.md fixture: d2/graphviz/plantuml draw the fixture's
-two-node diagram (labels mirror the fixture), math/mathjax draw the
+mathjax seeds are genuine MathJax-engine renders of their
+test_cases/plugin_mathjax*.md fixture fence sources (MathJax 3.2.1 SVG
+output via a pinned npm bootstrap, rasterized in headless Chrome;
+*_seed functions fail loudly without node/npm/Chrome). Remaining seeds
+are faithful static mimics of real renderer output: d2/graphviz/plantuml
+draw the fixture's diagram (labels mirror the fixture), math draws the
 fixture's formula typeset in STIX. Tall/wide companions
 (*-seed-tall.png, *-seed-wide.png) mirror the tall/wide fixtures
 node-for-node the same way; math-seed.png draws the simplified fixture
-formula, *-seed-complex.png the complex companions. Synthetic-but-plausible
-stand-ins (no d2/dot/plantuml/katex binaries in this env); the screenshot
-path proven (stat-exists seed -> ready -> stock image decode) is production,
-per suite practice (cf. scripts/gen-mermaid-seed.py).
+formula, *-seed-complex.png the complex companions.
+Synthetic-but-plausible stand-ins (no d2/dot/plantuml binaries in this
+env); the screenshot path proven (stat-exists seed -> ready -> stock
+image decode) is production, per suite practice
+(cf. scripts/gen-mermaid-seed.py).
 
 Requires Pillow (fixture generation only, never ships): pip install pillow.
 Usage:  python3 scripts/gen-plugin-seeds.py
@@ -164,13 +168,119 @@ def math_seed():
     return im, "math-seed.png"
 
 
+def _real_mathjax_render(fixture_md, out_name):
+    # Genuine engine render (round-two revision: seeds are real engine
+    # output, never Pillow mimics). Bootstraps the pinned mathjax-full
+    # npm package into a temp dir, typesets the fixture tex to SVG with
+    # the real MathJax engine, screenshots headless Chrome, and autocrops
+    # to content. Needs node+npm and Chrome; fails loudly without them.
+    # Verified deterministic (reruns pixel-identical) for 3.2.1.
+    import shutil
+    import subprocess
+    import tempfile
+    npm_pkg = "mathjax-full@3.2.1"
+    for bin_name in ("node", "npm"):
+        if shutil.which(bin_name) is None:
+            sys.exit("FAIL: %s not found (needed for %s)" %
+                     (bin_name, out_name))
+    chrome = (os.environ.get("CHROME_BIN") or
+              shutil.which("google-chrome") or
+              shutil.which("chromium") or shutil.which("chromium-browser") or
+              "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if not (os.path.exists(chrome) if os.sep in chrome else
+            shutil.which(chrome)):
+        sys.exit("FAIL: Chrome not found (needed for %s)" % out_name)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = open(os.path.join(root, fixture_md)).read().split('\n')
+    start = next(i for i, l in enumerate(lines)
+                 if l.lstrip().startswith('```') and
+                 l.lstrip()[3:].strip().split(' ')[:1] == ['mathjax'])
+    end = next(i for i in range(start + 1, len(lines))
+               if lines[i].lstrip().startswith('```'))
+    tex = '\n'.join(lines[start + 1:end])
+    workdir = tempfile.mkdtemp()
+    pkgdir = os.path.join(workdir, "pkg")
+    os.mkdir(pkgdir)
+    r = subprocess.run(["npm", "init", "-y"], cwd=pkgdir,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("FAIL: npm init: %s" % (r.stderr or '').strip())
+    r = subprocess.run(["npm", "install", npm_pkg], cwd=pkgdir,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("FAIL: npm install %s: %s" %
+                 (npm_pkg, (r.stderr or '').strip()))
+    mj = os.path.join(pkgdir, "node_modules", "mathjax-full", "js")
+    render_js = (
+        "const fs = require('fs');\n"
+        "const { mathjax } = require(%s);\n"
+        "const { TeX } = require(%s);\n"
+        "const { SVG } = require(%s);\n"
+        "const { liteAdaptor } = require(%s);\n"
+        "const { RegisterHTMLHandler } = require(%s);\n"
+        "const adaptor = liteAdaptor();\n"
+        "RegisterHTMLHandler(adaptor);\n"
+        "const tex = new TeX({ packages: ['base', 'ams'] });\n"
+        "const svg = new SVG({ fontCache: 'local' });\n"
+        "const doc = mathjax.document('', "
+        "{ InputJax: tex, OutputJax: svg });\n"
+        "const src = fs.readFileSync(%s, 'utf8');\n"
+        "const node = doc.convert(src, { display: true });\n"
+        "const body = '<div id=\"f\" style=\"background:white\">' +\n"
+        "  adaptor.innerHTML(node) + '</div>';\n"
+        "const html = '<!DOCTYPE html><html><head>"
+        "<meta charset=\"utf-8\">' +\n"
+        "  '<style>html,body{margin:0;padding:0;background:#fff;}' +\n"
+        "  '#f{display:inline-block;padding:28px;font-size:44px;color:#333;}' +\n"
+        "  '</style></head><body>' + body + '</body></html>';\n"
+        "fs.writeFileSync(%s, html);\n" % tuple(
+            __import__('json').dumps(p) for p in (
+                os.path.join(mj, "mathjax.js"),
+                os.path.join(mj, "input", "tex.js"),
+                os.path.join(mj, "output", "svg.js"),
+                os.path.join(mj, "adaptors", "liteAdaptor.js"),
+                os.path.join(mj, "handlers", "html.js"),
+                os.path.join(workdir, "formula.tex"),
+                os.path.join(workdir, "formula.html"),
+            )))
+    with open(os.path.join(workdir, "formula.tex"), 'w') as f:
+        f.write(tex)
+    with open(os.path.join(workdir, "render.js"), 'w') as f:
+        f.write(render_js)
+    r = subprocess.run(["node", "render.js"], cwd=workdir,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("FAIL: mathjax render %s: %s" %
+                 (fixture_md, (r.stderr or '').strip()))
+    shot = os.path.join(workdir, "shot.png")
+    page = "file://" + os.path.join(workdir, "formula.html")
+    r = subprocess.run([chrome, "--headless", "--disable-gpu",
+                        "--no-sandbox", "--screenshot=" + shot,
+                        "--window-size=1200,500", "--hide-scrollbars",
+                        page], capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(shot):
+        sys.exit("FAIL: chrome screenshot %s: %s" %
+                 (fixture_md, (r.stderr or '').strip()))
+    from PIL import ImageChops
+    im = Image.open(shot).convert('RGB')
+    bg = Image.new('RGB', im.size, (255, 255, 255))
+    bbox = ImageChops.difference(im, bg).getbbox()
+    if bbox is None:
+        sys.exit("FAIL: empty mathjax render for %s" % fixture_md)
+    pad = 28
+    x0, y0, x1, y1 = bbox
+    box = (max(0, x0 - pad), max(0, y0 - pad),
+           min(im.width, x1 + pad), min(im.height, y1 + pad))
+    out = os.path.join(os.getcwd(), out_name)
+    im.crop(box).save(out)
+    shutil.rmtree(workdir, ignore_errors=True)
+    return Image.open(out), out_name
+
+
 def mathjax_seed():
-    # Fixture: a^2 + b^2 = c^2
-    im = _typeset([
-        ("a", "body"), ("2", "sup"), ("+ b", "body"), ("2", "sup"),
-        ("= c", "body"), ("2", "sup"),
-    ])
-    return im, "mathjax-seed.png"
+    # Fixture: a^2 + b^2 = c^2. Genuine MathJax 3.2.1 output.
+    return _real_mathjax_render("test_cases/plugin_mathjax.md",
+                                "mathjax-seed.png")
 
 
 # --- Tall/wide companions (owner request 2026-09-12, mimicking the mermaid
@@ -512,12 +622,9 @@ def math_seed_complex():
 
 def mathjax_seed_complex():
     # Fixture test_cases/plugin_mathjax_complex.md: Gaussian integral.
-    im = _typeset([
-        ("\u222b", "big"), ("-\u221e", "sub"), ("\u221e", "sup"),
-        (" e", "body"), ("-x2", "sup"), (" dx = ", "body"),
-        ("\u221a\u03c0", "body"),
-    ])
-    return im, "mathjax-seed-complex.png"
+    # Genuine MathJax 3.2.1 output (display-style integral limits).
+    return _real_mathjax_render("test_cases/plugin_mathjax_complex.md",
+                                "mathjax-seed-complex.png")
 
 
 def main():

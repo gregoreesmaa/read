@@ -205,9 +205,9 @@ cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wi
 # or launches; the suite pre-seeds the cache PNG for the fixture fence and
 # the headless open resolves it to ready via the shipped stat-exists path
 # (no child processes); --settle-images decodes it through the stock image
-# path. Seed pixels are the synthetic test_cases/assets/mathjax-seed.png
-# fixture (regenerate with scripts/gen-plugin-seeds.py; no PNG-capable math
-# tool in this env, so a live open stays naive until #344's canary merges);
+# path. Seed pixels are genuine MathJax 3.2.1 output for the fixture tex
+# (test_cases/assets/mathjax-seed.png; regenerate with
+# scripts/gen-plugin-seeds.py, which renders via the real MathJax engine);
 # the path proven is production. The fence hash mirrors fenceHash in
 # src/core/plugin_cache.zig with the renderer ordinal parsed from the
 # Renderer enum, so seeds stay correct as the enum grows. The fixture tex
@@ -239,8 +239,8 @@ cp test_cases/assets/mathjax-seed.png "$cache_root/read/plugins/math/$mathjax_ha
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mathjax.png" --settle-images test_cases/plugin_mathjax.md
 
 # Complex companion (same case 4m): the Gaussian integral fixture renders
-# the mathjax-seed-complex.png typeset seed (integral with bounds,
-# superscript, radical).
+# the genuine MathJax 3.2.1 mathjax-seed-complex.png (display-style
+# integral limits, superscript, radical).
 complex_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_mathjax_complex.md mathjax math <<'EOF'
 import re, sys
 zig_src, md_path, info_token, renderer = sys.argv[1:5]
