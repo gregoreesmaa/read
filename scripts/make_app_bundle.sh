@@ -17,6 +17,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Read"
 chmod +x "$APP/Contents/MacOS/Read"
 cp "$ROOT/assets/icon/Read.icns" "$APP/Contents/Resources/Read.icns"
+cp "$ROOT/scripts/read-plugin-render.sh" "$APP/Contents/Resources/read-plugin-render.sh"
+chmod +x "$APP/Contents/Resources/read-plugin-render.sh"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

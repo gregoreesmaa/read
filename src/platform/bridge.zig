@@ -156,6 +156,30 @@ pub extern "c" fn platform_set_test_hover(x: f32, y: f32) void;
 pub extern "c" fn platform_test_button_damage(bx: f32, by: f32, bw: f32, bh: f32, ox: *f32, oy: *f32, ow: *f32, oh: *f32) void;
 pub extern "c" fn platform_images_pending() c_int;
 pub extern "c" fn platform_arm_images() void;
+/// Async plugin renderer launcher (issue #323, Task 3): non-blocking child
+/// launch. Returns 1 active (slot spent), 0 queued (table full: retry
+/// later, no error surfaced), -1 failed (binary unresolvable or not
+/// launchable: no slot spent). Args are NUL-terminated; the caller stages
+/// srcfile and hands over ownership until the terminal state. On the -1
+/// and 0 paths nothing is transferred: the caller retains srcfile (the
+/// 0-path is test-pinned: the rejected src stays present).
+/// Cap note: at most 8 children in flight (PLUGIN_MAX_INFLIGHT in
+/// macos.m) against the 16-entry Zig job table (MAX_PLUGIN_JOBS in
+/// src/core/plugin_cache.zig); Task 5 keeps the overflow queued.
+pub extern "c" fn launchPluginRender(renderer: [*:0]const u8, srcfile: [*:0]const u8, outfile: [*:0]const u8) c_int;
+/// Main-loop reap drain: reaps exited render children without blocking and
+/// frees their slots. Returns completions drained this call (>= 0).
+/// Task 5 calls this only while the in-flight count is > 0.
+pub extern "c" fn pollPluginCompletions() c_int;
+/// Per-job outcome query for Task 5 (the drain count alone cannot carry
+/// it: the slot is freed at reap). Query by outfile path promptly after
+/// poll reports completions: 1 clean render, 0 renderer failed (nonzero
+/// exit or bad outfile, even when bytes exist), -1 no record. Use it to
+/// mark ready vs failed without re-statting or duplicating the mtime
+/// check; an in-flight path may still show its prior generation.
+pub extern "c" fn pluginOutcomeFor(outfile: [*:0]const u8) c_int;
+/// Headless probe (TEST_HOOKS builds only): in-flight render child count.
+pub extern "c" fn platform_test_plugin_active() c_int;
 pub extern "c" fn platform_probe_px_add(x: c_int, y: c_int) void;
 
 pub extern "c" fn platform_register_text_run(

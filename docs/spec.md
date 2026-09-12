@@ -12,6 +12,7 @@ HTML rendering is intentionally unsupported. Numbers for speed and size live onl
 - Blockquotes, including nested (`>>`)
 - Unordered (`*`, `-`, `+`), ordered (`1.`, `1)`), and task (`- [ ]`, `- [x]`) lists
 - GFM tables with column measurement, cell alignment, and dividers
+- Plugin diagrams (mermaid; cached async render, code fallback)
 
 ## Inlines
 

@@ -203,6 +203,7 @@ test "idle: zero background threads on the hot path (issue #14 source audit)" {
         "src/layout/damage.zig",
         "src/main.zig",
         "src/platform/bridge.zig",
+        "src/core/plugin_cache.zig",
         "src/platform/glyph_cache.zig",
         "src/platform/idle.zig",
     };

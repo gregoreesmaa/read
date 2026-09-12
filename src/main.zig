@@ -9,6 +9,7 @@ const damage = @import("layout/damage.zig");
 const help_overlay = @import("layout/help_overlay.zig");
 const remote_policy = @import("core/remote_policy.zig");
 const bridge = @import("platform/bridge.zig");
+const plugin_cache = @import("core/plugin_cache.zig");
 
 const DEFAULT_DOC =
     \\# Read
@@ -105,6 +106,48 @@ fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) ca
 
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
+// Content-driven async plugin renders (issue #323, PR-1 Task 5). Per-doc
+// job table plus the parallel path buffers Task 4's borrow side reads
+// (slot index == job index; paths NUL-terminated in place for the outcome
+// query, layout borrows [0..len]). Static BSS, zero hot-path allocations:
+// the kick runs once per open (cold), the drain runs per frame only while
+// a render child is in flight.
+var g_plugin_jobs: [plugin_cache.MAX_PLUGIN_JOBS]plugin_cache.PluginJob = undefined;
+var g_plugin_count: usize = 0;
+var g_plugin_path_bufs: [plugin_cache.MAX_PLUGIN_JOBS][256]u8 = undefined;
+var g_plugin_path_lens: [plugin_cache.MAX_PLUGIN_JOBS]u8 = [_]u8{0} ** plugin_cache.MAX_PLUGIN_JOBS;
+var g_plugin_launched: [plugin_cache.MAX_PLUGIN_JOBS]bool = [_]bool{false} ** plugin_cache.MAX_PLUGIN_JOBS;
+var g_plugin_inflight: u8 = 0;
+// Previously tracked children orphaned by a document swap: still reaped by
+// the drain (never left behind), never queried.
+var g_plugin_orphans: u8 = 0;
+const PLUGIN_RENDERER_COUNT: usize = std.meta.fields(plugin_cache.Renderer).len;
+// Session probe verdicts (once per renderer per session) plus pending flags
+// and sentinel outfile paths for the in-flight probe child.
+var g_plugin_probe: [PLUGIN_RENDERER_COUNT]?bool = [_]?bool{null} ** PLUGIN_RENDERER_COUNT;
+var g_plugin_probe_pending: [PLUGIN_RENDERER_COUNT]bool = [_]bool{false} ** PLUGIN_RENDERER_COUNT;
+var g_plugin_probe_out: [PLUGIN_RENDERER_COUNT][256]u8 = undefined;
+var g_plugin_probe_out_len: [PLUGIN_RENDERER_COUNT]u8 = [_]u8{0} ** PLUGIN_RENDERER_COUNT;
+// Per-renderer probe sequence: sentinel leaves are unique per launch
+// (`probe-<hh>.src/.out`) because the outcome ring returns its
+// lowest-index path match — a reused sentinel would read a previous
+// generation's verdict. Staged src files are reaped by the launcher;
+// superseded outs are unlinked best-effort at the next probe launch.
+var g_plugin_probe_seq: [PLUGIN_RENDERER_COUNT]u8 = [_]u8{0} ** PLUGIN_RENDERER_COUNT;
+// Stable per-renderer paths: cache dir, render shim (the child entry
+// point), probe shim. Rebuilt every open; valid across drains.
+var g_plugin_dir_bufs: [PLUGIN_RENDERER_COUNT][512]u8 = undefined;
+var g_plugin_dir_lens: [PLUGIN_RENDERER_COUNT]u8 = [_]u8{0} ** PLUGIN_RENDERER_COUNT;
+var g_plugin_shim_render: [PLUGIN_RENDERER_COUNT][256]u8 = undefined;
+var g_plugin_shim_render_len: [PLUGIN_RENDERER_COUNT]u8 = [_]u8{0} ** PLUGIN_RENDERER_COUNT;
+var g_plugin_probe_shim: [PLUGIN_RENDERER_COUNT][256]u8 = undefined;
+var g_plugin_probe_shim_len: [PLUGIN_RENDERER_COUNT]u8 = [_]u8{0} ** PLUGIN_RENDERER_COUNT;
+var g_plugin_root_buf: [512]u8 = undefined;
+var g_plugin_root_len: usize = 0;
+var g_plugin_helper_buf: [1024]u8 = undefined;
+// Executable path (argv[0]) for bundle-Resources helper resolution.
+var g_exe_path_buf: [2048]u8 = undefined;
+var g_exe_path: []const u8 = "";
 var g_scroll_lock: layout.ScrollLockState = .{};
 // Gesture conditioning (#31): precise 1:1 untouched, wheel jitter
 // quantized. Edge rubber-band overshoot.
@@ -151,6 +194,595 @@ fn onImagesChanged(delta_above: f32) callconv(.c) void {
     if (delta_above != 0.0) {
         snapScroll(g_app.scroll_y + delta_above);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Content-driven async plugin renders (issue #323, PR-1 Task 5).
+// At open the kick builds the per-doc job table, stats cache hits to ready,
+// probes each distinct renderer once per session through a probe shim, and
+// launches queued renders FIFO (at most 8 in flight, mirroring
+// PLUGIN_MAX_INFLIGHT in macos.m) through per-renderer render shims. Both
+// shims exec the helper script, so tool knowledge stays in
+// scripts/read-plugin-render.sh, never in the binary. Completions drain per
+// frame from onTick only while a child is in flight (0% CPU when static);
+// every resolved job marks ready/failed via pluginOutcomeFor and
+// reconverges through onImagesChanged. Read-test/headless binaries skip the
+// kick, so fences stay deterministic code cards there.
+// ---------------------------------------------------------------------------
+
+/// Max render children in flight; mirrors PLUGIN_MAX_INFLIGHT in macos.m
+/// against the 16-entry job table (overflow stays queued).
+const PLUGIN_INFLIGHT_MAX: u8 = 8;
+
+/// Lowercase 16-hex of a fence hash for cache/sidecar names. Manual
+/// nibbles: no formatting machinery on this path.
+fn pluginHex16(h: u64, out: *[16]u8) void {
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const shift: u6 = @intCast((15 - i) * 4);
+        const nib: u8 = @intCast((h >> shift) & 0xf);
+        out[i] = if (nib < 10) '0' + nib else 'a' + (nib - 10);
+    }
+}
+
+/// `<dir>/src-<hex>.txt`: staged fence source bytes beside the cached PNG.
+/// The launcher unlinks it at reap. Pure string math, unit-tested.
+fn pluginSidecarPath(dir: []const u8, hash: u64, out: []u8) ?[]u8 {
+    const pre = "/src-";
+    const ext = ".txt";
+    if (dir.len + pre.len + 16 + ext.len > out.len) return null;
+    var s: usize = 0;
+    @memcpy(out[s..][0..dir.len], dir);
+    s += dir.len;
+    @memcpy(out[s..][0..pre.len], pre);
+    s += pre.len;
+    var hex: [16]u8 = undefined;
+    pluginHex16(hash, &hex);
+    @memcpy(out[s..][0..16], hex[0..]);
+    s += 16;
+    @memcpy(out[s..][0..ext.len], ext);
+    s += ext.len;
+    return out[0..s];
+}
+
+/// Five-part join for generated script bodies (single length check).
+fn pluginJoin5(a: []const u8, b: []const u8, c: []const u8, d: []const u8, e: []const u8, out: []u8) ?[]u8 {
+    if (a.len + b.len + c.len + d.len + e.len > out.len) return null;
+    const parts = [_][]const u8{ a, b, c, d, e };
+    var s: usize = 0;
+    for (parts) |part| {
+        @memcpy(out[s..][0..part.len], part);
+        s += part.len;
+    }
+    return out[0..s];
+}
+
+/// True when the helper path embeds safely in double quotes (the generated
+/// shims never interpret it, only exec through it).
+fn pluginHelperQuotable(helper: []const u8) bool {
+    if (helper.len == 0) return false;
+    for (helper) |c| {
+        if (c == '"' or c == '$' or c == '`' or c == '\\' or c == '\n') return false;
+    }
+    return true;
+}
+
+/// Render shim body: runs `helper render <name>` on the launcher's
+/// (srcfile, outfile) args. Pure, unit-tested.
+fn pluginRenderShim(helper: []const u8, name: []const u8, out: []u8) ?[]u8 {
+    if (!pluginHelperQuotable(helper) or name.len == 0) return null;
+    return pluginJoin5("#!/bin/sh\nexec \"", helper, "\" render ", name, " \"$1\" \"$2\"\n", out);
+}
+
+/// Probe shim body: answers `helper probe <name>` and copies the staged
+/// bytes to the sentinel outfile on success, so the outcome channel (exit
+/// 0 plus a fresh nonzero outfile) carries probe truth with no new FFI.
+/// Pure, unit-tested.
+fn pluginProbeShim(helper: []const u8, name: []const u8, out: []u8) ?[]u8 {
+    if (!pluginHelperQuotable(helper) or name.len == 0) return null;
+    return pluginJoin5("#!/bin/sh\nH=\"", helper, "\"\nif \"$H\" probe ", name, "; then cp \"$1\" \"$2\"; else exit 1; fi\n", out);
+}
+
+/// Fill the per-doc table plus path buffers from the scan (cold, per open).
+/// Truncation at MAX_PLUGIN_JOBS is explicit here: fences past 16 stay
+/// plain code (naive by absence — no layout cap exists downstream).
+/// NUL-terminates each path in place for the outcome query (layout borrows
+/// [0..len]). Returns the row count. Unit-tested.
+fn pluginResolvePaths(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    cache_root: []const u8,
+    jobs: []plugin_cache.PluginJob,
+    bufs: [][256]u8,
+    lens: []u8,
+) usize {
+    const cap = @min(jobs.len, plugin_cache.MAX_PLUGIN_JOBS);
+    const n = plugin_cache.collectPluginJobs(bytes, lines, cache_root, jobs[0..cap]);
+    const take = @min(n, cap);
+    var i: usize = 0;
+    while (i < take) : (i += 1) {
+        lens[i] = 0;
+        if (i < bufs.len) {
+            if (plugin_cache.cachePath(cache_root, jobs[i].renderer, jobs[i].hash, &bufs[i])) |p| {
+                if (p.len < bufs[i].len) {
+                    lens[i] = @intCast(p.len);
+                    bufs[i][p.len] = 0;
+                }
+            }
+        }
+    }
+    return take;
+}
+
+/// Cache root for rendered PNGs (`<root>/read/plugins/<name>/<hex>.png`):
+/// `$HOME/Library/Caches` (the NSCachesDirectory default outside a
+/// sandbox), else a `$TMPDIR`/`/tmp` fallback. Cold path only.
+fn pluginCacheRoot(out: []u8) ?[]u8 {
+    if (std.c.getenv("HOME")) |z| {
+        const home = std.mem.span(z);
+        const tail = "/Library/Caches";
+        if (home.len == 0 or home.len + tail.len > out.len) return null;
+        @memcpy(out[0..home.len], home);
+        @memcpy(out[home.len..][0..tail.len], tail);
+        return out[0 .. home.len + tail.len];
+    }
+    const tmp = if (std.c.getenv("TMPDIR")) |z| std.mem.span(z) else "/tmp";
+    const sub = "/read-plugin-cache";
+    if (tmp.len == 0 or tmp.len + sub.len > out.len) return null;
+    @memcpy(out[0..tmp.len], tmp);
+    @memcpy(out[tmp.len..][0..sub.len], sub);
+    return out[0 .. tmp.len + sub.len];
+}
+
+/// `<root>/read/plugins/<name>` (renderer name via @tagName, so follow-up
+/// rows need no new table here). Pure, cold path.
+fn pluginRendererDir(root: []const u8, name: []const u8, out: []u8) ?[]u8 {
+    const mid = "/read/plugins/";
+    if (root.len + mid.len + name.len > out.len) return null;
+    var s: usize = 0;
+    @memcpy(out[s..][0..root.len], root);
+    s += root.len;
+    @memcpy(out[s..][0..mid.len], mid);
+    s += mid.len;
+    @memcpy(out[s..][0..name.len], name);
+    s += name.len;
+    return out[0..s];
+}
+
+/// `<dir>/<leaf>` for sentinel sidecar names. Pure, cold path.
+fn pluginChildPath(dir: []const u8, leaf: []const u8, out: []u8) ?[]u8 {
+    if (dir.len + 1 + leaf.len > out.len) return null;
+    @memcpy(out[0..dir.len], dir);
+    out[dir.len] = '/';
+    @memcpy(out[dir.len + 1 ..][0..leaf.len], leaf);
+    return out[0 .. dir.len + 1 + leaf.len];
+}
+
+/// Copy a path into a stable buffer with NUL termination for FFI calls.
+fn pluginStoreNul(dst: []u8, len_out: *u8, s: []const u8) bool {
+    if (s.len == 0 or s.len + 1 > dst.len or s.len > 255) return false;
+    @memcpy(dst[0..s.len], s);
+    dst[s.len] = 0;
+    len_out.* = @intCast(s.len);
+    return true;
+}
+
+/// mkdir, tolerating EEXIST (verified by open: a pre-existing dir passes).
+fn pluginEnsureDir(path_z: [*:0]const u8) bool {
+    if (std.c.mkdir(path_z, 0o755) == 0) return true;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, std.mem.span(path_z), .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    _ = std.c.close(fd);
+    return true;
+}
+
+/// mkdir -p for the three plugin levels under root. Cold path only.
+fn pluginMkdirAll(root: []const u8, dir: []const u8) bool {
+    var lvl: [1024:0]u8 = [_:0]u8{0} ** 1024;
+    for ([_][]const u8{ "/read", "/read/plugins" }) |sfx| {
+        if (root.len + sfx.len + 1 > lvl.len) return false;
+        @memcpy(lvl[0..root.len], root);
+        @memcpy(lvl[root.len..][0..sfx.len], sfx);
+        lvl[root.len + sfx.len] = 0;
+        const z: [*:0]const u8 = @ptrCast(&lvl[0]);
+        if (!pluginEnsureDir(z)) return false;
+    }
+    if (dir.len + 1 > lvl.len) return false;
+    @memcpy(lvl[0..dir.len], dir);
+    lvl[dir.len] = 0;
+    const z: [*:0]const u8 = @ptrCast(&lvl[0]);
+    return pluginEnsureDir(z);
+}
+
+/// Cache-hit probe: the PNG exists and is nonzero (fresh renders carry the
+/// exit-status dimension too, validated at reap and reported by outcome).
+fn pluginCacheFileReady(path: []const u8) bool {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return false;
+    return st.size > 0;
+}
+
+/// Stage bytes to an absolute path (src sidecars, shims). Cold path only.
+fn pluginWriteFile(path_z: [*:0]const u8, data: []const u8) bool {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, std.mem.span(path_z), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return false;
+    defer _ = std.c.close(fd);
+    var off: usize = 0;
+    while (off < data.len) {
+        const w = std.c.write(fd, data[off..].ptr, data.len - off);
+        if (w <= 0) return false;
+        off += @intCast(w);
+    }
+    return true;
+}
+
+/// Resolve the renderer driver script: `$READ_PLUGIN_RENDERER`, then the
+/// app-bundle Resources copy beside the executable (verified present),
+/// then PATH. Cold path only.
+fn pluginHelperPath(out: []u8) ?[]u8 {
+    if (std.c.getenv("READ_PLUGIN_RENDERER")) |z| {
+        const v = std.mem.span(z);
+        if (v.len == 0 or v.len >= out.len) return null;
+        @memcpy(out[0..v.len], v);
+        return out[0..v.len];
+    }
+    if (g_exe_path.len > 0) {
+        const tail = "/../Resources/read-plugin-render.sh";
+        if (std.mem.lastIndexOfScalar(u8, g_exe_path, '/')) |li| {
+            const dir = g_exe_path[0..li];
+            if (dir.len + tail.len < out.len) {
+                @memcpy(out[0..dir.len], dir);
+                @memcpy(out[dir.len..][0..tail.len], tail);
+                const cand = out[0 .. dir.len + tail.len];
+                if (pluginCacheFileReady(cand)) return cand;
+            }
+        }
+    }
+    const bare = "read-plugin-render.sh";
+    if (bare.len >= out.len) return null;
+    @memcpy(out[0..bare.len], bare);
+    return out[0..bare.len];
+}
+
+/// Demote a renderer's queued jobs to naive (prerequisites unmet: no job,
+/// no indicator, no retry this session).
+fn pluginMarkNaive(r: usize) void {
+    var i: usize = 0;
+    while (i < g_plugin_count) : (i += 1) {
+        if (@intFromEnum(g_plugin_jobs[i].renderer) == r and g_plugin_jobs[i].state == .queued) {
+            g_plugin_jobs[i].state = .naive;
+        }
+    }
+}
+
+/// Write one shim script (render or probe entry point) under dir and mark
+/// it executable. The stable path persists for later launches.
+fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe: bool, stable: []u8, stable_len: *u8) bool {
+    const infix = if (probe) "/probe-" else "/run-";
+    const ext = ".sh";
+    if (dir.len + infix.len + name.len + ext.len + 1 > stable.len) return false;
+    var s: usize = 0;
+    @memcpy(stable[s..][0..dir.len], dir);
+    s += dir.len;
+    @memcpy(stable[s..][0..infix.len], infix);
+    s += infix.len;
+    @memcpy(stable[s..][0..name.len], name);
+    s += name.len;
+    @memcpy(stable[s..][0..ext.len], ext);
+    s += ext.len;
+    stable[s] = 0;
+    stable_len.* = @intCast(s);
+    const path_z: [*:0]const u8 = @ptrCast(&stable[0]);
+    var body: [2048]u8 = undefined;
+    const text = if (probe) pluginProbeShim(helper, name, &body) else pluginRenderShim(helper, name, &body);
+    const t = text orelse return false;
+    if (!pluginWriteFile(path_z, t)) return false;
+    if (std.c.chmod(path_z, 0o755) != 0) return false;
+    return true;
+}
+
+/// Launch one probe child for renderer `r` (once per session): the probe
+/// shim answers `helper probe <name>` and copies the staged bytes to the
+/// sentinel outfile on success, so the outcome channel carries probe truth.
+/// Unresolvable helpers demote to naive without launching.
+fn pluginLaunchProbe(r: usize) void {
+    const renderer: plugin_cache.Renderer = @enumFromInt(r);
+    const name = @tagName(renderer);
+    const helper = pluginHelperPath(g_plugin_helper_buf[0..]) orelse {
+        pluginMarkNaive(r);
+        return;
+    };
+    const root = g_plugin_root_buf[0..g_plugin_root_len];
+    var dbuf: [512]u8 = undefined;
+    const dir = pluginRendererDir(root, name, &dbuf) orelse {
+        pluginMarkNaive(r);
+        return;
+    };
+    if (!pluginStoreNul(g_plugin_dir_bufs[r][0..], &g_plugin_dir_lens[r], dir)) {
+        pluginMarkNaive(r);
+        return;
+    }
+    if (!pluginMkdirAll(root, dir)) {
+        pluginMarkNaive(r);
+        return;
+    }
+    if (!pluginWriteShim(dir, name, helper, false, g_plugin_shim_render[r][0..], &g_plugin_shim_render_len[r])) {
+        pluginMarkNaive(r);
+        return;
+    }
+    if (!pluginWriteShim(dir, name, helper, true, g_plugin_probe_shim[r][0..], &g_plugin_probe_shim_len[r])) {
+        pluginMarkNaive(r);
+        return;
+    }
+    // Unique sentinel leaves per launch (see g_plugin_probe_seq): never
+    // reuse a path within the session. Drop the superseded outfile, if any.
+    if (g_plugin_probe_out_len[r] > 0) {
+        const prev_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
+        _ = std.c.unlink(prev_z);
+        g_plugin_probe_out_len[r] = 0;
+    }
+    const seq = g_plugin_probe_seq[r];
+    g_plugin_probe_seq[r] +|= 1;
+    const hexdig = "0123456789abcdef";
+    var src_leaf: [12]u8 = .{ 'p', 'r', 'o', 'b', 'e', '-', 0, 0, '.', 's', 'r', 'c' };
+    src_leaf[6] = hexdig[seq >> 4];
+    src_leaf[7] = hexdig[seq & 15];
+    var out_leaf: [12]u8 = .{ 'p', 'r', 'o', 'b', 'e', '-', 0, 0, '.', 'o', 'u', 't' };
+    out_leaf[6] = hexdig[seq >> 4];
+    out_leaf[7] = hexdig[seq & 15];
+    var tmp: [1024:0]u8 = [_:0]u8{0} ** 1024;
+    const src = pluginChildPath(dir, src_leaf[0..], tmp[0..512]) orelse {
+        pluginMarkNaive(r);
+        return;
+    };
+    tmp[src.len] = 0;
+    const src_z: [*:0]const u8 = @ptrCast(&tmp[0]);
+    if (!pluginWriteFile(src_z, "probe\n")) {
+        pluginMarkNaive(r);
+        return;
+    }
+    const out = pluginChildPath(dir, out_leaf[0..], tmp[512..]) orelse {
+        _ = std.c.unlink(src_z);
+        pluginMarkNaive(r);
+        return;
+    };
+    if (!pluginStoreNul(g_plugin_probe_out[r][0..], &g_plugin_probe_out_len[r], out)) {
+        _ = std.c.unlink(src_z);
+        pluginMarkNaive(r);
+        return;
+    }
+    const shim_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_shim[r][0]);
+    const out_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
+    const rc = bridge.launchPluginRender(shim_z, src_z, out_z);
+    if (rc == 1) {
+        g_plugin_probe_pending[r] = true;
+        g_plugin_inflight += 1;
+        return;
+    }
+    _ = std.c.unlink(src_z);
+    _ = std.c.unlink(out_z);
+    // -1: shim unlaunchable, demote now. 0: table momentarily full; jobs
+    // stay queued and the next drain retries the probe structurally.
+    if (rc != 0) pluginMarkNaive(r);
+}
+
+/// Launch queued renders FIFO while in flight stays under the cap. Stages
+/// each fence's source bytes to its `src-<hex>.txt` sidecar first (owned by
+/// the launcher from a 1 return until reap). A rejected launch (0) stops
+/// the sweep for this pass; a failed one (-1) marks that job failed.
+fn pluginLaunchQueued() void {
+    var i: usize = 0;
+    while (i < g_plugin_count and g_plugin_inflight < PLUGIN_INFLIGHT_MAX) : (i += 1) {
+        if (g_plugin_jobs[i].state != .queued or g_plugin_launched[i]) continue;
+        const r: usize = @intFromEnum(g_plugin_jobs[i].renderer);
+        // Verdict true implies the probe wrote this renderer's shim, but
+        // never launch through an unwritten entry point.
+        if (r >= PLUGIN_RENDERER_COUNT or g_plugin_probe[r] != true) continue;
+        if (g_plugin_shim_render_len[r] == 0 or g_plugin_dir_lens[r] == 0) continue;
+        const dir = g_plugin_dir_bufs[r][0..g_plugin_dir_lens[r]];
+        var staging: [512:0]u8 = [_:0]u8{0} ** 512;
+        const src = pluginSidecarPath(dir, g_plugin_jobs[i].hash, staging[0..511]) orelse {
+            g_plugin_jobs[i].state = .failed;
+            continue;
+        };
+        staging[src.len] = 0;
+        const src_z: [*:0]const u8 = @ptrCast(&staging[0]);
+        const bytes = plugin_cache.fenceSource(g_app.bytes, g_app.lines[0..g_app.line_count], g_plugin_jobs[i].fence_line);
+        if (!pluginWriteFile(src_z, bytes)) {
+            g_plugin_jobs[i].state = .failed;
+            continue;
+        }
+        const out_z: [*:0]const u8 = @ptrCast(&g_plugin_path_bufs[i][0]);
+        const shim_z: [*:0]const u8 = @ptrCast(&g_plugin_shim_render[r][0]);
+        const rc = bridge.launchPluginRender(shim_z, src_z, out_z);
+        if (rc == 1) {
+            g_plugin_jobs[i].state = .rendering;
+            g_plugin_launched[i] = true;
+            g_plugin_inflight += 1;
+        } else {
+            // Nothing transferred on these paths: the staged sidecar is
+            // still ours, so remove it here (the launcher unlinks only
+            // what a 1 return took over).
+            _ = std.c.unlink(src_z);
+            if (rc == 0) break;
+            g_plugin_jobs[i].state = .failed;
+        }
+    }
+    if (g_plugin_inflight > 0) bridge.platform_smooth_kick();
+}
+
+/// Probe unknown renderers present in the table (once per session), demote
+/// known-absent renderers to naive, then launch queued renders FIFO.
+fn pluginProbeAndLaunch() void {
+    var r: usize = 0;
+    while (r < PLUGIN_RENDERER_COUNT) : (r += 1) {
+        if (g_plugin_probe[r] == false) {
+            pluginMarkNaive(r);
+        } else if (g_plugin_probe[r] == null and !g_plugin_probe_pending[r]) {
+            var present = false;
+            var i: usize = 0;
+            while (i < g_plugin_count) : (i += 1) {
+                if (@intFromEnum(g_plugin_jobs[i].renderer) == r and g_plugin_jobs[i].state == .queued) {
+                    present = true;
+                    break;
+                }
+            }
+            if (present) pluginLaunchProbe(r);
+        }
+    }
+    pluginLaunchQueued();
+}
+
+/// Per-frame reap drain: poll completions, resolve probe plus render
+/// outcomes promptly by path (the ring returns its lowest-index match, so
+/// outfiles are content-addressed and never reused within a session),
+/// launch the next queued FIFO, and reconverge metrics plus repaint on any
+/// flip. Returns true when anything resolved (the tick holds one frame).
+fn pluginPollAndAdvance() bool {
+    if (g_plugin_inflight +| g_plugin_orphans == 0) return false;
+    const drained = bridge.pollPluginCompletions();
+    if (drained <= 0) return false;
+    var resolved: u8 = 0;
+    var r: usize = 0;
+    while (r < PLUGIN_RENDERER_COUNT) : (r += 1) {
+        if (!g_plugin_probe_pending[r]) continue;
+        const probe_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
+        const oc = bridge.pluginOutcomeFor(probe_z);
+        if (oc == -1) continue;
+        g_plugin_probe_pending[r] = false;
+        g_plugin_probe[r] = (oc == 1);
+        g_plugin_inflight -= 1;
+        resolved += 1;
+        _ = std.c.unlink(probe_z);
+        if (oc != 1) pluginMarkNaive(r);
+    }
+    var i: usize = 0;
+    while (i < g_plugin_count) : (i += 1) {
+        if (!g_plugin_launched[i] or g_plugin_jobs[i].state != .rendering) continue;
+        const out_z: [*:0]const u8 = @ptrCast(&g_plugin_path_bufs[i][0]);
+        const oc = bridge.pluginOutcomeFor(out_z);
+        if (oc == -1) continue;
+        g_plugin_launched[i] = false;
+        g_plugin_inflight -= 1;
+        resolved += 1;
+        g_plugin_jobs[i].state = if (oc == 1) .ready else .failed;
+    }
+    // Untracked reaps belong to orphans from a previous document: absorb
+    // them so polling parks again.
+    const orphans_open: i32 = @as(i32, g_plugin_orphans) - @max(@as(i32, drained) - @as(i32, resolved), 0);
+    g_plugin_orphans = @intCast(@max(orphans_open, 0));
+    pluginProbeAndLaunch();
+    if (resolved > 0) {
+        // Same arrival path as async images (no above-viewport shift is
+        // known here: content below settles on the next frame's layout).
+        onImagesChanged(0.0);
+        bridge.platform_request_redraw();
+        return true;
+    }
+    return false;
+}
+
+/// Per-open plugin kick (cold): reset per-doc state, resolve the table,
+/// stat cache hits to ready, then probe and launch. Read-test/headless
+/// binaries skip the entire kick (same determinism rule as the parked image
+/// decodes: fences stay code cards there).
+fn pluginKickForDocument() void {
+    g_plugin_orphans +|= g_plugin_inflight;
+    g_plugin_count = 0;
+    g_plugin_inflight = 0;
+    for (&g_plugin_launched) |*l| l.* = false;
+    for (&g_plugin_probe_pending) |*p| p.* = false;
+    if (build_options.test_hooks) return;
+    if (!plugin_cache.hasPluginFences(g_app.bytes, g_app.lines[0..g_app.line_count])) return;
+    const root = pluginCacheRoot(g_plugin_root_buf[0..]) orelse return;
+    g_plugin_root_len = root.len;
+    const n = pluginResolvePaths(
+        g_app.bytes,
+        g_app.lines[0..g_app.line_count],
+        root,
+        g_plugin_jobs[0..],
+        g_plugin_path_bufs[0..],
+        g_plugin_path_lens[0..],
+    );
+    // Explicit truncation at 16 rows (Task 4 review F2): collection caps
+    // there too, so this minimum documents the bound at the build.
+    g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    if (g_plugin_count == 0) return;
+    var saw_ready = false;
+    var i: usize = 0;
+    while (i < g_plugin_count) : (i += 1) {
+        if (g_plugin_path_lens[i] == 0) {
+            g_plugin_jobs[i].state = .naive;
+            continue;
+        }
+        if (pluginCacheFileReady(g_plugin_path_bufs[i][0..g_plugin_path_lens[i]])) {
+            g_plugin_jobs[i].state = .ready;
+            saw_ready = true;
+        } else {
+            g_plugin_jobs[i].state = .queued;
+        }
+    }
+    // Ready-at-open changes heights after metrics ran: reconverge now so
+    // the first paint already carries the image boxes.
+    if (saw_ready) updateDocumentMetrics();
+    pluginProbeAndLaunch();
+    if (g_plugin_inflight > 0) bridge.platform_smooth_kick();
+}
+
+/// TEST_HOOKS-only cache-hit seeding for headless screenshots (issue #323
+/// review): read-test never probes or launches (see the test_hooks gate
+/// above), so plugin fences would always screenshot as code cards. This
+/// resolves the table and stat-marks PRE-SEEDED cache PNGs to `.ready` —
+/// the exact shipped ready path (stat-exists → ready → `.image` through
+/// the stock image decode/paint) — with zero child processes. The table
+/// attaches ONLY when at least one job is ready, so unseeded documents
+/// (plugin_fallback.md) keep a null table and render bit-identical to
+/// before; misses mark `.naive` (today's plain card, no launch to await).
+/// Called only from comptime-gated headless code, so it strips out of ship
+/// builds and costs zero ship bytes.
+fn pluginSeedReadyForScreenshot() void {
+    g_plugin_count = 0;
+    if (!plugin_cache.hasPluginFences(g_app.bytes, g_app.lines[0..g_app.line_count])) return;
+    const root = pluginCacheRoot(g_plugin_root_buf[0..]) orelse return;
+    g_plugin_root_len = root.len;
+    const n = pluginResolvePaths(
+        g_app.bytes,
+        g_app.lines[0..g_app.line_count],
+        root,
+        g_plugin_jobs[0..],
+        g_plugin_path_bufs[0..],
+        g_plugin_path_lens[0..],
+    );
+    g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    if (g_plugin_count == 0) return;
+    var saw_ready = false;
+    var i: usize = 0;
+    while (i < g_plugin_count) : (i += 1) {
+        if (g_plugin_path_lens[i] == 0) {
+            g_plugin_jobs[i].state = .naive;
+            continue;
+        }
+        if (pluginCacheFileReady(g_plugin_path_bufs[i][0..g_plugin_path_lens[i]])) {
+            g_plugin_jobs[i].state = .ready;
+            saw_ready = true;
+        } else {
+            g_plugin_jobs[i].state = .naive;
+        }
+    }
+    // No hit: drop the table so layout keeps its null defaults (existing
+    // screenshots stay bit-identical); the metrics pass below reconverges
+    // the ready case on its own.
+    if (!saw_ready) g_plugin_count = 0;
+}
+
+/// Attach the per-doc plugin table into a layout config (cold paths only:
+/// metrics, draw, anchor/find walks). An empty table keeps the null
+/// defaults so rendering stays bit-identical without plugin fences.
+fn pluginAttachConfig(cfg: *layout.ViewportConfig) void {
+    if (g_plugin_count == 0) return;
+    cfg.plugins = g_plugin_jobs[0..g_plugin_count];
+    cfg.plugin_paths = g_plugin_path_bufs[0..g_plugin_count];
+    cfg.plugin_path_lens = g_plugin_path_lens[0..g_plugin_count];
 }
 
 // 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
@@ -277,11 +909,20 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
 /// target. Returns 1 while more frames are needed, 0 when settled (the
 /// platform parks its timer on 0, so a static screen costs zero wakeups).
 fn onTick(dt_ms: f32) callconv(.c) c_int {
+    // Plugin reap drain (issue #323): bounded per-frame poll, only while a
+    // render child is in flight — a static screen with no in-flight job
+    // never reaches the poll. Resolved jobs hold one more frame to paint.
+    var plugin_changed = false;
+    var plugin_flying = false;
+    if (!build_options.test_hooks and g_plugin_inflight +| g_plugin_orphans > 0) {
+        plugin_changed = pluginPollAndAdvance();
+        plugin_flying = g_plugin_inflight +| g_plugin_orphans > 0;
+    }
     // Reduce Motion parks the timer immediately: nothing should have armed
     // it, but a shrunk max could leave a stale target behind.
     if (g_reduce_motion) {
         snapScroll(g_smooth.target);
-        return 0;
+        return if (plugin_flying or plugin_changed) 1 else 0;
     }
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
@@ -292,7 +933,7 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
         bridge.platform_request_redraw();
         return 1;
     }
-    return if (settled) 0 else 1;
+    return if (settled and !plugin_flying and !plugin_changed) 0 else 1;
 }
 
 /// Display preferences pushed by the platform (launch, Reduce Motion
@@ -312,7 +953,7 @@ fn onDisplay(category_class: c_int, reduce_motion: c_int) callconv(.c) void {
 }
 
 fn updateDocumentMetrics() void {
-    const vp_config = layout.ViewportConfig{
+    var vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
@@ -323,6 +964,7 @@ fn updateDocumentMetrics() void {
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
     };
+    pluginAttachConfig(&vp_config);
     const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
@@ -455,7 +1097,7 @@ fn resolveDocPath(rel: []const u8, out: []u8) ?[]const u8 {
 
 /// Document y of the heading targeted by `#fragment` (null = missing).
 fn anchorTargetY(frag: []const u8) ?f32 {
-    const vp_config = layout.ViewportConfig{
+    var vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
@@ -465,6 +1107,7 @@ fn anchorTargetY(frag: []const u8) ?f32 {
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
     };
+    pluginAttachConfig(&vp_config);
     return layout.anchorScrollY(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
@@ -476,7 +1119,7 @@ fn anchorTargetY(frag: []const u8) ?f32 {
 /// Shared measure config for document walks that need live geometry
 /// (anchor jumps, outline enumeration): zero scroll, live image sizes.
 fn measureConfig() layout.ViewportConfig {
-    return layout.ViewportConfig{
+    var cfg = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
@@ -485,6 +1128,8 @@ fn measureConfig() layout.ViewportConfig {
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
     };
+    pluginAttachConfig(&cfg);
+    return cfg;
 }
 
 /// Activate an already-opened mapping: rescan, reset per-document state,
@@ -509,6 +1154,9 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     // to the old bytes. (External reloads keep the query; see #44.)
     clearFind();
     updateDocumentMetrics();
+    // Plugin renders (issue #323): per-doc table, cache-hit stat-marking,
+    // probe and FIFO launch. No-op in read-test/headless binaries.
+    pluginKickForDocument();
     if (reset_scroll) snapScroll(0.0) else snapScroll(g_app.scroll_y);
     bridge.platform_request_redraw();
 }
@@ -636,7 +1284,7 @@ fn applyFindQuery(raw: []const u8) void {
 /// the metrics pass uses, so cycling lands precisely even for wrapped
 /// lines and tall blocks. Cold path (per cycle/Enter press only).
 fn findMatchY(offset: usize) ?f32 {
-    const vp_config = layout.ViewportConfig{
+    var vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
@@ -646,6 +1294,7 @@ fn findMatchY(offset: usize) ?f32 {
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
     };
+    pluginAttachConfig(&vp_config);
     return layout.findOffsetY(g_app.bytes, g_app.lines, vp_config, offset);
 }
 
@@ -950,7 +1599,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     g_markers.reset();
     g_entities.reset();
-    const vp_config = layout.ViewportConfig{
+    var vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = g_app.scroll_y,
@@ -964,6 +1613,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
     };
+    pluginAttachConfig(&vp_config);
 
     var t_layout_ns: u64 = 0;
     if (build_options.test_hooks and g_sweep_active) t_layout_ns = nowNs();
@@ -1495,7 +2145,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // ship binary contains none of it; it runs only in the read-test
     // binary. Trust the compiler.
     var args_it = std.process.Args.Iterator.init(init.args);
-    _ = args_it.next(); // skip exe name
+    // Capture argv[0] for bundle-Resources helper resolution (plugin probe:
+    // `<exe-dir>/../Resources/read-plugin-render.sh`). Best effort only.
+    if (args_it.next()) |exe_arg| {
+        const take = @min(exe_arg.len, g_exe_path_buf.len);
+        @memcpy(g_exe_path_buf[0..take], exe_arg[0..take]);
+        g_exe_path = g_exe_path_buf[0..take];
+    }
     var screenshot_path: ?[*:0]const u8 = null;
     var find_cli_query: ?[]const u8 = null;
     var dump_records = false;
@@ -1745,10 +2401,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Compute accurate total document height and max scroll limit
     updateDocumentMetrics();
+    // Plugin renders (issue #323): per-doc table, cache-hit stat-marking,
+    // probe and FIFO launch. No-op in read-test/headless binaries.
+    pluginKickForDocument();
 
     // Headless screenshot mode (test binary only: the comptime gate keeps
     // this block out of ship-build analysis entirely).
     if (build_options.test_hooks) {
+        // Pre-seeded plugin cache hits resolve to ready here (no probe or
+        // launch in headless); unseeded docs keep a null table, bit-identical.
+        pluginSeedReadyForScreenshot();
         if (screenshot_path) |sc_path| {
         g_app.window_width = 1200.0;
         g_app.window_height = 900.0;
@@ -2544,6 +3206,257 @@ test "image completeness contracts: doc-dir resolve + URL session (#45)" {
         try t.expectEqual(@as(c_int, -1), bridge.platform_test_image_resolve("", 0, "tmp", 3));
         // Session: shared, ephemeral, no shared cache, bounded timeouts.
         try t.expectEqual(@as(c_int, 1), bridge.platform_test_image_session());
+    }
+}
+
+// Deadline-bounded drain for the plugin launcher test below: spins the
+// non-blocking reap until no child is in flight or the MONOTONIC deadline
+// passes (same clock idiom as strict_benchmarks.zig). The common case
+// exits on the first all-reaped poll, so wall-clock load only delays the
+// verdict, never fails it (fixed spin budgets were a race by
+// construction); the deadline only bounds the worst case. Each phase logs
+// its own completion line so the next failure names the phase that hung.
+// Returns completions drained. No sleeping.
+fn drainPluginUntilIdle(timeout_ns: i128) c_int {
+    var start_ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &start_ts);
+    const start_ns: i128 = @as(i128, start_ts.sec) * 1_000_000_000 + start_ts.nsec;
+    var total: c_int = 0;
+    while (true) {
+        total += bridge.pollPluginCompletions();
+        if (bridge.platform_test_plugin_active() == 0) break;
+        var now_ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(.MONOTONIC, &now_ts);
+        const now_ns: i128 = @as(i128, now_ts.sec) * 1_000_000_000 + now_ts.nsec;
+        if (now_ns - start_ns >= timeout_ns) break;
+    }
+    return total;
+}
+
+// Staging helper for the plugin launcher test: write `data` to an
+// absolute scratch path (test-only; production stages via Task 5).
+fn writeTmpFile(io: std.Io, path: []const u8, data: []const u8) !void {
+    var f = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, data);
+}
+
+test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" {
+    // Task 3 integration (read-test binary only; same hooks gate as the
+    // image contracts above). Renderer doubles: a /tmp copy stub by
+    // absolute path (done path) and the bare-name `true` tool (resolves via
+    // PATH, exits with no outfile: terminal-failure path).
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        var threaded = std.Io.Threaded.init(t.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const cwd = std.Io.Dir.cwd();
+        const stub_path = "/tmp/read-plugint3-stub.sh";
+        {
+            var f = try std.Io.Dir.createFileAbsolute(io, stub_path, .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, "#!/bin/sh\ncp \"$1\" \"$2\"\n");
+            try f.setPermissions(io, .executable_file);
+        }
+        defer std.Io.Dir.deleteFileAbsolute(io, stub_path) catch {};
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+
+        // Missing binary: failed now, no slot spent, no crash. Same for an
+        // empty renderer name.
+        try t.expectEqual(@as(c_int, -1), bridge.launchPluginRender(
+            "read-missing-plugin-bin-zzz",
+            "/tmp/read-plugint3-miss-src.txt",
+            "/tmp/read-plugint3-miss-out.png",
+        ));
+        try t.expectEqual(@as(c_int, -1), bridge.launchPluginRender(
+            "",
+            "/tmp/read-plugint3-miss-src.txt",
+            "/tmp/read-plugint3-miss-out.png",
+        ));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+        std.debug.print("t3 phase=probe: missing/empty renderers failed fast, no slot\n", .{});
+        // Unknown outfile: no record yet.
+        try t.expectEqual(@as(c_int, -1), bridge.pluginOutcomeFor("/tmp/read-plugint3-never-launched.png"));
+
+        // Bare-name `true`: resolves, launches, drains; the missing outfile
+        // marks it failed at reap while the staged src is still unlinked.
+        {
+            const src = "/tmp/read-plugint3-true-src.txt";
+            try writeTmpFile(io, src, "A-->B\n");
+            defer std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+            defer std.Io.Dir.deleteFileAbsolute(io, "/tmp/read-plugint3-true-out.png") catch {};
+            try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(
+                "true",
+                src,
+                "/tmp/read-plugint3-true-out.png",
+            ));
+            try t.expectEqual(@as(c_int, 1), bridge.platform_test_plugin_active());
+            std.debug.print("t3 phase=true: launched, draining (10s deadline)\n", .{});
+            const true_drained = drainPluginUntilIdle(10_000_000_000);
+            std.debug.print("t3 phase=true: drained={d} active={d} outcome={d}\n", .{
+                true_drained,
+                bridge.platform_test_plugin_active(),
+                bridge.pluginOutcomeFor("/tmp/read-plugint3-true-out.png"),
+            });
+            try t.expectEqual(@as(c_int, 1), true_drained);
+            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            try t.expectEqual(@as(c_int, 0), bridge.pluginOutcomeFor("/tmp/read-plugint3-true-out.png"));
+            try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
+        }
+
+        // Copy stub by absolute path: done path — outfile arrives carrying
+        // the src bytes, staged src unlinked at reap, slot freed.
+        {
+            const src = "/tmp/read-plugint3-ok-src.txt";
+            const out = "/tmp/read-plugint3-ok-out.png";
+            try writeTmpFile(io, src, "graph TD\n    A-->B\n");
+            defer std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+            defer std.Io.Dir.deleteFileAbsolute(io, out) catch {};
+            try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
+            std.debug.print("t3 phase=copy: launched, draining (10s deadline)\n", .{});
+            const ok_drained = drainPluginUntilIdle(10_000_000_000);
+            std.debug.print("t3 phase=copy: drained={d} active={d} outcome={d}\n", .{
+                ok_drained,
+                bridge.platform_test_plugin_active(),
+                bridge.pluginOutcomeFor(out),
+            });
+            try t.expectEqual(@as(c_int, 1), ok_drained);
+            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out));
+            var buf: [64]u8 = undefined;
+            const bytes = try cwd.readFile(io, out, &buf);
+            try t.expectEqualStrings("graph TD\n    A-->B\n", bytes);
+            try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
+        }
+
+        // Table cap: 8 in flight, the 9th stays queued (0, silent), then
+        // all 8 drain; every staged src is gone except the rejected one.
+        {
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                var sbuf: [64]u8 = undefined;
+                var obuf: [64]u8 = undefined;
+                const src = try std.fmt.bufPrintZ(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
+                const out = try std.fmt.bufPrintZ(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
+                try writeTmpFile(io, src, "A-->B\n");
+                try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
+            }
+            const rsrc = "/tmp/read-plugint3-rej-src.txt";
+            const rout = "/tmp/read-plugint3-rej-out.png";
+            try writeTmpFile(io, rsrc, "A-->B\n");
+            defer std.Io.Dir.deleteFileAbsolute(io, rsrc) catch {};
+            defer std.Io.Dir.deleteFileAbsolute(io, rout) catch {};
+            try t.expectEqual(@as(c_int, 0), bridge.launchPluginRender(stub_path, rsrc, rout));
+            try t.expectEqual(@as(c_int, 8), bridge.platform_test_plugin_active());
+            std.debug.print("t3 phase=cap8: 8 in flight, draining (30s deadline)\n", .{});
+            const cap_drained = drainPluginUntilIdle(30_000_000_000);
+            std.debug.print("t3 phase=cap8: drained={d} active={d}\n", .{
+                cap_drained,
+                bridge.platform_test_plugin_active(),
+            });
+            try t.expectEqual(@as(c_int, 8), cap_drained);
+            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            // One cap-phase job landed clean per the outcome table.
+            var obuf0: [64]u8 = undefined;
+            const out0 = try std.fmt.bufPrintZ(&obuf0, "/tmp/read-plugint3-o{d}.png", .{@as(usize, 0)});
+            try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out0));
+            // Rejected src was never owned: still present, no outfile made.
+            _ = try cwd.statFile(io, rsrc, .{});
+            try t.expectError(error.FileNotFound, cwd.statFile(io, rout, .{}));
+            // Every slot landed done (outfile carries src bytes, staged src
+            // reaped away); then remove them explicitly (no per-iteration
+            // defers: staged srcs must survive to reap).
+            i = 0;
+            while (i < 8) : (i += 1) {
+                var sbuf: [64]u8 = undefined;
+                var obuf: [64]u8 = undefined;
+                var rbuf: [16]u8 = undefined;
+                const src = try std.fmt.bufPrint(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
+                const out = try std.fmt.bufPrint(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
+                try t.expectEqualStrings("A-->B\n", try cwd.readFile(io, out, &rbuf));
+                try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
+                std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+                std.Io.Dir.deleteFileAbsolute(io, out) catch {};
+            }
+        }
+        std.debug.print("t3: all phases complete (probe/true/copy/cap8)\n", .{});
+    }
+}
+
+test "plugin task5: sidecar path + shim bodies are exact, hostile helpers refused (#323)" {
+    // Pure string builders: no FS, no child launch, runs in every profile.
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    const p = pluginSidecarPath("/C/read/plugins/mermaid", 0x0123456789abcdef, &buf).?;
+    try t.expectEqualStrings("/C/read/plugins/mermaid/src-0123456789abcdef.txt", p);
+    // One naming scheme: the sidecar hex matches the cachePath stem.
+    var cbuf: [256]u8 = undefined;
+    const cp = plugin_cache.cachePath("/C", .mermaid, 0x0123456789abcdef, &cbuf).?;
+    try t.expect(std.mem.endsWith(u8, cp, "0123456789abcdef.png"));
+    var shim: [512]u8 = undefined;
+    const rs = pluginRenderShim("/h/read-plugin-render.sh", "mermaid", &shim).?;
+    try t.expectEqualStrings("#!/bin/sh\nexec \"/h/read-plugin-render.sh\" render mermaid \"$1\" \"$2\"\n", rs);
+    var ps: [512]u8 = undefined;
+    const pb = pluginProbeShim("/h/read-plugin-render.sh", "mermaid", &ps).?;
+    try t.expectEqualStrings("#!/bin/sh\nH=\"/h/read-plugin-render.sh\"\nif \"$H\" probe mermaid; then cp \"$1\" \"$2\"; else exit 1; fi\n", pb);
+    // Shell-active characters in the helper path never embed (no injection
+    // through the generated shim).
+    var jb: [512]u8 = undefined;
+    try t.expect(pluginRenderShim("/h/$(x).sh", "mermaid", &jb) == null);
+    try t.expect(pluginRenderShim("/h/a`b`.sh", "mermaid", &jb) == null);
+    try t.expect(pluginProbeShim("/h/a\"b.sh", "mermaid", &jb) == null);
+}
+
+test "plugin task5: table build truncates at 16, read-test never kicks (#323)" {
+    // Build truncation is explicit at table build (Task 4 review F2): a
+    // 17-fence doc keeps 16 rows with NUL-terminated paths for the query.
+    var doc_buf: [4096]u8 = undefined;
+    var doc_len: usize = 0;
+    var k: usize = 0;
+    while (k < 17) : (k += 1) {
+        const f = "```mermaid\nA-->B\n```\n";
+        @memcpy(doc_buf[doc_len..][0..f.len], f);
+        doc_len += f.len;
+    }
+    const doc = doc_buf[0..doc_len];
+    var lines: [128]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var jobs: [plugin_cache.MAX_PLUGIN_JOBS]plugin_cache.PluginJob = undefined;
+    var bufs: [plugin_cache.MAX_PLUGIN_JOBS][256]u8 = undefined;
+    var lens: [plugin_cache.MAX_PLUGIN_JOBS]u8 = [_]u8{0} ** plugin_cache.MAX_PLUGIN_JOBS;
+    const take = pluginResolvePaths(doc, lines[0..n], "/tmp/C", jobs[0..], bufs[0..], lens[0..]);
+    try std.testing.expectEqual(plugin_cache.MAX_PLUGIN_JOBS, take);
+    // Every kept row carries a NUL-terminated path for the outcome query.
+    var vi: usize = 0;
+    while (vi < take) : (vi += 1) {
+        try std.testing.expect(lens[vi] > 0);
+        try std.testing.expectEqual(@as(u8, 0), bufs[vi][lens[vi]]);
+        try std.testing.expect(std.mem.endsWith(u8, bufs[vi][0..lens[vi]], ".png"));
+    }
+    // Read-test gating: the kick resets and returns before any FS or child
+    // launch, so fences stay deterministic code cards there.
+    if (build_options.test_hooks) {
+        const doc1 = "```mermaid\nA-->B\n```\n";
+        var lb: [8]simd.Line = undefined;
+        var fs: simd.FenceState = .{};
+        const lc = simd.scanLines(doc1, &lb, &fs);
+        const save_bytes = g_app.bytes;
+        const save_lines = g_app.lines;
+        const save_lc = g_app.line_count;
+        const save_pc = g_plugin_count;
+        g_app.bytes = doc1;
+        g_app.lines = lb[0..lc];
+        g_app.line_count = lc;
+        pluginKickForDocument();
+        try std.testing.expectEqual(@as(usize, 0), g_plugin_count);
+        try std.testing.expectEqual(@as(u8, 0), g_plugin_inflight);
+        try std.testing.expect(g_plugin_probe[0] == null);
+        g_app.bytes = save_bytes;
+        g_app.lines = save_lines;
+        g_app.line_count = save_lc;
+        g_plugin_count = save_pc;
     }
 }
 
