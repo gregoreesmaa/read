@@ -25,6 +25,11 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # Case 3: Code blocks, syntax background card, copy button, task checkboxes, lists
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks.png" test_cases/code_and_tasks.md
 
+# Case 3b: Hanging-indent continuations at the end of the SAME doc (no new
+# test case): scrolled viewport frames the section so reviewers see sub-4sp
+# continuations aligned under the lead text, never the marker.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_hanging_indent.png" --scroll 800 test_cases/code_and_tasks.md
+
 # Case 4: Table structure, cell padding, column alignment, dividers
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/tables_formatting.png" test_cases/tables_formatting.md
 
