@@ -197,9 +197,10 @@ cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wi
 # or launches; the suite pre-seeds the cache PNG for the fixture fence and
 # the headless open resolves it to ready via the shipped stat-exists path
 # (no child processes); --settle-images decodes it through the stock image
-# path. Seed pixels are the synthetic test_cases/assets/graphviz-seed.png
-# fixture (regenerate with scripts/gen-plugin-seeds.py; no dot binary in
-# this env); the path proven is production. The fence hash mirrors
+# path. Seed pixels are genuine dot 16.0.0 output for the fixture source
+# (test_cases/assets/graphviz-seed.png; regenerate with
+# scripts/gen-plugin-seeds.py, which shells out to the real dot binary);
+# the path proven is production. The fence hash mirrors
 # fenceHash in src/core/plugin_cache.zig with the renderer ordinal parsed
 # from the Renderer enum, so seeds stay correct as the enum grows.
 graphviz_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_graphviz.md dot graphviz <<'EOF'
@@ -226,10 +227,11 @@ mkdir -p "$cache_root/read/plugins/graphviz"
 cp test_cases/assets/graphviz-seed.png "$cache_root/read/plugins/graphviz/$graphviz_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz.png" --settle-images test_cases/plugin_graphviz.md
 
-# Tall companion (same case 4j): the 476x3008 graphviz-seed-tall.png mirrors
-# the 22-node rankdir=TB tall fixture node-for-node (ellipses are dot's
-# default node shape); three scrolled frames walk the full image height
-# (mermaid-tall precedent).
+# Tall companion (same case 4j): graphviz-seed-tall.png is the genuine
+# dot 16.0.0 render (705x2065) of the 22-node rankdir=TB tall fixture
+# (ellipses are dot's default node shape); two scrolled frames walk the
+# full display height (the real render fits in initial + 800 + 1600, so
+# no third frame: 2400 showed only trailing sliver plus empty viewport).
 tall_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_graphviz_tall.md dot graphviz <<'EOF'
 import re, sys
 zig_src, md_path, info_token, renderer = sys.argv[1:5]
@@ -253,10 +255,9 @@ cp test_cases/assets/graphviz-seed-tall.png "$cache_root/read/plugins/graphviz/$
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz_tall.png" --settle-images test_cases/plugin_graphviz_tall.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz_tall__s1.png" --settle-images --scroll 800 test_cases/plugin_graphviz_tall.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz_tall__s2.png" --settle-images --scroll 1600 test_cases/plugin_graphviz_tall.md
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz_tall__s3.png" --settle-images --scroll 2400 test_cases/plugin_graphviz_tall.md
 
-# Wide companion (same case 4j): the 2000x600 graphviz-seed-wide.png mirrors
-# the 15-node rankdir=LR wide fixture (branch lane + collection rail).
+# Wide companion (same case 4j): graphviz-seed-wide.png is the genuine
+# dot 16.0.0 render (2465x181) of the 15-node rankdir=LR wide fixture.
 # Initial fold only, by design: ready-plugin `.image` cmds carry no
 # scrollable_id, so neither --scroll nor --scroll-x-end can add signal
 # (mermaid-wide 4h precedent).

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Regenerate plugin seed PNGs (issues #330/#329/#328/#326/#327).
 
-Each seed is a faithful static mimic of a real renderer output for its
-test_cases/plugin_*.md fixture: d2/graphviz/plantuml draw the fixture's
-two-node diagram (labels mirror the fixture), math/mathjax draw the
-fixture's formula typeset in STIX. Tall/wide companions
-(*-seed-tall.png, *-seed-wide.png) mirror the tall/wide fixtures
-node-for-node the same way; math-seed.png draws the simplified fixture
-formula, *-seed-complex.png the complex companions. Synthetic-but-plausible
-stand-ins (no d2/dot/plantuml/katex binaries in this env); the screenshot
-path proven (stat-exists seed -> ready -> stock image decode) is production,
-per suite practice (cf. scripts/gen-mermaid-seed.py).
+graphviz seeds are genuine dot-engine renders of their
+test_cases/plugin_graphviz*.md fixture fence sources (dot 16.0.0; *_seed
+functions shell out to the real binary and fail loudly without it).
+Remaining seeds are faithful static mimics of real renderer output:
+d2/plantuml draw the fixture's diagram (labels mirror the fixture),
+math/mathjax draw the fixture's formula typeset in STIX. Tall/wide
+companions (*-seed-tall.png, *-seed-wide.png) mirror the tall/wide
+fixtures node-for-node the same way; math-seed.png draws the simplified
+fixture formula, *-seed-complex.png the complex companions.
+Synthetic-but-plausible stand-ins (no d2/plantuml/katex binaries in this
+env); the screenshot path proven (stat-exists seed -> ready -> stock
+image decode) is production, per suite practice
+(cf. scripts/gen-mermaid-seed.py).
 
 Requires Pillow (fixture generation only, never ships): pip install pillow.
 Usage:  python3 scripts/gen-plugin-seeds.py
@@ -53,6 +56,39 @@ def center_text(d, cx, cy, s, font):
     d.text((cx, cy), s, font=font, fill=INK, anchor="mm")
 
 
+def _real_tool_render(fixture_md, info_token, out_name, tool, args):
+    # Genuine engine render of the fixture's fence source (round-two
+    # revision: seeds are real tool output, never Pillow mimics). Fails
+    # loudly when the tool is absent so a synthetic image can never pass
+    # silently.
+    import subprocess
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = open(os.path.join(root, fixture_md)).read().split('\n')
+    start = next(i for i, l in enumerate(lines)
+                 if l.lstrip().startswith('```') and
+                 l.lstrip()[3:].strip().split(' ')[:1] == [info_token])
+    end = next(i for i in range(start + 1, len(lines))
+               if lines[i].lstrip().startswith('```'))
+    with tempfile.NamedTemporaryFile('w', suffix='.src',
+                                     delete=False) as f:
+        f.write('\n'.join(lines[start + 1:end]) + '\n')
+        src = f.name
+    out = os.path.join(os.getcwd(), out_name)
+    try:
+        r = subprocess.run([tool] + [a.replace('SRC', src).replace(
+            'OUT', out) for a in args], capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("FAIL: %s binary not found (needed for %s)" %
+                 (tool, out_name))
+    finally:
+        os.unlink(src)
+    if r.returncode != 0 or not os.path.exists(out):
+        sys.exit("FAIL: %s render %s: %s" %
+                 (tool, fixture_md, (r.stderr or '').strip()))
+    return Image.open(out), out_name
+
+
 def d2_seed():
     # Fixture: direction:right, reader -> diagram: opens doc.
     W, H = 476, 280
@@ -72,20 +108,11 @@ def d2_seed():
 
 
 def graphviz_seed():
-    # Fixture (dot): rankdir=LR, reader -> diagram. Ellipse nodes are
-    # graphviz's default node shape.
-    W, H = 476, 280
-    im = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(im)
-    font = load_font(ARIAL, 24)
-    e1 = (28, 96, 180, 184)
-    e2 = (296, 96, 448, 184)
-    d.ellipse(e1, fill=FILL, outline=EDGE, width=EDGE_W)
-    d.ellipse(e2, fill=FILL, outline=EDGE, width=EDGE_W)
-    center_text(d, 104, 140, "reader", font)
-    center_text(d, 372, 140, "diagram", font)
-    arrow_h(d, 180, 140, 296)
-    return im, "graphviz-seed.png"
+    # Fixture test_cases/plugin_graphviz.md: genuine dot output (16.0.0).
+    # Ellipse nodes are graphviz's default node shape.
+    return _real_tool_render("test_cases/plugin_graphviz.md", "dot",
+                             "graphviz-seed.png", "dot",
+                             ["-Tpng", "SRC", "-o", "OUT"])
 
 
 def plantuml_seed():
@@ -322,8 +349,10 @@ def d2_seed_tall():
 
 
 def graphviz_seed_tall():
-    # Same node set in dot idiom; ellipses are dot's default node shape.
-    return _draw_tall("ellipse"), "graphviz-seed-tall.png"
+    # Same node set in dot idiom; genuine dot output (16.0.0).
+    return _real_tool_render("test_cases/plugin_graphviz_tall.md", "dot",
+                             "graphviz-seed-tall.png", "dot",
+                             ["-Tpng", "SRC", "-o", "OUT"])
 
 
 # Wide pipeline fixture node sets (test_cases/plugin_{d2,graphviz}_wide.md):
@@ -388,8 +417,10 @@ def d2_seed_wide():
 
 
 def graphviz_seed_wide():
-    # Same node set in dot idiom (rankdir=LR); ellipses are dot's default.
-    return _draw_wide("ellipse"), "graphviz-seed-wide.png"
+    # Same node set in dot idiom (rankdir=LR); genuine dot output (16.0.0).
+    return _real_tool_render("test_cases/plugin_graphviz_wide.md", "dot",
+                             "graphviz-seed-wide.png", "dot",
+                             ["-Tpng", "SRC", "-o", "OUT"])
 
 
 # PlantUML tall/wide companions use the sequence-diagram idiom of the base
