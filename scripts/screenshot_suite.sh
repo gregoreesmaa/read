@@ -197,9 +197,10 @@ cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wi
 # or launches; the suite pre-seeds the cache PNG for the fixture fence and
 # the headless open resolves it to ready via the shipped stat-exists path
 # (no child processes); --settle-images decodes it through the stock image
-# path. Seed pixels are the synthetic test_cases/assets/plantuml-seed.png
-# fixture (regenerate with scripts/gen-plugin-seeds.py; no plantuml binary
-# in this env); the path proven is production. The fence hash mirrors
+# path. Seed pixels are genuine PlantUML 1.2026.8 output for the fixture
+# source (test_cases/assets/plantuml-seed.png; regenerate with
+# scripts/gen-plugin-seeds.py, which shells out to the real plantuml
+# binary); the path proven is production. The fence hash mirrors
 # fenceHash in src/core/plugin_cache.zig with the renderer ordinal parsed
 # from the Renderer enum, so seeds stay correct as the enum grows.
 plantuml_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_plantuml.md plantuml plantuml <<'EOF'
@@ -226,10 +227,11 @@ mkdir -p "$cache_root/read/plugins/plantuml"
 cp test_cases/assets/plantuml-seed.png "$cache_root/read/plugins/plantuml/$plantuml_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml.png" --settle-images test_cases/plugin_plantuml.md
 
-# Tall companion (same case 4k): the 476x2080 plantuml-seed-tall.png mirrors
-# the 14-message four-participant sequence tall fixture message-for-message;
-# two scrolled frames walk the lifelines to the bottom (mermaid-tall
-# precedent, scaled to the shorter sheet).
+# Tall companion (same case 4k): plantuml-seed-tall.png is the genuine
+# PlantUML 1.2026.8 render (393x511) of the 14-message four-participant
+# sequence fixture. PlantUML lays sequence diagrams out compactly, so the
+# whole render fits the initial fold: no scrolled frames (700 showed only
+# the bottom footer sliver plus empty viewport).
 tall_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_plantuml_tall.md plantuml plantuml <<'EOF'
 import re, sys
 zig_src, md_path, info_token, renderer = sys.argv[1:5]
@@ -251,11 +253,10 @@ EOF
 [ -n "$tall_hash" ] || { echo "FAIL: plantuml tall fence hash empty" >&2; exit 1; }
 cp test_cases/assets/plantuml-seed-tall.png "$cache_root/read/plugins/plantuml/$tall_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml_tall.png" --settle-images test_cases/plugin_plantuml_tall.md
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml_tall__s1.png" --settle-images --scroll 700 test_cases/plugin_plantuml_tall.md
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml_tall__s2.png" --settle-images --scroll 1400 test_cases/plugin_plantuml_tall.md
 
-# Wide companion (same case 4k): the 2000x600 plantuml-seed-wide.png mirrors
-# the eight-participant wide fixture. Initial fold only, by design:
+# Wide companion (same case 4k): plantuml-seed-wide.png is the genuine
+# PlantUML 1.2026.8 render (460x306) of the eight-participant wide
+# fixture. Initial fold only, by design:
 # ready-plugin `.image` cmds carry no scrollable_id, so neither --scroll nor
 # --scroll-x-end can add signal (mermaid-wide 4h precedent).
 wide_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_plantuml_wide.md plantuml plantuml <<'EOF'
