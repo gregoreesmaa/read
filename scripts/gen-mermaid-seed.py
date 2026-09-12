@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Regenerate test_cases/assets/mermaid-seed.png (issue #323).
+"""Regenerate mermaid seed PNGs (issue #323).
 
-The seed is a faithful static mimic of a real `flowchart TD` mermaid render
-of the test_cases/plugin_mermaid.md fixture ("Reader opens doc" -->
-"Diagram renders"): vertical layout, two lavender-filled purple-bordered
-boxes, vertical arrow, smooth sans-serif labels. No mermaid renderer binary
-exists in this env, so this draws the reference geometry directly.
+mermaid-seed.png is a faithful static mimic of a real `flowchart TD`
+mermaid render of the test_cases/plugin_mermaid.md fixture ("Reader opens
+doc" --> "Diagram renders"): vertical layout, two lavender-filled
+purple-bordered boxes, vertical arrow, smooth sans-serif labels.
+
+mermaid-seed-tall.png is the huge-rendered-image companion for the
+test_cases/plugin_mermaid_tall.md fixture: same style and column width,
+but ~2000px tall (eight stacked boxes), proving oversize-image geometry
+(clamp/fit, scrollbar/height math, no blowup). No mermaid renderer binary
+exists in this env, so both draw reference geometry directly.
 
 Requires Pillow (fixture generation only, never ships): pip install pillow.
 Usage:  python3 scripts/gen-mermaid-seed.py
@@ -21,6 +26,7 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "test_cases", "assets", "mermaid-seed.png")
+OUT_TALL = os.path.join(ROOT, "test_cases", "assets", "mermaid-seed-tall.png")
 
 # Sampled from the reference mermaid render (/tmp/ref-mermaid.png, 476x424).
 W, H = 476, 424
@@ -75,6 +81,42 @@ def main():
         d.text((cx, cy), label, font=font, fill=INK, anchor="mm")
     im.save(OUT)
     print("wrote %s (%dx%d) font=%s" % (OUT, W, H, font_path))
+    tall = draw_tall(font)
+    tall.save(OUT_TALL)
+    print("wrote %s (%dx%d) font=%s" % (OUT_TALL, TALL_W, TALL_H, font_path))
+
+
+# Huge-rendered-image companion (issue #323, PR #340 owner request): same
+# column width and style as the standard seed, but TALL_H px tall — eight
+# stacked boxes with arrows, fully deterministic (fixed geometry, labels,
+# font, colors; Pillow writes no timestamps).
+TALL_W, TALL_H = 476, 2000
+TALL_BOXES = 8
+TALL_BOX_H = 110
+TALL_TOP = 54
+TALL_STEP = 230
+TALL_X0, TALL_X1 = 53, 427
+
+
+def draw_tall(font):
+    im = Image.new("RGB", (TALL_W, TALL_H), BG)
+    d = ImageDraw.Draw(im)
+    tops = [TALL_TOP + s * TALL_STEP for s in range(TALL_BOXES)]
+    for top in tops:
+        d.rectangle((TALL_X0, top, TALL_X1, top + TALL_BOX_H),
+                    fill=FILL, outline=EDGE, width=EDGE_W)
+    for top, nxt in zip(tops, tops[1:]):
+        base = nxt - 16
+        d.line([(ARROW_X, top + TALL_BOX_H + 1), (ARROW_X, base)],
+               fill=INK, width=2)
+        d.polygon([(ARROW_X, nxt - 1),
+                   (ARROW_X - ARROW_HALF, base),
+                   (ARROW_X + ARROW_HALF, base)], fill=INK)
+    for n, top in enumerate(tops, 1):
+        cx = (TALL_X0 + TALL_X1) // 2
+        d.text((cx, top + TALL_BOX_H // 2), "Tall step %d" % n,
+               font=font, fill=INK, anchor="mm")
+    return im
 
 
 if __name__ == "__main__":
