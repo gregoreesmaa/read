@@ -13,7 +13,7 @@ idx: Index
 bidi: Bidi Split
 code: Code Spans
 join: Join Runs
-style: Apply Styles
+styles: Apply Styles
 img: Images
 paint: Paint
 idle: Idle
@@ -28,8 +28,8 @@ tok -> idx
 idx -> bidi
 bidi -> code
 code -> join
-join -> style
-style -> img
+join -> styles
+styles -> img
 img -> paint
 paint -> idle
 deny -> idle

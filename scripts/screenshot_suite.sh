@@ -193,13 +193,14 @@ cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wi
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_sql.png" --scroll 5206 test_cases/highlight.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_lua.png" --scroll 5487 test_cases/highlight.md
 
-# Case 4i: D2 rendered image (issue #330) — read-test never probes or
+# Case 4j: D2 rendered image (issue #330) — read-test never probes or
 # launches; the suite pre-seeds the cache PNG for the fixture fence and
 # the headless open resolves it to ready via the shipped stat-exists path
 # (no child processes); --settle-images decodes it through the stock image
-# path. Seed pixels are the synthetic test_cases/assets/d2-seed.png
-# fixture (regenerate with scripts/gen-plugin-seeds.py; no d2 binary in
-# this env); the path proven is production. The fence hash mirrors
+# path. Seed pixels are genuine d2 0.9.0 output for the fixture source
+# (test_cases/assets/d2-seed.png; regenerate with
+# scripts/gen-plugin-seeds.py, which shells out to the real d2 binary);
+# the path proven is production. The fence hash mirrors
 # fenceHash in src/core/plugin_cache.zig with the renderer ordinal parsed
 # from the Renderer enum, so seeds stay correct as the enum grows.
 d2_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_d2.md d2 d2 <<'EOF'
@@ -226,9 +227,11 @@ mkdir -p "$cache_root/read/plugins/d2"
 cp test_cases/assets/d2-seed.png "$cache_root/read/plugins/d2/$d2_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2.png" --settle-images test_cases/plugin_d2.md
 
-# Tall companion (same case 4i): the 476x3008 d2-seed-tall.png mirrors the
-# 22-node direction:down tall fixture node-for-node (rank grid, fan elbows);
-# three scrolled frames walk the full image height (mermaid-tall precedent).
+# Tall companion (same case 4j): d2-seed-tall.png is the genuine d2 0.9.0
+# render (1804x6894) of the 22-node direction:down tall fixture; two
+# scrolled frames walk the full display height (the real render fits in
+# initial + 800 + 1600, so no third frame: 2400 showed only trailing
+# sliver plus empty viewport).
 tall_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_d2_tall.md d2 d2 <<'EOF'
 import re, sys
 zig_src, md_path, info_token, renderer = sys.argv[1:5]
@@ -252,10 +255,9 @@ cp test_cases/assets/d2-seed-tall.png "$cache_root/read/plugins/d2/$tall_hash.pn
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2_tall.png" --settle-images test_cases/plugin_d2_tall.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2_tall__s1.png" --settle-images --scroll 800 test_cases/plugin_d2_tall.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2_tall__s2.png" --settle-images --scroll 1600 test_cases/plugin_d2_tall.md
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2_tall__s3.png" --settle-images --scroll 2400 test_cases/plugin_d2_tall.md
 
-# Wide companion (same case 4i): the 2000x600 d2-seed-wide.png mirrors the
-# 15-node direction:right wide fixture (branch lane + collection rail).
+# Wide companion (same case 4j): d2-seed-wide.png is the genuine d2 0.9.0
+# render (5914x1040) of the 15-node direction:right wide fixture.
 # Initial fold only, by design: ready-plugin `.image` cmds carry no
 # scrollable_id, so neither --scroll nor --scroll-x-end can add signal
 # (mermaid-wide 4h precedent).

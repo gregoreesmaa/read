@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Regenerate plugin seed PNGs (issues #330/#329/#328/#326/#327).
 
-Each seed is a faithful static mimic of a real renderer output for its
-test_cases/plugin_*.md fixture: d2/graphviz/plantuml draw the fixture's
-two-node diagram (labels mirror the fixture), math/mathjax draw the
-fixture's formula typeset in STIX. Tall/wide companions
-(*-seed-tall.png, *-seed-wide.png) mirror the tall/wide fixtures
-node-for-node the same way; math-seed.png draws the simplified fixture
-formula, *-seed-complex.png the complex companions. Synthetic-but-plausible
-stand-ins (no d2/dot/plantuml/katex binaries in this env); the screenshot
+d2 seeds are genuine d2-engine renders of their test_cases/plugin_d2*.md
+fixture fence sources (d2 0.9.0; *_seed functions shell out to the real
+binary and fail loudly without it). Remaining seeds are faithful static
+mimics of real renderer output: graphviz/plantuml draw the fixture's
+diagram (labels mirror the fixture), math/mathjax draw the fixture's
+formula typeset in STIX. Tall/wide companions (*-seed-tall.png,
+*-seed-wide.png) mirror the tall/wide fixtures node-for-node the same
+way; math-seed.png draws the simplified fixture formula,
+*-seed-complex.png the complex companions. Synthetic-but-plausible
+stand-ins (no dot/plantuml/katex binaries in this env); the screenshot
 path proven (stat-exists seed -> ready -> stock image decode) is production,
 per suite practice (cf. scripts/gen-mermaid-seed.py).
 
@@ -53,22 +55,43 @@ def center_text(d, cx, cy, s, font):
     d.text((cx, cy), s, font=font, fill=INK, anchor="mm")
 
 
+def _real_tool_render(fixture_md, info_token, out_name, tool, args):
+    # Genuine engine render of the fixture's fence source (issue #330
+    # revision: seeds are real tool output, never Pillow mimics). Fails
+    # loudly when the tool is absent so a synthetic image can never pass
+    # silently.
+    import subprocess
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = open(os.path.join(root, fixture_md)).read().split('\n')
+    start = next(i for i, l in enumerate(lines)
+                 if l.lstrip().startswith('```') and
+                 l.lstrip()[3:].strip().split(' ')[:1] == [info_token])
+    end = next(i for i in range(start + 1, len(lines))
+               if lines[i].lstrip().startswith('```'))
+    with tempfile.NamedTemporaryFile('w', suffix='.src',
+                                     delete=False) as f:
+        f.write('\n'.join(lines[start + 1:end]) + '\n')
+        src = f.name
+    out = os.path.join(os.getcwd(), out_name)
+    try:
+        r = subprocess.run([tool] + [a.replace('SRC', src).replace(
+            'OUT', out) for a in args], capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("FAIL: %s binary not found (needed for %s)" %
+                 (tool, out_name))
+    finally:
+        os.unlink(src)
+    if r.returncode != 0 or not os.path.exists(out):
+        sys.exit("FAIL: %s render %s: %s" %
+                 (tool, fixture_md, (r.stderr or '').strip()))
+    return Image.open(out), out_name
+
+
 def d2_seed():
-    # Fixture: direction:right, reader -> diagram: opens doc.
-    W, H = 476, 280
-    im = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(im)
-    font = load_font(ARIAL, 24)
-    font_edge = load_font(ARIAL, 16)
-    b1 = (28, 96, 180, 184)
-    b2 = (296, 96, 448, 184)
-    d.rectangle(b1, fill=FILL, outline=EDGE, width=EDGE_W)
-    d.rectangle(b2, fill=FILL, outline=EDGE, width=EDGE_W)
-    center_text(d, 104, 140, "reader", font)
-    center_text(d, 372, 140, "diagram", font)
-    arrow_h(d, 180, 140, 296)
-    center_text(d, 238, 112, "opens doc", font_edge)
-    return im, "d2-seed.png"
+    # Fixture test_cases/plugin_d2.md: genuine d2 output (d2 0.9.0).
+    return _real_tool_render("test_cases/plugin_d2.md", "d2",
+                             "d2-seed.png", "d2", ["SRC", "OUT"])
 
 
 def graphviz_seed():
@@ -317,8 +340,9 @@ def _draw_tall(shape):
 
 
 def d2_seed_tall():
-    # Fixture test_cases/plugin_d2_tall.md (direction: down reader pipeline).
-    return _draw_tall("rect"), "d2-seed-tall.png"
+    # Fixture test_cases/plugin_d2_tall.md: genuine d2 output (d2 0.9.0).
+    return _real_tool_render("test_cases/plugin_d2_tall.md", "d2",
+                             "d2-seed-tall.png", "d2", ["SRC", "OUT"])
 
 
 def graphviz_seed_tall():
@@ -383,8 +407,9 @@ def _draw_wide(shape):
 
 
 def d2_seed_wide():
-    # Fixture test_cases/plugin_d2_wide.md (direction: right pipeline).
-    return _draw_wide("rect"), "d2-seed-wide.png"
+    # Fixture test_cases/plugin_d2_wide.md: genuine d2 output (d2 0.9.0).
+    return _real_tool_render("test_cases/plugin_d2_wide.md", "d2",
+                             "d2-seed-wide.png", "d2", ["SRC", "OUT"])
 
 
 def graphviz_seed_wide():

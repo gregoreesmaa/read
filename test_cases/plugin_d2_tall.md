@@ -14,7 +14,7 @@ list: Bullet Lists
 para: Paragraph Flow
 spans: Inline Spans
 emph: Emphasis Pairs
-link: Links Autolinks
+links: Links Autolinks
 code: Code Spans
 image: Image Placeholders
 layout: Layout Viewport
@@ -40,10 +40,10 @@ quote -> para: quoted text
 list -> para: item text
 para -> spans: text runs
 spans -> emph: star runs
-spans -> link: bare urls
+spans -> links: bare urls
 spans -> code: backticks
 emph -> image: styled runs
-link -> image: linked runs
+links -> image: linked runs
 code -> image: pill runs
 image -> layout: sized boxes
 layout -> view: visible slice
