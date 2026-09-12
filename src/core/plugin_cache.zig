@@ -1,5 +1,16 @@
 const std = @import("std");
 const simd = @import("hot");
+const core_options = @import("core_options");
+
+// Differential-twin stub (AGENTS.md §7): with -Dplugin_stub=true every body
+// below early-returns a trivial value (same decl names and signatures, so
+// all callers in src/main.zig and src/layout/viewport.zig keep compiling —
+// the twin links and runs, resolving every fence to its non-plugin path).
+// With the option off each guard folds away at comptime and the real body
+// compiles exactly as before (ship __TEXT byte-identical, proven by the
+// size gate). Types (Renderer, JobState, PluginJob, MAX_PLUGIN_JOBS) are
+// identical in both modes: they cost zero bytes and keep call-site codegen
+// stable.
 
 /// Content-driven async plugin pipeline, stage 1: pure-Zig cache state
 /// machine (issue #323, PR 1 of 6). No threads, no spawning, no file I/O
@@ -15,11 +26,13 @@ pub const Renderer = enum { mermaid };
 pub const MAX_PLUGIN_JOBS: usize = 16;
 
 pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
+    if (comptime core_options.plugin_stub) return null;
     if (std.mem.eql(u8, info_token, "mermaid")) return .mermaid;
     return null;
 }
 
 pub fn fenceHash(renderer: Renderer, source: []const u8) u64 {
+    if (comptime core_options.plugin_stub) return 0;
     var h: u64 = 0xcbf29ce484222325;
     h ^= @intFromEnum(renderer);
     h *%= 0x100000001b3;
@@ -39,6 +52,7 @@ fn rendererName(r: Renderer) []const u8 {
 }
 
 pub fn cachePath(cache_root: []const u8, renderer: Renderer, hash: u64, out: []u8) ?[]u8 {
+    if (comptime core_options.plugin_stub) return null;
     var hex: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x:0>16}", .{hash}) catch return null;
     const name = rendererName(renderer);
@@ -111,6 +125,7 @@ fn fenceInfoToken(doc: []const u8, line: simd.Line) []const u8 {
 /// block-index folds). The info line itself is excluded. An unclosed fence
 /// runs to the last scanned line; an empty or non-fence index yields "".
 pub fn fenceSource(doc: []const u8, lines: []const simd.Line, fence_idx: usize) []const u8 {
+    if (comptime core_options.plugin_stub) return "";
     if (fence_idx >= lines.len) return "";
     if (lines[fence_idx].block_type != .code_fence_start) return "";
     if (fence_idx + 1 >= lines.len) return "";
@@ -132,6 +147,7 @@ pub fn fenceSource(doc: []const u8, lines: []const simd.Line, fence_idx: usize) 
 /// True when any fenced block's first info token maps to a plugin renderer.
 /// Cheap pre-check so documents without plugin fences skip job collection.
 pub fn hasPluginFences(doc: []const u8, lines: []const simd.Line) bool {
+    if (comptime core_options.plugin_stub) return false;
     for (lines) |line| {
         if (line.block_type != .code_fence_start) continue;
         if (pluginRendererOf(fenceInfoToken(doc, line)) != null) return true;
@@ -149,6 +165,7 @@ pub fn hasPluginFences(doc: []const u8, lines: []const simd.Line) bool {
 /// the launcher flow threads the root into `cachePath` itself and sets
 /// `ready`/`rendering`/`naive`/`failed`.
 pub fn collectPluginJobs(doc: []const u8, lines: []const simd.Line, cache_root: []const u8, jobs_out: []PluginJob) usize {
+    if (comptime core_options.plugin_stub) return 0;
     _ = cache_root;
     const cap = @min(jobs_out.len, MAX_PLUGIN_JOBS);
     var n: usize = 0;
@@ -169,6 +186,8 @@ pub fn collectPluginJobs(doc: []const u8, lines: []const simd.Line, cache_root: 
 }
 
 test "plugin: mermaid info token maps, others do not" {
+    // Twin builds stub every body above: pin nothing there.
+    if (comptime core_options.plugin_stub) return;
     try std.testing.expectEqual(Renderer.mermaid, pluginRendererOf("mermaid").?);
     try std.testing.expect(pluginRendererOf("d2") == null); // later PR
     try std.testing.expect(pluginRendererOf("foobar") == null);
@@ -176,6 +195,7 @@ test "plugin: mermaid info token maps, others do not" {
 }
 
 test "plugin: hash golden vector + cache path shape" {
+    if (comptime core_options.plugin_stub) return;
     const h = fenceHash(.mermaid, "flowchart TD\n    A-->B\n");
     try std.testing.expectEqual(@as(u64, 0xec4fa197df3351dc), h);
     var buf: [256]u8 = undefined;
@@ -184,6 +204,7 @@ test "plugin: hash golden vector + cache path shape" {
 }
 
 test "plugin: collect finds fences, caps at 16, skips unknown" {
+    if (comptime core_options.plugin_stub) return;
     const doc = "```mermaid\nA-->B\n```\n\n```rust\nlet x = 1;\n```\n";
     var lines: [8]simd.Line = undefined;
     var fence: simd.FenceState = .{};
@@ -197,6 +218,7 @@ test "plugin: collect finds fences, caps at 16, skips unknown" {
 }
 
 test "plugin: collect stops at 16 with 17 fences, unknown tokens skip slots" {
+    if (comptime core_options.plugin_stub) return;
     // 17 mermaid fences with two unknown-token (rust) fences interleaved
     // before the 6th and 13th mermaid fence; each fence spans 3 scan lines.
     var doc_buf: [4096]u8 = undefined;

@@ -4,6 +4,7 @@ const parser = @import("../core/parser.zig");
 const highlight = @import("../core/highlight.zig");
 const bidi = @import("../core/bidi.zig");
 const plugin_cache = @import("../core/plugin_cache.zig");
+const core_options = @import("core_options");
 
 // Calibrated ASCII advance widths for IBM Plex Serif Regular (in 1/1000 em)
 pub const SERIF_FONT_WIDTHS = [128]u16{
@@ -4572,6 +4573,8 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
 }
 
 test "plugin fence: ready job emits image box, rendering shows indicator (#323 PR-1 Task 4)" {
+    // Twin builds stub cachePath (used below), so skip there.
+    if (comptime core_options.plugin_stub) return;
     const test_doc =
         \\```mermaid
         \\A-->B
@@ -4653,6 +4656,8 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
 }
 
 test "plugin fence: ready job grows document height by the image box (#323 PR-1 Task 5 F1)" {
+    // Twin builds stub cachePath (used below), so skip there.
+    if (comptime core_options.plugin_stub) return;
     const test_doc =
         \\```mermaid
         \\A-->B
