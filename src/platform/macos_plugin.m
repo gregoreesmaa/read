@@ -48,8 +48,17 @@ static char plugin_out[PLUGIN_MAX_INFLIGHT][512];
 static char plugin_hist_out[PLUGIN_HIST][512];
 static char plugin_hist_ok[PLUGIN_HIST];
 static int plugin_hist_pos = 0;
+// Bounded "%s" copy (snprintf(dst, 512, "%s", src) without the format
+// machinery: snprintf was the only format call in ship, and the import
+// plus per-site setup cost __TEXT for zero behavior delta).
+static void plugin_copy512(char dst[512], const char* src) {
+    size_t n = strlen(src);
+    if (n > 511) n = 511;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 static void plugin_hist_record(const char* outfile, int ok) {
-    snprintf(plugin_hist_out[plugin_hist_pos], 512, "%s", outfile);
+    plugin_copy512(plugin_hist_out[plugin_hist_pos], outfile);
     plugin_hist_ok[plugin_hist_pos] = ok ? 1 : 0;
     plugin_hist_pos = (plugin_hist_pos + 1) % PLUGIN_HIST;
 }
@@ -96,7 +105,10 @@ static int plugin_which_ok(const char* renderer) {
 int launchPluginRender(const char* renderer, const char* srcfile, const char* outfile) {
     if (!renderer || !*renderer || !srcfile || !*srcfile || !outfile || !*outfile) return -1;
     if (strlen(srcfile) >= 512 || strlen(outfile) >= 512) {
-        fprintf(stderr, "read: plugin render path too long\n");
+        // write(2), not fprintf: the only no-arg print in ship, and the
+        // format call pulls _fwrite into the binary for one line. stderr
+        // is unbuffered, so bytes hit the fd in order either way.
+        (void)write(STDERR_FILENO, "read: plugin render path too long\n", sizeof("read: plugin render path too long\n") - 1);
         return -1;
     }
     if (!plugin_which_ok(renderer)) {
@@ -116,8 +128,8 @@ int launchPluginRender(const char* renderer, const char* srcfile, const char* ou
     }
     plugin_pid[slot] = pid;
     plugin_start[slot] = start;
-    snprintf(plugin_src[slot], 512, "%s", srcfile);
-    snprintf(plugin_out[slot], 512, "%s", outfile);
+    plugin_copy512(plugin_src[slot], srcfile);
+    plugin_copy512(plugin_out[slot], outfile);
     return 1;
 }
 

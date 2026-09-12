@@ -62,22 +62,32 @@ pub const Segment = struct {
 
 pub const MAX_SEGMENTS: usize = 32;
 
-/// Language from a raw fence-start line (leading indent and trailing
-/// whitespace tolerated). First info-string token, exact match.
-pub fn langFromFenceLine(line: []const u8) Lang {
+/// First info-string token of a raw fence-start line (leading indent
+/// tolerated): skip indent, skip the fence run, skip blanks, take up to
+/// the next blank. Empty when the line carries no token. Shared by
+/// langFromFenceLine and the plugin cache's fenceInfoToken (one scanner
+/// in ship, not two). Scan lines never carry `\r` (stripped by
+/// simd.scanLines) and never start with `\r`/`\n`, so space/tab-only
+/// trims agree with wider trims on every real input; no test feeds `\r`.
+pub fn fenceToken(line: []const u8) []const u8 {
     var s = line;
-    while (s.len > 0 and (s[0] == ' ' or s[0] == '\t' or s[0] == '\r' or s[0] == '\n')) : (s = s[1..]) {}
-    while (s.len > 0 and (s[s.len - 1] == ' ' or s[s.len - 1] == '\t' or s[s.len - 1] == '\r' or s[s.len - 1] == '\n')) : (s = s[0 .. s.len - 1]) {}
-    if (s.len < 3) return .none;
+    while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) : (s = s[1..]) {}
+    if (s.len < 3) return "";
     const fc = s[0];
-    if (fc != '`' and fc != '~') return .none;
+    if (fc != '`' and fc != '~') return "";
     var p: usize = 0;
     while (p < s.len and s[p] == fc) : (p += 1) {}
-    if (p < 3) return .none;
+    if (p < 3) return "";
     while (p < s.len and (s[p] == ' ' or s[p] == '\t')) : (p += 1) {}
     const start = p;
     while (p < s.len and s[p] != ' ' and s[p] != '\t') : (p += 1) {}
-    const token = s[start..p];
+    return s[start..p];
+}
+
+/// Language from a raw fence-start line: first info-string token via the
+/// shared fenceToken scanner, exact match.
+pub fn langFromFenceLine(line: []const u8) Lang {
+    const token = fenceToken(line);
     if (token.len == 0) return .none;
     if (std.mem.eql(u8, token, "zig")) return .zig;
     if (std.mem.eql(u8, token, "c")) return .c;
@@ -112,7 +122,10 @@ const js_keywords = "const let var function return if else while for do switch c
 
 const bash_keywords = "if then else elif fi for while until do done case esac in function select time echo exit return local export true false";
 
-const ts_keywords = "const let var function return if else while for do switch case default break continue new delete typeof instanceof in of try catch finally throw class extends import export from default async await this null true false undefined interface type enum namespace abstract implements readonly declare keyof infer satisfies";
+/// TypeScript-only delta over the shared js blob (ts words ⊋ js words, so
+/// .ts scans js_keywords then this; identical match set, ~0.2 KiB less
+/// __cstring than a second full blob).
+const ts_extra_keywords = "interface type enum namespace abstract implements readonly declare keyof infer satisfies";
 
 const rust_keywords = "fn let mut pub return if else while for loop in match struct enum impl trait use mod const static ref move async await dyn crate self Self true false None Some Ok Err";
 
@@ -128,7 +141,9 @@ const kotlin_keywords = "fun return if else when while for in do class object in
 
 const php_keywords = "function return if else elseif while for foreach as class public private protected static new echo print require include namespace use true false null this";
 
-const cpp_keywords = "int char float double void bool long short signed unsigned const static extern volatile register auto return if else while for do switch case default break continue goto sizeof typedef struct union enum class namespace template typename public private protected virtual override new delete try catch throw using true false nullptr NULL";
+/// C++-only delta over the shared c blob (every c word is also a cpp word,
+/// so .cpp scans c_keywords then this; identical match set).
+const cpp_extra_keywords = "bool class namespace template typename public private protected virtual override new delete try catch throw using nullptr";
 
 const csharp_keywords = "using namespace public private protected class interface enum struct return if else while for foreach in new var string void int bool true false null this base try catch finally";
 
@@ -147,7 +162,7 @@ fn blobFor(lang: Lang) []const u8 {
         .python => python_keywords,
         .js => js_keywords,
         .bash => bash_keywords,
-        .ts => ts_keywords,
+        .ts => js_keywords,
         .rust => rust_keywords,
         .go => go_keywords,
         .java => java_keywords,
@@ -155,7 +170,7 @@ fn blobFor(lang: Lang) []const u8 {
         .swift => swift_keywords,
         .kotlin => kotlin_keywords,
         .php => php_keywords,
-        .cpp => cpp_keywords,
+        .cpp => c_keywords,
         .csharp => csharp_keywords,
         .html => html_keywords,
         .css => css_keywords,
@@ -165,10 +180,9 @@ fn blobFor(lang: Lang) []const u8 {
     };
 }
 
-fn isKeyword(lang: Lang, word: []const u8) bool {
-    // Whole-token scan over the space-separated blob: identical match
+fn scanBlob(blob: []const u8, word: []const u8) bool {
+    // Whole-token scan over a space-separated blob: identical match
     // semantics to the per-word tables, without per-word slice headers.
-    const blob = blobFor(lang);
     var i: usize = 0;
     while (i < blob.len) {
         var j = i;
@@ -178,6 +192,16 @@ fn isKeyword(lang: Lang, word: []const u8) bool {
         i = j + 1;
     }
     return false;
+}
+
+fn isKeyword(lang: Lang, word: []const u8) bool {
+    if (scanBlob(blobFor(lang), word)) return true;
+    const extra = switch (lang) {
+        .ts => ts_extra_keywords,
+        .cpp => cpp_extra_keywords,
+        else => return false,
+    };
+    return scanBlob(extra, word);
 }
 
 fn isWordChar(c: u8) bool {
@@ -427,6 +451,20 @@ test "fence info string language detection" {
     try std.testing.expectEqual(Lang.none, langFromFenceLine("not a fence"));
 }
 
+test "fenceToken scanner edges agree with lang mapping" {
+    // Tokens the plugin cache also relies on (shared scanner contract).
+    try std.testing.expectEqualStrings("mermaid", fenceToken("```mermaid"));
+    try std.testing.expectEqualStrings("rust", fenceToken("   ```rust extra"));
+    try std.testing.expectEqualStrings("", fenceToken("```"));
+    try std.testing.expectEqualStrings("", fenceToken("not a fence"));
+    try std.testing.expectEqualStrings("", fenceToken("  "));
+    try std.testing.expectEqualStrings("", fenceToken("``mermaid"));
+    try std.testing.expectEqualStrings("ZIG", fenceToken("```ZIG"));
+    // Case-sensitive mapping still falls back on unknown-case tokens.
+    try std.testing.expectEqual(Lang.none, langFromFenceLine("```ZIG"));
+    try std.testing.expectEqual(Lang.none, langFromFenceLine("```"));
+}
+
 test "fence info string top-20 detection and aliases" {
     // New families (issue #333); every one resolved .none before.
     try std.testing.expectEqual(Lang.ts, langFromFenceLine("```ts"));
@@ -453,6 +491,24 @@ test "fence info string top-20 detection and aliases" {
     // Unknown languages still fall back to the plain run.
     try std.testing.expectEqual(Lang.none, langFromFenceLine("```haskell"));
     try std.testing.expectEqual(Lang.none, langFromFenceLine("```RUST"));
+}
+
+test "ts/cpp share base blobs plus extras" {
+    // Shared words resolve through the base-family blob ...
+    try std.testing.expect(isKeyword(.ts, "const"));
+    try std.testing.expect(isKeyword(.cpp, "return"));
+    try std.testing.expect(isKeyword(.cpp, "NULL"));
+    // ... family-only words through the delta blob ...
+    try std.testing.expect(isKeyword(.ts, "interface"));
+    try std.testing.expect(isKeyword(.ts, "satisfies"));
+    try std.testing.expect(isKeyword(.cpp, "nullptr"));
+    try std.testing.expect(isKeyword(.cpp, "namespace"));
+    // ... and non-keywords stay plain on both sides of the split.
+    try std.testing.expect(!isKeyword(.ts, "i32"));
+    try std.testing.expect(!isKeyword(.cpp, "interface"));
+    try std.testing.expect(!isKeyword(.ts, "nullptr"));
+    try std.testing.expect(!isKeyword(.js, "interface"));
+    try std.testing.expect(!isKeyword(.c, "nullptr"));
 }
 
 fn classAt(segs: []Segment, idx: usize) Class {

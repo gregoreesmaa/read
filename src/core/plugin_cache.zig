@@ -11,6 +11,7 @@ const core_options = @import("core_options");
 // size gate). Types (Renderer, JobState, PluginJob, MAX_PLUGIN_JOBS) are
 // identical in both modes: they cost zero bytes and keep call-site codegen
 // stable.
+const highlight = @import("highlight.zig");
 
 /// Content-driven async plugin pipeline, stage 1: pure-Zig cache state
 /// machine (issue #323, PR 1 of 6). No threads, no spawning, no file I/O
@@ -51,10 +52,23 @@ fn rendererName(r: Renderer) []const u8 {
     };
 }
 
+/// Lowercase 16-hex of a hash for cache/sidecar names. Manual nibbles:
+/// std.fmt.bufPrint pulls the Io.Writer vtable into the ship binary
+/// (~0.6 KiB of __TEXT), so cold paths format by hand. Output is identical
+/// to "{x:0>16}".
+pub fn hex16(h: u64, out: *[16]u8) void {
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const shift: u6 = @intCast((15 - i) * 4);
+        const nib: u8 = @intCast((h >> shift) & 0xf);
+        out[i] = if (nib < 10) '0' + nib else 'a' + (nib - 10);
+    }
+}
+
 pub fn cachePath(cache_root: []const u8, renderer: Renderer, hash: u64, out: []u8) ?[]u8 {
     if (comptime core_options.plugin_stub) return null;
     var hex: [16]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x:0>16}", .{hash}) catch return null;
+    hex16(hash, &hex);
     const name = rendererName(renderer);
     const tail = "/read/plugins/";
     const ext = ".png";
@@ -100,23 +114,11 @@ pub const PluginJob = struct {
 };
 
 /// First info token of a `code_fence_start` line (e.g. `mermaid` in
-/// "```mermaid"), tokenized like `highlight.langFromFenceLine`: skip indent,
-/// skip the fence run, skip blanks, take up to the next blank. Borrowed
-/// from `doc`; empty when the line carries no token.
+/// "```mermaid"): the shared `highlight.fenceToken` scanner over the raw
+/// line bytes (one copy in ship, not two). Borrowed from `doc`; empty when
+/// the line carries no token.
 fn fenceInfoToken(doc: []const u8, line: simd.Line) []const u8 {
-    const raw = doc[line.offset..][0..line.len];
-    var s = raw;
-    while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) : (s = s[1..]) {}
-    if (s.len < 3) return "";
-    const fc = s[0];
-    if (fc != '`' and fc != '~') return "";
-    var p: usize = 0;
-    while (p < s.len and s[p] == fc) : (p += 1) {}
-    if (p < 3) return "";
-    while (p < s.len and (s[p] == ' ' or s[p] == '\t')) : (p += 1) {}
-    const start = p;
-    while (p < s.len and s[p] != ' ' and s[p] != '\t') : (p += 1) {}
-    return s[start..p];
+    return highlight.fenceToken(doc[line.offset..][0..line.len]);
 }
 
 /// Content bytes of the fence opened at `lines[fence_idx]`: from the first
