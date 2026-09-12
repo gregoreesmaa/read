@@ -3,6 +3,7 @@ const simd = @import("hot");
 const parser = @import("../core/parser.zig");
 const highlight = @import("../core/highlight.zig");
 const bidi = @import("../core/bidi.zig");
+const plugin_cache = @import("../core/plugin_cache.zig");
 
 // Calibrated ASCII advance widths for IBM Plex Serif Regular (in 1/1000 em)
 pub const SERIF_FONT_WIDTHS = [128]u16{
@@ -484,6 +485,15 @@ pub const ViewportConfig = struct {
     /// disables the joint (lines flow separately). Render and measurement
     /// share the config, so both always agree.
     join_buf: ?*[JOIN_BUF_LEN]u8 = null,
+    /// Plugin render jobs, borrow side (issue #323, PR-1 Task 4). Null
+    /// (the default, and every existing caller) keeps today's rendering
+    /// bit-identical. Task 5 (main.zig) owns the table plus the parallel
+    /// per-slot path buffers and fills them at open; layout threads these
+    /// into `UnitCx` and only reads job `state` plus the borrowed path
+    /// bytes. Zero allocations: plain slices, linear scan of <= 16 rows.
+    plugins: ?[]const plugin_cache.PluginJob = null,
+    plugin_paths: ?[]const [256]u8 = null,
+    plugin_path_lens: ?[]const u8 = null,
 };
 
 /// Cross-line reference joint scratch length: two source lines plus a space.
@@ -1809,6 +1819,17 @@ const UnitCx = struct {
     qord_active: bool = false,
     qord_depth: usize = 0,
     qord_next: u32 = 0,
+    /// Plugin render jobs (issue #323, PR-1 Task 4, borrow side only).
+    /// Null (all existing callers) disables the fence decision and today's
+    /// rendering is bit-identical. Task 5 owns the table and the parallel
+    /// path buffers and fills them at open; layout only reads `state`
+    /// (readiness is precomputed at open; `cachePath` is never called here)
+    /// and borrows `paths[slot][0..lens[slot]]` for the ready image's
+    /// `link_target`.
+    /// Slot index == job-table index; guarded at use, never trusted.
+    plugins: ?[]const plugin_cache.PluginJob = null,
+    plugin_paths: ?[]const [256]u8 = null,
+    plugin_path_lens: ?[]const u8 = null,
 };
 
 const UnitOut = struct {
@@ -2269,6 +2290,9 @@ fn measureCx(
         .commands_out = &.{},
         .cmd_count = dummy,
         .markers = null,
+        .plugins = config.plugins,
+        .plugin_paths = config.plugin_paths,
+        .plugin_path_lens = config.plugin_path_lens,
     };
 }
 
@@ -2915,6 +2939,9 @@ pub fn renderViewportCore(
         .commands_out = commands_out,
         .cmd_count = &cmd_count,
         .markers = config.ordered_markers,
+        .plugins = config.plugins,
+        .plugin_paths = config.plugin_paths,
+        .plugin_path_lens = config.plugin_path_lens,
     };
 
     while (i < lines.len) : (i += 1) {
@@ -2960,7 +2987,74 @@ pub fn renderViewportCore(
                 code_line_count += 1;
             }
 
-            const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0;
+            // Plugin fence decision (issue #323, PR-1 Task 4): look up the
+            // job owning this fence line (linear scan, <= 16 rows, only
+            // when a table is attached). Null table, unknown fence, or
+            // naive/failed state falls through to today's code card.
+            // Zero allocations: index compare plus borrowed path bytes.
+            var plugin_slot: ?usize = null;
+            if (unit_cx.plugins) |jobs| {
+                var s: usize = 0;
+                while (s < jobs.len) : (s += 1) {
+                    if (jobs[s].fence_line == i) {
+                        plugin_slot = s;
+                        break;
+                    }
+                }
+            }
+            var plugin_state: ?plugin_cache.JobState = null;
+            var plugin_path: ?[]const u8 = null;
+            if (plugin_slot) |s| {
+                plugin_state = unit_cx.plugins.?[s].state;
+                if (unit_cx.plugin_paths) |paths| {
+                    if (unit_cx.plugin_path_lens) |lens| {
+                        if (s < paths.len and s < lens.len and lens[s] > 0) {
+                            plugin_path = paths[s][0..lens[s]];
+                        }
+                    }
+                }
+            }
+
+            // Ready: swap the code card for the cached-PNG image box, shaped
+            // like the stock image path (natural size when the platform
+            // knows it, 240px fallback while it does not; no caption).
+            // The scrollable-block id is still consumed so later blocks keep
+            // the ids the measure pass assigns (it counts every fence).
+            if (plugin_state == .ready and plugin_path != null) {
+                var nat_w: f32 = 0.0;
+                var nat_h: f32 = 0.0;
+                if (config.image_size_fn) |fn_ptr| {
+                    const pp = plugin_path.?;
+                    if (pp.len > 0) fn_ptr(pp.ptr, @intCast(pp.len), &nat_w, &nat_h);
+                }
+                const img_w: f32 = if (nat_w > 0.0) @min(nat_w, content_width) else content_width;
+                const img_h: f32 = laidOutImageHeight(nat_w, nat_h, content_width);
+                const img_margin: f32 = 18.0;
+                cur_y += img_margin;
+                if (cur_y + img_h >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .image,
+                        .rect = .{
+                            .x = content_x,
+                            .y = cur_y,
+                            .w = img_w,
+                            .h = img_h,
+                        },
+                        .text = "",
+                        .link_target = plugin_path,
+                    };
+                    cmd_count += 1;
+                }
+                cur_y += img_h + img_margin;
+                next_block_id += 1;
+                i = scan_i; // Skip past code_fence_end
+                continue;
+            }
+
+            // Queued/rendering: today's card plus one muted header line.
+            const plugin_pending = plugin_state == .queued or plugin_state == .rendering;
+            const plugin_header_h: f32 = if (plugin_pending) config.line_height * 0.88 else 0.0;
+            const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0 + plugin_header_h;
             const block_top = cur_y;
             const block_bottom = cur_y + code_block_h;
             const block_id = next_block_id;
@@ -3043,6 +3137,27 @@ pub fn renderViewportCore(
                 const mono_advance = mono_size * 0.60;
 
                 var code_y = cur_y + 12.0;
+                // Pending plugin render: muted header-suffix run on the
+                // card's first line; code lines start one row lower.
+                if (plugin_pending) {
+                    if (code_y + 20.0 >= 0 and code_y <= vp_bottom and cmd_count < commands_out.len) {
+                        commands_out[cmd_count] = .{
+                            .kind = .text_run,
+                            .rect = .{
+                                .x = content_x,
+                                .y = code_y,
+                                .w = content_width,
+                                .h = config.line_height * 0.88,
+                            },
+                            .color = theme.muted,
+                            .text = "· rendering…",
+                            .font_size = mono_size,
+                            .style = .{ .code = true },
+                        };
+                        cmd_count += 1;
+                    }
+                    code_y += plugin_header_h;
+                }
                 var draw_i = i + 1;
                 while (draw_i < scan_i and draw_i < lines.len) : (draw_i += 1) {
                     // Reserve room for scroll shadows + end clip below.
@@ -3688,6 +3803,9 @@ pub fn computeDocumentHeightEx(
         .commands_out = &.{},
         .cmd_count = &dummy_cmd_count,
         .markers = null,
+        .plugins = config.plugins,
+        .plugin_paths = config.plugin_paths,
+        .plugin_path_lens = config.plugin_path_lens,
     };
 
     while (i < lines.len) : (i += 1) {
@@ -4242,6 +4360,68 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
     // Unknown info string: exactly one run, body-text color, as before.
     try std.testing.expectEqual(@as(usize, 1), rust_runs);
     try std.testing.expect(rust_plain);
+}
+
+test "plugin fence: ready job emits image box, rendering shows indicator (#323 PR-1 Task 4)" {
+    const test_doc =
+        \\```mermaid
+        \\A-->B
+        \\```
+    ;
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+    try std.testing.expectEqual(@as(usize, 3), line_count);
+
+    // Hand-built 1-job table: no launcher involved.
+    var jobs: [1]plugin_cache.PluginJob = .{
+        .{ .fence_line = 0, .hash = 0, .renderer = .mermaid, .state = .ready },
+    };
+    // Borrow-side path buffers (Task 5 owns and fills these at open).
+    var path_bufs: [1][256]u8 = undefined;
+    var path_lens: [1]u8 = undefined;
+    const p = plugin_cache.cachePath("/tmp/C", .mermaid, 0, &path_bufs[0]).?;
+    path_lens[0] = @intCast(p.len);
+
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .plugins = jobs[0..],
+        .plugin_paths = path_bufs[0..],
+        .plugin_path_lens = path_lens[0..],
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    // Ready: exactly one .image whose link_target ends with ".png".
+    var images: usize = 0;
+    for (cmds[0..count]) |c| {
+        if (c.kind != .image) continue;
+        images += 1;
+        const target = c.link_target orelse "";
+        try std.testing.expect(std.mem.endsWith(u8, target, ".png"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), images);
+
+    // Rendering: today's code card + a muted "rendering" run, no .image.
+    jobs[0].state = .rendering;
+    var cmds2: [256]DrawCommand = undefined;
+    const count2 = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds2);
+    var images2: usize = 0;
+    var saw_card = false;
+    var saw_rendering = false;
+    for (cmds2[0..count2]) |c| {
+        if (c.kind == .image) images2 += 1;
+        if (c.kind == .code_block_bg) saw_card = true;
+        if (c.kind == .text_run and std.mem.indexOf(u8, c.text, "rendering") != null) {
+            saw_rendering = true;
+            try std.testing.expectEqual(Theme.dark.muted, c.color);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), images2);
+    try std.testing.expect(saw_card);
+    try std.testing.expect(saw_rendering);
 }
 
 test "html subset: break/kbd/mark/sub/sup/del render, fallback muted, details hidden" {
