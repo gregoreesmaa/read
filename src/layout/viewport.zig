@@ -1013,15 +1013,23 @@ pub const ViewportConfig = struct {
     join_buf: ?*[JOIN_BUF_LEN]u8 = null,
     /// Plugin render jobs, borrow side (issue #323, PR-1 Task 4). Null
     /// (the default, and every existing caller) keeps today's rendering
-    /// bit-identical. Task 5 (main.zig) owns the table plus the parallel
-    /// per-slot path buffers and fills them at open; layout threads these
-    /// into `UnitCx` and only reads job `state` plus the borrowed path
-    /// bytes. Zero allocations: plain slices, linear scan of the attached
-    /// table (Task 5 truncates the build at 16 rows; no cap is enforced
-    /// here, so overlong tables are honored, never silently cut).
-    plugins: ?[]const plugin_cache.PluginJob = null,
-    plugin_paths: ?[]const [256]u8 = null,
-    plugin_path_lens: ?[]const u8 = null,
+    /// bit-identical. Task 5 (main.zig) owns the table and fills it at
+    /// open; layout threads it into `UnitCx` and only reads each entry's
+    /// fence index, job `state`, and borrowed path bytes. Zero
+    /// allocations: one plain slice (not three parallel ones — a single
+    /// 16-byte field keeps every config literal and copy small), linear
+    /// scan of the attached table (Task 5 truncates the build at 16 rows;
+    /// no cap is enforced here, so overlong tables are honored, never
+    /// silently cut).
+    plugins: ?[]const PluginEntry = null,
+};
+
+/// One layout-facing plugin row: the fence anchor plus what the fence
+/// decision and the ready-image link need. Built by main.zig at open from
+/// the job table and the per-slot path buffers; layout never writes it.
+pub const PluginEntry = struct {
+    job: plugin_cache.PluginJob,
+    path: []const u8,
 };
 
 /// Cross-line reference joint scratch length: two source lines plus a space.
@@ -2125,15 +2133,48 @@ const AlertKind = enum { note, tip, important, warning, caution };
 
 /// Table-driven alert tint (GitHub Primer hues, dark/light pair per kind).
 /// Comptime table, no Theme change: the bar and label recolor per visible
-/// admonition unit only, every other quote keeps `theme.quote_bar`.
-fn alertColor(kind: AlertKind, is_dark: bool) Color {
-    return switch (kind) {
-        .note => if (is_dark) Color{ .r = 68, .g = 147, .b = 248, .a = 255 } else Color{ .r = 9, .g = 105, .b = 218, .a = 255 },
-        .tip => if (is_dark) Color{ .r = 63, .g = 185, .b = 80, .a = 255 } else Color{ .r = 26, .g = 127, .b = 55, .a = 255 },
-        .important => if (is_dark) Color{ .r = 171, .g = 125, .b = 248, .a = 255 } else Color{ .r = 130, .g = 80, .b = 223, .a = 255 },
-        .warning => if (is_dark) Color{ .r = 210, .g = 153, .b = 34, .a = 255 } else Color{ .r = 154, .g = 103, .b = 0, .a = 255 },
-        .caution => if (is_dark) Color{ .r = 248, .g = 81, .b = 73, .a = 255 } else Color{ .r = 207, .g = 34, .b = 46, .a = 255 },
+/// admonition unit only, every other quote keeps `theme.quote_bar`. Packed
+/// RGB rows (not a 10-way literal switch): identical colors, less __text.
+const alert_dark_rgb: [5][3]u8 = .{
+    .{ 68, 147, 248 }, // note
+    .{ 63, 185, 80 }, // tip
+    .{ 171, 125, 248 }, // important
+    .{ 210, 153, 34 }, // warning
+    .{ 248, 81, 73 }, // caution
+};
+const alert_light_rgb: [5][3]u8 = .{
+    .{ 9, 105, 218 }, // note
+    .{ 26, 127, 55 }, // tip
+    .{ 130, 80, 223 }, // important
+    .{ 154, 103, 0 }, // warning
+    .{ 207, 34, 46 }, // caution
+};
+/// noinline: two layout call sites share one copy; per-quote cost stays a
+/// single predictable call on an already-branchy path.
+noinline fn alertColor(kind: AlertKind, is_dark: bool) Color {
+    const c = if (is_dark) alert_dark_rgb[@intFromEnum(kind)] else alert_light_rgb[@intFromEnum(kind)];
+    return .{ .r = c[0], .g = c[1], .b = c[2], .a = 255 };
+}
+
+test "alert hues match GitHub Primer pairs" {
+    // Golden RGBs: guards the packed table against typos and enum reorders.
+    const wants = [_]struct { kind: AlertKind, dark: [3]u8, light: [3]u8 }{
+        .{ .kind = .note, .dark = .{ 68, 147, 248 }, .light = .{ 9, 105, 218 } },
+        .{ .kind = .tip, .dark = .{ 63, 185, 80 }, .light = .{ 26, 127, 55 } },
+        .{ .kind = .important, .dark = .{ 171, 125, 248 }, .light = .{ 130, 80, 223 } },
+        .{ .kind = .warning, .dark = .{ 210, 153, 34 }, .light = .{ 154, 103, 0 } },
+        .{ .kind = .caution, .dark = .{ 248, 81, 73 }, .light = .{ 207, 34, 46 } },
     };
+    for (wants) |w| {
+        const d = alertColor(w.kind, true);
+        try std.testing.expectEqual(w.dark[0], d.r);
+        try std.testing.expectEqual(w.dark[1], d.g);
+        try std.testing.expectEqual(w.dark[2], d.b);
+        const l = alertColor(w.kind, false);
+        try std.testing.expectEqual(w.light[0], l.r);
+        try std.testing.expectEqual(w.light[1], l.g);
+        try std.testing.expectEqual(w.light[2], l.b);
+    }
 }
 
 fn alertLabel(kind: AlertKind) []const u8 {
@@ -2150,7 +2191,7 @@ fn alertLabel(kind: AlertKind) []const u8 {
 /// tolerated, word case-insensitive). Returns the kind plus the remainder
 /// past the marker with padding stripped. The closer must be followed by
 /// end/space/tab, so `[!NOTE]x` stays literal text.
-fn parseAlertMarker(body: []const u8) ?struct { kind: AlertKind, rest: []const u8 } {
+fn parseAlertMarker(body: []const u8) ?AlertMark {
     var s = body;
     while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) : (s = s[1..]) {}
     if (s.len < 3 or s[0] != '[' or s[1] != '!') return null;
@@ -2159,22 +2200,27 @@ fn parseAlertMarker(body: []const u8) ?struct { kind: AlertKind, rest: []const u
     if (e >= s.len) return null;
     if (e + 1 < s.len and s[e + 1] != ' ' and s[e + 1] != '\t') return null;
     const word = s[2..e];
-    var lower: [16]u8 = undefined;
-    if (word.len == 0 or word.len > lower.len) return null;
-    for (word, 0..) |c, k| lower[k] = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
-    const folded = lower[0..word.len];
-    const kind: AlertKind = if (std.mem.eql(u8, folded, "note"))
-        .note
-    else if (std.mem.eql(u8, folded, "tip"))
-        .tip
-    else if (std.mem.eql(u8, folded, "important"))
-        .important
-    else if (std.mem.eql(u8, folded, "warning"))
-        .warning
-    else if (std.mem.eql(u8, folded, "caution"))
-        .caution
-    else
-        return null;
+    if (word.len == 0 or word.len > 16) return null;
+    // (Length, lowercase-first-byte) pairs are unique across the five
+    // markers (4/n, 3/t, 9/i, 7/w, 7/c), so dispatch to one candidate and
+    // verify it case-insensitively: one compare, not a five-eql cascade.
+    const f0 = if (word[0] >= 'A' and word[0] <= 'Z') word[0] + ('a' - 'A') else word[0];
+    const kind: AlertKind, const want: []const u8 = switch (word.len) {
+        3 => if (f0 == 't') .{ .tip, "tip" } else return null,
+        4 => if (f0 == 'n') .{ .note, "note" } else return null,
+        7 => if (f0 == 'w')
+            .{ .warning, "warning" }
+        else if (f0 == 'c')
+            .{ .caution, "caution" }
+        else
+            return null,
+        9 => if (f0 == 'i') .{ .important, "important" } else return null,
+        else => return null,
+    };
+    for (word, 0..) |c, k| {
+        const d = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+        if (d != want[k]) return null;
+    }
     var rest = s[e + 1 ..];
     while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) : (rest = rest[1..]) {}
     return .{ .kind = kind, .rest = rest };
@@ -2194,18 +2240,22 @@ fn quoteRunStart(lines: []const simd.Line, i: usize) usize {
     return k;
 }
 
-/// Alert kind when unit `i` sits in an admonition run: the run's first line
-/// carries a marker AND parses as plain text (a `    [!NOTE]` indented-code
-/// leader or any non-text body keeps the literal rendering). Null for every
-/// ordinary quote, so the common path pays one backscan that stops at the
-/// first non-quote line.
-fn quoteAlert(bytes: []const u8, lines: []const simd.Line, i: usize) ?AlertKind {
-    const k = quoteRunStart(lines, i);
-    const qb0 = bytes[lines[k].offset..][0..lines[k].len];
+/// Parsed admonition marker: the alert kind plus the remainder past the
+/// marker with padding stripped. Shared by parseAlertMarker and quoteAlertAt
+/// (one named type so the marker rides along without re-parsing).
+const AlertMark = struct { kind: AlertKind, rest: []const u8 };
+
+/// Alert marker when unit `i` sits in an admonition run: the run's first
+/// line carries a marker AND parses as plain text (a `    [!NOTE]`
+/// indented-code leader or any non-text body keeps the literal rendering).
+/// Null for every ordinary quote. Takes the run start from the caller (one
+/// capped backscan per unit, not two) and returns the parsed remainder so
+/// the leader row never parses the same marker line twice.
+fn quoteAlertAt(bytes: []const u8, lines: []const simd.Line, run_start: usize) ?AlertMark {
+    const qb0 = bytes[lines[run_start].offset..][0..lines[run_start].len];
     const b0 = stripQuoteMarkers(qb0).body;
     if (classifyQuoteBody(b0).kind != .text) return null;
-    if (parseAlertMarker(b0)) |m| return m.kind;
-    return null;
+    return parseAlertMarker(b0);
 }
 
 /// True for list-item leader lines (bullets, ordered items, tasks).
@@ -2443,15 +2493,11 @@ const UnitCx = struct {
     qord_next: u32 = 0,
     /// Plugin render jobs (issue #323, PR-1 Task 4, borrow side only).
     /// Null (all existing callers) disables the fence decision and today's
-    /// rendering is bit-identical. Task 5 owns the table and the parallel
-    /// path buffers and fills them at open; layout only reads `state`
+    /// rendering is bit-identical. Task 5 owns the entry table and fills
+    /// it at open; layout only reads each entry's fence index, job `state`
     /// (readiness is precomputed at open; `cachePath` is never called here)
-    /// and borrows `paths[slot][0..lens[slot]]` for the ready image's
-    /// `link_target`.
-    /// Slot index == job-table index; guarded at use, never trusted.
-    plugins: ?[]const plugin_cache.PluginJob = null,
-    plugin_paths: ?[]const [256]u8 = null,
-    plugin_path_lens: ?[]const u8 = null,
+    /// and borrows `entry.path` for the ready image's `link_target`.
+    plugins: ?[]const PluginEntry = null,
 };
 
 const UnitOut = struct {
@@ -2913,8 +2959,6 @@ fn measureCx(
         .cmd_count = dummy,
         .markers = null,
         .plugins = config.plugins,
-        .plugin_paths = config.plugin_paths,
-        .plugin_path_lens = config.plugin_path_lens,
     };
 }
 
@@ -2979,16 +3023,20 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
     var quote_rtl = false;
     // Admonition alert (issue #325): marker on the run's first line tints
     // every unit's bar; the leader line additionally swaps the marker for
-    // a bold label row. Null for ordinary quotes (one capped backscan).
-    const alert = quoteAlert(ux.bytes, ux.lines, i);
-    const alert_bar = if (alert) |a| alertColor(a, ux.config.is_dark_theme) else ux.theme.quote_bar;
-    const is_leader = quoteRunStart(ux.lines, i) == i;
+    // a bold label row. Null for ordinary quotes (one capped backscan,
+    // shared with the leader check; the remainder rides along so the
+    // leader never re-parses its own marker line).
+    const run_start = quoteRunStart(ux.lines, i);
+    const alert = quoteAlertAt(ux.bytes, ux.lines, run_start);
+    const alert_bar = if (alert) |a| alertColor(a.kind, ux.config.is_dark_theme) else ux.theme.quote_bar;
+    const is_leader = run_start == i;
 
     switch (body.kind) {
         .text => {
             if (alert != null and is_leader) {
-                y = layoutAlertLabel(ux, alert.?, tx, tw, y);
-                const rest = parseAlertMarker(sq.body).?.rest;
+                const a = alert.?;
+                y = layoutAlertLabel(ux, a.kind, tx, tw, y);
+                const rest = a.rest;
                 // flowLeadPara re-derives direction from the text it flows,
                 // so the region must match: derive from the remainder, not
                 // the marker line (same-inputs invariant, see list items).
@@ -3585,25 +3633,15 @@ const PluginFenceGeom = struct {
     path: ?[]const u8 = null,
 };
 
-fn pluginFenceGeom(
-    plugins: ?[]const plugin_cache.PluginJob,
-    paths: ?[]const [256]u8,
-    lens: ?[]const u8,
-    i: usize,
-) PluginFenceGeom {
-    if (plugins) |jobs| {
+fn pluginFenceGeom(entries: ?[]const PluginEntry, i: usize) PluginFenceGeom {
+    if (entries) |rows| {
         var s: usize = 0;
-        while (s < jobs.len) : (s += 1) {
-            if (jobs[s].fence_line == i) {
-                var path: ?[]const u8 = null;
-                if (paths) |p| {
-                    if (lens) |l| {
-                        if (s < p.len and s < l.len and l[s] > 0) {
-                            path = p[s][0..l[s]];
-                        }
-                    }
-                }
-                return .{ .state = jobs[s].state, .path = path };
+        while (s < rows.len) : (s += 1) {
+            if (rows[s].job.fence_line == i) {
+                // Attach pre-slices paths to their staged lengths, so an
+                // empty path here means exactly what a zero lens meant.
+                const path: ?[]const u8 = if (rows[s].path.len > 0) rows[s].path else null;
+                return .{ .state = rows[s].job.state, .path = path };
             }
         }
     }
@@ -3666,8 +3704,6 @@ pub fn renderViewportCore(
         .cmd_count = &cmd_count,
         .markers = config.ordered_markers,
         .plugins = config.plugins,
-        .plugin_paths = config.plugin_paths,
-        .plugin_path_lens = config.plugin_path_lens,
     };
 
     while (i < lines.len) : (i += 1) {
@@ -3718,7 +3754,7 @@ pub fn renderViewportCore(
             // pixels and measured heights agree bit-for-bit. Null table,
             // unknown fence, or naive/failed state falls through to
             // today's code card.
-            const plugin_geom = pluginFenceGeom(unit_cx.plugins, unit_cx.plugin_paths, unit_cx.plugin_path_lens, i);
+            const plugin_geom = pluginFenceGeom(unit_cx.plugins, i);
             const plugin_state: ?plugin_cache.JobState = plugin_geom.state;
             const plugin_path: ?[]const u8 = plugin_geom.path;
 
@@ -4511,8 +4547,6 @@ pub fn computeDocumentHeightEx(
         .cmd_count = &dummy_cmd_count,
         .markers = null,
         .plugins = config.plugins,
-        .plugin_paths = config.plugin_paths,
-        .plugin_path_lens = config.plugin_path_lens,
     };
 
     while (i < lines.len) : (i += 1) {
@@ -4560,7 +4594,7 @@ pub fn computeDocumentHeightEx(
             // pluginFenceGeom decision the render branch draws, so the
             // document height (scrollbar, checkpoints) tracks ready image
             // boxes and pending header rows exactly.
-            const plugin_geom = pluginFenceGeom(unit_cx.plugins, unit_cx.plugin_paths, unit_cx.plugin_path_lens, i);
+            const plugin_geom = pluginFenceGeom(unit_cx.plugins, i);
             if (plugin_geom.state == .ready and plugin_geom.path != null) {
                 var nat_w: f32 = 0.0;
                 var nat_h: f32 = 0.0;
@@ -5114,24 +5148,20 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
     try std.testing.expectEqual(@as(usize, 3), line_count);
 
-    // Hand-built 1-job table: no launcher involved.
-    var jobs: [1]plugin_cache.PluginJob = .{
-        .{ .fence_line = 0, .hash = 0, .renderer = .mermaid, .state = .ready },
-    };
-    // Borrow-side path buffers (Task 5 owns and fills these at open).
+    // Hand-built 1-entry table: no launcher involved. The path buffer is
+    // Task 5's borrow side at open; here cachePath stages it directly.
     var path_bufs: [1][256]u8 = undefined;
-    var path_lens: [1]u8 = undefined;
     const p = plugin_cache.cachePath("/tmp/C", .mermaid, 0, &path_bufs[0]).?;
-    path_lens[0] = @intCast(p.len);
+    var entries: [1]PluginEntry = .{
+        .{ .job = .{ .fence_line = 0, .hash = 0, .renderer = .mermaid, .state = .ready }, .path = p },
+    };
 
     var cmds: [256]DrawCommand = undefined;
     const config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
-        .plugins = jobs[0..],
-        .plugin_paths = path_bufs[0..],
-        .plugin_path_lens = path_lens[0..],
+        .plugins = entries[0..],
     };
     const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
 
@@ -5146,7 +5176,7 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
     try std.testing.expectEqual(@as(usize, 1), images);
 
     // Rendering: today's code card + a muted "rendering" run, no .image.
-    jobs[0].state = .rendering;
+    entries[0].job.state = .rendering;
     var cmds2: [256]DrawCommand = undefined;
     const count2 = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds2);
     var images2: usize = 0;
@@ -5167,7 +5197,7 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
     // All four non-ready states: code card, never an image; only the two
     // in-flight states carry the indicator (Task 4 review F4).
     for ([_]plugin_cache.JobState{ .queued, .naive, .failed }) |st| {
-        jobs[0].state = st;
+        entries[0].job.state = st;
         var cmds_n: [256]DrawCommand = undefined;
         const count_n = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds_n);
         var images_n: usize = 0;
@@ -5196,13 +5226,11 @@ test "plugin fence: ready job grows document height by the image box (#323 PR-1 
     var fence: simd.FenceState = .{};
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
-    var jobs: [1]plugin_cache.PluginJob = .{
-        .{ .fence_line = 0, .hash = 0, .renderer = .mermaid, .state = .ready },
-    };
     var path_bufs: [1][256]u8 = undefined;
-    var path_lens: [1]u8 = undefined;
     const p = plugin_cache.cachePath("/tmp/C", .mermaid, 0, &path_bufs[0]).?;
-    path_lens[0] = @intCast(p.len);
+    var entries: [1]PluginEntry = .{
+        .{ .job = .{ .fence_line = 0, .hash = 0, .renderer = .mermaid, .state = .ready }, .path = p },
+    };
 
     const S = struct {
         fn size800x400(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void {
@@ -5220,9 +5248,7 @@ test "plugin fence: ready job grows document height by the image box (#323 PR-1 
     };
     const plain_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], base, null, null);
     var ready_cfg = base;
-    ready_cfg.plugins = jobs[0..];
-    ready_cfg.plugin_paths = path_bufs[0..];
-    ready_cfg.plugin_path_lens = path_lens[0..];
+    ready_cfg.plugins = entries[0..];
     const ready_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], ready_cfg, null, null);
     // 1-line card: 1*29.75*0.88 + 24 + 16; ready image box: 36 + 300
     // (800x400 natural in the 600px column keeps aspect: 400*600/800).
@@ -5238,10 +5264,10 @@ test "plugin fence: ready job grows document height by the image box (#323 PR-1 
     const ready_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
     try std.testing.expectApproxEqAbs(36.0 + img_h, ready_unit.height, 0.01);
     try std.testing.expectEqual(@as(usize, 3), ready_unit.consumed);
-    jobs[0].state = .queued;
+    entries[0].job.state = .queued;
     const pending_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
     try std.testing.expectApproxEqAbs(card_h + 29.75 * 0.88, pending_unit.height, 0.01);
-    jobs[0].state = .naive;
+    entries[0].job.state = .naive;
     const naive_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
     try std.testing.expectApproxEqAbs(card_h, naive_unit.height, 0.01);
 }
@@ -6173,7 +6199,7 @@ pub fn refineLineHeight(
             // Plugin fence mirror (issue #323, PR-1 Task 5 F1): same
             // pluginFenceGeom decision as render/height so JIT refine
             // converges to the drawn box, never the stale card.
-            const plugin_geom = pluginFenceGeom(config.plugins, config.plugin_paths, config.plugin_path_lens, idx);
+            const plugin_geom = pluginFenceGeom(config.plugins, idx);
             const consumed = if (j < lines.len) j - idx + 1 else lines.len - idx;
             if (plugin_geom.state == .ready and plugin_geom.path != null) {
                 var nat_w: f32 = 0.0;

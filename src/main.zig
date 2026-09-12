@@ -114,6 +114,10 @@ var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
 // a render child is in flight.
 var g_plugin_jobs: [plugin_cache.MAX_PLUGIN_JOBS]plugin_cache.PluginJob = undefined;
 var g_plugin_count: usize = 0;
+// Layout-facing entry bundle (one 16-byte config field instead of three
+// parallel slices). Rebuilt from the job table plus per-slot path buffers
+// on every attach; BSS, zero ship-file cost.
+var g_plugin_entries: [plugin_cache.MAX_PLUGIN_JOBS]layout.PluginEntry = undefined;
 var g_plugin_path_bufs: [plugin_cache.MAX_PLUGIN_JOBS][256]u8 = undefined;
 var g_plugin_path_lens: [plugin_cache.MAX_PLUGIN_JOBS]u8 = [_]u8{0} ** plugin_cache.MAX_PLUGIN_JOBS;
 var g_plugin_launched: [plugin_cache.MAX_PLUGIN_JOBS]bool = [_]bool{false} ** plugin_cache.MAX_PLUGIN_JOBS;
@@ -214,19 +218,9 @@ fn onImagesChanged(delta_above: f32) callconv(.c) void {
 /// against the 16-entry job table (overflow stays queued).
 const PLUGIN_INFLIGHT_MAX: u8 = 8;
 
-/// Lowercase 16-hex of a fence hash for cache/sidecar names. Manual
-/// nibbles: no formatting machinery on this path.
-fn pluginHex16(h: u64, out: *[16]u8) void {
-    var i: usize = 0;
-    while (i < 16) : (i += 1) {
-        const shift: u6 = @intCast((15 - i) * 4);
-        const nib: u8 = @intCast((h >> shift) & 0xf);
-        out[i] = if (nib < 10) '0' + nib else 'a' + (nib - 10);
-    }
-}
-
 /// `<dir>/src-<hex>.txt`: staged fence source bytes beside the cached PNG.
-/// The launcher unlinks it at reap. Pure string math, unit-tested.
+/// The launcher unlinks it at reap. Pure string math, unit-tested. Hex via
+/// the shared plugin_cache.hex16 (one nibble loop in ship, not two).
 fn pluginSidecarPath(dir: []const u8, hash: u64, out: []u8) ?[]u8 {
     const pre = "/src-";
     const ext = ".txt";
@@ -237,7 +231,7 @@ fn pluginSidecarPath(dir: []const u8, hash: u64, out: []u8) ?[]u8 {
     @memcpy(out[s..][0..pre.len], pre);
     s += pre.len;
     var hex: [16]u8 = undefined;
-    pluginHex16(hash, &hex);
+    plugin_cache.hex16(hash, &hex);
     @memcpy(out[s..][0..16], hex[0..]);
     s += 16;
     @memcpy(out[s..][0..ext.len], ext);
@@ -319,14 +313,16 @@ fn pluginResolvePaths(
 /// sandbox), else a `$TMPDIR`/`/tmp` fallback. Cold path only.
 fn pluginCacheRoot(out: []u8) ?[]u8 {
     if (std.c.getenv("HOME")) |z| {
-        const home = std.mem.span(z);
+        // Const view: shares the [*:0]const u8 span instantiation instead
+        // of emitting a second one for the mutable getenv pointer.
+        const home = std.mem.span(@as([*:0]const u8, z));
         const tail = "/Library/Caches";
         if (home.len == 0 or home.len + tail.len > out.len) return null;
         @memcpy(out[0..home.len], home);
         @memcpy(out[home.len..][0..tail.len], tail);
         return out[0 .. home.len + tail.len];
     }
-    const tmp = if (std.c.getenv("TMPDIR")) |z| std.mem.span(z) else "/tmp";
+    const tmp = if (std.c.getenv("TMPDIR")) |z| std.mem.span(@as([*:0]const u8, z)) else "/tmp";
     const sub = "/read-plugin-cache";
     if (tmp.len == 0 or tmp.len + sub.len > out.len) return null;
     @memcpy(out[0..tmp.len], tmp);
@@ -421,15 +417,29 @@ fn pluginWriteFile(path_z: [*:0]const u8, data: []const u8) bool {
 /// then PATH. Cold path only.
 fn pluginHelperPath(out: []u8) ?[]u8 {
     if (std.c.getenv("READ_PLUGIN_RENDERER")) |z| {
-        const v = std.mem.span(z);
+        const v = std.mem.span(@as([*:0]const u8, z));
         if (v.len == 0 or v.len >= out.len) return null;
         @memcpy(out[0..v.len], v);
         return out[0..v.len];
     }
+    // The bare PATH fallback is the tail of the bundle-relative literal
+    // (one cstring in ship, not two): `tail[trix..]`.
+    const tail = "/../Resources/read-plugin-render.sh";
+    const trix = comptime std.mem.indexOf(u8, tail, "read-plugin-render.sh").?;
+    const bare = tail[trix..];
     if (g_exe_path.len > 0) {
-        const tail = "/../Resources/read-plugin-render.sh";
-        if (std.mem.lastIndexOfScalar(u8, g_exe_path, '/')) |li| {
-            const dir = g_exe_path[0..li];
+        // Manual rscan: shares no generic instantiation for one cold use.
+        var li: ?usize = null;
+        var k = g_exe_path.len;
+        while (k > 0) {
+            k -= 1;
+            if (g_exe_path[k] == '/') {
+                li = k;
+                break;
+            }
+        }
+        if (li) |slash| {
+            const dir = g_exe_path[0..slash];
             if (dir.len + tail.len < out.len) {
                 @memcpy(out[0..dir.len], dir);
                 @memcpy(out[dir.len..][0..tail.len], tail);
@@ -438,7 +448,6 @@ fn pluginHelperPath(out: []u8) ?[]u8 {
             }
         }
     }
-    const bare = "read-plugin-render.sh";
     if (bare.len >= out.len) return null;
     @memcpy(out[0..bare.len], bare);
     return out[0..bare.len];
@@ -523,13 +532,18 @@ fn pluginLaunchProbe(r: usize) void {
     }
     const seq = g_plugin_probe_seq[r];
     g_plugin_probe_seq[r] +|= 1;
+    // One stem for both `probe-<hh>.<ext>` sentinel leaves (src/out differ
+    // only in the extension): half the literal setup of two full leaves.
     const hexdig = "0123456789abcdef";
-    var src_leaf: [12]u8 = .{ 'p', 'r', 'o', 'b', 'e', '-', 0, 0, '.', 's', 'r', 'c' };
-    src_leaf[6] = hexdig[seq >> 4];
-    src_leaf[7] = hexdig[seq & 15];
-    var out_leaf: [12]u8 = .{ 'p', 'r', 'o', 'b', 'e', '-', 0, 0, '.', 'o', 'u', 't' };
-    out_leaf[6] = hexdig[seq >> 4];
-    out_leaf[7] = hexdig[seq & 15];
+    var stem: [9]u8 = .{ 'p', 'r', 'o', 'b', 'e', '-', 0, 0, '.' };
+    stem[6] = hexdig[seq >> 4];
+    stem[7] = hexdig[seq & 15];
+    var src_leaf: [12]u8 = undefined;
+    @memcpy(src_leaf[0..9], stem[0..]);
+    @memcpy(src_leaf[9..12], "src");
+    var out_leaf: [12]u8 = undefined;
+    @memcpy(out_leaf[0..9], stem[0..]);
+    @memcpy(out_leaf[9..12], "out");
     var tmp: [1024:0]u8 = [_:0]u8{0} ** 1024;
     const src = pluginChildPath(dir, src_leaf[0..], tmp[0..512]) orelse {
         pluginMarkNaive(r);
@@ -693,7 +707,9 @@ fn pluginKickForDocument() void {
     for (&g_plugin_launched) |*l| l.* = false;
     for (&g_plugin_probe_pending) |*p| p.* = false;
     if (build_options.test_hooks) return;
-    if (!plugin_cache.hasPluginFences(g_app.bytes, g_app.lines[0..g_app.line_count])) return;
+    // No hasPluginFences pre-check: collectPluginJobs already scans the
+    // lines once and returns 0 when none match, so a separate pre-scan
+    // would walk every plain document twice (one inline copy + one pass).
     const root = pluginCacheRoot(g_plugin_root_buf[0..]) orelse return;
     g_plugin_root_len = root.len;
     const n = pluginResolvePaths(
@@ -778,11 +794,18 @@ fn pluginSeedReadyForScreenshot() void {
 /// Attach the per-doc plugin table into a layout config (cold paths only:
 /// metrics, draw, anchor/find walks). An empty table keeps the null
 /// defaults so rendering stays bit-identical without plugin fences.
-fn pluginAttachConfig(cfg: *layout.ViewportConfig) void {
+/// noinline: five call sites share one copy instead of five (~0.1 KiB);
+/// the empty-table fast path stays a single predictable branch.
+noinline fn pluginAttachConfig(cfg: *layout.ViewportConfig) void {
     if (g_plugin_count == 0) return;
-    cfg.plugins = g_plugin_jobs[0..g_plugin_count];
-    cfg.plugin_paths = g_plugin_path_bufs[0..g_plugin_count];
-    cfg.plugin_path_lens = g_plugin_path_lens[0..g_plugin_count];
+    var i: usize = 0;
+    while (i < g_plugin_count) : (i += 1) {
+        g_plugin_entries[i] = .{
+            .job = g_plugin_jobs[i],
+            .path = g_plugin_path_bufs[i][0..g_plugin_path_lens[i]],
+        };
+    }
+    cfg.plugins = g_plugin_entries[0..g_plugin_count];
 }
 
 // 8192 checkpoints x 32-line grid = 262,144 covered lines, matching the
@@ -2073,7 +2096,7 @@ fn stdinPiped() bool {
 /// path (borrowed from `buf`). The name embeds our pid, so no live process
 /// shares it; stale files from crashed runs are unlinked before create.
 fn spoolStdinToTemp(buf: *[std.fs.max_path_bytes:0]u8) ![:0]const u8 {
-    const tmpdir = if (std.c.getenv("TMPDIR")) |z| std.mem.span(z) else "/tmp";
+    const tmpdir = if (std.c.getenv("TMPDIR")) |z| std.mem.span(@as([*:0]const u8, z)) else "/tmp";
     const stem = "/read-stdin-";
     const suffix = ".md";
     // 20 digits of pid + slack; fall back to /tmp when TMPDIR is absurd.
