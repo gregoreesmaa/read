@@ -100,10 +100,20 @@ Three layers, one direction of knowledge:
    - d2: `d2 SRC OUT`
    - graphviz: `dot -Tpng SRC -o OUT`
    - plantuml: `plantuml -tpng -o OUTDIR SRC`
-   - math: first present of `katex`, `mjpage`, `mathjax` with that
-     tool's file→PNG flags; none present → nonzero exit (fallback).
-     Rationale: no canonical PNG CLI exists for TeX math; the
-     pipeline is real for all six, math lights up with user tools.
+   - math (capability canary, issues #326/#327): NO presence probe.
+     No canonical PNG CLI exists for TeX math — the KaTeX CLI is
+     TeX→HTML only, and stock mjpage/mathjax CLIs likewise emit no
+     PNG — so `command -v` would lie (probe-true/render-always-fail).
+     Instead `probe math` renders a minimal TeX snippet to a tmp file
+     with each first-present tool in katex→mjpage→mathjax order and
+     passes only when the bytes carry PNG magic (89 50 4E 47); the
+     first tool passing wins and its name is recorded for the render
+     path. None capable → nonzero exit → naive code cards (no spawn,
+     no indicator flicker). Convention flags (user wrappers that
+     speak them light up): katex/mjpage `TOOL SRC -o DST`, mathjax
+     `TOOL SRC DST`. `render math` uses the canary-proven tool only
+     and promotes PNG bytes or nothing (the reader-side decode check
+     fails closed on top).
 
 ## 4. Layout integration
 
@@ -125,7 +135,10 @@ Three layers, one direction of knowledge:
 - Probe says absent → `naive`: no job, no indicator, no retry this
   session. Probe verdicts are cached ONCE per session (process
   lifetime): installing a renderer mid-process lights up only after
-  restart; re-probed at next open.
+  restart; re-probed at next open. (Math: the verdict is the canary
+  outcome; the winning tool name rides a helper-side handoff file,
+  re-validated — `command -v` plus fresh-canary fallback — at every
+  render, so a stale entry fails closed.)
 - Nonzero exit / no PNG after exit / PNG undecodable: `failed` →
   code card, indicator cleared, no retry this session.
 - Cache write races (two readers): content-addressed bytes are
@@ -149,9 +162,9 @@ Three layers, one direction of knowledge:
 - End-to-end: stub renderer script (copies a fixture PNG, answers
   `probe` true) proves probe → queue → render → arrival → image swap
   with zero real tools installed (none are: verified
-  `mmdc/d2/dot/plantuml/katex` absent on dev machine; `node`/`java`
-  present but drive nothing). A probe-false stub proves the `naive`
-  path (no job, no indicator).
+  `mmdc/d2/dot/plantuml/katex/mjpage/mathjax` absent on dev machine;
+  `node`/`java` present but drive nothing). A probe-false stub proves
+  the `naive` path (no job, no indicator).
 - Gates on every commit: full suite + strict benchmarks, both audit
   tests, `size_gate.sh`, screenshot determinism.
 
@@ -164,8 +177,9 @@ Six PRs, each closing ONE issue, each stacked on the previous:
 2. #330 D2, 3. #329 Graphviz, 4. #328 PlantUML: one renderer row
    each (table + helper stanza + tests). Small by construction.
 3. #326 KaTeX, 6. #327 MathJax: math-renderer rows against the
-   shared `math` slot (probe-first; code fallback where the user has
-   no math CLI — the pipeline is the deliverable, tools are user env).
+   shared `math` slot (capability canary; code fallback where no
+   PNG-capable math tool exists — the pipeline is the deliverable,
+   tools are user env).
 
 Each PR rebases onto its parent at merge time (suite-case numbering,
 `spec.md`, screenshots); each carries its own fixture + skeleton
