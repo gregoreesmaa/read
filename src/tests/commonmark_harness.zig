@@ -12,7 +12,8 @@ const parser = @import("../core/parser.zig");
 /// reasons. Test-gated only: nothing here ships.
 ///
 /// Current gate: zero failures outside `exclusions`. Green since 562/562
-/// (87 raw-HTML examples excluded per standing rule, 3 listed exclusions).
+/// (87 raw-HTML examples excluded per standing rule, 5 listed exclusions:
+/// 156-158 verbatim blocks plus 608/611 GFM bare autolinks).
 const ENFORCE_GATE = true;
 
 const SPEC_PATH = "test_cases/commonmark_spec_0_31_2.txt";
@@ -102,10 +103,15 @@ const HError = std.mem.Allocator.Error || error{ TooDeep, TooBig, NoAdvance };
 /// Intentional divergences (non-HTML): GFM-reader behaviour the spec's
 /// 2004-lineage expectations disagree with. HTML verbatim blocks are out of
 /// scope (HTML rendering is unsupported): 156-158 echo raw tag fragments.
+/// 608/611 pin CommonMark-literal bare URLs; the GFM bare-autolink
+/// extension (issue #332) linkifies them instead, like tables/task lists
+/// before it.
 const exclusions: []const Exclusion = &.{
     .{ .num = 156, .reason = "html-verbatim-block" },
     .{ .num = 157, .reason = "html-verbatim-block" },
     .{ .num = 158, .reason = "html-verbatim-block" },
+    .{ .num = 608, .reason = "gfm-bare-autolink" },
+    .{ .num = 611, .reason = "gfm-bare-autolink" },
 };
 
 fn isExcluded(num: usize) ?[]const u8 {

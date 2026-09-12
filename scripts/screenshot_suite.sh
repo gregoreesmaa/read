@@ -167,7 +167,7 @@ cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wi
 # marker for a bold tinted label and recolor the quote bar per kind.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/admonitions.png" test_cases/admonitions.md
 
-# Case 4i: Syntax-highlight demo (issue #333) — one frame per language.
+# Case 4j: Syntax-highlight demo (issue #333) — one frame per language.
 # Sections are uniform (H3 + 5-line fence, blank-separated), so fixed-stride
 # scrolled frames seat one language per PNG (mermaid-tall fixed-offset
 # precedent). Stride 280.9px measured from layout (H3 rows at doc y 269.5 /
@@ -192,7 +192,12 @@ cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wi
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_css.png" --scroll 4925 test_cases/highlight.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_sql.png" --scroll 5206 test_cases/highlight.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_lua.png" --scroll 5487 test_cases/highlight.md
-# Case 4j: YAML frontmatter (issue #334) — the metadata block renders
+
+# Case 4k: Bare-URL linkification (issue #332) — pasted http(s) URLs render
+# as links with trailing punctuation left literal.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/bare_links.png" test_cases/bare_links.md
+
+# Case 4l: YAML frontmatter (issue #334) — the metadata block renders
 # nothing; only the heading and paragraph below reach the viewport.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/frontmatter.png" test_cases/frontmatter.md
 

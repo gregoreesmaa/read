@@ -904,6 +904,99 @@ fn matchAutolink(line: []const u8, lt: usize) ?usize {
     return p + 1;
 }
 
+/// GFM bare-URL autolink extent (issue #332): `http://`/`https://` runs in
+/// plain text linkify the way browsers detect links. `www.` without a
+/// scheme stays literal (its target would differ from its text, breaking
+/// the zero-copy slice contract), as do bare emails. Caller guarantees
+/// position `i` is not inside a formed link, code span, or autolink: the
+/// main loops consume those positionally before any interior byte.
+///
+/// Rules: never opens mid-word (byte before must not be alphanumeric)
+/// nor glued to `<` or `\` (escape-neutralized forms stay literal);
+/// runs to whitespace/`<>`/backtick/`"`; strips one trailing run of
+/// `?!.,:*_~`; balances a trailing `)` run against interior `(`; cuts an
+/// entity-like `&...;` tail before the `&`. The host (past `userinfo@`,
+/// before `:port`) must hold a dot or be `localhost`, so `http://foo`
+/// and bare schemes stay literal. Zero-copy: start/end slice the line.
+pub fn linkifyAt(line: []const u8, i: usize) ?struct { start: usize, end: usize } {
+    if (i >= line.len or line[i] != 'h') return null;
+    const scheme_len: usize = if (std.mem.startsWith(u8, line[i..], "https://"))
+        8
+    else if (std.mem.startsWith(u8, line[i..], "http://"))
+        7
+    else
+        return null;
+    if (i > 0 and std.ascii.isAlphanumeric(line[i - 1])) return null;
+    // Glued to `<` or `\`: escape-neutralized `<…>` forms stay literal
+    // (escapes win, issue #18 precedent); a `<` that opens a formed
+    // autolink never reaches here (consumed positionally first).
+    if (i > 0 and (line[i - 1] == '<' or line[i - 1] == '\\')) return null;
+    var end = i + scheme_len;
+    while (end < line.len) {
+        const c = line[end];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '<' or c == '>' or c == '`' or c == '"') break;
+        end += 1;
+    }
+    // One trailing run of sentence punctuation never belongs to the URL.
+    while (end > i + scheme_len) {
+        const c = line[end - 1];
+        if (c == '?' or c == '!' or c == '.' or c == ',' or c == ':' or c == '*' or c == '_' or c == '~') {
+            end -= 1;
+        } else break;
+    }
+    // A trailing `)` run belongs only when balanced by interior `(`.
+    var depth: usize = 0;
+    var k = i + scheme_len;
+    while (k < end) : (k += 1) {
+        if (line[k] == '(') depth += 1 else if (line[k] == ')') {
+            if (depth > 0) depth -= 1;
+        }
+    }
+    while (end > i + scheme_len and line[end - 1] == ')' and depth == 0) {
+        // Unmatched closers strip one by one; each strip exposes the
+        // balance check for the next.
+        var inner: usize = 0;
+        var j = i + scheme_len;
+        while (j < end - 1) : (j += 1) {
+            if (line[j] == '(') inner += 1 else if (line[j] == ')') {
+                if (inner > 0) inner -= 1;
+            }
+        }
+        if (inner > 0) break;
+        end -= 1;
+    }
+    // An entity-like tail (`&amp;`) is markup, not address: cut before it,
+    // else drop a lone trailing semicolon.
+    if (end > i + scheme_len and line[end - 1] == ';') {
+        var j = end - 1;
+        while (j > i + scheme_len and (std.ascii.isAlphanumeric(line[j - 1]) or line[j - 1] == '#')) : (j -= 1) {}
+        if (j > i + scheme_len and line[j - 1] == '&') {
+            end = j - 1;
+        } else {
+            end -= 1;
+        }
+    }
+    if (end <= i + scheme_len) return null;
+    // Authority check: up to the first `/`, `?`, `#`; the host is past
+    // any `userinfo@` and before any `:port`.
+    var a = i + scheme_len;
+    while (a < end and line[a] != '/' and line[a] != '?' and line[a] != '#') : (a += 1) {}
+    if (a == i + scheme_len) return null;
+    var auth = line[i + scheme_len .. a];
+    if (std.mem.lastIndexOfScalar(u8, auth, '@')) |at| auth = auth[at + 1 ..];
+    if (std.mem.indexOfScalar(u8, auth, ':')) |ci| auth = auth[0..ci];
+    if (auth.len == 0) return null;
+    var has_dot = false;
+    for (auth) |c| {
+        if (c == '.') {
+            has_dot = true;
+            break;
+        }
+    }
+    if (!has_dot and !std.ascii.eqlIgnoreCase(auth, "localhost")) return null;
+    return .{ .start = i, .end = end };
+}
+
 /// Issue #40 inline HTML tag scan. Caller guarantees `line[lt] == '<'` and
 /// the position is not an autolink (the link-match block runs first).
 /// Single-line only, quote-aware, bounded: malformed input returns null and
@@ -1454,6 +1547,35 @@ pub fn parseInlinesWithDefs(
             continue;
         }
 
+        // GFM bare-URL autolink (issue #332): formed links, images, and
+        // `<...>` autolinks above win positionally (their openers precede
+        // any interior byte), as do code spans and escapes below only when
+        // they open first. No `autolink` flag: the harness renders plain
+        // `<a href>` for `link`, matching GFM output.
+        if (c == 'h' and span_count < spans_out.len) {
+            if (linkifyAt(line, i)) |u| {
+                if (i > span_start) {
+                    spans_out[span_count] = .{
+                        .text = line[span_start..i],
+                        .style = segStyle(run_buf[0..n_runs], pairs, span_start, cur_style),
+                    };
+                    span_count += 1;
+                    if (span_count >= spans_out.len) break;
+                }
+                var ustyle = segStyle(run_buf[0..n_runs], pairs, i, cur_style);
+                ustyle.link = true;
+                spans_out[span_count] = .{
+                    .text = line[u.start..u.end],
+                    .style = ustyle,
+                    .link_target = line[u.start..u.end],
+                };
+                span_count += 1;
+                i = u.end;
+                span_start = i;
+                continue;
+            }
+        }
+
         // Issue #40 inline HTML: blessed subset renders typographically
         // (br/kbd/sub/sup/del/s/mark, comments and details/summary
         // stripped); everything else keeps the muted-mono fallback span,
@@ -1818,6 +1940,20 @@ pub fn parseInlinesStream(
             }
         }
 
+        // GFM bare-URL autolink (issue #332): mirrors the span arm above
+        // (same extents, same precedence) so stream tokens stay in lockstep.
+        if (c == 'h') {
+            if (linkifyAt(line, i)) |u| {
+                em.flushText(span_start, i);
+                em.emitSlice(.start_link, u.start, u.end);
+                em.emitText(u.start, u.end);
+                em.emitEvent(.end_link);
+                i = u.end;
+                span_start = i;
+                continue;
+            }
+        }
+
         i += 1;
     }
 
@@ -1908,6 +2044,62 @@ test "pass2: escapes, strikethrough, autolink, triple emphasis stream" {
         }
     }
     try std.testing.expect(found_auto);
+}
+
+test "linkify: bare URL extents, trailing punctuation, parens" {
+    // Basic extent with trailing period stripped (acceptance gate).
+    const l1 = "See https://example.com/foo. next";
+    const m1 = linkifyAt(l1, 4).?;
+    try std.testing.expectEqualStrings("https://example.com/foo", l1[m1.start..m1.end]);
+    // Balanced parens stay; an unbalanced closer strips.
+    const l2 = "(https://example.com/a)";
+    const m2 = linkifyAt(l2, 1).?;
+    try std.testing.expectEqualStrings("https://example.com/a", l2[m2.start..m2.end]);
+    const l3 = "https://en.wikipedia.org/wiki/Link_(film)";
+    const m3 = linkifyAt(l3, 0).?;
+    try std.testing.expectEqualStrings(l3, l3[m3.start..m3.end]);
+    // Entity-like tails cut before the ampersand.
+    const l4 = "see https://x.test/?a=1&amp; ok";
+    const m4 = linkifyAt(l4, 4).?;
+    try std.testing.expectEqualStrings("https://x.test/?a=1", l4[m4.start..m4.end]);
+    // Mid-word never opens; empty authority never opens.
+    try std.testing.expect(linkifyAt("abchttps://x.test", 3) == null);
+    try std.testing.expect(linkifyAt("https://", 0) == null);
+    try std.testing.expect(linkifyAt("https:///path", 0) == null);
+    // Dotless hosts stay literal, except localhost.
+    try std.testing.expect(linkifyAt("go http://foo here", 3) == null);
+    try std.testing.expect(linkifyAt("go http://localhost:3000/a here", 3) != null);
+    // www. without a scheme is out of scope and stays literal.
+    try std.testing.expect(linkifyAt("see www.example.com", 4) == null);
+}
+
+test "linkify: spans and stream tokens mirror" {
+    const line = "See https://example.com/foo. next";
+    var spans: [16]InlineSpan = undefined;
+    const n = parseInlines(line, &spans);
+    var saw_link = false;
+    var saw_dot = false;
+    for (spans[0..n]) |s| {
+        if (s.style.link) {
+            try std.testing.expectEqualStrings("https://example.com/foo", s.text);
+            try std.testing.expectEqualStrings("https://example.com/foo", s.link_target.?);
+            saw_link = true;
+        }
+        if (std.mem.indexOf(u8, s.text, ".") != null and !s.style.link) saw_dot = true;
+    }
+    try std.testing.expect(saw_link and saw_dot);
+
+    var backing: [256]u8 = [_]u8{0} ** 256;
+    @memcpy(backing[32..][0..line.len], line);
+    var toks: [16]Token = undefined;
+    const nt = parseInlinesStream(32, line, &toks);
+    var found_bare = false;
+    for (toks[0..nt]) |t| {
+        if (t.kind == .start_link and std.mem.eql(u8, tokenSlice(&backing, t), "https://example.com/foo")) {
+            found_bare = true;
+        }
+    }
+    try std.testing.expect(found_bare);
 }
 
 test "pass2: parseLineStream slices one mmap line with zero copies" {

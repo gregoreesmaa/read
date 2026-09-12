@@ -1662,10 +1662,9 @@ test "spec compliance: autolinks validate URI and email forms, else literal" {
     try std.testing.expect(hasRun(cmds[0..m], "<a:b>"));
 }
 
-test "spec compliance: bare URLs stay literal while linkify is off" {
-    // No bare-URL linkifier is enabled: trailing punctuation has nothing
-    // to strip because no link forms (the acceptance gate for linkify,
-    // when it lands, is trailing-punctuation stripping).
+test "spec compliance: bare URLs linkify with trailing punctuation stripped" {
+    // GFM bare-URL linkification (issue #332): the acceptance gate is
+    // trailing-punctuation stripping — the period stays literal text.
     const doc = "See https://example.com/foo. next";
     var lines: [8]simd.Line = undefined;
     var fence: simd.FenceState = .{};
@@ -1673,10 +1672,32 @@ test "spec compliance: bare URLs stay literal while linkify is off" {
     var cmds: [128]layout.DrawCommand = undefined;
     var st = FullStore{};
     const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    try std.testing.expect(hasLink(cmds[0..m], "https://example.com/foo"));
+    try std.testing.expect(hasRun(cmds[0..m], "."));
+    var link_runs: usize = 0;
     for (cmds[0..m]) |c| {
-        if (c.kind == .text_run) try std.testing.expect(!c.style.link);
+        if (c.kind == .text_run and c.style.link) link_runs += 1;
     }
-    try std.testing.expect(hasRun(cmds[0..m], "https://example.com/foo."));
+    try std.testing.expectEqual(@as(usize, 1), link_runs);
+}
+
+test "spec compliance: linkify yields to code spans and formed links" {
+    // Code spans and formed-link destinations never linkify inside.
+    const doc = "`https://example.com` and [t](https://example.com) end";
+    var lines: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var cmds: [128]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    var link_runs: usize = 0;
+    for (cmds[0..m]) |c| {
+        if (c.kind == .text_run and c.style.link) link_runs += 1;
+    }
+    // One link (the formed one, text "t"); the code span stays a plain
+    // code run (hasLink matches run text, like its neighbours above).
+    try std.testing.expectEqual(@as(usize, 1), link_runs);
+    try std.testing.expect(hasLink(cmds[0..m], "t"));
 }
 
 test "spec compliance: backslash escapes win over emphasis and autolinks" {
