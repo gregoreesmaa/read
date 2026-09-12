@@ -3,14 +3,16 @@
 
 d2 seeds are genuine d2-engine renders of their test_cases/plugin_d2*.md
 fixture fence sources (d2 0.9.0; *_seed functions shell out to the real
-binary and fail loudly without it). Remaining seeds are faithful static
-mimics of real renderer output: graphviz/plantuml draw the fixture's
+binary and fail loudly without it). Graphviz seeds are genuine dot-engine
+renders of their test_cases/plugin_graphviz*.md fixture fence sources
+(dot 16.0.0; same fail-loudly contract). Remaining seeds are faithful
+static mimics of real renderer output: plantuml draws the fixture's
 diagram (labels mirror the fixture), math/mathjax draw the fixture's
 formula typeset in STIX. Tall/wide companions (*-seed-tall.png,
 *-seed-wide.png) mirror the tall/wide fixtures node-for-node the same
 way; math-seed.png draws the simplified fixture formula,
 *-seed-complex.png the complex companions. Synthetic-but-plausible
-stand-ins (no dot/plantuml/katex binaries in this env); the screenshot
+stand-ins (no plantuml/katex binaries in this env); the screenshot
 path proven (stat-exists seed -> ready -> stock image decode) is production,
 per suite practice (cf. scripts/gen-mermaid-seed.py).
 
@@ -56,7 +58,8 @@ def center_text(d, cx, cy, s, font):
 
 
 def _real_tool_render(fixture_md, info_token, out_name, tool, args):
-    # Genuine engine render of the fixture's fence source (issue #330
+    # Genuine engine render of the fixture's fence source (issue #330,
+    # round-two revision: seeds are real tool output, never Pillow mimics).
     # revision: seeds are real tool output, never Pillow mimics). Fails
     # loudly when the tool is absent so a synthetic image can never pass
     # silently.
@@ -95,20 +98,11 @@ def d2_seed():
 
 
 def graphviz_seed():
-    # Fixture (dot): rankdir=LR, reader -> diagram. Ellipse nodes are
-    # graphviz's default node shape.
-    W, H = 476, 280
-    im = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(im)
-    font = load_font(ARIAL, 24)
-    e1 = (28, 96, 180, 184)
-    e2 = (296, 96, 448, 184)
-    d.ellipse(e1, fill=FILL, outline=EDGE, width=EDGE_W)
-    d.ellipse(e2, fill=FILL, outline=EDGE, width=EDGE_W)
-    center_text(d, 104, 140, "reader", font)
-    center_text(d, 372, 140, "diagram", font)
-    arrow_h(d, 180, 140, 296)
-    return im, "graphviz-seed.png"
+    # Fixture test_cases/plugin_graphviz.md: genuine dot output (16.0.0).
+    # Ellipse nodes are graphviz's default node shape.
+    return _real_tool_render("test_cases/plugin_graphviz.md", "dot",
+                             "graphviz-seed.png", "dot",
+                             ["-Tpng", "SRC", "-o", "OUT"])
 
 
 def plantuml_seed():
@@ -346,8 +340,10 @@ def d2_seed_tall():
 
 
 def graphviz_seed_tall():
-    # Same node set in dot idiom; ellipses are dot's default node shape.
-    return _draw_tall("ellipse"), "graphviz-seed-tall.png"
+    # Same node set in dot idiom; genuine dot output (16.0.0).
+    return _real_tool_render("test_cases/plugin_graphviz_tall.md", "dot",
+                             "graphviz-seed-tall.png", "dot",
+                             ["-Tpng", "SRC", "-o", "OUT"])
 
 
 # Wide pipeline fixture node sets (test_cases/plugin_{d2,graphviz}_wide.md):
@@ -413,8 +409,10 @@ def d2_seed_wide():
 
 
 def graphviz_seed_wide():
-    # Same node set in dot idiom (rankdir=LR); ellipses are dot's default.
-    return _draw_wide("ellipse"), "graphviz-seed-wide.png"
+    # Same node set in dot idiom (rankdir=LR); genuine dot output (16.0.0).
+    return _real_tool_render("test_cases/plugin_graphviz_wide.md", "dot",
+                             "graphviz-seed-wide.png", "dot",
+                             ["-Tpng", "SRC", "-o", "OUT"])
 
 
 # PlantUML tall/wide companions use the sequence-diagram idiom of the base
