@@ -22,12 +22,13 @@ const core_options = @import("core_options");
 /// Zero heap allocations throughout: every function borrows slices of the
 /// caller's document/scan buffers or writes into a caller-owned `out` span.
 
-pub const Renderer = enum { mermaid };
+pub const Renderer = enum { mermaid, d2 };
 pub const MAX_PLUGIN_JOBS: usize = 16;
 
 pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
     if (comptime core_options.plugin_stub) return null;
     if (std.mem.eql(u8, info_token, "mermaid")) return .mermaid;
+    if (std.mem.eql(u8, info_token, "d2")) return .d2;
     return null;
 }
 
@@ -48,6 +49,7 @@ pub fn fenceHash(renderer: Renderer, source: []const u8) u64 {
 fn rendererName(r: Renderer) []const u8 {
     return switch (r) {
         .mermaid => "mermaid",
+        .d2 => "d2",
     };
 }
 
@@ -189,7 +191,7 @@ test "plugin: mermaid info token maps, others do not" {
     // Twin builds stub every body above: pin nothing there.
     if (comptime core_options.plugin_stub) return;
     try std.testing.expectEqual(Renderer.mermaid, pluginRendererOf("mermaid").?);
-    try std.testing.expect(pluginRendererOf("d2") == null); // later PR
+    try std.testing.expectEqual(Renderer.d2, pluginRendererOf("d2").?);
     try std.testing.expect(pluginRendererOf("foobar") == null);
     try std.testing.expect(pluginRendererOf("") == null);
 }
@@ -261,4 +263,15 @@ test "plugin: collect stops at 16 with 17 fences, unknown tokens skip slots" {
         try std.testing.expectEqual(JobState.queued, job.state);
         try std.testing.expectEqual(Renderer.mermaid, job.renderer);
     }
+}
+
+test "plugin: d2 info token maps + cache path shape" {
+    try std.testing.expectEqual(Renderer.d2, pluginRendererOf("d2").?);
+    try std.testing.expect(pluginRendererOf("dot") == null);
+    var buf: [256]u8 = undefined;
+    const h = fenceHash(.d2, "a -> b: opens\n");
+    const p = cachePath("/tmp/C", .d2, h, &buf).?;
+    var expect_buf: [128]u8 = undefined;
+    const expect = try std.fmt.bufPrint(&expect_buf, "/tmp/C/read/plugins/d2/{x:0>16}.png", .{h});
+    try std.testing.expectEqualStrings(expect, p);
 }
