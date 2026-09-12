@@ -9,7 +9,7 @@ HTML rendering is intentionally unsupported. Numbers for speed and size live onl
 - ATX headings (`#`–`######`, optional closing `#`), Setext headings (`===` / `---`)
 - Thematic breaks (`---`, `***`, `___`)
 - Fenced code blocks (`` ``` `` and `~~~`) and indented code blocks
-- Blockquotes, including nested (`>>`)
+- Blockquotes, including nested (`>>`); GitHub alerts (`> [!NOTE]`/`TIP`/`IMPORTANT`/`WARNING`/`CAUTION`) tint the bar and label
 - Unordered (`*`, `-`, `+`), ordered (`1.`, `1)`), and task (`- [ ]`, `- [x]`) lists
 - GFM tables with column measurement, cell alignment, and dividers
 - Plugin diagrams (mermaid; cached async render, code fallback)

@@ -163,6 +163,9 @@ EOF
 [ -n "$wide_hash" ] || { echo "FAIL: case 4h fence hash empty" >&2; exit 1; }
 cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wide_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_wide.png" --settle-images test_cases/plugin_mermaid_wide.md
+# Case 4i: Admonition alerts (issue #325) — `> [!KIND]` leaders swap the
+# marker for a bold tinted label and recolor the quote bar per kind.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/admonitions.png" test_cases/admonitions.md
 
 # Case 4i: Syntax-highlight demo (issue #333) — one frame per language.
 # Sections are uniform (H3 + 5-line fence, blank-separated), so fixed-stride
