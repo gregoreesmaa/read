@@ -9,6 +9,7 @@ set -eu
 tool_for() {
     case "$1" in
         mermaid) echo "mmdc" ;;
+        plantuml) echo "plantuml" ;;
         *) echo "" ;;
     esac
 }
@@ -29,6 +30,14 @@ if [ "${1:-}" = "render" ]; then
     rm -f "$out.tmp"
     case "$renderer" in
         mermaid) "$tool" -i "$src" -o "$out.tmp" ;;
+        plantuml)
+            # plantuml names its output after the input stem inside
+            # OUTDIR, so render there and promote the stem PNG atomically.
+            dest_dir=$(dirname "$out.tmp")
+            "$tool" -tpng -o "$dest_dir" "$src"
+            stem=$(basename "$src"); stem=${stem%.*}
+            [ -f "$dest_dir/$stem.png" ] && mv "$dest_dir/$stem.png" "$out.tmp"
+            ;;
     esac
     [ -f "$out.tmp" ] && mv "$out.tmp" "$out"
     exit 0
