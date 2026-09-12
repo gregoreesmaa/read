@@ -59,8 +59,7 @@ def center_text(d, cx, cy, s, font):
 
 def _real_tool_render(fixture_md, info_token, out_name, tool, args):
     # Genuine engine render of the fixture's fence source (issue #330,
-    # round-two revision: seeds are real tool output, never Pillow mimics).
-    # revision: seeds are real tool output, never Pillow mimics). Fails
+    # round-two revision: seeds are real tool output, never Pillow mimics). Fails
     # loudly when the tool is absent so a synthetic image can never pass
     # silently.
     import subprocess
