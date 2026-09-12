@@ -3,6 +3,12 @@
 #include <Carbon/Carbon.h> // IsSecureEventInputEnabled for Copy validation
 #import <dispatch/dispatch.h> // vnode watcher (libSystem, no new framework)
 #include <fcntl.h> // O_EVTONLY for the watcher (libSystem)
+#include <spawn.h> // posix_spawnp: no NSTask/threads/timers (audit-safe)
+#include <sys/wait.h> // waitpid/WNOHANG/WIFEXITED for the reap drain
+#include <sys/stat.h> // outfile validation (exists + nonzero + mtime)
+#include <time.h> // start stamp for the mtime check
+#include <unistd.h> // access/unlink
+#include <crt_externs.h> // _NSGetEnviron: children inherit our environment
 #include "platform.h"
 
 static PlatformCallbacks g_callbacks = {0};
@@ -4098,3 +4104,112 @@ static void read_find_show(void) {
     [g_find_panel makeKeyAndOrderFront:nil];
     [g_find_field selectText:nil];
 }
+
+// Async plugin renderer launcher (issue #323, PR-1 Task 3; kept at
+// end-of-file per the SIZE NOTE). Two C entry points (declared for Zig in
+// src/platform/bridge.zig): launchPluginRender + pollPluginCompletions.
+// Model: main-loop reap, no threads/locks/atomics/timers. Children are
+// reaped with waitpid(WNOHANG) and matched by pid in a static 8-slot
+// table. This layer only launches, reaps, validates the outfile (exists +
+// nonzero size + mtime >= start), and unlinks the staged srcfile at
+// terminal states (ownership passes from the caller at launch and ends at
+// reap). Failures append to stderr; nothing here ever dialogs, crashes,
+// invalidates, or touches Viewport/cache state — arrival wiring is Task 5.
+#define MAX_PLUGIN_JOBS 8
+static pid_t plugin_pid[MAX_PLUGIN_JOBS] = { 0 };
+static time_t plugin_start[MAX_PLUGIN_JOBS] = { 0 };
+static char plugin_src[MAX_PLUGIN_JOBS][512];
+static char plugin_out[MAX_PLUGIN_JOBS][512];
+
+// Quiet spawn: children inherit neither our stdout nor our stderr (both
+// to /dev/null), so renderer chatter can never pollute the reader's own
+// output streams (--dump-* purity). Returns the posix_spawnp status.
+static int plugin_spawnq(const char* file, char* const argv[], pid_t* pid) {
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    int rc = posix_spawnp(pid, file, &actions, NULL, argv, *_NSGetEnviron());
+    posix_spawn_file_actions_destroy(&actions);
+    return rc;
+}
+
+// `which` semantics for a renderer: slash paths are checked directly,
+// bare names must resolve on PATH. 1 when executable, else 0.
+static int plugin_which_ok(const char* renderer) {
+    if (strchr(renderer, '/') != NULL) return access(renderer, X_OK) == 0 ? 1 : 0;
+    pid_t pid = 0;
+    char* const argv[] = { (char*)"which", (char*)renderer, NULL };
+    if (plugin_spawnq("/usr/bin/which", argv, &pid) != 0) return 0;
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return 0;
+    return status == 0 ? 1 : 0;
+}
+
+// Non-blocking launch of `renderer srcfile outfile`. Returns 1 active
+// (slot spent), 0 queued (table full: silent, the cache retries later),
+// -1 failed (bad args, unresolvable or unlaunchable binary: no slot
+// spent). Never waits, never dialogs; errors go to stderr only.
+int launchPluginRender(const char* renderer, const char* srcfile, const char* outfile) {
+    if (!renderer || !*renderer || !srcfile || !*srcfile || !outfile || !*outfile) return -1;
+    if (strlen(srcfile) >= 512 || strlen(outfile) >= 512) {
+        fprintf(stderr, "read: plugin render path too long\n");
+        return -1;
+    }
+    if (!plugin_which_ok(renderer)) {
+        fprintf(stderr, "read: plugin renderer missing: %s\n", renderer);
+        return -1;
+    }
+    int slot = -1;
+    for (int i = 0; i < MAX_PLUGIN_JOBS; i++)
+        if (plugin_pid[i] <= 0) { slot = i; break; }
+    if (slot < 0) return 0;
+    time_t start = time(NULL);
+    char* const argv[] = { (char*)renderer, (char*)srcfile, (char*)outfile, NULL };
+    pid_t pid = 0;
+    if (plugin_spawnq(renderer, argv, &pid) != 0) {
+        fprintf(stderr, "read: plugin render launch failed: %s\n", renderer);
+        return -1;
+    }
+    plugin_pid[slot] = pid;
+    plugin_start[slot] = start;
+    snprintf(plugin_src[slot], 512, "%s", srcfile);
+    snprintf(plugin_out[slot], 512, "%s", outfile);
+    return 1;
+}
+
+// Main-loop drain, called once per frame: reap exited children without
+// blocking, validate each outfile, unlink the staged srcfile, free the
+// slot. Returns completions drained. Touches no Viewport/cache/UI state.
+int pollPluginCompletions(void) {
+    int drained = 0;
+    for (int i = 0; i <= MAX_PLUGIN_JOBS; i++) {
+        int status = 0;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0) break;
+        int slot = -1;
+        for (int j = 0; j < MAX_PLUGIN_JOBS; j++)
+            if (plugin_pid[j] == pid) { slot = j; break; }
+        if (slot < 0) continue;
+        plugin_pid[slot] = 0;
+        struct stat st;
+        int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+            stat(plugin_out[slot], &st) == 0 && st.st_size > 0 &&
+            st.st_mtime >= plugin_start[slot];
+        if (!ok) fprintf(stderr, "read: plugin render failed pid=%d out=%s\n", (int)pid, plugin_out[slot]);
+        drained++;
+        unlink(plugin_src[slot]);
+        plugin_src[slot][0] = '\0';
+        plugin_out[slot][0] = '\0';
+    }
+    return drained;
+}
+
+#ifdef TEST_HOOKS
+// Headless probe for the Task 3 integration test: in-flight child count.
+int platform_test_plugin_active(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_PLUGIN_JOBS; i++) if (plugin_pid[i] > 0) n++;
+    return n;
+}
+#endif

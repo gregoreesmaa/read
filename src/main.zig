@@ -2547,6 +2547,141 @@ test "image completeness contracts: doc-dir resolve + URL session (#45)" {
     }
 }
 
+// Drain helper for the plugin launcher test below: spins the non-blocking
+// reap until every in-flight child lands or the spin budget runs out.
+// Returns completions drained. No sleeping: children exit in milliseconds,
+// so a bounded spin stays fast and keeps the test free of timer calls.
+fn drainPluginFor(spins: usize) c_int {
+    var total: c_int = 0;
+    var n: usize = 0;
+    while (n < spins) : (n += 1) {
+        total += bridge.pollPluginCompletions();
+        if (total > 0 and bridge.platform_test_plugin_active() == 0) break;
+    }
+    return total;
+}
+
+// Staging helper for the plugin launcher test: write `data` to an
+// absolute scratch path (test-only; production stages via Task 5).
+fn writeTmpFile(io: std.Io, path: []const u8, data: []const u8) !void {
+    var f = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, data);
+}
+
+test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" {
+    // Task 3 integration (read-test binary only; same hooks gate as the
+    // image contracts above). Renderer doubles: a /tmp copy stub by
+    // absolute path (done path) and the bare-name `true` tool (resolves via
+    // PATH, exits with no outfile: terminal-failure path).
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        var threaded = std.Io.Threaded.init(t.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const cwd = std.Io.Dir.cwd();
+        const stub_path = "/tmp/read-plugint3-stub.sh";
+        {
+            var f = try std.Io.Dir.createFileAbsolute(io, stub_path, .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, "#!/bin/sh\ncp \"$1\" \"$2\"\n");
+            try f.setPermissions(io, .executable_file);
+        }
+        defer std.Io.Dir.deleteFileAbsolute(io, stub_path) catch {};
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+
+        // Missing binary: failed now, no slot spent, no crash. Same for an
+        // empty renderer name.
+        try t.expectEqual(@as(c_int, -1), bridge.launchPluginRender(
+            "read-missing-plugin-bin-zzz",
+            "/tmp/read-plugint3-miss-src.txt",
+            "/tmp/read-plugint3-miss-out.png",
+        ));
+        try t.expectEqual(@as(c_int, -1), bridge.launchPluginRender(
+            "",
+            "/tmp/read-plugint3-miss-src.txt",
+            "/tmp/read-plugint3-miss-out.png",
+        ));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+
+        // Bare-name `true`: resolves, launches, drains; the missing outfile
+        // marks it failed at reap while the staged src is still unlinked.
+        {
+            const src = "/tmp/read-plugint3-true-src.txt";
+            try writeTmpFile(io, src, "A-->B\n");
+            defer std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+            defer std.Io.Dir.deleteFileAbsolute(io, "/tmp/read-plugint3-true-out.png") catch {};
+            try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(
+                "true",
+                src,
+                "/tmp/read-plugint3-true-out.png",
+            ));
+            try t.expectEqual(@as(c_int, 1), bridge.platform_test_plugin_active());
+            try t.expectEqual(@as(c_int, 1), drainPluginFor(2000000));
+            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
+        }
+
+        // Copy stub by absolute path: done path — outfile arrives carrying
+        // the src bytes, staged src unlinked at reap, slot freed.
+        {
+            const src = "/tmp/read-plugint3-ok-src.txt";
+            const out = "/tmp/read-plugint3-ok-out.png";
+            try writeTmpFile(io, src, "graph TD\n    A-->B\n");
+            defer std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+            defer std.Io.Dir.deleteFileAbsolute(io, out) catch {};
+            try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
+            try t.expectEqual(@as(c_int, 1), drainPluginFor(2000000));
+            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            var buf: [64]u8 = undefined;
+            const bytes = try cwd.readFile(io, out, &buf);
+            try t.expectEqualStrings("graph TD\n    A-->B\n", bytes);
+            try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
+        }
+
+        // Table cap: 8 in flight, the 9th stays queued (0, silent), then
+        // all 8 drain; every staged src is gone except the rejected one.
+        {
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                var sbuf: [64]u8 = undefined;
+                var obuf: [64]u8 = undefined;
+                const src = try std.fmt.bufPrintZ(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
+                const out = try std.fmt.bufPrintZ(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
+                try writeTmpFile(io, src, "A-->B\n");
+                try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
+            }
+            const rsrc = "/tmp/read-plugint3-rej-src.txt";
+            const rout = "/tmp/read-plugint3-rej-out.png";
+            try writeTmpFile(io, rsrc, "A-->B\n");
+            defer std.Io.Dir.deleteFileAbsolute(io, rsrc) catch {};
+            defer std.Io.Dir.deleteFileAbsolute(io, rout) catch {};
+            try t.expectEqual(@as(c_int, 0), bridge.launchPluginRender(stub_path, rsrc, rout));
+            try t.expectEqual(@as(c_int, 8), bridge.platform_test_plugin_active());
+            try t.expectEqual(@as(c_int, 8), drainPluginFor(8000000));
+            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            // Rejected src was never owned: still present, no outfile made.
+            _ = try cwd.statFile(io, rsrc, .{});
+            try t.expectError(error.FileNotFound, cwd.statFile(io, rout, .{}));
+            // Every slot landed done (outfile carries src bytes, staged src
+            // reaped away); then remove them explicitly (no per-iteration
+            // defers: staged srcs must survive to reap).
+            i = 0;
+            while (i < 8) : (i += 1) {
+                var sbuf: [64]u8 = undefined;
+                var obuf: [64]u8 = undefined;
+                var rbuf: [16]u8 = undefined;
+                const src = try std.fmt.bufPrint(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
+                const out = try std.fmt.bufPrint(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
+                try t.expectEqualStrings("A-->B\n", try cwd.readFile(io, out, &rbuf));
+                try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
+                std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+                std.Io.Dir.deleteFileAbsolute(io, out) catch {};
+            }
+        }
+    }
+}
+
 fn outlineFilterCase(text: []const u8, filter: []const u8) c_int {
     return bridge.platform_test_outline_filter(
         text.ptr,
