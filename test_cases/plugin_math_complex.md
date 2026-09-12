@@ -1,0 +1,5 @@
+# Complex Formula
+
+```math
+\sum_{k=1}^{n} k^2 = n(n+1)(2n+1)/6
+```

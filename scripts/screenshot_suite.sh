@@ -231,6 +231,30 @@ mkdir -p "$cache_root/read/plugins/math"
 cp test_cases/assets/math-seed.png "$cache_root/read/plugins/math/$math_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_math.png" --settle-images test_cases/plugin_math.md
 
+# Complex companion (same case 4l): the sum-of-squares fixture renders the
+# math-seed-complex.png typeset seed (big sigma with sub/superscripts).
+complex_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_math_complex.md math math <<'EOF'
+import re, sys
+zig_src, md_path, info_token, renderer = sys.argv[1:5]
+m = re.search(r"Renderer\s*=\s*enum\s*\{([^}]*)\}", open(zig_src).read())
+ordinal = [x.strip() for x in m.group(1).split(",") if x.strip()].index(renderer)
+lines = open(md_path).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.lstrip().startswith('```') and l.lstrip()[3:].strip().split(' ')[:1] == [info_token])
+end = next(i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith('```'))
+src = '\n'.join(lines[start + 1:end]).encode()
+h = 0xCBF29CE484222325
+M = (1 << 64) - 1
+for b in bytes([ordinal]) + b'\x00' + src:
+    h ^= b
+    h = (h * 0x100000001B3) & M
+print('%016x' % h)
+EOF
+)
+[ -n "$complex_hash" ] || { echo "FAIL: math complex fence hash empty" >&2; exit 1; }
+cp test_cases/assets/math-seed-complex.png "$cache_root/read/plugins/math/$complex_hash.png"
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_math_complex.png" --settle-images test_cases/plugin_math_complex.md
+
 # Case 4k: Bare-URL linkification (issue #332) — pasted http(s) URLs render
 # as links with trailing punctuation left literal.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/bare_links.png" test_cases/bare_links.md
