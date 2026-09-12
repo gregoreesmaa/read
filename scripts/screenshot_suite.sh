@@ -30,14 +30,14 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # continuations aligned under the lead text, never the marker.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_hanging_indent.png" --scroll 800 test_cases/code_and_tasks.md
 
-# Cases 3c/3d: Multi-level indenting 0-5 at the end of the SAME doc (PR #324
-# review; no new test case): 3c frames bullets 0-5 plus ordered 0-2 with
-# paragraph continuations; 3d walks the nested-fence code section levels
-# 0-5 (nested fence promotion + relative code-level cutoff) across two
-# frames to the end of content.
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_indent_text.png" --scroll 1400 test_cases/code_and_tasks.md
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_indent_code.png" --scroll 2000 test_cases/code_and_tasks.md
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_indent_code__s1.png" --scroll 2600 test_cases/code_and_tasks.md
+# Cases 3c/3d: Multi-level indenting 0-5 in dedicated files (PR #324
+# review: split from code_and_tasks.md so each frame shows one clean
+# section). A no-indent comparison paragraph (3c) / fence (3d) heads each
+# file; 3c covers bullets 0-5 plus ordered 0-2 continuations, 3d the
+# nested-fence code levels 0-5 (nested fence promotion + relative
+# code-level cutoff).
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/list_indent_text.png" test_cases/list_indent_text.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/list_indent_code.png" test_cases/list_indent_code.md
 
 # Case 4: Table structure, cell padding, column alignment, dividers
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/tables_formatting.png" test_cases/tables_formatting.md
