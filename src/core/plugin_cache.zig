@@ -22,12 +22,14 @@ const core_options = @import("core_options");
 /// Zero heap allocations throughout: every function borrows slices of the
 /// caller's document/scan buffers or writes into a caller-owned `out` span.
 
-pub const Renderer = enum { mermaid };
+pub const Renderer = enum { mermaid, math };
 pub const MAX_PLUGIN_JOBS: usize = 16;
 
 pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
     if (comptime core_options.plugin_stub) return null;
     if (std.mem.eql(u8, info_token, "mermaid")) return .mermaid;
+    if (std.mem.eql(u8, info_token, "math")) return .math;
+    if (std.mem.eql(u8, info_token, "mathjax")) return .math;
     return null;
 }
 
@@ -48,6 +50,7 @@ pub fn fenceHash(renderer: Renderer, source: []const u8) u64 {
 fn rendererName(r: Renderer) []const u8 {
     return switch (r) {
         .mermaid => "mermaid",
+        .math => "math",
     };
 }
 
@@ -190,6 +193,8 @@ test "plugin: mermaid info token maps, others do not" {
     if (comptime core_options.plugin_stub) return;
     try std.testing.expectEqual(Renderer.mermaid, pluginRendererOf("mermaid").?);
     try std.testing.expect(pluginRendererOf("d2") == null); // later PR
+    try std.testing.expectEqual(Renderer.math, pluginRendererOf("math").?);
+    try std.testing.expectEqual(Renderer.math, pluginRendererOf("mathjax").?);
     try std.testing.expect(pluginRendererOf("foobar") == null);
     try std.testing.expect(pluginRendererOf("") == null);
 }
@@ -261,4 +266,15 @@ test "plugin: collect stops at 16 with 17 fences, unknown tokens skip slots" {
         try std.testing.expectEqual(JobState.queued, job.state);
         try std.testing.expectEqual(Renderer.mermaid, job.renderer);
     }
+}
+
+test "plugin: math info tokens map + cache path shape" {
+    try std.testing.expectEqual(Renderer.math, pluginRendererOf("math").?);
+    try std.testing.expectEqual(Renderer.math, pluginRendererOf("mathjax").?);
+    var buf: [256]u8 = undefined;
+    const h = fenceHash(.math, "x^2 + y^2\n");
+    const p = cachePath("/tmp/C", .math, h, &buf).?;
+    var expect_buf: [128]u8 = undefined;
+    const expect = try std.fmt.bufPrint(&expect_buf, "/tmp/C/read/plugins/math/{x:0>16}.png", .{h});
+    try std.testing.expectEqualStrings(expect, p);
 }

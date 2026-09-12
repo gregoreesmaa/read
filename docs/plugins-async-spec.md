@@ -56,7 +56,10 @@ Three layers, one direction of knowledge:
      over the first fence info-string token:
      `mermaid→mermaid`, `d2→d2`, `dot→graphviz`, `graphviz→graphviz`,
      `plantuml→plantuml`, `puml→plantuml`, `math→math`,
-     `tex→math`, `latex→math`, `katex→math`.
+     `tex→math`, `latex→math`, `katex→math`, `mathjax→math`
+     (mathjax joins the shared `math` slot, issue #327; mjpage needs no
+     info token — fallback engine, not fence language. The math render
+     path — capability canary — lands in #326: merge after that PR.)
    - `fenceHash(renderer, source) u64`: FNV-1a 64 over renderer byte,
      `0x00`, source bytes.
    - `cachePath(buf, renderer, hash)`: `<cache>/read/plugins/
