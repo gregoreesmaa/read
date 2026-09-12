@@ -2369,6 +2369,11 @@ fn indentedCodeLeader(bytes: []const u8, lines: []const simd.Line, j: usize) ?us
     const bt = lines[j].block_type;
     if ((bt == .quote or isHeadingType(bt) or bt == .hr) and
         listContentMarker(bytes, lines, j, 4) != null) return null;
+    // In-item lazy paragraphs (e.g. a continuation after an in-item fence)
+    // belong to the item at any indent, never to top-level code: without
+    // this, a 4sp+ trailing line after an in-item fence_end falls through
+    // to `return k` below and renders as a code card (issue #324).
+    if (enclosingListMarker(bytes, lines, j) != null) return null;
     // Run start: step back over adjacent code rows only (inside blanks are
     // resolved forward by lookahead, never by crossing them here).
     var k = j;
@@ -2881,9 +2886,10 @@ fn enclosingListMarker(bytes: []const u8, lines: []const simd.Line, j: usize) ?u
         r -= 1;
     }
     if (r > 0 and isListLeader(lines[r - 1].block_type)) return r - 1;
-    // Post-blank run: 2 is the smallest content indent any marker needs
-    // (`- `); the exact need is verified once the marker resolves below.
-    if (!isIndentedBy(bytes, lines[r], 2) or isIndentedBy(bytes, lines[r], 8)) return null;
+    // Post-gap run: 2 is the smallest content indent any marker needs
+    // (`- `); the exact need — and the relative code-level cutoff — is
+    // verified once the marker resolves below, so no absolute cap here.
+    if (!isIndentedBy(bytes, lines[r], 2)) return null;
     // Starts crossed between the marker and j whose indent the resolved
     // need must cover. Fixed scratch, zero allocations; overflow orphans
     // deterministically (top-level) instead of risking a corrupt claim.
@@ -2916,7 +2922,7 @@ fn enclosingListMarker(bytes: []const u8, lines: []const simd.Line, j: usize) ?u
                 m = r2 - 1;
                 break;
             }
-            if (!isIndentedBy(bytes, lines[r2], 2) or isIndentedBy(bytes, lines[r2], 8)) return null;
+            if (!isIndentedBy(bytes, lines[r2], 2)) return null;
             if (nseg >= segs.len) return null;
             segs[nseg] = r2;
             nseg += 1;
@@ -2954,8 +2960,15 @@ fn enclosingListMarker(bytes: []const u8, lines: []const simd.Line, j: usize) ?u
     }
     const owner = m orelse return null;
     const need = markerContentNeed(bytes, lines[owner]);
+    // Code-level cutoff is relative, never absolute: 8sp+ lines in a
+    // shallow item are in-item code, but the same columns in a deep item
+    // (need > 4) are still lazy paragraph text. max() keeps every
+    // need <= 4 outcome bit-identical while opening [8, need + 4) for
+    // deep owners (issue #324: level-3+ trailers after in-item fences).
+    const code_cut = @max(8, need + 4);
     for (segs[0..nseg]) |s| {
-        if (indentColumns(bytes, lines[s]) < need) return null;
+        const w = indentColumns(bytes, lines[s]);
+        if (w < need or w >= code_cut) return null;
     }
     return owner;
 }
@@ -3077,6 +3090,298 @@ fn fencedCodeMarker(bytes: []const u8, lines: []const simd.Line, i: usize) ?usiz
         if (indentColumns(bytes, lines[s]) < need) return null;
     }
     return owner;
+}
+
+/// Shape of a fence-marker line: the run character, its length, whether the
+/// rest is blank, and (for backtick opens) whether the info string holds a
+/// backtick. Mirrors the scanner's `classifyFenceBody` gate byte-for-byte;
+/// the scanner owns indent < 4, so promotion only fires at indent >= 4.
+const FenceShape = struct {
+    char: u8,
+    run: usize,
+    rest_blank: bool,
+    info_backtick: bool,
+    indent_w: usize,
+};
+
+fn fenceRunShape(bytes: []const u8, line: simd.Line) ?FenceShape {
+    const raw = bytes[line.offset..][0..line.len];
+    var idx: usize = 0;
+    var w: usize = 0;
+    while (idx < raw.len and (raw[idx] == ' ' or raw[idx] == '\t')) {
+        if (raw[idx] == ' ') {
+            w += 1;
+        } else {
+            w += 4 - (w % 4);
+        }
+        idx += 1;
+    }
+    if (idx + 3 > raw.len) return null;
+    const first = raw[idx];
+    if (first != '`' and first != '~') return null;
+    if (raw[idx + 1] != first or raw[idx + 2] != first) return null;
+    var run: usize = 3;
+    while (idx + run < raw.len and raw[idx + run] == first) : (run += 1) {}
+    var rest = idx + run;
+    while (rest < raw.len and (raw[rest] == ' ' or raw[rest] == '\t')) : (rest += 1) {}
+    var info_backtick = false;
+    var t = rest;
+    while (t < raw.len) : (t += 1) {
+        if (raw[t] == '`') info_backtick = true;
+    }
+    return .{
+        .char = first,
+        .run = run,
+        .rest_blank = rest >= raw.len,
+        .info_backtick = info_backtick,
+        .indent_w = w,
+    };
+}
+
+/// True when the nearest preceding non-blank line belongs to the same item
+/// `owner`: the marker itself, its paragraph/code content, or its closed
+/// fence. Anything else (a foreign block, a foreign item's content) means
+/// the candidate cannot open here. Blanks are looked through, mirroring the
+/// ownership walk above.
+fn nestedFencePrevOwned(bytes: []const u8, lines: []const simd.Line, i: usize, owner: usize) bool {
+    var k = i;
+    while (k > 0 and lines[k - 1].block_type == .blank) k -= 1;
+    if (k == 0) return false;
+    const p = k - 1;
+    const pb = lines[p].block_type;
+    if (isListLeader(pb)) return p == owner;
+    if (pb == .paragraph) {
+        const po = enclosingListMarker(bytes, lines, p) orelse return false;
+        return po == owner;
+    }
+    if (pb == .code_fence_end) {
+        var q = p;
+        while (q > 0 and lines[q].block_type != .code_fence_start) q -= 1;
+        if (lines[q].block_type != .code_fence_start) return false;
+        const fo = fencedCodeMarker(bytes, lines, q) orelse return false;
+        return fo == owner;
+    }
+    if (pb == .code_line) {
+        const co = listContentMarker(bytes, lines, p, 8) orelse return false;
+        return co == owner;
+    }
+    return false;
+}
+
+/// Close index for a nested open at `i` (same character, run >= open run,
+/// blank rest, still clearing the owner's need), or null when the region is
+/// unbounded here: EOF without a close, a line dedenting out of the item,
+/// or a scanner-claimed fence inside (scanner topology wins; promotion only
+/// fires in scanner-clean regions). Every accepted close keeps the fold,
+/// the owner claim, and the indent strip exactly where the level-0 in-item
+/// fence path already proves them.
+fn nestedFenceClose(bytes: []const u8, lines: []const simd.Line, i: usize, need: usize, open: FenceShape) ?usize {
+    var j = i + 1;
+    while (j < lines.len) : (j += 1) {
+        const bt = lines[j].block_type;
+        if (bt == .blank) continue;
+        if (bt == .code_fence_start or bt == .code_fence_end) return null;
+        if (indentColumns(bytes, lines[j]) < need) return null;
+        const sh = fenceRunShape(bytes, lines[j]) orelse continue;
+        if (sh.char != open.char or sh.run < open.run or !sh.rest_blank) continue;
+        if (sh.indent_w > need + 3) continue;
+        return j;
+    }
+    return null;
+}
+
+/// Promote nested in-item fences the context-free scanner cannot classify:
+/// a ```/~~~ run at indent >= 4 owned by a list item whose content column
+/// it clears by at most 3 (CommonMark: fence indent is relative to the
+/// container; 4+ relative is indented code, never a fence). Between-lines
+/// become code (blank lines stay blank), mirroring scanner-classified
+/// fences, so measure/render/refine and the owner claim work unchanged.
+/// Runs once per open (cold); the SIMD scanner is untouched, so no hot-path
+/// cost and no benchmark movement. Conservative: anything ambiguous
+/// (unclosed, dedented, scanner-claimed inside) is left exactly as today.
+pub fn promoteNestedFences(bytes: []const u8, lines: []simd.Line) void {
+    var i: usize = 0;
+    while (i < lines.len) : (i += 1) {
+        if (lines[i].block_type != .paragraph) continue;
+        const open = fenceRunShape(bytes, lines[i]) orelse continue;
+        if (open.indent_w < 4) continue;
+        if (open.char == '`' and open.info_backtick) continue;
+        const owner = enclosingListMarker(bytes, lines, i) orelse continue;
+        const need = markerContentNeed(bytes, lines[owner]);
+        if (open.indent_w < need or open.indent_w > need + 3) continue;
+        if (!nestedFencePrevOwned(bytes, lines, i, owner)) continue;
+        const close = nestedFenceClose(bytes, lines, i, need, open) orelse continue;
+        lines[i].block_type = .code_fence_start;
+        var j = i + 1;
+        while (j < close) : (j += 1) {
+            if (lines[j].block_type != .blank) lines[j].block_type = .code_line;
+        }
+        lines[close].block_type = .code_fence_end;
+        i = close;
+    }
+}
+
+test "nested fences: levels 1-2 promote with owner and close" {
+    const doc =
+        \\- zero:
+        \\  ```
+        \\  echo zero
+        \\  ```
+        \\  - one:
+        \\    ```
+        \\    echo one
+        \\    ```
+        \\    - two:
+        \\      ```
+        \\      echo two
+        \\      ```
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(@as(usize, 12), n);
+    // Scanner owns the level-0 fence; nested markers stay paragraphs.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.paragraph, lines[5].block_type);
+    try std.testing.expectEqual(simd.BlockType.paragraph, lines[9].block_type);
+    promoteNestedFences(doc, lines);
+    // Level-1 region promotes with the level-1 marker as owner.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[5].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_line, lines[6].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[7].block_type);
+    try std.testing.expectEqual(@as(?usize, 4), fencedCodeMarker(doc, lines, 5));
+    // Level-2 region promotes with the level-2 marker as owner.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[9].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_line, lines[10].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[11].block_type);
+    try std.testing.expectEqual(@as(?usize, 8), fencedCodeMarker(doc, lines, 9));
+    // The scanner fence is untouched.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[1].block_type);
+}
+
+test "nested fences: top-level indented backticks stay literal" {
+    const doc =
+        \\para
+        \\
+        \\    ```
+        \\    not a fence
+        \\    ```
+    ;
+    var lines_buf: [8]simd.Line = undefined;
+    var fstate: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fstate);
+    const lines = lines_buf[0..n];
+    const before = lines[2].block_type;
+    try std.testing.expect(before != .code_fence_start);
+    promoteNestedFences(doc, lines);
+    try std.testing.expectEqual(before, lines[2].block_type);
+    try std.testing.expectEqual(before, lines[3].block_type);
+    try std.testing.expectEqual(before, lines[4].block_type);
+}
+
+test "nested fences: unclosed and dedented regions stay literal" {
+    const unclosed =
+        \\- item:
+        \\    ```
+        \\    echo hi
+    ;
+    var ubuf: [8]simd.Line = undefined;
+    var uf: simd.FenceState = .{};
+    const un = simd.scanLines(unclosed, &ubuf, &uf);
+    const ulines = ubuf[0..un];
+    promoteNestedFences(unclosed, ulines);
+    try std.testing.expect(ulines[1].block_type != .code_fence_start);
+    const dedented =
+        \\- item:
+        \\    ```
+        \\    echo hi
+        \\```
+        \\tail
+    ;
+    var dbuf: [8]simd.Line = undefined;
+    var df: simd.FenceState = .{};
+    const dn = simd.scanLines(dedented, &dbuf, &df);
+    const dlines = dbuf[0..dn];
+    // The col-0 fence is the scanner's; the nested open must not promote.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, dlines[3].block_type);
+    promoteNestedFences(dedented, dlines);
+    try std.testing.expect(dlines[1].block_type != .code_fence_start);
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, dlines[3].block_type);
+}
+
+test "nested fences: info strings and tildes promote, backtick info does not" {
+    const doc =
+        \\- item:
+        \\    ```js
+        \\    const x = 1;
+        \\    ```
+        \\    ~~~
+        \\    wave
+        \\    ~~~
+    ;
+    var lines_buf: [12]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    promoteNestedFences(doc, lines);
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[3].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[4].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[6].block_type);
+    try std.testing.expectEqual(@as(?usize, 0), fencedCodeMarker(doc, lines, 1));
+    const bad =
+        \\- item2:
+        \\    ```a`b
+        \\    literal
+        \\    ```
+    ;
+    var bbuf: [8]simd.Line = undefined;
+    var bf: simd.FenceState = .{};
+    const bn = simd.scanLines(bad, &bbuf, &bf);
+    const blines = bbuf[0..bn];
+    promoteNestedFences(bad, blines);
+    try std.testing.expect(blines[1].block_type != .code_fence_start);
+    try std.testing.expect(blines[3].block_type != .code_fence_end);
+}
+
+test "nested fences: trailers after in-item fences stay item paragraphs" {
+    const doc =
+        \\- zero:
+        \\  ```
+        \\  echo zero
+        \\  ```
+        \\  trailing zero.
+        \\  - one:
+        \\    ```
+        \\    echo one
+        \\    ```
+        \\    trailing one.
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(@as(usize, 10), n);
+    promoteNestedFences(doc, lines);
+    // Both trailers stay owned by their items, never top-level code.
+    try std.testing.expectEqual(@as(?usize, 0), enclosingListMarker(doc, lines, 4));
+    try std.testing.expectEqual(@as(?usize, 5), enclosingListMarker(doc, lines, 9));
+    try std.testing.expect(indentedCodeLeader(doc, lines, 4) == null);
+    try std.testing.expect(indentedCodeLeader(doc, lines, 9) == null);
+    // Sanity: genuine top-level code after a fence still claims.
+    const top =
+        \\```
+        \\fence
+        \\```
+        \\    top code
+    ;
+    var tbuf: [8]simd.Line = undefined;
+    var tf: simd.FenceState = .{};
+    const tn = simd.scanLines(top, &tbuf, &tf);
+    const tlines = tbuf[0..tn];
+    promoteNestedFences(top, tlines);
+    try std.testing.expect(indentedCodeLeader(top, tlines, 3) != null);
 }
 
 test "list hanging indent: sub-4sp continuations stay owned by the item" {
