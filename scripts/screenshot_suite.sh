@@ -226,6 +226,60 @@ mkdir -p "$cache_root/read/plugins/plantuml"
 cp test_cases/assets/plantuml-seed.png "$cache_root/read/plugins/plantuml/$plantuml_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml.png" --settle-images test_cases/plugin_plantuml.md
 
+# Tall companion (same case 4k): the 476x2080 plantuml-seed-tall.png mirrors
+# the 14-message four-participant sequence tall fixture message-for-message;
+# two scrolled frames walk the lifelines to the bottom (mermaid-tall
+# precedent, scaled to the shorter sheet).
+tall_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_plantuml_tall.md plantuml plantuml <<'EOF'
+import re, sys
+zig_src, md_path, info_token, renderer = sys.argv[1:5]
+m = re.search(r"Renderer\s*=\s*enum\s*\{([^}]*)\}", open(zig_src).read())
+ordinal = [x.strip() for x in m.group(1).split(",") if x.strip()].index(renderer)
+lines = open(md_path).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.lstrip().startswith('```') and l.lstrip()[3:].strip().split(' ')[:1] == [info_token])
+end = next(i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith('```'))
+src = '\n'.join(lines[start + 1:end]).encode()
+h = 0xCBF29CE484222325
+M = (1 << 64) - 1
+for b in bytes([ordinal]) + b'\x00' + src:
+    h ^= b
+    h = (h * 0x100000001B3) & M
+print('%016x' % h)
+EOF
+)
+[ -n "$tall_hash" ] || { echo "FAIL: plantuml tall fence hash empty" >&2; exit 1; }
+cp test_cases/assets/plantuml-seed-tall.png "$cache_root/read/plugins/plantuml/$tall_hash.png"
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml_tall.png" --settle-images test_cases/plugin_plantuml_tall.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml_tall__s1.png" --settle-images --scroll 700 test_cases/plugin_plantuml_tall.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml_tall__s2.png" --settle-images --scroll 1400 test_cases/plugin_plantuml_tall.md
+
+# Wide companion (same case 4k): the 2000x600 plantuml-seed-wide.png mirrors
+# the eight-participant wide fixture. Initial fold only, by design:
+# ready-plugin `.image` cmds carry no scrollable_id, so neither --scroll nor
+# --scroll-x-end can add signal (mermaid-wide 4h precedent).
+wide_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_plantuml_wide.md plantuml plantuml <<'EOF'
+import re, sys
+zig_src, md_path, info_token, renderer = sys.argv[1:5]
+m = re.search(r"Renderer\s*=\s*enum\s*\{([^}]*)\}", open(zig_src).read())
+ordinal = [x.strip() for x in m.group(1).split(",") if x.strip()].index(renderer)
+lines = open(md_path).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.lstrip().startswith('```') and l.lstrip()[3:].strip().split(' ')[:1] == [info_token])
+end = next(i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith('```'))
+src = '\n'.join(lines[start + 1:end]).encode()
+h = 0xCBF29CE484222325
+M = (1 << 64) - 1
+for b in bytes([ordinal]) + b'\x00' + src:
+    h ^= b
+    h = (h * 0x100000001B3) & M
+print('%016x' % h)
+EOF
+)
+[ -n "$wide_hash" ] || { echo "FAIL: plantuml wide fence hash empty" >&2; exit 1; }
+cp test_cases/assets/plantuml-seed-wide.png "$cache_root/read/plugins/plantuml/$wide_hash.png"
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml_wide.png" --settle-images test_cases/plugin_plantuml_wide.md
+
 # Case 4k: Bare-URL linkification (issue #332) — pasted http(s) URLs render
 # as links with trailing punctuation left literal.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/bare_links.png" test_cases/bare_links.md
