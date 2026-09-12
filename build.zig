@@ -16,6 +16,16 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    // Differential-twin select (AGENTS.md §7): when true, the build swaps the
+    // plugin launcher source for an empty stub (READ_PLUGIN_STUB=1 on the C
+    // side, trivial bodies in src/core/plugin_cache.zig) and emits the
+    // `read-noplugins` twin under twin/ instead of the ship binary. Default
+    // false: the ship shape is always the default; the twin is observability
+    // tooling, never installed, bundled, or shipped.
+    const plugin_stub = b.option(bool, "plugin_stub", "Build the no-plugins size twin (never shipped)") orelse false;
+    // C-side twin select, always passed (0/1) so every TU agrees: macos.m
+    // #includes the real launcher source at 0, the empty stub at 1.
+    const stub_define: []const u8 = if (plugin_stub) "-DREAD_PLUGIN_STUB=1" else "-DREAD_PLUGIN_STUB=0";
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -36,6 +46,14 @@ pub fn build(b: *std.Build) void {
     ship_options.addOption(bool, "test_hooks", false);
     const hooks_options = b.addOptions();
     hooks_options.addOption(bool, "test_hooks", true);
+    // The twin select rides the app options too so main.zig test guards can
+    // see it (same value everywhere; ship shape stays the default).
+    ship_options.addOption(bool, "plugin_stub", plugin_stub);
+    hooks_options.addOption(bool, "plugin_stub", plugin_stub);
+    // Twin select for the platform-independent core module: `read` sees only
+    // this flag (never test_hooks) via `core_options`.
+    const read_options = b.addOptions();
+    read_options.addOption(bool, "plugin_stub", plugin_stub);
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -86,6 +104,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "hot", .module = mod_hot },
+            .{ .name = "core_options", .module = read_options.createModule() },
         },
     });
 
@@ -117,6 +136,7 @@ pub fn build(b: *std.Build) void {
             mod2: *std.Build.Module,
             hot2: *std.Build.Module,
             opts2: *std.Build.Step.Options,
+            core_opts2: *std.Build.Step.Options,
             unwind: ?std.builtin.UnwindTables,
             single_threaded: ?bool,
         ) *std.Build.Module {
@@ -138,11 +158,14 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "read", .module = mod2 },
                     .{ .name = "hot", .module = hot2 },
                     .{ .name = "build_options", .module = opts2.createModule() },
+                    // main.zig and viewport.zig path-import plugin_cache.zig,
+                    // which reads the twin select as `core_options`.
+                    .{ .name = "core_options", .module = core_opts2.createModule() },
                 },
             });
         }
     }.make;
-    const exe_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, null, null);
+    const exe_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, read_options, null, null);
     // Ship module: identical sources, unwind tables off. Unwind data is
     // metadata only — no instruction changes — so screenshots, benchmarks,
     // and scroll behavior are unaffected; only crash-report backtraces
@@ -152,9 +175,11 @@ pub fn build(b: *std.Build) void {
     // weight in ship. Measured 2026-09 on main: 177848 -> 177784 bytes
     // (-64B file, -160B __TEXT, +160B page headroom). Test modules keep
     // null so test codegen is unaffected.
-    const ship_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, .none, true);
+    const ship_mod = makeAppModule(b, target, optimize, mod, mod_hot, ship_options, read_options, .none, true);
     const exe = b.addExecutable(.{
-        .name = "read",
+        // Twin binary renamed so it can never be mistaken for (or overwrite)
+        // the ship binary; installed under twin/ below.
+        .name = if (plugin_stub) "read-noplugins" else "read",
         .root_module = ship_mod,
     });
 
@@ -172,6 +197,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "read", .module = mod },
                 .{ .name = "hot", .module = mod_hot },
                 .{ .name = "build_options", .module = hooks_options.createModule() },
+                .{ .name = "core_options", .module = read_options.createModule() },
             },
         }),
     });
@@ -250,17 +276,17 @@ pub fn build(b: *std.Build) void {
         // post-strip. The test TUs below keep these flags off.
         ship_mod.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = &.{ "-fobjc-arc", "-Oz", "-fno-unwind-tables", "-fno-exceptions", "-fno-objc-exceptions", "-fvisibility=hidden", "-DREAD_ANIMATED_GIF=1" },
+            .flags = &.{ "-fobjc-arc", "-Oz", "-fno-unwind-tables", "-fno-exceptions", "-fno-objc-exceptions", "-fvisibility=hidden", "-DREAD_ANIMATED_GIF=1", stub_define },
         });
         // Exe-test glue TU: same -Oz codegen as ship (pixel-identical
         // headless screenshots) with unwind tables kept for backtraces.
         exe_mod.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = &.{"-fobjc-arc", "-Oz", "-DREAD_ANIMATED_GIF=1"},
+            .flags = &.{"-fobjc-arc", "-Oz", "-DREAD_ANIMATED_GIF=1", stub_define},
         });
         exe_test.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1", "-DREAD_ANIMATED_GIF=1"},
+            .flags = &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1", "-DREAD_ANIMATED_GIF=1", stub_define},
         });
     }
 
@@ -274,8 +300,16 @@ pub fn build(b: *std.Build) void {
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
     if (target.result.os.tag.isDarwin()) {
-        const install_exe = b.addInstallArtifact(exe, .{});
-        b.installArtifact(exe_test);
+        // Twin (plugin_stub): observability tooling — installed under twin/
+        // as read-noplugins, never the ship path, never bundled (bundle and
+        // release scripts take an explicit binary path; nothing globs twin/).
+        // read-test is deliberately NOT installed here so a twin build can
+        // never clobber the real hooks binary beside the ship binary.
+        const install_exe = if (plugin_stub)
+            b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "twin" } } })
+        else
+            b.addInstallArtifact(exe, .{});
+        if (!plugin_stub) b.installArtifact(exe_test);
         // Serialize strip before the install copy (sibling steps under the
         // install step otherwise race: the copy could read pre-strip bytes).
         if (strip_ship) |s| install_exe.step.dependOn(&s.step);

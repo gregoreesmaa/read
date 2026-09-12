@@ -3245,8 +3245,10 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
     // Task 3 integration (read-test binary only; same hooks gate as the
     // image contracts above). Renderer doubles: a /tmp copy stub by
     // absolute path (done path) and the bare-name `true` tool (resolves via
-    // PATH, exits with no outfile: terminal-failure path).
-    if (build_options.test_hooks) {
+    // PATH, exits with no outfile: terminal-failure path). Twin builds stub
+    // the launcher C side (nothing ever launches), so there is nothing to
+    // pin there either.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
         const t = std.testing;
         var threaded = std.Io.Threaded.init(t.allocator, .{});
         defer threaded.deinit();
@@ -3386,6 +3388,8 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
 
 test "plugin task5: sidecar path + shim bodies are exact, hostile helpers refused (#323)" {
     // Pure string builders: no FS, no child launch, runs in every profile.
+    // Twin builds stub cachePath (used below), so skip there.
+    if (comptime build_options.plugin_stub) return;
     const t = std.testing;
     var buf: [256]u8 = undefined;
     const p = pluginSidecarPath("/C/read/plugins/mermaid", 0x0123456789abcdef, &buf).?;
@@ -3411,6 +3415,8 @@ test "plugin task5: sidecar path + shim bodies are exact, hostile helpers refuse
 test "plugin task5: table build truncates at 16, read-test never kicks (#323)" {
     // Build truncation is explicit at table build (Task 4 review F2): a
     // 17-fence doc keeps 16 rows with NUL-terminated paths for the query.
+    // Twin builds collect zero jobs, so skip there.
+    if (comptime build_options.plugin_stub) return;
     var doc_buf: [4096]u8 = undefined;
     var doc_len: usize = 0;
     var k: usize = 0;

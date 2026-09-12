@@ -14,7 +14,7 @@ Every agent working on this repository MUST strictly follow these principles.
   - Virtualized viewport: Only tokens visibly intersecting the screen are parsed and rendered.
   - Memory-mapped files: Zero-copy virtual address space mapping.
 - **Zero Dependencies**: No Electron, no WebKit, no heavy UI toolkits, no external package manager dependencies.
-- **Binary Footprint**: Executable size must remain strictly under 200 KiB (raised from 180 KiB by owner decision 2026-09-09 to land in-document find; diet discipline and all other gates unchanged).
+- **Binary Footprint**: Executable size must remain strictly under 200 KiB (raised from 180 KiB by owner decision 2026-09-09 to land in-document find; diet discipline and all other gates unchanged). The budget is split into two accounts — core and plugins — enforced by `scripts/size_gate.sh`; the bust procedure lives in §7.
 - **Lean Production Build**: The ship binary contains only what reading needs — nothing test-only ever ships.
   - Testing, debugging, and observability tooling lives in a separate binary behind compile-time gates, never behind runtime flags. The separation is structural: no build option may re-enable test code in production.
   - Production surfaces a minimal interface; anything outside it is rejected, never silently absorbed.
@@ -107,3 +107,36 @@ Before pushing or committing any code:
    - Code blocks & task lists
    - Tables formatting
    - **Only 1 test case for scrollable documents** (do not add multiple scrolling tests).
+
+---
+
+## 7. Size-Budget Enforcement & Diet Procedure
+
+The ship binary carries two size accounts, enforced by `scripts/size_gate.sh`:
+
+- **Core account** (`CORE_BUDGET = 200 KiB`): everything except plugin-attributable code.
+- **Plugin account** (`PLUGIN_BUDGET`, constant in `size_gate.sh`): all plugin-attributable code.
+
+**What counts as plugin code.** Exactly the code that vanishes when plugins compile out: `src/core/plugin_cache.zig` bodies, the launcher TU (`src/platform/macos_plugin.m`), the per-document plugin flow in `src/main.zig`, the fence-decision branches in `src/layout/viewport.zig`, and the plugin bridge decls. The nullable-table guards at the integration seams (`plugins != null` checks) count as **core** — the core chose that seam. Shared helpers used by both core and plugins count as **core**.
+
+**How plugins are measured (differential twin).** The ship binary is stripped, and Zig emits a single object per compilation unit, so symbol attribution is impossible — instead the gate builds a twin: `zig build -Dplugin_stub=true` produces an otherwise byte-identical binary with the plugin file swapped for an API-compatible stub and the launcher TU swapped for an empty stub (same flags, same everything else). `plugin_bytes = __TEXT(ship) - __TEXT(twin)`, compared on `__TEXT` segment bytes (never file bytes — page padding lies). The twin is observability tooling: it is never installed, bundled, or shipped, and the option defaults to full plugins, so the ship shape is always the default. Zero-delta acceptance: adding the stub plumbing with the option off must leave ship `__TEXT` byte-identical (prove with `size -m` before/after). Each renderer PR quotes its twin-delta (`plugin_bytes` before/after) in the PR body.
+
+**Gate rule.** FAIL if `total - plugin > CORE_BUDGET` or `plugin > PLUGIN_BUDGET`. Both numbers print on every run.
+
+### When the gate busts
+
+1. **Confirm it is real.** Re-run the gate; rule out page-padding noise (file bytes can jump a full 16 KiB page on a few dozen bytes of `__text` — the `__TEXT` figure is the truth). Attribute the growth (`git log`, diff stat, per-PR twin-deltas).
+2. **One agent diets `main`.** Broad scan: comptime-table compression, string pooling, dead code, section bloat, duplicate logic. No behavior change: screenshots must stay byte-identical, all tests and strict benchmarks green — a cut that moves any benchmark is reverted, never compensated elsewhere (§2 is untouched by this procedure).
+3. **Three agents diet the failing changes.** The controller splits the bust-causing scope (the PR branch, or the merged commits that caused it) into three disjoint areas — e.g. per file or per feature — and assigns one agent per area. Disjoint by construction; agents never touch each other's files.
+4. **One final agent considers changes-in-whole.** It takes all found opportunities and evaluates interactions the area scans cannot see: cross-boundary inlining, alignment and section placement, opportunities that only exist when old and new code are considered together. It picks and combines; it does not re-scan.
+5. **Build-slot mutex.** Gate builds are the long pole and parallel builds thrash into flakes: only one agent on a machine runs a gate build at a time. Coordinate with a lock directory (e.g. `.zig-cache/size-gate.lock` via `mkdir`, bounded wait, backoff); never delete another agent's lock, never kill its build. Reads and edits need no lock.
+6. **Evidence per opportunity.** Each agent reports every candidate with measured bytes (ship `__TEXT` before/after), the gate results proving no behavior change, and what it rejected with reasons. "Nothing found" is a valid result only with the scanned areas and the largest rejected candidate stated.
+
+**Small functionality loss.** Allowed ONLY when all of these hold: no test covers the lost behavior; CommonMark/spec compliance is unaffected (conformance suite green); screenshots are byte-identical; the loss is documented in the commit message and PR body. Anything user-visible beyond that is forbidden — cut bytes, not features.
+
+**If nothing is found: bump 5% and re-gate.** If every agent reports nothing with evidence, increase the busting account by 5% (multiply by 1.05, round up to a whole KiB), re-run the gate to confirm green, and record the decision here as a history line with date and reason (precedent: 180 → 200 KiB, owner decision 2026-09-09, in-document find). Do not re-run the diet agents against an already-green gate; the loop re-arms on the next bust.
+
+**Budget history.**
+- 180 → 200 KiB core, owner decision 2026-09-09, to land in-document find.
+- Plugin account split out (twin mechanism); initial `PLUGIN_BUDGET` = measured plugin `__TEXT` + 4 KiB headroom — value set by the implementing agent below, recorded in `size_gate.sh`:
+  - `PLUGIN_BUDGET = 12 KiB, measured 2026-09-12` (twin-measured 8062 bytes + 4 KiB headroom).
