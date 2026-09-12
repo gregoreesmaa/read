@@ -1260,7 +1260,7 @@ test "regression: list multi-paragraph items keep indent; bare lines end them" {
         if (std.mem.eql(u8, c.text, "2.")) saw_2 = true;
     }
     try std.testing.expect(saw_2);
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 22.0), second_x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 30.0), second_x, 0.5);
 
     // A col-0 paragraph after a blank ends the item instead.
     const doc2 =
@@ -1303,8 +1303,8 @@ test "regression: quotes and code indent inside list items" {
         if (c.kind == .text_run and std.mem.eql(u8, c.text, "This")) quote_x = c.rect.x;
     }
     // Bar hugs the text with a 12px gap (single source; see #24).
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 22.0 + 16.0) - layout.quote_bar_gap - layout.quote_bar_w, bar_x, 0.5);
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 22.0 + 16.0), quote_x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 30.0 + 16.0) - layout.quote_bar_gap - layout.quote_bar_w, bar_x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 30.0 + 16.0), quote_x, 0.5);
 
     // Code card sits at the item column with mono rows.
     var bg_x: f32 = -1;
@@ -1313,7 +1313,7 @@ test "regression: quotes and code indent inside list items" {
         if (c.kind == .code_block_bg) bg_x = c.rect.x;
         if (c.kind == .text_run and c.style.code and std.mem.indexOf(u8, c.text, "<code") != null) code_mono = true;
     }
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 22.0), bg_x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 30.0), bg_x, 0.5);
     try std.testing.expect(code_mono);
 }
 

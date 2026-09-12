@@ -2861,12 +2861,12 @@ fn emitCheckbox(ux: *UnitCx, tx: f32, y: f32, checked: bool) void {
 
 /// Content x for a list item's text given its marker line.
 fn itemContentX(marker: simd.Line, content_x: f32) f32 {
-    if (marker.block_type == .task_list) return content_x + 28.0;
+    if (marker.block_type == .task_list) return content_x + 30.0;
     var indent_level: f32 = @floatFromInt(marker.indent);
     if (indent_level > 32) indent_level = 32;
-    // PR #324 review: 22px gutter per level (4px pad each side of the
+    // PR #324 review: 30px gutter per level (8px pad each side of the
     // marker), matching layoutListUnit so GitHub-like columns agree.
-    return content_x + indent_level * 10.0 + 22.0;
+    return content_x + indent_level * 10.0 + 30.0;
 }
 
 /// Owns paragraph line `j`: the list-item marker whose unit contains it, or
@@ -3553,7 +3553,7 @@ test "list hanging indent: in-item fence card indents with its text" {
     // Render (PR #324 review, GitHub-like card model): card left edges sit
     // exactly on the same-indent text column, code 12px inside. Window 800
     // -> content_x 100: top card at 100 with code at 112; in-item card at
-    // the ordered item's text column 122 with code at 134.
+    // the ordered item's text column 130 with code at 142.
     var cmds: [512]DrawCommand = undefined;
     const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
     const count = layoutViewport(doc, lines, config, &cmds);
@@ -3583,7 +3583,7 @@ test "list hanging indent: in-item fence card indents with its text" {
     try std.testing.expect(top_code_x != null);
     try std.testing.expect(item_bg.? > top_bg.?);
     try std.testing.expectEqual(@as(f32, 100.0), top_bg.?);
-    try std.testing.expectEqual(@as(f32, 122.0), item_bg.?);
+    try std.testing.expectEqual(@as(f32, 130.0), item_bg.?);
     try std.testing.expectEqual(top_bg.? + 12.0, top_code_x.?);
     try std.testing.expectEqual(item_bg.? + 12.0, code_x.?);
 }
@@ -3631,17 +3631,17 @@ test "list bullets: centered dots with equal side spacing; card flush with text"
     try std.testing.expect(lead_x != null);
     try std.testing.expect(code1_x != null);
     try std.testing.expect(code2_x != null);
-    // Level-0 dot centered: 4px from content edge, 4px to its text.
-    try std.testing.expectEqual(@as(f32, 104.0), dots[0]);
-    try std.testing.expectEqual(@as(f32, 122.0), lead_x.?);
+    // Level-0 dot centered: 8px from content edge, 8px to its text.
+    try std.testing.expectEqual(@as(f32, 108.0), dots[0]);
+    try std.testing.expectEqual(@as(f32, 130.0), lead_x.?);
     try std.testing.expectEqual(dots[0] - 100.0, lead_x.? - (dots[0] + 14.0));
     // Nested dot at its own indent, same symmetric cell.
-    try std.testing.expectEqual(@as(f32, 124.0), dots[1]);
+    try std.testing.expectEqual(@as(f32, 128.0), dots[1]);
     // Cards flush on the same-indent text column, code 12px inside:
     // top card under the plain comparison paragraph, in-item card under
     // the level-0 lead text.
     try std.testing.expectEqual(@as(f32, 112.0), code1_x.?);
-    try std.testing.expectEqual(@as(f32, 134.0), code2_x.?);
+    try std.testing.expectEqual(@as(f32, 142.0), code2_x.?);
 }
 
 /// Measurement context for height/refine passes: empty command buffer, no
@@ -3909,10 +3909,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
     if (info.block_type == .bullet_list) {
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        // PR #324 review: the 14px bullet glyph sits centered in its 22px
-        // gutter (4px each side), so the dot has equal spacing left/right
+        // PR #324 review: the 14px bullet glyph sits centered in its 30px
+        // gutter (8px each side), so the dot has equal spacing left/right
         // with airy GitHub-like padding.
-        bullet_x = ux.content_x + indent_level * 10.0 + 4.0;
+        bullet_x = ux.content_x + indent_level * 10.0 + 8.0;
         var text_start: usize = 1; // past the marker; skip all padding
         text_start += skipSpaces(text_slice[@min(text_start, text_slice.len)..]);
         item_text = text_slice[@min(text_start, text_slice.len)..];
@@ -3929,11 +3929,11 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         }
         ux.ord_active = false;
     } else {
-        // Ordered item: parse marker, resolve corrected number. Same +4
+        // Ordered item: parse marker, resolve corrected number. Same +8
         // origin as bullets so both flavors share one text column.
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        bullet_x = ux.content_x + indent_level * 10.0 + 4.0;
+        bullet_x = ux.content_x + indent_level * 10.0 + 8.0;
         var prefix_len: usize = 0;
         while (prefix_len < text_slice.len and text_slice[prefix_len] != ' ' and text_slice[prefix_len] != '\t') : (prefix_len += 1) {}
         if (prefix_len < text_slice.len) prefix_len += 1;
@@ -3957,10 +3957,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         }
     }
 
-    // Both flavors share one 22px cell: bullets center 4px each side of
+    // Both flavors share one 30px cell: bullets center 8px each side of
     // the 14px dot; ordered markers sit at the same column with the text
-    // 18px past the marker origin, so bullet and ordered columns agree.
-    const list_tx = bullet_x + 18.0;
+    // 22px past the marker origin, so bullet and ordered columns agree.
+    const list_tx = bullet_x + 22.0;
     const list_tw = textRight(ux) - list_tx;
     const list_rtl = leadParaDirection(ux, item_text, i + 1);
     const list_rtx = if (list_rtl) mirrorX(list_tx, list_tw, ux) else list_tx;
