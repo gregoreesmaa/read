@@ -5,8 +5,9 @@ const simd = @import("hot");
 /// machine (issue #323, PR 1 of 6). No threads, no spawning, no file I/O
 /// here — this file only maps fence info tokens to renderers, hashes fence
 /// sources for cache filenames, and collects bounded job lists from scanned
-/// lines. Readiness (`ready` for cache hit, `naive` fallback for probe
-/// failure) is decided by the launcher flow in a later PR, never here.
+/// lines. Readiness (`ready` for cache hit, `rendering` while in flight,
+/// `naive` fallback for probe failure, `failed` for terminal render errors)
+/// is decided by the launcher flow in a later PR, never here.
 /// Zero heap allocations throughout: every function borrows slices of the
 /// caller's document/scan buffers or writes into a caller-owned `out` span.
 
@@ -16,15 +17,6 @@ pub const MAX_PLUGIN_JOBS: usize = 16;
 pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
     if (std.mem.eql(u8, info_token, "mermaid")) return .mermaid;
     return null;
-}
-
-fn fnv1a(bytes: []const u8) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    for (bytes) |b| {
-        h ^= b;
-        h *%= 0x100000001b3;
-    }
-    return h;
 }
 
 pub fn fenceHash(renderer: Renderer, source: []const u8) u64 {
@@ -50,42 +42,47 @@ pub fn cachePath(cache_root: []const u8, renderer: Renderer, hash: u64, out: []u
     var hex: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x:0>16}", .{hash}) catch return null;
     const name = rendererName(renderer);
+    const tail = "/read/plugins/";
+    const ext = ".png";
     // "<root>/read/plugins/<name>/<hex>.png"
-    const need = cache_root.len + 1 + 4 + 1 + 8 + 1 + name.len + 1 + 16 + 4;
+    const need = cache_root.len + tail.len + name.len + 1 + hex.len + ext.len;
     if (out.len < need) return null;
     var s: usize = 0;
     @memcpy(out[s..][0..cache_root.len], cache_root);
     s += cache_root.len;
-    const tail = "/read/plugins/";
     @memcpy(out[s..][0..tail.len], tail);
     s += tail.len;
     @memcpy(out[s..][0..name.len], name);
     s += name.len;
     out[s] = '/';
     s += 1;
-    @memcpy(out[s..][0..16], hex[0..]);
-    s += 16;
-    const ext = ".png";
-    @memcpy(out[s..][0..4], ext);
-    s += 4;
+    @memcpy(out[s..][0..hex.len], hex[0..]);
+    s += hex.len;
+    @memcpy(out[s..][0..ext.len], ext);
+    s += ext.len;
     return out[0..s];
 }
 
 /// Lifecycle of one plugin job. `collectPluginJobs` below always emits
-/// `.queued`; the launcher flow (later PR) promotes cache hits to `.ready`
-/// and probe failures to `.naive` (plain code-block fallback rendering).
-pub const JobState = enum { queued, ready, naive };
+/// `.queued`; the launcher flow (later PR) promotes cache hits to `.ready`,
+/// marks in-flight launches `.rendering`, demotes probe failures to `.naive`
+/// (plain code-block fallback rendering) and terminal render errors to
+/// `.failed`.
+pub const JobState = enum { naive, queued, rendering, ready, failed };
 
-/// One render unit: borrowed fence source plus its content hash, the cache
-/// root it was collected under (so later stages can rebuild the cache path
-/// with `cachePath` without re-threading the root), and current state.
-/// All slices borrow the caller's document — no copies, no allocations.
+/// One render unit: the scan index of its opening fence plus the content
+/// hash, renderer, and current state. Later stages re-derive bytes via
+/// `fenceSource(doc, lines, job.fence_line)` and rebuild paths via
+/// `cachePath(cache_root, job.renderer, job.hash, &buf)` — both thread
+/// their buffers at call time, so a job owns no borrowed slices and never
+/// aliases the document or root strings: only `fence_line` needs the scan
+/// to still match the document. All fields are plain values — no copies,
+/// no allocations, no lifetime obligations beyond the index mapping.
 pub const PluginJob = struct {
+    fence_line: usize,
+    hash: u64,
     renderer: Renderer,
     state: JobState,
-    source: []const u8,
-    hash: u64,
-    cache_root: []const u8,
 };
 
 /// First info token of a `code_fence_start` line (e.g. `mermaid` in
@@ -145,9 +142,14 @@ pub fn hasPluginFences(doc: []const u8, lines: []const simd.Line) bool {
 /// Fill `jobs_out` with one `.queued` job per plugin fence, in document
 /// order; unknown info tokens are skipped without consuming a slot. Stops
 /// at `min(jobs_out.len, MAX_PLUGIN_JOBS)` so callers can never overflow.
-/// Returns the number of jobs written. File-exists/readiness checks are
-/// deliberately NOT done here — the launcher flow sets `ready`/`naive`.
+/// Returns the number of jobs written. Each job anchors its fence by scan
+/// index (`fence_line`); bytes are re-derived later via `fenceSource`.
+/// `cache_root` is accepted for call-site uniformity but intentionally
+/// unused: file-exists/readiness checks are deliberately NOT done here —
+/// the launcher flow threads the root into `cachePath` itself and sets
+/// `ready`/`rendering`/`naive`/`failed`.
 pub fn collectPluginJobs(doc: []const u8, lines: []const simd.Line, cache_root: []const u8, jobs_out: []PluginJob) usize {
+    _ = cache_root;
     const cap = @min(jobs_out.len, MAX_PLUGIN_JOBS);
     var n: usize = 0;
     for (lines, 0..) |line, i| {
@@ -156,11 +158,10 @@ pub fn collectPluginJobs(doc: []const u8, lines: []const simd.Line, cache_root: 
         const renderer = pluginRendererOf(fenceInfoToken(doc, line)) orelse continue;
         const source = fenceSource(doc, lines, i);
         jobs_out[n] = .{
+            .fence_line = i,
+            .hash = fenceHash(renderer, source),
             .renderer = renderer,
             .state = .queued,
-            .source = source,
-            .hash = fenceHash(renderer, source),
-            .cache_root = cache_root,
         };
         n += 1;
     }
@@ -193,4 +194,49 @@ test "plugin: collect finds fences, caps at 16, skips unknown" {
     try std.testing.expectEqual(@as(usize, 1), nj);
     try std.testing.expectEqual(JobState.queued, jobs[0].state);
     try std.testing.expectEqual(Renderer.mermaid, jobs[0].renderer);
+}
+
+test "plugin: collect stops at 16 with 17 fences, unknown tokens skip slots" {
+    // 17 mermaid fences with two unknown-token (rust) fences interleaved
+    // before the 6th and 13th mermaid fence; each fence spans 3 scan lines.
+    var doc_buf: [4096]u8 = undefined;
+    var doc_len: usize = 0;
+    var k: usize = 0;
+    while (k < 17) : (k += 1) {
+        if (k == 5 or k == 12) {
+            const u = "```rust\nlet x = 1;\n```\n";
+            @memcpy(doc_buf[doc_len..][0..u.len], u);
+            doc_len += u.len;
+        }
+        const f = "```mermaid\nA-->B\n```\n";
+        @memcpy(doc_buf[doc_len..][0..f.len], f);
+        doc_len += f.len;
+    }
+    const doc = doc_buf[0..doc_len];
+    var lines: [128]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    try std.testing.expect(hasPluginFences(doc, lines[0..n]));
+    var jobs: [MAX_PLUGIN_JOBS]PluginJob = undefined;
+    const nj = collectPluginJobs(doc, lines[0..n], "/tmp/C", &jobs);
+    try std.testing.expectEqual(@as(usize, MAX_PLUGIN_JOBS), nj);
+    // First fence anchors scan line 0; anchors strictly increase.
+    try std.testing.expectEqual(@as(usize, 0), jobs[0].fence_line);
+    var i: usize = 0;
+    while (i + 1 < nj) : (i += 1) {
+        try std.testing.expect(jobs[i].fence_line < jobs[i + 1].fence_line);
+    }
+    // The rust fence at scan line 15 consumed no slot: the 6th mermaid job
+    // still anchors its opener at line 18, with bytes re-derivable via
+    // fenceSource and matching the stored hash.
+    try std.testing.expectEqual(@as(usize, 18), jobs[5].fence_line);
+    try std.testing.expectEqualStrings("A-->B", fenceSource(doc, lines[0..n], jobs[5].fence_line));
+    try std.testing.expectEqual(
+        fenceHash(.mermaid, fenceSource(doc, lines[0..n], jobs[5].fence_line)),
+        jobs[5].hash,
+    );
+    for (jobs[0..nj]) |job| {
+        try std.testing.expectEqual(JobState.queued, job.state);
+        try std.testing.expectEqual(Renderer.mermaid, job.renderer);
+    }
 }
