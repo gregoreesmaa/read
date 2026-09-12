@@ -164,6 +164,32 @@ EOF
 cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wide_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_wide.png" --settle-images test_cases/plugin_mermaid_wide.md
 
+# Case 4i: Syntax-highlight demo (issue #333) — one frame per language.
+# Sections are uniform (H3 + 5-line fence, blank-separated), so fixed-stride
+# scrolled frames seat one language per PNG (mermaid-tall fixed-offset
+# precedent). Stride 280.9px measured from layout (H3 rows at doc y 269.5 /
+# 550.4); each frame puts its H3 ~120px below the top, prior tail above.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_zig.png" test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_c.png" --scroll 430 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_python.png" --scroll 711 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_js.png" --scroll 992 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_bash.png" --scroll 1273 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_diff.png" --scroll 1554 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_ts.png" --scroll 1835 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_rust.png" --scroll 2116 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_go.png" --scroll 2397 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_java.png" --scroll 2678 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_ruby.png" --scroll 2958 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_swift.png" --scroll 3239 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_kotlin.png" --scroll 3520 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_php.png" --scroll 3801 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_cpp.png" --scroll 4082 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_csharp.png" --scroll 4363 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_html.png" --scroll 4644 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_css.png" --scroll 4925 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_sql.png" --scroll 5206 test_cases/highlight.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_lua.png" --scroll 5487 test_cases/highlight.md
+
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
 

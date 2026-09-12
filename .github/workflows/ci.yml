@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: No platform symbols outside the seam
         run: |
-          if grep -rnE 'NS[A-Z][A-Za-z]|AppKit|Cocoa|CoreText|CoreGraphics|CoreFoundation|NSString|NSURL|NSFont|CTFont|CTLine|CGContext|CGImage|dispatch_async' src/core src/layout; then
+          if grep -rnE '(^|[^A-Za-z0-9_])NS[A-Z][A-Za-z]|AppKit|Cocoa|CoreText|CoreGraphics|CoreFoundation|NSString|NSURL|NSFont|CTFont|CTLine|CGContext|CGImage|dispatch_async' src/core src/layout; then
             echo 'FAIL: platform symbol outside src/platform (see docs/cross-platform-rfc.md §6)'
             exit 1
           fi
