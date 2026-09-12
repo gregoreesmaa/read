@@ -70,7 +70,7 @@ mkdir -p "$cache_root/read/plugins/mermaid"
 cp test_cases/assets/mermaid-seed.png "$cache_root/read/plugins/mermaid/$seed_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid.png" --settle-images test_cases/plugin_mermaid.md
 
-# Cases 4f/4g: Huge mermaid diagrams (issue #323, PR #340 owner request).
+# Cases 4f/4g/4h: Huge mermaid diagrams (issue #323, PR #340 owner request).
 # Same-file scrolled frames (images_scrolled precedent: no new test case,
 # no new test_cases/*.md), so scrollable_doc.md stays the single
 # scrolled-viewport test case per AGENTS.md §6 / check_test_cases.sh.
@@ -136,6 +136,33 @@ cp test_cases/assets/mermaid-seed-tall.png "$cache_root/read/plugins/mermaid/$ta
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_tall__s1.png" --scroll 900 --settle-images test_cases/plugin_mermaid_tall.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_tall__s2.png" --scroll 1800 --settle-images test_cases/plugin_mermaid_tall.md
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_tall__s3.png" --scroll 2700 --settle-images test_cases/plugin_mermaid_tall.md
+# Case 4h (wide rendered image): the 2000x600 mermaid-seed-wide.png — a
+# genuinely complex 22-node `flowchart LR` (15 columns across top/main/
+# bottom lanes, fan-out/join buses, decision diamonds, bypass rail)
+# mirroring the fixture node-for-node — proves the wide-image clamp
+# (natural width fits to the 600px column via laidOutImageHeight, aspect
+# kept, no blowup) through the shipped stat-exists path. Initial fold
+# only, by design: ready-plugin `.image` cmds carry no scrollable_id, so
+# neither --scroll (vertical doc scroll; the whole band already fits one
+# fold) nor --scroll-x-end (parks code/table blocks only) can add signal.
+wide_hash=$(python3 - "test_cases/plugin_mermaid_wide.md" <<'EOF'
+import sys
+lines = open(sys.argv[1]).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.lstrip().startswith('```') and l.lstrip()[3:].strip().split(' ')[:1] == ['mermaid'])
+end = next(i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith('```'))
+src = '\n'.join(lines[start + 1:end]).encode()
+h = 0xCBF29CE484222325
+M = (1 << 64) - 1
+for b in (0).to_bytes(1, 'big') + b'\x00' + src:
+    h ^= b
+    h = (h * 0x100000001B3) & M
+print('%016x' % h)
+EOF
+)
+[ -n "$wide_hash" ] || { echo "FAIL: case 4h fence hash empty" >&2; exit 1; }
+cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wide_hash.png"
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_wide.png" --settle-images test_cases/plugin_mermaid_wide.md
 
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
