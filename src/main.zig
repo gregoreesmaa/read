@@ -729,6 +729,52 @@ fn pluginKickForDocument() void {
     if (g_plugin_inflight > 0) bridge.platform_smooth_kick();
 }
 
+/// TEST_HOOKS-only cache-hit seeding for headless screenshots (issue #323
+/// review): read-test never probes or launches (see the test_hooks gate
+/// above), so plugin fences would always screenshot as code cards. This
+/// resolves the table and stat-marks PRE-SEEDED cache PNGs to `.ready` —
+/// the exact shipped ready path (stat-exists → ready → `.image` through
+/// the stock image decode/paint) — with zero child processes. The table
+/// attaches ONLY when at least one job is ready, so unseeded documents
+/// (plugin_fallback.md) keep a null table and render bit-identical to
+/// before; misses mark `.naive` (today's plain card, no launch to await).
+/// Called only from comptime-gated headless code, so it strips out of ship
+/// builds and costs zero ship bytes.
+fn pluginSeedReadyForScreenshot() void {
+    g_plugin_count = 0;
+    if (!plugin_cache.hasPluginFences(g_app.bytes, g_app.lines[0..g_app.line_count])) return;
+    const root = pluginCacheRoot(g_plugin_root_buf[0..]) orelse return;
+    g_plugin_root_len = root.len;
+    const n = pluginResolvePaths(
+        g_app.bytes,
+        g_app.lines[0..g_app.line_count],
+        root,
+        g_plugin_jobs[0..],
+        g_plugin_path_bufs[0..],
+        g_plugin_path_lens[0..],
+    );
+    g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    if (g_plugin_count == 0) return;
+    var saw_ready = false;
+    var i: usize = 0;
+    while (i < g_plugin_count) : (i += 1) {
+        if (g_plugin_path_lens[i] == 0) {
+            g_plugin_jobs[i].state = .naive;
+            continue;
+        }
+        if (pluginCacheFileReady(g_plugin_path_bufs[i][0..g_plugin_path_lens[i]])) {
+            g_plugin_jobs[i].state = .ready;
+            saw_ready = true;
+        } else {
+            g_plugin_jobs[i].state = .naive;
+        }
+    }
+    // No hit: drop the table so layout keeps its null defaults (existing
+    // screenshots stay bit-identical); the metrics pass below reconverges
+    // the ready case on its own.
+    if (!saw_ready) g_plugin_count = 0;
+}
+
 /// Attach the per-doc plugin table into a layout config (cold paths only:
 /// metrics, draw, anchor/find walks). An empty table keeps the null
 /// defaults so rendering stays bit-identical without plugin fences.
@@ -2362,6 +2408,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Headless screenshot mode (test binary only: the comptime gate keeps
     // this block out of ship-build analysis entirely).
     if (build_options.test_hooks) {
+        // Pre-seeded plugin cache hits resolve to ready here (no probe or
+        // launch in headless); unseeded docs keep a null table, bit-identical.
+        pluginSeedReadyForScreenshot();
         if (screenshot_path) |sc_path| {
         g_app.window_width = 1200.0;
         g_app.window_height = 900.0;

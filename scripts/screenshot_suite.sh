@@ -40,9 +40,35 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # as plain code blocks, source intact.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_fallback.png" test_cases/plugin_fallback.md
 
-# Case 4e: Mermaid skeleton (issue #323) — job never launches in
-# read-test, so the fence renders its code card deterministically.
-./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid.png" test_cases/plugin_mermaid.md
+# Case 4e: Mermaid rendered image (issue #323) — read-test never probes or
+# launches, so the suite pre-seeds the cache PNG for the fixture fence and
+# the headless open resolves it to ready via the shipped stat-exists path
+# (no child processes); --settle-images decodes it through the stock image
+# path. Seed pixels are the synthetic test_cases/assets/mermaid-seed.png
+# fixture (no mermaid renderer binary in this env); the path proven is
+# production. Unseeded docs (case 4d) keep a null table, bit-identical.
+command -v python3 >/dev/null 2>&1 || { echo "FAIL: case 4e needs python3 for fence hashing" >&2; exit 1; }
+FIXTURE_MD="test_cases/plugin_mermaid.md"
+seed_hash=$(python3 - "$FIXTURE_MD" <<'EOF'
+import sys
+lines = open(sys.argv[1]).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.lstrip().startswith('```') and l.lstrip()[3:].strip().split(' ')[:1] == ['mermaid'])
+end = next(i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith('```'))
+src = '\n'.join(lines[start + 1:end]).encode()
+h = 0xCBF29CE484222325
+M = (1 << 64) - 1
+for b in (0).to_bytes(1, 'big') + b'\x00' + src:
+    h ^= b
+    h = (h * 0x100000001B3) & M
+print('%016x' % h)
+EOF
+)
+[ -n "$seed_hash" ] || { echo "FAIL: case 4e fence hash empty" >&2; exit 1; }
+if [ -n "${HOME:-}" ]; then cache_root="$HOME/Library/Caches"; else cache_root="${TMPDIR:-/tmp}/read-plugin-cache"; fi
+mkdir -p "$cache_root/read/plugins/mermaid"
+cp test_cases/assets/mermaid-seed.png "$cache_root/read/plugins/mermaid/$seed_hash.png"
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid.png" --settle-images test_cases/plugin_mermaid.md
 
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
