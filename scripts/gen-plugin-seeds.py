@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Regenerate plugin seed PNGs (issues #330/#329/#328/#326/#327).
 
-Each seed is a faithful static mimic of a real renderer output for its
-test_cases/plugin_*.md fixture: d2/graphviz/plantuml draw the fixture's
-two-node diagram (labels mirror the fixture), math/mathjax draw the
+math (KaTeX) seeds are genuine KaTeX-engine renders of their
+test_cases/plugin_math*.md fixture fence sources (KaTeX 0.18.7 via a
+pinned npm bootstrap, rasterized in headless Chrome; *_seed functions
+fail loudly without node/npm/Chrome). Remaining seeds are faithful
+static mimics of real renderer output: d2/graphviz/plantuml draw the
+fixture's diagram (labels mirror the fixture), mathjax draws the
 fixture's formula typeset in STIX. Tall/wide companions
 (*-seed-tall.png, *-seed-wide.png) mirror the tall/wide fixtures
 node-for-node the same way; math-seed.png draws the simplified fixture
-formula, *-seed-complex.png the complex companions. Synthetic-but-plausible
-stand-ins (no d2/dot/plantuml/katex binaries in this env); the screenshot
-path proven (stat-exists seed -> ready -> stock image decode) is production,
-per suite practice (cf. scripts/gen-mermaid-seed.py).
+formula, *-seed-complex.png the complex companions.
+Synthetic-but-plausible stand-ins (no d2/dot/plantuml binaries in this
+env); the screenshot path proven (stat-exists seed -> ready -> stock
+image decode) is production, per suite practice
+(cf. scripts/gen-mermaid-seed.py).
 
 Requires Pillow (fixture generation only, never ships): pip install pillow.
 Usage:  python3 scripts/gen-plugin-seeds.py
@@ -156,12 +160,110 @@ def _typeset(formula_runs, size=44, small=30, pad=28):
     return im
 
 
+def _real_math_render(fixture_md, out_name, engine, npm_pkg):
+    # Genuine engine render (round-two revision: seeds are real engine
+    # output, never Pillow mimics). Bootstraps the pinned npm package
+    # into a temp dir, typesets the fixture tex with the real engine,
+    # screenshots headless Chrome, and autocrops to content. Needs
+    # node+npm and Chrome; fails loudly without them. Verified
+    # deterministic (reruns pixel-identical) for KaTeX 0.18.7.
+    import shutil
+    import subprocess
+    import tempfile
+    for bin_name in ("node", "npm"):
+        if shutil.which(bin_name) is None:
+            sys.exit("FAIL: %s not found (needed for %s)" %
+                     (bin_name, out_name))
+    chrome = (os.environ.get("CHROME_BIN") or
+              shutil.which("google-chrome") or
+              shutil.which("chromium") or shutil.which("chromium-browser") or
+              "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if not (os.path.exists(chrome) if os.sep in chrome else
+            shutil.which(chrome)):
+        sys.exit("FAIL: Chrome not found (needed for %s)" % out_name)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = open(os.path.join(root, fixture_md)).read().split('\n')
+    start = next(i for i, l in enumerate(lines)
+                 if l.lstrip().startswith('```') and
+                 l.lstrip()[3:].strip().split(' ')[:1] == ['math'])
+    end = next(i for i in range(start + 1, len(lines))
+               if lines[i].lstrip().startswith('```'))
+    tex = '\n'.join(lines[start + 1:end])
+    workdir = tempfile.mkdtemp()
+    pkgdir = os.path.join(workdir, "pkg")
+    os.mkdir(pkgdir)
+    r = subprocess.run(["npm", "init", "-y"], cwd=pkgdir,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("FAIL: npm init: %s" % (r.stderr or '').strip())
+    r = subprocess.run(["npm", "install", npm_pkg], cwd=pkgdir,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("FAIL: npm install %s: %s" %
+                 (npm_pkg, (r.stderr or '').strip()))
+    render_js = (
+        "const fs = require('fs');\n"
+        "const katex = require(%s);\n"
+        "const tex = fs.readFileSync(%s, 'utf8');\n"
+        "const css = 'file://' + %s;\n"
+        "const body = '<link rel=\"stylesheet\" href=\"' + css + '\">' +\n"
+        "  '<div id=\"f\">' + katex.renderToString(tex, "
+        "{ displayMode: true, throwOnError: false }) + '</div>';\n"
+        "const html = '<!DOCTYPE html><html><head><meta charset=\"utf-8\">' +\n"
+        "  '<style>html,body{margin:0;padding:0;background:#fff;}' +\n"
+        "  '#f{display:inline-block;padding:28px;font-size:44px;color:#333;}' +\n"
+        "  '</style></head><body>' + body + '</body></html>';\n"
+        "fs.writeFileSync(%s, html);\n" % (
+            json_repr(os.path.join(pkgdir, "node_modules", "katex")),
+            json_repr(os.path.join(workdir, "formula.tex")),
+            json_repr(os.path.join(pkgdir, "node_modules", "katex",
+                                   "dist", "katex.min.css")),
+            json_repr(os.path.join(workdir, "formula.html")),
+        ))
+    with open(os.path.join(workdir, "formula.tex"), 'w') as f:
+        f.write(tex)
+    with open(os.path.join(workdir, "render.js"), 'w') as f:
+        f.write(render_js)
+    r = subprocess.run(["node", "render.js"], cwd=workdir,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("FAIL: katex render %s: %s" %
+                 (fixture_md, (r.stderr or '').strip()))
+    shot = os.path.join(workdir, "shot.png")
+    page = "file://" + os.path.join(workdir, "formula.html")
+    r = subprocess.run([chrome, "--headless", "--disable-gpu",
+                        "--no-sandbox", "--screenshot=" + shot,
+                        "--window-size=1200,500", "--hide-scrollbars",
+                        page], capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(shot):
+        sys.exit("FAIL: chrome screenshot %s: %s" %
+                 (fixture_md, (r.stderr or '').strip()))
+    from PIL import ImageChops
+    im = Image.open(shot).convert('RGB')
+    bg = Image.new('RGB', im.size, (255, 255, 255))
+    bbox = ImageChops.difference(im, bg).getbbox()
+    if bbox is None:
+        sys.exit("FAIL: empty %s render for %s" % (engine, fixture_md))
+    pad = 28
+    x0, y0, x1, y1 = bbox
+    box = (max(0, x0 - pad), max(0, y0 - pad),
+           min(im.width, x1 + pad), min(im.height, y1 + pad))
+    out = os.path.join(os.getcwd(), out_name)
+    im.crop(box).save(out)
+    shutil.rmtree(workdir, ignore_errors=True)
+    return Image.open(out), out_name
+
+
+def json_repr(path):
+    import json
+    return json.dumps(path)
+
+
 def math_seed():
     # Fixture test_cases/plugin_math.md (owner: simpler formula): E = mc^2.
-    im = _typeset([
-        ("E = mc", "body"), ("2", "sup"),
-    ])
-    return im, "math-seed.png"
+    # Genuine KaTeX 0.18.7 output.
+    return _real_math_render("test_cases/plugin_math.md", "math-seed.png",
+                             "katex", "katex@0.18.7")
 
 
 def mathjax_seed():
@@ -502,12 +604,10 @@ def plantuml_seed_wide():
 
 def math_seed_complex():
     # Fixture test_cases/plugin_math_complex.md: sum of squares.
-    im = _typeset([
-        ("\u2211", "big"), ("k=1", "sub"), ("n", "sup"),
-        (" k", "body"), ("2", "sup"),
-        (" = n(n+1)(2n+1)/6", "body"),
-    ])
-    return im, "math-seed-complex.png"
+    # Genuine KaTeX 0.18.7 output (display-style limits).
+    return _real_math_render("test_cases/plugin_math_complex.md",
+                             "math-seed-complex.png",
+                             "katex", "katex@0.18.7")
 
 
 def mathjax_seed_complex():

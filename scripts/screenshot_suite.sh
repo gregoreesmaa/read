@@ -197,11 +197,10 @@ cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wi
 # probes or launches; the suite pre-seeds the cache PNG for the fixture
 # fence and the headless open resolves it to ready via the shipped
 # stat-exists path (no child processes); --settle-images decodes it
-# through the stock image path. Seed pixels are the synthetic
-# test_cases/assets/math-seed.png fixture (regenerate with
-# scripts/gen-plugin-seeds.py; no PNG-capable math tool in this env, so a
-# live open stays a naive code card per the §3 capability canary); the
-# path proven is production. The fence hash mirrors fenceHash in
+# through the stock image path. Seed pixels are genuine KaTeX 0.18.7
+# output for the fixture tex (test_cases/assets/math-seed.png; regenerate
+# with scripts/gen-plugin-seeds.py, which renders via the real KaTeX
+# engine); the path proven is production. The fence hash mirrors fenceHash in
 # src/core/plugin_cache.zig with the renderer ordinal parsed from the
 # Renderer enum, so seeds stay correct as the enum grows. The fixture tex
 # differs from test_cases/plugin_fallback.md's on purpose: identical
@@ -232,7 +231,8 @@ cp test_cases/assets/math-seed.png "$cache_root/read/plugins/math/$math_hash.png
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_math.png" --settle-images test_cases/plugin_math.md
 
 # Complex companion (same case 4l): the sum-of-squares fixture renders the
-# math-seed-complex.png typeset seed (big sigma with sub/superscripts).
+# genuine KaTeX 0.18.7 math-seed-complex.png (big sigma with
+# sub/superscripts, display-style limits).
 complex_hash=$(python3 - src/core/plugin_cache.zig test_cases/plugin_math_complex.md math math <<'EOF'
 import re, sys
 zig_src, md_path, info_token, renderer = sys.argv[1:5]
