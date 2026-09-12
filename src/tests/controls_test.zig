@@ -1066,10 +1066,10 @@ test "controls: rtl list markers mirror right (issue #50)" {
     }
     try std.testing.expect(marker_x > 0 and text_x > 0);
     // Mirrored: bullet sits right of the item text (PR #324: 14px dot
-    // centered +2 in its gutter, so the LTR dot is at 202 and its mirror
-    // at 2*200+600-202-14 = 784).
+    // centered +4 in its 22px gutter, so the LTR dot is at 204 and its
+    // mirror at 2*200+600-204-14 = 782).
     try std.testing.expect(marker_x > text_x);
-    try std.testing.expectApproxEqAbs(@as(f32, 784.0), marker_x, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 782.0), marker_x, 0.05);
 
     const n_ltr = layoutDoc("- Hello\n", &cmds);
     marker_x = -1;
@@ -1083,7 +1083,7 @@ test "controls: rtl list markers mirror right (issue #50)" {
         }
     }
     try std.testing.expect(marker_x >= 0 and text_x >= 0);
-    try std.testing.expectApproxEqAbs(@as(f32, 202.0), marker_x, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 204.0), marker_x, 0.05);
     try std.testing.expect(marker_x < text_x);
 }
 

@@ -2864,7 +2864,9 @@ fn itemContentX(marker: simd.Line, content_x: f32) f32 {
     if (marker.block_type == .task_list) return content_x + 28.0;
     var indent_level: f32 = @floatFromInt(marker.indent);
     if (indent_level > 32) indent_level = 32;
-    return content_x + indent_level * 10.0 + 18.0;
+    // PR #324 review: 22px gutter per level (4px pad each side of the
+    // marker), matching layoutListUnit so GitHub-like columns agree.
+    return content_x + indent_level * 10.0 + 22.0;
 }
 
 /// Owns paragraph line `j`: the list-item marker whose unit contains it, or
@@ -3548,10 +3550,10 @@ test "list hanging indent: in-item fence card indents with its text" {
     try std.testing.expectEqualStrings("  code", stripFenceIndent("     code", 3));
     try std.testing.expectEqualStrings("x", stripFenceIndent("  x", 9));
     try std.testing.expectEqualStrings("   raw", stripFenceIndent("   raw", 0));
-    // Render (PR #324 review): cards stay per-item (in-item right of
-    // top-level) while in-item code aligns to the bullet at the fence's own
-    // indent. Window 800 -> content_x 100: top fence stays pixel-identical
-    // (bg 88, code 100); in-item fence (indent 3) codes at 132 (item bg 106).
+    // Render (PR #324 review, GitHub-like card model): card left edges sit
+    // exactly on the same-indent text column, code 12px inside. Window 800
+    // -> content_x 100: top card at 100 with code at 112; in-item card at
+    // the ordered item's text column 122 with code at 134.
     var cmds: [512]DrawCommand = undefined;
     const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
     const count = layoutViewport(doc, lines, config, &cmds);
@@ -3580,16 +3582,16 @@ test "list hanging indent: in-item fence card indents with its text" {
     try std.testing.expect(code_text != null);
     try std.testing.expect(top_code_x != null);
     try std.testing.expect(item_bg.? > top_bg.?);
-    try std.testing.expectEqual(@as(f32, 88.0), top_bg.?);
-    try std.testing.expectEqual(@as(f32, 106.0), item_bg.?);
+    try std.testing.expectEqual(@as(f32, 100.0), top_bg.?);
+    try std.testing.expectEqual(@as(f32, 122.0), item_bg.?);
     try std.testing.expectEqual(top_bg.? + 12.0, top_code_x.?);
-    try std.testing.expectEqual(@as(f32, 132.0), code_x.?);
+    try std.testing.expectEqual(item_bg.? + 12.0, code_x.?);
 }
 
-test "list bullets: centered dots with equal side spacing; code aligns to its bullet" {
-    // PR #324 review: 14px dot centered in its 18px gutter (2px each side,
-    // text column stable), and fenced code sits under the dot at its own
-    // indent. Window 800 -> content_x 100.
+test "list bullets: centered dots with equal side spacing; card flush with text" {
+    // PR #324 review, GitHub-like model: 14px dot centered in its 22px
+    // gutter (4px each side); code cards sit flush on the same-indent text
+    // column with code 12px inside. Window 800 -> content_x 100.
     const doc =
         \\```
         \\code1
@@ -3629,16 +3631,17 @@ test "list bullets: centered dots with equal side spacing; code aligns to its bu
     try std.testing.expect(lead_x != null);
     try std.testing.expect(code1_x != null);
     try std.testing.expect(code2_x != null);
-    // Level-0 dot centered: 2px from content edge, 2px to its text.
-    try std.testing.expectEqual(@as(f32, 102.0), dots[0]);
-    try std.testing.expectEqual(@as(f32, 118.0), lead_x.?);
+    // Level-0 dot centered: 4px from content edge, 4px to its text.
+    try std.testing.expectEqual(@as(f32, 104.0), dots[0]);
+    try std.testing.expectEqual(@as(f32, 122.0), lead_x.?);
     try std.testing.expectEqual(dots[0] - 100.0, lead_x.? - (dots[0] + 14.0));
     // Nested dot at its own indent, same symmetric cell.
-    try std.testing.expectEqual(@as(f32, 122.0), dots[1]);
-    // In-item code sits under the dot at its own indent (review example);
-    // top-level code stays pixel-identical at the bullet cell (dot +2 inset).
-    try std.testing.expectEqual(@as(f32, 100.0), code1_x.?);
-    try std.testing.expectEqual(dots[1], code2_x.?);
+    try std.testing.expectEqual(@as(f32, 124.0), dots[1]);
+    // Cards flush on the same-indent text column, code 12px inside:
+    // top card under the plain comparison paragraph, in-item card under
+    // the level-0 lead text.
+    try std.testing.expectEqual(@as(f32, 112.0), code1_x.?);
+    try std.testing.expectEqual(@as(f32, 134.0), code2_x.?);
 }
 
 /// Measurement context for height/refine passes: empty command buffer, no
@@ -3906,10 +3909,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
     if (info.block_type == .bullet_list) {
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        // PR #324 review: the 14px bullet glyph sits centered in its 18px
-        // gutter (2px each side), so the dot has equal spacing left/right.
-        // list_tx below uses +16 for bullets to keep the text column stable.
-        bullet_x = ux.content_x + indent_level * 10.0 + 2.0;
+        // PR #324 review: the 14px bullet glyph sits centered in its 22px
+        // gutter (4px each side), so the dot has equal spacing left/right
+        // with airy GitHub-like padding.
+        bullet_x = ux.content_x + indent_level * 10.0 + 4.0;
         var text_start: usize = 1; // past the marker; skip all padding
         text_start += skipSpaces(text_slice[@min(text_start, text_slice.len)..]);
         item_text = text_slice[@min(text_start, text_slice.len)..];
@@ -3926,10 +3929,11 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         }
         ux.ord_active = false;
     } else {
-        // Ordered item: parse marker, resolve corrected number.
+        // Ordered item: parse marker, resolve corrected number. Same +4
+        // origin as bullets so both flavors share one text column.
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        bullet_x = ux.content_x + indent_level * 10.0;
+        bullet_x = ux.content_x + indent_level * 10.0 + 4.0;
         var prefix_len: usize = 0;
         while (prefix_len < text_slice.len and text_slice[prefix_len] != ' ' and text_slice[prefix_len] != '\t') : (prefix_len += 1) {}
         if (prefix_len < text_slice.len) prefix_len += 1;
@@ -3953,9 +3957,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         }
     }
 
-    // Bullets: 14px glyph + 2px each side = 18px cell, text column stable.
-    // Ordered markers fill their 18px cell (symmetric 0/0), unchanged.
-    const list_tx = bullet_x + if (info.block_type == .bullet_list) @as(f32, 16.0) else @as(f32, 18.0);
+    // Both flavors share one 22px cell: bullets center 4px each side of
+    // the 14px dot; ordered markers sit at the same column with the text
+    // 18px past the marker origin, so bullet and ordered columns agree.
+    const list_tx = bullet_x + 18.0;
     const list_tw = textRight(ux) - list_tx;
     const list_rtl = leadParaDirection(ux, item_text, i + 1);
     const list_rtx = if (list_rtl) mirrorX(list_tx, list_tw, ux) else list_tx;
@@ -4217,7 +4222,10 @@ fn layoutIndentedCodeUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) Unit
     const n = j - i;
     const row_h = ux.config.line_height * 0.88;
     const card_h = @as(f32, @floatFromInt(n)) * row_h + 24.0;
-    const card_x = base_x - 12.0;
+    // PR #324 review, GitHub-like card model: the card's left edge sits
+    // exactly on the same-indent text column (no overhang); code rides
+    // 12px inside.
+    const card_x = base_x;
     const card_w = textRight(ux) - card_x;
     if (start_y + card_h >= 0 and start_y <= ux.vp_bottom) {
         const slice = ux.bytes[ux.lines[i].offset..][0 .. ux.lines[j - 1].offset + ux.lines[j - 1].len - ux.lines[i].offset];
@@ -4241,7 +4249,7 @@ fn layoutIndentedCodeUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) Unit
                 }
                 emitCmd(ux, .{
                     .kind = .text_run,
-                    .rect = .{ .x = base_x, .y = row_y, .w = card_w, .h = row_h },
+                    .rect = .{ .x = base_x + 12.0, .y = row_y, .w = card_w, .h = row_h },
                     .color = ux.theme.text,
                     .text = row_text,
                     .font_size = ux.config.base_font_size * 0.88,
@@ -4545,31 +4553,23 @@ pub fn renderViewportCore(
             const block_id = next_block_id;
             next_block_id += 1;
 
-            // In-item fence (issue #324 review): the card rides at the
-            // owning item's text column (background aligns per-item), while
-            // the code text aligns to the bullet at the fence's own indent
-            // (centered +2, mirroring layoutListUnit), so `code2` sits under
-            // the level-2 dot. Stripping still uses the owner's content
-            // need. Top-level fences stay fully pixel-identical at content_x
-            // (their code aligns to the bullet cell; the centered dot sits
-            // 2px inside), so unrelated code screenshots never churn.
+            // Fenced code (issue #324 review, GitHub-like card model): the
+            // card's left edge sits exactly on the same-indent normal text
+            // column — content_x top-level, the owning item's text column
+            // in-item — with no overhang, and the right edge is flush with
+            // the content column too. Code rides 12px inside the card.
+            // Stripping still uses the owner's content need.
             const fence_owner = fencedCodeMarker(bytes, lines, i);
-            const fence_card_base = if (fence_owner) |m|
+            const fence_card_x = if (fence_owner) |m|
                 itemContentX(lines[m], content_x)
             else
                 content_x;
-            var fence_own: f32 = @floatFromInt(lines[i].indent);
-            if (fence_own > 32) fence_own = 32;
-            const fence_base = if (fence_owner != null)
-                content_x + fence_own * 10.0 + 2.0
-            else
-                content_x;
+            const fence_base = fence_card_x + 12.0;
             const fence_strip: usize = if (fence_owner) |m|
                 markerContentNeed(bytes, lines[m])
             else
                 0;
-            const fence_card_x = fence_card_base - 12.0;
-            const fence_card_w = content_x + content_width + 12.0 - fence_card_x;
+            const fence_card_w = content_x + content_width - fence_card_x;
 
             if (block_bottom >= 0 and block_top <= vp_bottom) {
                 // Find longest line to determine max_scroll_x (displayed
@@ -6332,10 +6332,10 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
     }
     try std.testing.expect(max_scroll > 1.0);
 
-    // Block card: content_x=100, content_width=600 -> x=88, right edge=712.
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 712.0, false, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 0));
+    // Block card: content_x=100, content_width=600 -> x=100, right edge=700.
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 700.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 100.0, true, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 700.0, false, 0));
 
     // Rounded ends, straight on the clip edge: the brightest (outermost)
     // strip runs full height while the dimmest (innermost) recedes.
@@ -6344,7 +6344,7 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
     for (cmds[0..count]) |c| {
         if (c.kind != .fill_rect or c.color.r != 255 or c.color.g != 255 or c.color.b != 255) continue;
         if (@abs(c.rect.w - scroll_shadow_strip_w) > 0.01) continue;
-        if (@abs((c.rect.x + c.rect.w) - 712.0) > 12.01) continue;
+        if (@abs((c.rect.x + c.rect.w) - 700.0) > 12.01) continue;
         if (outer == null or c.color.a > outer.?.color.a) outer = c;
         if (inner == null or c.color.a < inner.?.color.a) inner = c;
     }
@@ -6373,9 +6373,9 @@ test "scroll shadows: scrolled-right code block shows left-edge fade, no right f
     config.block_scroll_x[0] = 1e9; // clamped to max inside layout
     const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
 
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 88.0, true, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 0));
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 100.0, true, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 700.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 100.0, true, 0));
 }
 
 test "scroll shadows: fitting code block shows no fade" {
@@ -6460,9 +6460,9 @@ test "scroll shadows: light theme uses a dark overlay" {
     const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
 
     // Dark strips at the right edge, no light strips anywhere near the block.
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 712.0, false, 0));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 0));
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 700.0, false, 0));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 700.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 100.0, true, 0));
 }
 
 test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
