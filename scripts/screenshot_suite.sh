@@ -163,6 +163,9 @@ EOF
 [ -n "$wide_hash" ] || { echo "FAIL: case 4h fence hash empty" >&2; exit 1; }
 cp test_cases/assets/mermaid-seed-wide.png "$cache_root/read/plugins/mermaid/$wide_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_wide.png" --settle-images test_cases/plugin_mermaid_wide.md
+# Case 4i: Admonition alerts (issue #325) — `> [!KIND]` leaders swap the
+# marker for a bold tinted label and recolor the quote bar per kind.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/admonitions.png" test_cases/admonitions.md
 
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md

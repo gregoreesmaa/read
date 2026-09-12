@@ -1588,6 +1588,96 @@ fn classifyQuoteBody(body: []const u8) QuoteBody {
     return .{ .kind = .text };
 }
 
+/// GitHub-alert admonition kinds (issue #325): the `> [!NOTE]` blockquote
+/// prefix form only. The `:::note` container form stays OUT per RFC #41
+/// (new block syntax + layout risk for no gain over the alert form).
+const AlertKind = enum { note, tip, important, warning, caution };
+
+/// Table-driven alert tint (GitHub Primer hues, dark/light pair per kind).
+/// Comptime table, no Theme change: the bar and label recolor per visible
+/// admonition unit only, every other quote keeps `theme.quote_bar`.
+fn alertColor(kind: AlertKind, is_dark: bool) Color {
+    return switch (kind) {
+        .note => if (is_dark) Color{ .r = 68, .g = 147, .b = 248, .a = 255 } else Color{ .r = 9, .g = 105, .b = 218, .a = 255 },
+        .tip => if (is_dark) Color{ .r = 63, .g = 185, .b = 80, .a = 255 } else Color{ .r = 26, .g = 127, .b = 55, .a = 255 },
+        .important => if (is_dark) Color{ .r = 171, .g = 125, .b = 248, .a = 255 } else Color{ .r = 130, .g = 80, .b = 223, .a = 255 },
+        .warning => if (is_dark) Color{ .r = 210, .g = 153, .b = 34, .a = 255 } else Color{ .r = 154, .g = 103, .b = 0, .a = 255 },
+        .caution => if (is_dark) Color{ .r = 248, .g = 81, .b = 73, .a = 255 } else Color{ .r = 207, .g = 34, .b = 46, .a = 255 },
+    };
+}
+
+fn alertLabel(kind: AlertKind) []const u8 {
+    return switch (kind) {
+        .note => "Note",
+        .tip => "Tip",
+        .important => "Important",
+        .warning => "Warning",
+        .caution => "Caution",
+    };
+}
+
+/// Matches `[!WORD]` at the start of a stripped quote body (leading spaces
+/// tolerated, word case-insensitive). Returns the kind plus the remainder
+/// past the marker with padding stripped. The closer must be followed by
+/// end/space/tab, so `[!NOTE]x` stays literal text.
+fn parseAlertMarker(body: []const u8) ?struct { kind: AlertKind, rest: []const u8 } {
+    var s = body;
+    while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) : (s = s[1..]) {}
+    if (s.len < 3 or s[0] != '[' or s[1] != '!') return null;
+    var e: usize = 2;
+    while (e < s.len and s[e] != ']') : (e += 1) {}
+    if (e >= s.len) return null;
+    if (e + 1 < s.len and s[e + 1] != ' ' and s[e + 1] != '\t') return null;
+    const word = s[2..e];
+    var lower: [16]u8 = undefined;
+    if (word.len == 0 or word.len > lower.len) return null;
+    for (word, 0..) |c, k| lower[k] = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+    const folded = lower[0..word.len];
+    const kind: AlertKind = if (std.mem.eql(u8, folded, "note"))
+        .note
+    else if (std.mem.eql(u8, folded, "tip"))
+        .tip
+    else if (std.mem.eql(u8, folded, "important"))
+        .important
+    else if (std.mem.eql(u8, folded, "warning"))
+        .warning
+    else if (std.mem.eql(u8, folded, "caution"))
+        .caution
+    else
+        return null;
+    var rest = s[e + 1 ..];
+    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) : (rest = rest[1..]) {}
+    return .{ .kind = kind, .rest = rest };
+}
+
+/// First line of the contiguous `.quote` run holding unit `i` (capped
+/// backscan like `seedOrderedNumber`: beyond the cap the run restarts
+/// gracefully with no tint). A blank line ends the run: only uninterrupted
+/// `>` lines share one admonition scope.
+fn quoteRunStart(lines: []const simd.Line, i: usize) usize {
+    var k = i;
+    var steps: usize = 0;
+    while (k > 0 and steps < 512) : (steps += 1) {
+        if (lines[k - 1].block_type != .quote) break;
+        k -= 1;
+    }
+    return k;
+}
+
+/// Alert kind when unit `i` sits in an admonition run: the run's first line
+/// carries a marker AND parses as plain text (a `    [!NOTE]` indented-code
+/// leader or any non-text body keeps the literal rendering). Null for every
+/// ordinary quote, so the common path pays one backscan that stops at the
+/// first non-quote line.
+fn quoteAlert(bytes: []const u8, lines: []const simd.Line, i: usize) ?AlertKind {
+    const k = quoteRunStart(lines, i);
+    const qb0 = bytes[lines[k].offset..][0..lines[k].len];
+    const b0 = stripQuoteMarkers(qb0).body;
+    if (classifyQuoteBody(b0).kind != .text) return null;
+    if (parseAlertMarker(b0)) |m| return m.kind;
+    return null;
+}
+
 /// True for list-item leader lines (bullets, ordered items, tasks).
 fn isListLeader(bt: simd.BlockType) bool {
     return bt == .bullet_list or bt == .ordered_list or bt == .task_list;
@@ -1947,7 +2037,7 @@ fn mirrorX(x: f32, w: f32, ux: *UnitCx) f32 {
     return 2.0 * ux.content_x + ux.content_width - x - w;
 }
 
-fn quoteBars(ux: *UnitCx, base_x: f32, depth: usize, start_y: f32, end_y: f32, rtl: bool) void {
+fn quoteBars(ux: *UnitCx, base_x: f32, depth: usize, start_y: f32, end_y: f32, rtl: bool, bar: Color) void {
     if (end_y < 0 or start_y > ux.vp_bottom) return;
     var d: usize = 1;
     while (d <= depth) : (d += 1) {
@@ -1960,7 +2050,7 @@ fn quoteBars(ux: *UnitCx, base_x: f32, depth: usize, start_y: f32, end_y: f32, r
                 .w = quote_bar_w,
                 .h = end_y - start_y,
             },
-            .color = ux.theme.quote_bar,
+            .color = bar,
         });
     }
 }
@@ -2302,6 +2392,47 @@ fn measureCx(
 /// top-level or the item text column for in-list quotes. Returns the new y
 /// and lines consumed (1 + lazy tail). Exactly one bar set spans the unit.
 /// Never inlined: one copy serves render, height, and refine (binary budget).
+/// Admonition label row (issue #325): one bold line in the alert tint
+/// ("Note", "Tip", …) with half a line of air above and a quarter line
+/// below, so the label groups with its body instead of the previous block.
+/// Flows through the span pipeline so measure and render pens agree
+/// bit-for-bit; the label literal is static storage, so borrowed runs stay
+/// valid past the frame.
+fn layoutAlertLabel(ux: *UnitCx, kind: AlertKind, tx: f32, tw: f32, y: f32) f32 {
+    const lh = ux.config.line_height;
+    var pen = flowPenStart(tx, tw, y + lh * 0.5, false);
+    const ctx = flowCtxFor(ux, tx, tw, ux.config.base_font_size, lh, alertColor(kind, ux.config.is_dark_theme));
+    flowSpans(alertLabel(kind), .{ .bold = true }, null, &pen, ctx, false);
+    // Body start: a quarter line below the label row's bottom edge. This
+    // one return serves the same-line remainder, lazy followers, and the
+    // next unit's pen alike (pen.y is the label row top, or lower when the
+    // label itself wraps).
+    return pen.y + lh * 1.25;
+}
+
+/// Lazy followers of a marker-only admonition leader: flowLeadPara's shape
+/// minus its leading soft space (there is no first text, so the space
+/// would indent the run by one advance).
+fn flowAlertFollowers(ux: *UnitCx, tx: f32, tw: f32, y: f32, rtl: bool, from: usize) struct { y: f32, next: usize } {
+    var pen = flowPenStart(tx, tw, y, rtl);
+    var ctx = flowCtxFor(ux, tx, tw, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
+    ctx.rtl = rtl;
+    var j = from;
+    var first_follower = true;
+    while (j < ux.lines.len and isLazyContinuation(ux.bytes, ux.lines, j)) {
+        if (!first_follower) softSpace(&pen, ctx, ux.config.base_font_size);
+        const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
+        flowSourceLine(lb, true, false, false, &pen, ctx);
+        first_follower = false;
+        j += 1;
+    }
+    // No followers: no rows flowed, so no advance — the caller seats the
+    // next unit exactly at the label's quarter-line gap instead of a full
+    // phantom row below it.
+    if (first_follower) return .{ .y = pen.y, .next = j };
+    return .{ .y = pen.y + ux.config.line_height, .next = j };
+}
+
 fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
     ux.ord_active = false;
     const qb = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
@@ -2316,14 +2447,39 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
     // move the bars right; the mirrored regions keep identical widths so
     // wrapping never changes. Set per text-carrying branch below.
     var quote_rtl = false;
+    // Admonition alert (issue #325): marker on the run's first line tints
+    // every unit's bar; the leader line additionally swaps the marker for
+    // a bold label row. Null for ordinary quotes (one capped backscan).
+    const alert = quoteAlert(ux.bytes, ux.lines, i);
+    const alert_bar = if (alert) |a| alertColor(a, ux.config.is_dark_theme) else ux.theme.quote_bar;
+    const is_leader = quoteRunStart(ux.lines, i) == i;
 
     switch (body.kind) {
         .text => {
-            quote_rtl = leadParaDirection(ux, sq.body, i + 1);
-            const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
-            const f = flowLeadPara(ux, rtx, tw, y, ux.theme.muted, sq.body, i + 1);
-            y = f.y;
-            consumed = f.next - i;
+            if (alert != null and is_leader) {
+                y = layoutAlertLabel(ux, alert.?, tx, tw, y);
+                const rest = parseAlertMarker(sq.body).?.rest;
+                // flowLeadPara re-derives direction from the text it flows,
+                // so the region must match: derive from the remainder, not
+                // the marker line (same-inputs invariant, see list items).
+                quote_rtl = leadParaDirection(ux, rest, i + 1);
+                const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
+                if (rest.len > 0) {
+                    const f = flowLeadPara(ux, rtx, tw, y, ux.theme.muted, rest, i + 1);
+                    y = f.y;
+                    consumed = f.next - i;
+                } else {
+                    const f = flowAlertFollowers(ux, rtx, tw, y, quote_rtl, i + 1);
+                    y = f.y;
+                    consumed = f.next - i;
+                }
+            } else {
+                quote_rtl = leadParaDirection(ux, sq.body, i + 1);
+                const rtx = if (quote_rtl) mirrorX(tx, tw, ux) else tx;
+                const f = flowLeadPara(ux, rtx, tw, y, ux.theme.muted, sq.body, i + 1);
+                y = f.y;
+                consumed = f.next - i;
+            }
         },
         .code => {
             var pen = FlowPen{ .x = tx, .y = y };
@@ -2426,7 +2582,7 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
     if (run_continues) {
         bar_end += @as(f32, @floatFromInt(k - (i + consumed))) * ux.config.line_height * 0.75;
     }
-    quoteBars(ux, base_x, sq.depth, start_y, bar_end, quote_rtl);
+    quoteBars(ux, base_x, sq.depth, start_y, bar_end, quote_rtl, alert_bar);
     return .{ .y = end_y, .consumed = consumed };
 }
 
@@ -4624,6 +4780,128 @@ test "html subset: break/kbd/mark/sub/sup/del render, fallback muted, details hi
     // paragraph step apart (line height plus the trailing paragraph gap).
     try std.testing.expect(y_hidden != null and y_after != null);
     try std.testing.expectApproxEqAbs(config.line_height + 4.0, y_after.? - y_hidden.?, 1.0);
+}
+
+test "admonition alert: marker becomes tinted label, bar takes alert color" {
+    const test_doc =
+        \\> [!NOTE]
+        \\> Useful info here.
+        \\
+        \\> Plain quote.
+        \\> [!BOGUS] stays literal.
+    ;
+
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    const note_color = alertColor(.note, config.is_dark_theme);
+    const plain_bar = if (config.is_dark_theme) Theme.dark.quote_bar else Theme.light.quote_bar;
+    var saw_label = false;
+    var saw_tinted_bar = false;
+    var saw_plain_bar = false;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run) {
+            // The raw marker never leaks; unknown markers stay literal text.
+            try std.testing.expect(std.mem.indexOf(u8, c.text, "[!NOTE]") == null);
+            if (std.mem.eql(u8, c.text, "Note") and c.style.bold and
+                c.color.r == note_color.r and c.color.g == note_color.g and c.color.b == note_color.b)
+            {
+                saw_label = true;
+            }
+            if (std.mem.indexOf(u8, c.text, "[!BOGUS]") != null) {
+                try std.testing.expect(!c.style.bold);
+            }
+        }
+        if (c.kind == .fill_rect and c.rect.w == quote_bar_w) {
+            if (c.color.r == note_color.r and c.color.g == note_color.g and c.color.b == note_color.b) {
+                saw_tinted_bar = true;
+            }
+            if (c.color.r == plain_bar.r and c.color.g == plain_bar.g and c.color.b == plain_bar.b) {
+                saw_plain_bar = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_label);
+    try std.testing.expect(saw_tinted_bar);
+    try std.testing.expect(saw_plain_bar);
+}
+
+test "admonition alert: label carries half-line above, quarter-line below" {
+    const test_doc =
+        \\> [!NOTE]
+        \\> Useful info here.
+    ;
+
+    var lines_buf: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+
+    const note_color = alertColor(.note, config.is_dark_theme);
+    const lh = config.line_height;
+    var label_y: ?f32 = null;
+    var body_y: ?f32 = null;
+    var bar_y: ?f32 = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Note") and c.style.bold) {
+            label_y = c.rect.y;
+        }
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Useful")) {
+            body_y = c.rect.y;
+        }
+        if (c.kind == .fill_rect and c.rect.w == quote_bar_w and
+            c.color.r == note_color.r and c.color.g == note_color.g and c.color.b == note_color.b)
+        {
+            if (bar_y == null) bar_y = c.rect.y;
+        }
+    }
+    try std.testing.expect(label_y != null);
+    try std.testing.expect(body_y != null);
+    try std.testing.expect(bar_y != null);
+    // Half a line of air above the label (bar starts there); the body row
+    // starts a quarter line below the label row's bottom edge.
+    try std.testing.expectApproxEqAbs(label_y.? - lh * 0.5, bar_y.?, 0.01);
+    try std.testing.expectApproxEqAbs(label_y.? + lh * 1.25, body_y.?, 0.01);
+
+    // Same-line remainder shares the leader unit: it must also clear the
+    // label row (a return of label-top + 0.25 overlapped the glyphs).
+    const same_doc =
+        \\> [!NOTE] Same-line remainder here.
+    ;
+    var same_buf: [4]simd.Line = undefined;
+    var same_fence: simd.FenceState = .{};
+    const same_n = simd.scanLines(same_doc, &same_buf, &same_fence);
+    var same_cmds: [256]DrawCommand = undefined;
+    const same_count = layoutViewport(same_doc, same_buf[0..same_n], config, &same_cmds);
+    var same_label_y: ?f32 = null;
+    var same_body_y: ?f32 = null;
+    for (same_cmds[0..same_count]) |c| {
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Note") and c.style.bold) {
+            same_label_y = c.rect.y;
+        }
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "Same-line")) {
+            same_body_y = c.rect.y;
+        }
+    }
+    try std.testing.expect(same_label_y != null);
+    try std.testing.expect(same_body_y != null);
+    try std.testing.expectApproxEqAbs(same_label_y.? + lh * 1.25, same_body_y.?, 0.01);
 }
 
 /// Counts scroll-shadow strips (`fill_rect`s of shadow-strip width in the
