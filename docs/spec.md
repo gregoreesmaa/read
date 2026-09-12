@@ -13,6 +13,7 @@ HTML rendering is intentionally unsupported. Numbers for speed and size live onl
 - Unordered (`*`, `-`, `+`), ordered (`1.`, `1)`), and task (`- [ ]`, `- [x]`) lists
 - GFM tables with column measurement, cell alignment, and dividers
 - Plugin diagrams (mermaid; cached async render, code fallback)
+- YAML frontmatter (`---` … `---`/`...` at byte 0 with a `key: value` line): hidden, renders nothing
 
 ## Inlines
 
