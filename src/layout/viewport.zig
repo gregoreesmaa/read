@@ -490,7 +490,9 @@ pub const ViewportConfig = struct {
     /// bit-identical. Task 5 (main.zig) owns the table plus the parallel
     /// per-slot path buffers and fills them at open; layout threads these
     /// into `UnitCx` and only reads job `state` plus the borrowed path
-    /// bytes. Zero allocations: plain slices, linear scan of <= 16 rows.
+    /// bytes. Zero allocations: plain slices, linear scan of the attached
+    /// table (Task 5 truncates the build at 16 rows; no cap is enforced
+    /// here, so overlong tables are honored, never silently cut).
     plugins: ?[]const plugin_cache.PluginJob = null,
     plugin_paths: ?[]const [256]u8 = null,
     plugin_path_lens: ?[]const u8 = null,
@@ -2884,6 +2886,44 @@ fn emitScrollShadows(
     }
 }
 
+/// Shared plugin-fence geometry decision (issue #323, PR-1 Task 5 F1).
+/// Render, document-height, and refine paths all gate on this one lookup
+/// so measured heights agree bit-for-bit with drawn pixels: `ready` (with
+/// a borrowed path) takes the image box, `queued`/`rendering` takes the
+/// card plus one header row, everything else takes today's card.
+/// Zero allocations: index compares plus borrowed path bytes. Scans the
+/// attached table as built — Task 5 truncates the build at 16 rows, so no
+/// silent cap lives here.
+const PluginFenceGeom = struct {
+    state: ?plugin_cache.JobState = null,
+    path: ?[]const u8 = null,
+};
+
+fn pluginFenceGeom(
+    plugins: ?[]const plugin_cache.PluginJob,
+    paths: ?[]const [256]u8,
+    lens: ?[]const u8,
+    i: usize,
+) PluginFenceGeom {
+    if (plugins) |jobs| {
+        var s: usize = 0;
+        while (s < jobs.len) : (s += 1) {
+            if (jobs[s].fence_line == i) {
+                var path: ?[]const u8 = null;
+                if (paths) |p| {
+                    if (lens) |l| {
+                        if (s < p.len and s < l.len and l[s] > 0) {
+                            path = p[s][0..l[s]];
+                        }
+                    }
+                }
+                return .{ .state = jobs[s].state, .path = path };
+            }
+        }
+    }
+    return .{};
+}
+
 /// scrollable block ids from `start_block_id`.
 /// Zero heap allocations: writes directly into `commands_out`.
 /// Both `layoutViewport` (checkpoint seek) and `layoutViewportJIT`
@@ -2987,33 +3027,14 @@ pub fn renderViewportCore(
                 code_line_count += 1;
             }
 
-            // Plugin fence decision (issue #323, PR-1 Task 4): look up the
-            // job owning this fence line (linear scan, <= 16 rows, only
-            // when a table is attached). Null table, unknown fence, or
-            // naive/failed state falls through to today's code card.
-            // Zero allocations: index compare plus borrowed path bytes.
-            var plugin_slot: ?usize = null;
-            if (unit_cx.plugins) |jobs| {
-                var s: usize = 0;
-                while (s < jobs.len) : (s += 1) {
-                    if (jobs[s].fence_line == i) {
-                        plugin_slot = s;
-                        break;
-                    }
-                }
-            }
-            var plugin_state: ?plugin_cache.JobState = null;
-            var plugin_path: ?[]const u8 = null;
-            if (plugin_slot) |s| {
-                plugin_state = unit_cx.plugins.?[s].state;
-                if (unit_cx.plugin_paths) |paths| {
-                    if (unit_cx.plugin_path_lens) |lens| {
-                        if (s < paths.len and s < lens.len and lens[s] > 0) {
-                            plugin_path = paths[s][0..lens[s]];
-                        }
-                    }
-                }
-            }
+            // Plugin fence decision (issue #323, PR-1 Task 4/5): one shared
+            // lookup with the height paths (see pluginFenceGeom) so drawn
+            // pixels and measured heights agree bit-for-bit. Null table,
+            // unknown fence, or naive/failed state falls through to
+            // today's code card.
+            const plugin_geom = pluginFenceGeom(unit_cx.plugins, unit_cx.plugin_paths, unit_cx.plugin_path_lens, i);
+            const plugin_state: ?plugin_cache.JobState = plugin_geom.state;
+            const plugin_path: ?[]const u8 = plugin_geom.path;
 
             // Ready: swap the code card for the cached-PNG image box, shaped
             // like the stock image path (natural size when the platform
@@ -3849,7 +3870,28 @@ pub fn computeDocumentHeightEx(
             while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
                 code_line_count += 1;
             }
-            const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0;
+            // Plugin fence mirror (issue #323, PR-1 Task 5 F1): the same
+            // pluginFenceGeom decision the render branch draws, so the
+            // document height (scrollbar, checkpoints) tracks ready image
+            // boxes and pending header rows exactly.
+            const plugin_geom = pluginFenceGeom(unit_cx.plugins, unit_cx.plugin_paths, unit_cx.plugin_path_lens, i);
+            if (plugin_geom.state == .ready and plugin_geom.path != null) {
+                var nat_w: f32 = 0.0;
+                var nat_h: f32 = 0.0;
+                if (config.image_size_fn) |fn_ptr| {
+                    const pp = plugin_geom.path.?;
+                    if (pp.len > 0) fn_ptr(pp.ptr, @intCast(pp.len), &nat_w, &nat_h);
+                }
+                cur_y += 18.0 + laidOutImageHeight(nat_w, nat_h, content_width) + 18.0;
+                next_block_id += 1;
+                i = scan_i;
+                continue;
+            }
+            const plugin_header_h: f32 = if (plugin_geom.state == .queued or plugin_geom.state == .rendering)
+                config.line_height * 0.88
+            else
+                0.0;
+            const code_block_h = (@as(f32, @floatFromInt(code_line_count)) * (config.line_height * 0.88)) + 24.0 + plugin_header_h;
             cur_y += code_block_h + 16.0;
             next_block_id += 1;
             i = scan_i;
@@ -4422,6 +4464,85 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
     try std.testing.expectEqual(@as(usize, 0), images2);
     try std.testing.expect(saw_card);
     try std.testing.expect(saw_rendering);
+
+    // All four non-ready states: code card, never an image; only the two
+    // in-flight states carry the indicator (Task 4 review F4).
+    for ([_]plugin_cache.JobState{ .queued, .naive, .failed }) |st| {
+        jobs[0].state = st;
+        var cmds_n: [256]DrawCommand = undefined;
+        const count_n = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds_n);
+        var images_n: usize = 0;
+        var card_n = false;
+        var ind_n = false;
+        for (cmds_n[0..count_n]) |c| {
+            if (c.kind == .image) images_n += 1;
+            if (c.kind == .code_block_bg) card_n = true;
+            if (c.kind == .text_run and std.mem.indexOf(u8, c.text, "rendering") != null) ind_n = true;
+        }
+        try std.testing.expectEqual(@as(usize, 0), images_n);
+        try std.testing.expect(card_n);
+        try std.testing.expectEqual(st == .queued, ind_n);
+    }
+}
+
+test "plugin fence: ready job grows document height by the image box (#323 PR-1 Task 5 F1)" {
+    const test_doc =
+        \\```mermaid
+        \\A-->B
+        \\```
+    ;
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+
+    var jobs: [1]plugin_cache.PluginJob = .{
+        .{ .fence_line = 0, .hash = 0, .renderer = .mermaid, .state = .ready },
+    };
+    var path_bufs: [1][256]u8 = undefined;
+    var path_lens: [1]u8 = undefined;
+    const p = plugin_cache.cachePath("/tmp/C", .mermaid, 0, &path_bufs[0]).?;
+    path_lens[0] = @intCast(p.len);
+
+    const S = struct {
+        fn size800x400(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void {
+            _ = url;
+            _ = url_len;
+            out_w.* = 800.0;
+            out_h.* = 400.0;
+        }
+    };
+    const base = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .image_size_fn = S.size800x400,
+    };
+    const plain_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], base, null, null);
+    var ready_cfg = base;
+    ready_cfg.plugins = jobs[0..];
+    ready_cfg.plugin_paths = path_bufs[0..];
+    ready_cfg.plugin_path_lens = path_lens[0..];
+    const ready_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], ready_cfg, null, null);
+    // 1-line card: 1*29.75*0.88 + 24 + 16; ready image box: 36 + 300
+    // (800x400 natural in the 600px column keeps aspect: 400*600/800).
+    const card_h: f32 = 1.0 * 29.75 * 0.88 + 24.0 + 16.0;
+    const img_h: f32 = 400.0 * (600.0 / 800.0);
+    // Document height pads 50px top and bottom around the block walk.
+    try std.testing.expectApproxEqAbs(100.0 + card_h, plain_h, 0.01);
+    try std.testing.expectApproxEqAbs(100.0 + 36.0 + img_h, ready_h, 0.01);
+
+    // Refine agrees bit-for-bit: ready refines to the image box, pending
+    // to the card plus one header row, naive to today's card.
+    const cw = contentWidthOf(ready_cfg);
+    const ready_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
+    try std.testing.expectApproxEqAbs(36.0 + img_h, ready_unit.height, 0.01);
+    try std.testing.expectEqual(@as(usize, 3), ready_unit.consumed);
+    jobs[0].state = .queued;
+    const pending_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
+    try std.testing.expectApproxEqAbs(card_h + 29.75 * 0.88, pending_unit.height, 0.01);
+    jobs[0].state = .naive;
+    const naive_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
+    try std.testing.expectApproxEqAbs(card_h, naive_unit.height, 0.01);
 }
 
 test "html subset: break/kbd/mark/sub/sup/del render, fallback muted, details hidden" {
@@ -5193,8 +5314,25 @@ pub fn refineLineHeight(
                 j += 1;
                 n += 1;
             }) {}
-            const h = @as(f32, @floatFromInt(n)) * (lh * 0.88) + 24.0 + 16.0;
+            // Plugin fence mirror (issue #323, PR-1 Task 5 F1): same
+            // pluginFenceGeom decision as render/height so JIT refine
+            // converges to the drawn box, never the stale card.
+            const plugin_geom = pluginFenceGeom(config.plugins, config.plugin_paths, config.plugin_path_lens, idx);
             const consumed = if (j < lines.len) j - idx + 1 else lines.len - idx;
+            if (plugin_geom.state == .ready and plugin_geom.path != null) {
+                var nat_w: f32 = 0.0;
+                var nat_h: f32 = 0.0;
+                if (config.image_size_fn) |fn_ptr| {
+                    const pp = plugin_geom.path.?;
+                    if (pp.len > 0) fn_ptr(pp.ptr, @intCast(pp.len), &nat_w, &nat_h);
+                }
+                return .{ .height = 18.0 + laidOutImageHeight(nat_w, nat_h, content_width) + 18.0, .consumed = consumed };
+            }
+            const plugin_header_h: f32 = if (plugin_geom.state == .queued or plugin_geom.state == .rendering)
+                lh * 0.88
+            else
+                0.0;
+            const h = @as(f32, @floatFromInt(n)) * (lh * 0.88) + 24.0 + plugin_header_h + 16.0;
             return .{ .height = h, .consumed = consumed };
         },
         .table_row => {

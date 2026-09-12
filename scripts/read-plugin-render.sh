@@ -24,6 +24,9 @@ if [ "${1:-}" = "render" ]; then
     tool=$(tool_for "$renderer")
     [ -n "$tool" ] || exit 1
     command -v "$tool" >/dev/null 2>&1 || exit 1
+    # Drop any stale tmp from a crashed earlier run so a succeeding render
+    # can never promote previous bytes (Task 5 scope: OUT.tmp + rename).
+    rm -f "$out.tmp"
     case "$renderer" in
         mermaid) "$tool" -i "$src" -o "$out.tmp" ;;
     esac
