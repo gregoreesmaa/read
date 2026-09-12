@@ -70,15 +70,19 @@ mkdir -p "$cache_root/read/plugins/mermaid"
 cp test_cases/assets/mermaid-seed.png "$cache_root/read/plugins/mermaid/$seed_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid.png" --settle-images test_cases/plugin_mermaid.md
 
-# Cases 4f/4g: Huge mermaid diagrams (issue #323, PR #340 owner request) —
-# initial viewport only (no --scroll), so scrollable_doc.md stays the
-# single scrolled-viewport test case per AGENTS.md §6 / check_test_cases.sh.
+# Cases 4f/4g: Huge mermaid diagrams (issue #323, PR #340 owner request).
+# Same-file scrolled frames (images_scrolled precedent: no new test case,
+# no new test_cases/*.md), so scrollable_doc.md stays the single
+# scrolled-viewport test case per AGENTS.md §6 / check_test_cases.sh.
 # 4f (huge source): 20 mermaid fences reuse mermaid-seed.png; only the
 # first 16 reach ready (explicit MAX_PLUGIN_JOBS truncation, pinned by the
 # "collect stops at 16" unit test in plugin_cache.zig) while fences 17-20
 # stay plain code cards below the fold. 4g (huge rendered image): the
-# 476x2000 mermaid-seed-tall.png proves oversize-image geometry (width
-# clamp/fit via laidOutImageHeight, scrollbar/height math, no blowup).
+# 476x3140 mermaid-seed-tall.png — a genuinely complex 26-node flowchart
+# (branches/joins, decision diamonds, bypass rail) mirroring the fixture
+# node-for-node — proves oversize-image geometry (width clamp/fit via
+# laidOutImageHeight, scrollbar/height math, no blowup) across the initial
+# viewport plus three --scroll frames covering middle/deep/bottom.
 # Both seed through the shipped stat-exists path with zero child processes.
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: cases 4f/4g need python3 for fence hashing" >&2; exit 1; }
 if [ -n "${HOME:-}" ]; then cache_root="$HOME/Library/Caches"; else cache_root="${TMPDIR:-/tmp}/read-plugin-cache"; fi
@@ -126,6 +130,12 @@ EOF
 [ -n "$tall_hash" ] || { echo "FAIL: case 4g fence hash empty" >&2; exit 1; }
 cp test_cases/assets/mermaid-seed-tall.png "$cache_root/read/plugins/mermaid/$tall_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_tall.png" --settle-images test_cases/plugin_mermaid_tall.md
+# Below-fold frames of the SAME tall doc via the existing --scroll
+# mechanism (no src/ changes, no new test case): offsets 900/1800/2700
+# step through the 3140px render (viewport 900) to the bottom frame.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_tall__s1.png" --scroll 900 --settle-images test_cases/plugin_mermaid_tall.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_tall__s2.png" --scroll 1800 --settle-images test_cases/plugin_mermaid_tall.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid_tall__s3.png" --scroll 2700 --settle-images test_cases/plugin_mermaid_tall.md
 
 # Case 5: The ONLY test for scrollable docs (scrolled viewport virtualization)
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
