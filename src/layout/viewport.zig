@@ -3548,14 +3548,17 @@ test "list hanging indent: in-item fence card indents with its text" {
     try std.testing.expectEqualStrings("  code", stripFenceIndent("     code", 3));
     try std.testing.expectEqualStrings("x", stripFenceIndent("  x", 9));
     try std.testing.expectEqualStrings("   raw", stripFenceIndent("   raw", 0));
-    // Render: the in-item card sits right of the top-level card with the
-    // 12px card padding around stripped code text.
+    // Render (PR #324 review): cards stay per-item (in-item right of
+    // top-level) while in-item code aligns to the bullet at the fence's own
+    // indent. Window 800 -> content_x 100: top fence stays pixel-identical
+    // (bg 88, code 100); in-item fence (indent 3) codes at 132 (item bg 106).
     var cmds: [512]DrawCommand = undefined;
     const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
     const count = layoutViewport(doc, lines, config, &cmds);
     var top_bg: ?f32 = null;
     var item_bg: ?f32 = null;
     var code_x: ?f32 = null;
+    var top_code_x: ?f32 = null;
     var code_text: ?[]const u8 = null;
     var seen_bg: usize = 0;
     for (cmds[0..count]) |c| {
@@ -3563,6 +3566,9 @@ test "list hanging indent: in-item fence card indents with its text" {
             seen_bg += 1;
             if (seen_bg == 1) top_bg = c.rect.x;
             if (seen_bg == 2) item_bg = c.rect.x;
+        }
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "hi")) {
+            top_code_x = c.rect.x;
         }
         if (c.kind == .text_run and std.mem.eql(u8, c.text, "zig build test")) {
             code_x = c.rect.x;
@@ -3572,8 +3578,67 @@ test "list hanging indent: in-item fence card indents with its text" {
     try std.testing.expect(top_bg != null);
     try std.testing.expect(item_bg != null);
     try std.testing.expect(code_text != null);
+    try std.testing.expect(top_code_x != null);
     try std.testing.expect(item_bg.? > top_bg.?);
-    try std.testing.expectEqual(item_bg.? + 12.0, code_x.?);
+    try std.testing.expectEqual(@as(f32, 88.0), top_bg.?);
+    try std.testing.expectEqual(@as(f32, 106.0), item_bg.?);
+    try std.testing.expectEqual(top_bg.? + 12.0, top_code_x.?);
+    try std.testing.expectEqual(@as(f32, 132.0), code_x.?);
+}
+
+test "list bullets: centered dots with equal side spacing; code aligns to its bullet" {
+    // PR #324 review: 14px dot centered in its 18px gutter (2px each side,
+    // text column stable), and fenced code sits under the dot at its own
+    // indent. Window 800 -> content_x 100.
+    const doc =
+        \\```
+        \\code1
+        \\```
+        \\
+        \\- level1
+        \\  ```
+        \\  code2
+        \\  ```
+        \\  - level2
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    var cmds: [512]DrawCommand = undefined;
+    const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
+    const count = layoutViewport(doc, lines, config, &cmds);
+    var dots: [4]f32 = undefined;
+    var ndot: usize = 0;
+    var lead_x: ?f32 = null;
+    var code1_x: ?f32 = null;
+    var code2_x: ?f32 = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind != .text_run) continue;
+        if (std.mem.eql(u8, c.text, "•")) {
+            if (ndot < dots.len) {
+                dots[ndot] = c.rect.x;
+                ndot += 1;
+            }
+        }
+        if (std.mem.eql(u8, c.text, "level1")) lead_x = c.rect.x;
+        if (std.mem.eql(u8, c.text, "code1")) code1_x = c.rect.x;
+        if (std.mem.eql(u8, c.text, "code2")) code2_x = c.rect.x;
+    }
+    try std.testing.expectEqual(@as(usize, 2), ndot);
+    try std.testing.expect(lead_x != null);
+    try std.testing.expect(code1_x != null);
+    try std.testing.expect(code2_x != null);
+    // Level-0 dot centered: 2px from content edge, 2px to its text.
+    try std.testing.expectEqual(@as(f32, 102.0), dots[0]);
+    try std.testing.expectEqual(@as(f32, 118.0), lead_x.?);
+    try std.testing.expectEqual(dots[0] - 100.0, lead_x.? - (dots[0] + 14.0));
+    // Nested dot at its own indent, same symmetric cell.
+    try std.testing.expectEqual(@as(f32, 122.0), dots[1]);
+    // In-item code sits under the dot at its own indent (review example);
+    // top-level code stays pixel-identical at the bullet cell (dot +2 inset).
+    try std.testing.expectEqual(@as(f32, 100.0), code1_x.?);
+    try std.testing.expectEqual(dots[1], code2_x.?);
 }
 
 /// Measurement context for height/refine passes: empty command buffer, no
@@ -3841,7 +3906,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
     if (info.block_type == .bullet_list) {
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        bullet_x = ux.content_x + indent_level * 10.0;
+        // PR #324 review: the 14px bullet glyph sits centered in its 18px
+        // gutter (2px each side), so the dot has equal spacing left/right.
+        // list_tx below uses +16 for bullets to keep the text column stable.
+        bullet_x = ux.content_x + indent_level * 10.0 + 2.0;
         var text_start: usize = 1; // past the marker; skip all padding
         text_start += skipSpaces(text_slice[@min(text_start, text_slice.len)..]);
         item_text = text_slice[@min(text_start, text_slice.len)..];
@@ -3885,7 +3953,9 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         }
     }
 
-    const list_tx = bullet_x + 18.0;
+    // Bullets: 14px glyph + 2px each side = 18px cell, text column stable.
+    // Ordered markers fill their 18px cell (symmetric 0/0), unchanged.
+    const list_tx = bullet_x + if (info.block_type == .bullet_list) @as(f32, 16.0) else @as(f32, 18.0);
     const list_tw = textRight(ux) - list_tx;
     const list_rtl = leadParaDirection(ux, item_text, i + 1);
     const list_rtx = if (list_rtl) mirrorX(list_tx, list_tw, ux) else list_tx;
@@ -4475,21 +4545,30 @@ pub fn renderViewportCore(
             const block_id = next_block_id;
             next_block_id += 1;
 
-            // In-item fence (issue #324 review): the whole card —
-            // background, scroll registration, clip, and text — rides at
-            // the item column with the item content indent stripped from
-            // each code line (mirrors layoutIndentedCodeUnit). Top-level
-            // fences keep full-width cards exactly as before.
+            // In-item fence (issue #324 review): the card rides at the
+            // owning item's text column (background aligns per-item), while
+            // the code text aligns to the bullet at the fence's own indent
+            // (centered +2, mirroring layoutListUnit), so `code2` sits under
+            // the level-2 dot. Stripping still uses the owner's content
+            // need. Top-level fences stay fully pixel-identical at content_x
+            // (their code aligns to the bullet cell; the centered dot sits
+            // 2px inside), so unrelated code screenshots never churn.
             const fence_owner = fencedCodeMarker(bytes, lines, i);
-            const fence_base = if (fence_owner) |m|
+            const fence_card_base = if (fence_owner) |m|
                 itemContentX(lines[m], content_x)
+            else
+                content_x;
+            var fence_own: f32 = @floatFromInt(lines[i].indent);
+            if (fence_own > 32) fence_own = 32;
+            const fence_base = if (fence_owner != null)
+                content_x + fence_own * 10.0 + 2.0
             else
                 content_x;
             const fence_strip: usize = if (fence_owner) |m|
                 markerContentNeed(bytes, lines[m])
             else
                 0;
-            const fence_card_x = fence_base - 12.0;
+            const fence_card_x = fence_card_base - 12.0;
             const fence_card_w = content_x + content_width + 12.0 - fence_card_x;
 
             if (block_bottom >= 0 and block_top <= vp_bottom) {
