@@ -5,14 +5,15 @@ d2 seeds are genuine d2-engine renders of their test_cases/plugin_d2*.md
 fixture fence sources (d2 0.9.0; *_seed functions shell out to the real
 binary and fail loudly without it). Graphviz seeds are genuine dot-engine
 renders of their test_cases/plugin_graphviz*.md fixture fence sources
-(dot 16.0.0; same fail-loudly contract). Remaining seeds are faithful
-static mimics of real renderer output: plantuml draws the fixture's
-diagram (labels mirror the fixture), math/mathjax draw the fixture's
-formula typeset in STIX. Tall/wide companions (*-seed-tall.png,
-*-seed-wide.png) mirror the tall/wide fixtures node-for-node the same
-way; math-seed.png draws the simplified fixture formula,
-*-seed-complex.png the complex companions. Synthetic-but-plausible
-stand-ins (no plantuml/katex binaries in this env); the screenshot
+(dot 16.0.0; same fail-loudly contract). PlantUML seeds are genuine
+PlantUML-engine renders of their test_cases/plugin_plantuml*.md fixture
+fence sources (PlantUML 1.2026.8; same fail-loudly contract). Remaining
+seeds are faithful static mimics of real renderer output: math/mathjax
+draw the fixture's formula typeset in STIX. Tall/wide companions
+(*-seed-tall.png, *-seed-wide.png) mirror the tall/wide fixtures
+node-for-node the same way; math-seed.png draws the simplified fixture
+formula, *-seed-complex.png the complex companions.
+Synthetic-but-plausible stand-ins (no katex binaries in this env); the screenshot
 path proven (stat-exists seed -> ready -> stock image decode) is production,
 per suite practice (cf. scripts/gen-mermaid-seed.py).
 
@@ -104,30 +105,47 @@ def graphviz_seed():
                              ["-Tpng", "SRC", "-o", "OUT"])
 
 
+def _plantuml_render(fixture_md, out_name):
+    # Genuine PlantUML render (1.2026.8). plantuml writes to an output
+    # DIRECTORY (plantuml -tpng -o OUTDIR SRC, the shipped helper's flags),
+    # so render into a temp dir and promote the single PNG. Fails loudly
+    # without the binary.
+    import shutil
+    import subprocess
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = open(os.path.join(root, fixture_md)).read().split('\n')
+    start = next(i for i, l in enumerate(lines)
+                 if l.lstrip().startswith('```') and
+                 l.lstrip()[3:].strip().split(' ')[:1] == ['plantuml'])
+    end = next(i for i in range(start + 1, len(lines))
+               if lines[i].lstrip().startswith('```'))
+    workdir = tempfile.mkdtemp()
+    src = os.path.join(workdir, "fixture.puml")
+    with open(src, 'w') as f:
+        f.write('\n'.join(lines[start + 1:end]) + '\n')
+    outdir = os.path.join(workdir, "out")
+    os.mkdir(outdir)
+    try:
+        r = subprocess.run(["plantuml", "-tpng", "-o", outdir, src],
+                           capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("FAIL: plantuml binary not found (needed for %s)" %
+                 out_name)
+    made = [p for p in os.listdir(outdir) if p.endswith(".png")]
+    if r.returncode != 0 or len(made) != 1:
+        sys.exit("FAIL: plantuml render %s: %s" %
+                 (fixture_md, (r.stderr or '').strip()))
+    out = os.path.join(os.getcwd(), out_name)
+    shutil.move(os.path.join(outdir, made[0]), out)
+    shutil.rmtree(workdir, ignore_errors=True)
+    return Image.open(out), out_name
+
+
 def plantuml_seed():
-    # Fixture: @startuml / Reader -> Diagram : opens doc / @enduml.
-    # Sequence-diagram mimic: participant heads, dashed lifelines, one
-    # message arrow carrying the fixture's label.
-    W, H = 476, 320
-    im = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(im)
-    font = load_font(ARIAL, 22)
-    font_msg = load_font(ARIAL, 16)
-    p1 = (40, 28, 180, 68)
-    p2 = (296, 28, 436, 68)
-    d.rectangle(p1, fill=FILL, outline=EDGE, width=EDGE_W)
-    d.rectangle(p2, fill=FILL, outline=EDGE, width=EDGE_W)
-    center_text(d, 110, 48, "Reader", font)
-    center_text(d, 366, 48, "Diagram", font)
-    for x in (110, 366):
-        y = 80
-        while y < 300:
-            d.line([(x, y), (x, min(y + 8, 300))], fill=INK, width=2)
-            y += 16
-    d.line([(110, 160), (354, 160)], fill=INK, width=2)
-    d.polygon([(366, 160), (354, 151), (354, 169)], fill=INK)
-    d.text((118, 132), "opens doc", font=font_msg, fill=INK, anchor="lm")
-    return im, "plantuml-seed.png"
+    # Fixture test_cases/plugin_plantuml.md: genuine PlantUML output.
+    return _plantuml_render("test_cases/plugin_plantuml.md",
+                            "plantuml-seed.png")
 
 
 def _typeset(formula_runs, size=44, small=30, pad=28):
@@ -414,112 +432,16 @@ def graphviz_seed_wide():
                              ["-Tpng", "SRC", "-o", "OUT"])
 
 
-# PlantUML tall/wide companions use the sequence-diagram idiom of the base
-# seed (participant heads, dashed lifelines, message arrows): tall is a long
-# 14-message exchange (lifelines run the full height), wide spreads eight
-# participants across the 2000px sheet.
-_PLANT_TALL_MSGS = [
-    ("Reader", "Mmap", "zero-copy open"),
-    ("Mmap", "Blocks", "byte window"),
-    ("Blocks", "Para", "other lines"),
-    ("Para", "Blocks", "styled runs"),
-    ("Blocks", "Para", "cell text"),
-    ("Para", "Mmap", "sized boxes"),
-    ("Mmap", "Reader", "frame ready"),
-    ("Reader", "Blocks", "find query"),
-    ("Blocks", "Para", "match text"),
-    ("Para", "Reader", "match range"),
-    ("Reader", "Mmap", "copy bytes"),
-    ("Mmap", "Blocks", "reindex"),
-    ("Blocks", "Para", "tokenize"),
-    ("Para", "Reader", "await input"),
-]
-_PLANT_TALL_PARTS = ["Reader", "Mmap", "Blocks", "Para"]
-_PLANT_WIDE_PARTS = ["In", "Auth", "Cache", "Plan", "Tok", "Join", "Paint",
-                     "Idle"]
-_PLANT_WIDE_MSGS = [
-    ("In", "Auth", "request"),
-    ("Auth", "Cache", "allow"),
-    ("Cache", "Plan", "miss"),
-    ("Plan", "Tok", "split"),
-    ("Tok", "Join", "runs"),
-    ("Join", "Paint", "draw"),
-    ("Paint", "Idle", "ready"),
-]
-
-
-def _plant_heads(d, parts, x_of, font, top=28, h=40):
-    for p in parts:
-        x = x_of[p]
-        d.rectangle((x - 70, top, x + 70, top + h), fill=FILL,
-                    outline=EDGE, width=EDGE_W)
-        center_text(d, x, top + h // 2, p, font)
-
-
-def _plant_lifeline(d, x, y0, y1):
-    y = y0
-    while y < y1:
-        d.line([(x, y), (x, min(y + 8, y1))], fill=INK, width=2)
-        y += 16
-
-
-def _plant_msg(d, x0, x1, y, label, font_msg):
-    if x1 >= x0:
-        d.line([(x0, y), (x1 - 12, y)], fill=INK, width=2)
-        d.polygon([(x1, y), (x1 - 12, y - 9), (x1 - 12, y + 9)], fill=INK)
-        d.text((x0 + 8, y - 28), label, font=font_msg, fill=INK,
-               anchor="lm")
-    else:
-        d.line([(x0, y), (x1 + 12, y)], fill=INK, width=2)
-        d.polygon([(x1, y), (x1 + 12, y - 9), (x1 + 12, y + 9)], fill=INK)
-        d.text((x1 + 8, y - 28), label, font=font_msg, fill=INK,
-               anchor="lm")
-
-
 def plantuml_seed_tall():
-    # Fixture test_cases/plugin_plantuml_tall.md (14-message exchange
-    # across four participants).
-    W, H = 476, 2080
-    parts = _PLANT_TALL_PARTS
-    xs = [60, 180, 300, 420]
-    x_of = dict(zip(parts, xs))
-    im = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(im)
-    font = load_font(ARIAL, 16)
-    font_msg = load_font(ARIAL, 13)
-    for p in parts:
-        x = x_of[p]
-        d.rectangle((x - 48, 28, x + 48, 68), fill=FILL,
-                    outline=EDGE, width=EDGE_W)
-        center_text(d, x, 48, p, font)
-    for x in xs:
-        _plant_lifeline(d, x, 80, H - 24)
-    y = 200
-    for a, b, label in _PLANT_TALL_MSGS:
-        _plant_msg(d, x_of[a], x_of[b], y, label, font_msg)
-        y += 130
-    return im, "plantuml-seed-tall.png"
+    # Fixture test_cases/plugin_plantuml_tall.md: genuine PlantUML output.
+    return _plantuml_render("test_cases/plugin_plantuml_tall.md",
+                            "plantuml-seed-tall.png")
 
 
 def plantuml_seed_wide():
-    # Fixture test_cases/plugin_plantuml_wide.md (eight participants).
-    W, H = 2000, 600
-    parts = _PLANT_WIDE_PARTS
-    n = len(parts)
-    xs = [110 + i * (1780 // (n - 1)) for i in range(n)]
-    x_of = dict(zip(parts, xs))
-    im = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(im)
-    font = load_font(ARIAL, 22)
-    font_msg = load_font(ARIAL, 16)
-    _plant_heads(d, parts, x_of, font)
-    for x in xs:
-        _plant_lifeline(d, x, 80, H - 24)
-    y = 190
-    for a, b, label in _PLANT_WIDE_MSGS:
-        _plant_msg(d, x_of[a], x_of[b], y, label, font_msg)
-        y += 56
-    return im, "plantuml-seed-wide.png"
+    # Fixture test_cases/plugin_plantuml_wide.md: genuine PlantUML output.
+    return _plantuml_render("test_cases/plugin_plantuml_wide.md",
+                            "plantuml-seed-wide.png")
 
 
 def math_seed_complex():
