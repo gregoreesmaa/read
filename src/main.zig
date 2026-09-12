@@ -2547,16 +2547,26 @@ test "image completeness contracts: doc-dir resolve + URL session (#45)" {
     }
 }
 
-// Drain helper for the plugin launcher test below: spins the non-blocking
-// reap until every in-flight child lands or the spin budget runs out.
-// Returns completions drained. No sleeping: children exit in milliseconds,
-// so a bounded spin stays fast and keeps the test free of timer calls.
-fn drainPluginFor(spins: usize) c_int {
+// Deadline-bounded drain for the plugin launcher test below: spins the
+// non-blocking reap until no child is in flight or the MONOTONIC deadline
+// passes (same clock idiom as strict_benchmarks.zig). The common case
+// exits on the first all-reaped poll, so wall-clock load only delays the
+// verdict, never fails it (fixed spin budgets were a race by
+// construction); the deadline only bounds the worst case. Each phase logs
+// its own completion line so the next failure names the phase that hung.
+// Returns completions drained. No sleeping.
+fn drainPluginUntilIdle(timeout_ns: i128) c_int {
+    var start_ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &start_ts);
+    const start_ns: i128 = @as(i128, start_ts.sec) * 1_000_000_000 + start_ts.nsec;
     var total: c_int = 0;
-    var n: usize = 0;
-    while (n < spins) : (n += 1) {
+    while (true) {
         total += bridge.pollPluginCompletions();
-        if (total > 0 and bridge.platform_test_plugin_active() == 0) break;
+        if (bridge.platform_test_plugin_active() == 0) break;
+        var now_ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(.MONOTONIC, &now_ts);
+        const now_ns: i128 = @as(i128, now_ts.sec) * 1_000_000_000 + now_ts.nsec;
+        if (now_ns - start_ns >= timeout_ns) break;
     }
     return total;
 }
@@ -2603,6 +2613,9 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
             "/tmp/read-plugint3-miss-out.png",
         ));
         try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+        std.debug.print("t3 phase=probe: missing/empty renderers failed fast, no slot\n", .{});
+        // Unknown outfile: no record yet.
+        try t.expectEqual(@as(c_int, -1), bridge.pluginOutcomeFor("/tmp/read-plugint3-never-launched.png"));
 
         // Bare-name `true`: resolves, launches, drains; the missing outfile
         // marks it failed at reap while the staged src is still unlinked.
@@ -2617,8 +2630,16 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
                 "/tmp/read-plugint3-true-out.png",
             ));
             try t.expectEqual(@as(c_int, 1), bridge.platform_test_plugin_active());
-            try t.expectEqual(@as(c_int, 1), drainPluginFor(2000000));
+            std.debug.print("t3 phase=true: launched, draining (10s deadline)\n", .{});
+            const true_drained = drainPluginUntilIdle(10_000_000_000);
+            std.debug.print("t3 phase=true: drained={d} active={d} outcome={d}\n", .{
+                true_drained,
+                bridge.platform_test_plugin_active(),
+                bridge.pluginOutcomeFor("/tmp/read-plugint3-true-out.png"),
+            });
+            try t.expectEqual(@as(c_int, 1), true_drained);
             try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            try t.expectEqual(@as(c_int, 0), bridge.pluginOutcomeFor("/tmp/read-plugint3-true-out.png"));
             try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
         }
 
@@ -2631,8 +2652,16 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
             defer std.Io.Dir.deleteFileAbsolute(io, src) catch {};
             defer std.Io.Dir.deleteFileAbsolute(io, out) catch {};
             try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
-            try t.expectEqual(@as(c_int, 1), drainPluginFor(2000000));
+            std.debug.print("t3 phase=copy: launched, draining (10s deadline)\n", .{});
+            const ok_drained = drainPluginUntilIdle(10_000_000_000);
+            std.debug.print("t3 phase=copy: drained={d} active={d} outcome={d}\n", .{
+                ok_drained,
+                bridge.platform_test_plugin_active(),
+                bridge.pluginOutcomeFor(out),
+            });
+            try t.expectEqual(@as(c_int, 1), ok_drained);
             try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out));
             var buf: [64]u8 = undefined;
             const bytes = try cwd.readFile(io, out, &buf);
             try t.expectEqualStrings("graph TD\n    A-->B\n", bytes);
@@ -2658,8 +2687,18 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
             defer std.Io.Dir.deleteFileAbsolute(io, rout) catch {};
             try t.expectEqual(@as(c_int, 0), bridge.launchPluginRender(stub_path, rsrc, rout));
             try t.expectEqual(@as(c_int, 8), bridge.platform_test_plugin_active());
-            try t.expectEqual(@as(c_int, 8), drainPluginFor(8000000));
+            std.debug.print("t3 phase=cap8: 8 in flight, draining (30s deadline)\n", .{});
+            const cap_drained = drainPluginUntilIdle(30_000_000_000);
+            std.debug.print("t3 phase=cap8: drained={d} active={d}\n", .{
+                cap_drained,
+                bridge.platform_test_plugin_active(),
+            });
+            try t.expectEqual(@as(c_int, 8), cap_drained);
             try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+            // One cap-phase job landed clean per the outcome table.
+            var obuf0: [64]u8 = undefined;
+            const out0 = try std.fmt.bufPrintZ(&obuf0, "/tmp/read-plugint3-o{d}.png", .{@as(usize, 0)});
+            try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out0));
             // Rejected src was never owned: still present, no outfile made.
             _ = try cwd.statFile(io, rsrc, .{});
             try t.expectError(error.FileNotFound, cwd.statFile(io, rout, .{}));
@@ -2679,6 +2718,7 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
                 std.Io.Dir.deleteFileAbsolute(io, out) catch {};
             }
         }
+        std.debug.print("t3: all phases complete (probe/true/copy/cap8)\n", .{});
     }
 }
 

@@ -30,11 +30,16 @@ visibility-prioritized scheduling (FIFO at open for v1; follow-up).
   contain no plugin fences, so the hot path must not move.
 - Issue #14 contract, enforced by source-audit tests: no threads, no
   `fork`/`spawn` in hot files; run loop stays event-driven (no timers,
-  no polling, 0% CPU when static). Consequences:
+  no polling when idle, 0% CPU when static). Consequences:
   - `src/core/plugin_cache.zig` (new) is pure computation only and is
     ADDED to the thread-audit file list.
   - Process launching lives ONLY in `src/platform/macos.m` via
-    `NSTask` + termination handler (main-runloop callback).
+    `posix_spawn` + main-loop `waitpid` poll (per-slot `WNOHANG`,
+    called only while the in-flight count is > 0, so idle frames cost
+    nothing). Ratified Task 3 fix loop (issue #323): `NSTask`
+    termination handlers fire off-thread, violating the
+    no-threads/no-locks model; a bounded per-frame reap of at most 8
+    slots is negligible.
   - No banned substrings (`spawn(`, `fork(`, `std.Thread`,
     `Thread.spawn`, `pthread`) anywhere in Zig sources, comments
     included (substring audit).
@@ -57,7 +62,9 @@ Three layers, one direction of knowledge:
    - `cachePath(buf, renderer, hash)`: `<cache>/read/plugins/
      <renderer>/<16-hex>.png`. Cache root comes from the platform
      (VC: `NSCachesDirectory`).
-   - `PluginJob` table: fixed-cap (16 fences/doc; beyond stays code),
+   - `PluginJob` table: fixed-cap (16 fences/doc; beyond stays code —
+     16-entry Zig table vs at most 8 in-flight render children, see
+     launcher below),
      caller-provided buffer, states
      `naive | queued → rendering → ready | failed`.
      `naive` means NO job exists (prerequisites unmet or cap hit):
@@ -70,11 +77,19 @@ Three layers, one direction of knowledge:
    in the document (each a fast `command -v`; results cached for the
    session). Absent tool → every fence of that renderer is `naive`:
    the plugin does not load at all.
-3. **Launcher** (`src/platform/macos.m` only): on open, asks Zig for
-   queued jobs; runs at most ONE `NSTask` at a time (FIFO) invoking
-   the helper script; the termination handler marks the job and fires
-   the EXISTING async-image-arrival redraw path (same anchoring as
-   remote images: `VirtualCache.reset` + arrival shift). No timers.
+3. **Launcher** (`src/platform/macos.m` only): `launchPluginRender`
+   (non-blocking `posix_spawn`, int codes 1 active / 0 queued /
+   -1 failed), `pollPluginCompletions` (per-slot `WNOHANG` reap;
+   Task 5 calls it only while the in-flight count is > 0), and
+   `pluginOutcomeFor` (per-job 1 clean / 0 failed / -1 unknown query
+   by outfile path for the ready-vs-failed mark — the reap frees the
+   slot, so the exit status would otherwise be unrecoverable). At most
+   8 children in flight (`PLUGIN_MAX_INFLIGHT`) against the 16-entry
+   Zig job table; the Zig side keeps the overflow queued. Task 5
+   invokes the helper script as the renderer, so tool CLI knowledge
+   stays in the helper, not the binary. Completion fires the EXISTING
+   async-image-arrival redraw path (same anchoring as remote images:
+   `VirtualCache.reset` + arrival shift). No timers.
 4. **Helper** (`scripts/read-plugin-render.sh` + tool mapping):
    `probe <renderer>` and `render <renderer> <srcfile> <outfile>`;
    `render` re-probes first and exits nonzero when absent (→ `failed`
@@ -112,8 +127,10 @@ Three layers, one direction of knowledge:
 - Nonzero exit / no PNG after exit / PNG undecodable: `failed` →
   code card, indicator cleared, no retry this session.
 - Cache write races (two readers): content-addressed bytes are
-  identical; last-writer-wins is safe. Partial writes: helper writes
-  to `OUT.tmp` + renames (atomic).
+  identical; last-writer-wins is safe. Partial writes: the atomic
+  `OUT.tmp` + rename is owned by the helper script (Task 5 scope);
+  the C layer validates the outfile at reap (exists + nonzero +
+  mtime) and reports the verdict via `pluginOutcomeFor`.
 - Security: renderers run locally on document bytes (same trust as
   the document); no network by the reader; cache dir only; renderer
   crashes never affect the reader (reaped, marked failed).
