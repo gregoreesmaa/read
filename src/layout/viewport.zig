@@ -1980,6 +1980,71 @@ fn isIndentedBy(bytes: []const u8, line: simd.Line, n: usize) bool {
     return w >= n;
 }
 
+/// Leading-whitespace width of a line in source columns (space = 1, tab =
+/// next multiple of 4): the full column space `isIndentedBy` gates on.
+fn indentColumns(bytes: []const u8, line: simd.Line) usize {
+    const raw = bytes[line.offset..][0..line.len];
+    var w: usize = 0;
+    for (raw) |c| {
+        if (c == ' ') {
+            w += 1;
+        } else if (c == '\t') {
+            w += 4 - (w % 4);
+        } else break;
+    }
+    return w;
+}
+
+/// Source column where a list item's content starts: the CommonMark content
+/// indent a continuation line must reach to belong to the item (`- ` -> 2,
+/// `1. ` -> 3, `- [ ] ` -> 6; the marker's own indent included for nested
+/// items). Five-plus columns of padding, a blank remainder, or missing
+/// padding collapse to marker end + 1. Unrecognized markers fall back to
+/// the legacy 4-column gate. Cold: runs once per resolved owner.
+fn markerContentNeed(bytes: []const u8, marker: simd.Line) usize {
+    const raw = bytes[marker.offset..][0..marker.len];
+    var i: usize = 0;
+    var col: usize = 0;
+    while (i < raw.len and (raw[i] == ' ' or raw[i] == '\t')) {
+        if (raw[i] == ' ') {
+            col += 1;
+        } else {
+            col += 4 - (col % 4);
+        }
+        i += 1;
+    }
+    var tok: usize = 0;
+    if (i < raw.len and (raw[i] == '-' or raw[i] == '+' or raw[i] == '*')) {
+        tok = 1;
+        if (i + 5 <= raw.len and raw[i + 1] == ' ' and raw[i + 2] == '[' and
+            (raw[i + 3] == ' ' or raw[i + 3] == 'x' or raw[i + 3] == 'X') and raw[i + 4] == ']')
+        {
+            tok = 5;
+        }
+    } else {
+        var d = i;
+        while (d < raw.len and raw[d] >= '0' and raw[d] <= '9') : (d += 1) {}
+        if (d > i and d < raw.len and (raw[d] == '.' or raw[d] == ')')) {
+            tok = (d - i) + 1;
+        } else {
+            return col + 4;
+        }
+    }
+    const tend = col + tok;
+    var pc = tend;
+    var k = i + tok;
+    while (k < raw.len and (raw[k] == ' ' or raw[k] == '\t')) {
+        if (raw[k] == ' ') {
+            pc += 1;
+        } else {
+            pc += 4 - (pc % 4);
+        }
+        k += 1;
+    }
+    if (k >= raw.len or pc == tend or pc - tend >= 5) return tend + 1;
+    return pc;
+}
+
 /// CommonMark lazy continuation: a plain paragraph line that continues the
 /// current block even without a marker. Only paragraph continuation text
 /// qualifies — headings, lists, rules, tables, code, images, and blanks all
@@ -2354,6 +2419,11 @@ fn indentedCodeLeader(bytes: []const u8, lines: []const simd.Line, j: usize) ?us
     const bt = lines[j].block_type;
     if ((bt == .quote or isHeadingType(bt) or bt == .hr) and
         listContentMarker(bytes, lines, j, 4) != null) return null;
+    // In-item lazy paragraphs (e.g. a continuation after an in-item fence)
+    // belong to the item at any indent, never to top-level code: without
+    // this, a 4sp+ trailing line after an in-item fence_end falls through
+    // to `return k` below and renders as a code card (issue #324).
+    if (enclosingListMarker(bytes, lines, j) != null) return null;
     // Run start: step back over adjacent code rows only (inside blanks are
     // resolved forward by lookahead, never by crossing them here).
     var k = j;
@@ -2837,18 +2907,26 @@ fn emitCheckbox(ux: *UnitCx, tx: f32, y: f32, checked: bool) void {
 
 /// Content x for a list item's text given its marker line.
 fn itemContentX(marker: simd.Line, content_x: f32) f32 {
-    if (marker.block_type == .task_list) return content_x + 28.0;
+    if (marker.block_type == .task_list) return content_x + 30.0;
     var indent_level: f32 = @floatFromInt(marker.indent);
     if (indent_level > 32) indent_level = 32;
-    return content_x + indent_level * 10.0 + 18.0;
+    // PR #324 review: 30px gutter per level (8px pad each side of the
+    // marker), matching layoutListUnit so GitHub-like columns agree.
+    // Each source indent column maps to 18px, so a 2-space nested level
+    // steps 36px: its dot lands ~14px right of the parent text column,
+    // like GitHub, never flush under it.
+    return content_x + indent_level * 18.0 + 30.0;
 }
 
 /// Owns paragraph line `j`: the list-item marker whose unit contains it, or
 /// null. Ownership follows j's paragraph run: a run directly after a marker
-/// is segment 0 (any indent, lazy text); otherwise the run must start
-/// 4-space/tab indented but below code level (8sp+ is an in-item code block,
-/// never paragraph text). Earlier segments resolve through blank gaps the
-/// same way. Iterative and capped.
+/// is segment 0 (any indent, lazy text); otherwise the run must be indented
+/// but below code level (8sp+ is an in-item code block, never paragraph
+/// text). Earlier segments resolve through blank gaps the same way, and an
+/// in-item fenced block no longer cuts the chain. Every crossed run/fence
+/// start must clear the owning marker's CommonMark content indent
+/// (`markerContentNeed`: `- ` takes 2, `1. ` takes 3); a short segment ends
+/// the item instead of joining it. Iterative and capped.
 fn enclosingListMarker(bytes: []const u8, lines: []const simd.Line, j: usize) ?usize {
     if (!isLazyContinuation(bytes, lines, j)) return null;
     // Run containing j (direct lazy connections, no blanks crossed).
@@ -2859,28 +2937,63 @@ fn enclosingListMarker(bytes: []const u8, lines: []const simd.Line, j: usize) ?u
         r -= 1;
     }
     if (r > 0 and isListLeader(lines[r - 1].block_type)) return r - 1;
-    // Post-blank run: indented content, never code-level.
-    if (!isIndentedBy(bytes, lines[r], 4) or isIndentedBy(bytes, lines[r], 8)) return null;
+    // Post-gap run: 2 is the smallest content indent any marker needs
+    // (`- `); the exact need — and the relative code-level cutoff — is
+    // verified once the marker resolves below, so no absolute cap here.
+    if (!isIndentedBy(bytes, lines[r], 2)) return null;
+    // Starts crossed between the marker and j whose indent the resolved
+    // need must cover. Fixed scratch, zero allocations; overflow orphans
+    // deterministically (top-level) instead of risking a corrupt claim.
+    var segs: [64]usize = undefined;
+    segs[0] = r;
+    var nseg: usize = 1;
     // Walk back over gaps and item content to the marker.
     var k = r;
     var guard: usize = 0;
+    var m: ?usize = null;
     while (k > 0 and guard < 512) : (guard += 1) {
         while (k > 0 and lines[k - 1].block_type == .blank) k -= 1;
         if (k == 0) return null;
         const pk = k - 1;
         const pb = lines[pk].block_type;
-        if (isListLeader(pb)) return pk;
+        if (isListLeader(pb)) {
+            m = pk;
+            break;
+        }
         if (pb == .paragraph) {
-            // Previous run: seg0-anchored, or indented non-code.
+            // Previous run: seg0-anchored (lazy, exempt), or indented
+            // non-code (recorded for the need check below).
             var r2 = pk;
             while (r2 > 0 and lines[r2 - 1].block_type == .paragraph and
                 isLazyContinuation(bytes, lines, r2))
             {
                 r2 -= 1;
             }
-            if (r2 > 0 and isListLeader(lines[r2 - 1].block_type)) return r2 - 1;
-            if (!isIndentedBy(bytes, lines[r2], 4) or isIndentedBy(bytes, lines[r2], 8)) return null;
+            if (r2 > 0 and isListLeader(lines[r2 - 1].block_type)) {
+                m = r2 - 1;
+                break;
+            }
+            if (!isIndentedBy(bytes, lines[r2], 2)) return null;
+            if (nseg >= segs.len) return null;
+            segs[nseg] = r2;
+            nseg += 1;
             k = r2;
+            continue;
+        }
+        // Cross a whole in-item fenced block as one segment: the fence
+        // start must itself clear the need (a col-0 fence ended the item).
+        if (pb == .code_fence_end) {
+            var q = pk;
+            while (q > 0 and lines[q].block_type != .code_fence_start) {
+                if (guard >= 512) return null;
+                guard += 1;
+                q -= 1;
+            }
+            if (lines[q].block_type != .code_fence_start) return null;
+            if (nseg >= segs.len) return null;
+            segs[nseg] = q;
+            nseg += 1;
+            k = q;
             continue;
         }
         // Cross in-item quote / heading / hr (4sp+) and code (8sp+) lines.
@@ -2896,7 +3009,19 @@ fn enclosingListMarker(bytes: []const u8, lines: []const simd.Line, j: usize) ?u
         }
         return null;
     }
-    return null;
+    const owner = m orelse return null;
+    const need = markerContentNeed(bytes, lines[owner]);
+    // Code-level cutoff is relative, never absolute: 8sp+ lines in a
+    // shallow item are in-item code, but the same columns in a deep item
+    // (need > 4) are still lazy paragraph text. max() keeps every
+    // need <= 4 outcome bit-identical while opening [8, need + 4) for
+    // deep owners (issue #324: level-3+ trailers after in-item fences).
+    const code_cut = @max(8, need + 4);
+    for (segs[0..nseg]) |s| {
+        const w = indentColumns(bytes, lines[s]);
+        if (w < need or w >= code_cut) return null;
+    }
+    return owner;
 }
 
 /// Marker owning an indented non-paragraph content line (in-item quote /
@@ -2935,6 +3060,639 @@ fn listContentBase(ux: *UnitCx, i: usize, need: usize) ?f32 {
         return itemContentX(ux.lines[m], ux.content_x);
     }
     return null;
+}
+
+/// Marker owning the fenced code block whose fence-start line is `i`
+/// (an in-item fence indented under the marker's content column), or null
+/// for top-level fences. A fence indented under 2 columns can never be
+/// item-owned (2 is the smallest content indent any marker needs); every
+/// crossed segment (an earlier in-item fence, quote, heading, hr, or code
+/// line) must clear the owner's `markerContentNeed`, so a col-0 fence
+/// between the marker and `i` ends the item instead of joining it.
+/// Mirrors `listContentMarker` with fence-specific need; the caller strips
+/// that need from each code line. Cold: runs once per fenced block.
+fn fencedCodeMarker(bytes: []const u8, lines: []const simd.Line, i: usize) ?usize {
+    if (i >= lines.len) return null;
+    if (lines[i].block_type != .code_fence_start) return null;
+    if (!isIndentedBy(bytes, lines[i], 2)) return null;
+    // Fence starts crossed between the marker and i whose indent the
+    // resolved need must cover. Fixed scratch, zero allocations; overflow
+    // orphans deterministically (top-level) instead of risking a corrupt
+    // claim.
+    var segs: [64]usize = undefined;
+    segs[0] = i;
+    var nseg: usize = 1;
+    var k = i;
+    var m: ?usize = null;
+    var guard: usize = 0;
+    while (k > 0 and guard < 512) : (guard += 1) {
+        while (k > 0 and lines[k - 1].block_type == .blank) k -= 1;
+        if (k == 0) return null;
+        const pk = k - 1;
+        const pb = lines[pk].block_type;
+        if (isListLeader(pb)) {
+            m = pk;
+            break;
+        }
+        if (pb == .paragraph) {
+            if (enclosingListMarker(bytes, lines, pk)) |om| {
+                m = om;
+                break;
+            }
+            return null;
+        }
+        // Cross a whole earlier in-item fenced block as one segment.
+        if (pb == .code_fence_end) {
+            var q = pk;
+            while (q > 0 and lines[q].block_type != .code_fence_start) {
+                if (guard >= 512) return null;
+                guard += 1;
+                q -= 1;
+            }
+            if (lines[q].block_type != .code_fence_start) return null;
+            if (nseg >= segs.len) return null;
+            segs[nseg] = q;
+            nseg += 1;
+            k = q;
+            continue;
+        }
+        // Cross in-item quote / heading / hr (4sp+) and code (8sp+) lines.
+        if ((pb == .quote or isHeadingType(pb) or pb == .hr) and
+            isIndentedBy(bytes, lines[pk], 4))
+        {
+            if (nseg >= segs.len) return null;
+            segs[nseg] = pk;
+            nseg += 1;
+            k = pk;
+            continue;
+        }
+        if (isCodeClaimable(pb) and isIndentedBy(bytes, lines[pk], 8)) {
+            if (nseg >= segs.len) return null;
+            segs[nseg] = pk;
+            nseg += 1;
+            k = pk;
+            continue;
+        }
+        return null;
+    }
+    const owner = m orelse return null;
+    const need = markerContentNeed(bytes, lines[owner]);
+    for (segs[0..nseg]) |s| {
+        if (indentColumns(bytes, lines[s]) < need) return null;
+    }
+    return owner;
+}
+
+/// Shape of a fence-marker line: the run character, its length, whether the
+/// rest is blank, and (for backtick opens) whether the info string holds a
+/// backtick. Mirrors the scanner's `classifyFenceBody` gate byte-for-byte;
+/// the scanner owns indent < 4, so promotion only fires at indent >= 4.
+const FenceShape = struct {
+    char: u8,
+    run: usize,
+    rest_blank: bool,
+    info_backtick: bool,
+    indent_w: usize,
+};
+
+fn fenceRunShape(bytes: []const u8, line: simd.Line) ?FenceShape {
+    const raw = bytes[line.offset..][0..line.len];
+    var idx: usize = 0;
+    var w: usize = 0;
+    while (idx < raw.len and (raw[idx] == ' ' or raw[idx] == '\t')) {
+        if (raw[idx] == ' ') {
+            w += 1;
+        } else {
+            w += 4 - (w % 4);
+        }
+        idx += 1;
+    }
+    if (idx + 3 > raw.len) return null;
+    const first = raw[idx];
+    if (first != '`' and first != '~') return null;
+    if (raw[idx + 1] != first or raw[idx + 2] != first) return null;
+    var run: usize = 3;
+    while (idx + run < raw.len and raw[idx + run] == first) : (run += 1) {}
+    var rest = idx + run;
+    while (rest < raw.len and (raw[rest] == ' ' or raw[rest] == '\t')) : (rest += 1) {}
+    var info_backtick = false;
+    var t = rest;
+    while (t < raw.len) : (t += 1) {
+        if (raw[t] == '`') info_backtick = true;
+    }
+    return .{
+        .char = first,
+        .run = run,
+        .rest_blank = rest >= raw.len,
+        .info_backtick = info_backtick,
+        .indent_w = w,
+    };
+}
+
+/// True when the nearest preceding non-blank line belongs to the same item
+/// `owner`: the marker itself, its paragraph/code content, or its closed
+/// fence. Anything else (a foreign block, a foreign item's content) means
+/// the candidate cannot open here. Blanks are looked through, mirroring the
+/// ownership walk above.
+fn nestedFencePrevOwned(bytes: []const u8, lines: []const simd.Line, i: usize, owner: usize) bool {
+    var k = i;
+    while (k > 0 and lines[k - 1].block_type == .blank) k -= 1;
+    if (k == 0) return false;
+    const p = k - 1;
+    const pb = lines[p].block_type;
+    if (isListLeader(pb)) return p == owner;
+    if (pb == .paragraph) {
+        const po = enclosingListMarker(bytes, lines, p) orelse return false;
+        return po == owner;
+    }
+    if (pb == .code_fence_end) {
+        var q = p;
+        while (q > 0 and lines[q].block_type != .code_fence_start) q -= 1;
+        if (lines[q].block_type != .code_fence_start) return false;
+        const fo = fencedCodeMarker(bytes, lines, q) orelse return false;
+        return fo == owner;
+    }
+    if (pb == .code_line) {
+        const co = listContentMarker(bytes, lines, p, 8) orelse return false;
+        return co == owner;
+    }
+    return false;
+}
+
+/// Close index for a nested open at `i` (same character, run >= open run,
+/// blank rest, still clearing the owner's need), or null when the region is
+/// unbounded here: EOF without a close, a line dedenting out of the item,
+/// or a scanner-claimed fence inside (scanner topology wins; promotion only
+/// fires in scanner-clean regions). Every accepted close keeps the fold,
+/// the owner claim, and the indent strip exactly where the level-0 in-item
+/// fence path already proves them.
+fn nestedFenceClose(bytes: []const u8, lines: []const simd.Line, i: usize, need: usize, open: FenceShape) ?usize {
+    var j = i + 1;
+    while (j < lines.len) : (j += 1) {
+        const bt = lines[j].block_type;
+        if (bt == .blank) continue;
+        if (bt == .code_fence_start or bt == .code_fence_end) return null;
+        if (indentColumns(bytes, lines[j]) < need) return null;
+        const sh = fenceRunShape(bytes, lines[j]) orelse continue;
+        if (sh.char != open.char or sh.run < open.run or !sh.rest_blank) continue;
+        if (sh.indent_w > need + 3) continue;
+        return j;
+    }
+    return null;
+}
+
+/// Promote nested in-item fences the context-free scanner cannot classify:
+/// a ```/~~~ run at indent >= 4 owned by a list item whose content column
+/// it clears by at most 3 (CommonMark: fence indent is relative to the
+/// container; 4+ relative is indented code, never a fence). Between-lines
+/// become code (blank lines stay blank), mirroring scanner-classified
+/// fences, so measure/render/refine and the owner claim work unchanged.
+/// Runs once per open (cold); the SIMD scanner is untouched, so no hot-path
+/// cost and no benchmark movement. Conservative: anything ambiguous
+/// (unclosed, dedented, scanner-claimed inside) is left exactly as today.
+pub fn promoteNestedFences(bytes: []const u8, lines: []simd.Line) void {
+    var i: usize = 0;
+    while (i < lines.len) : (i += 1) {
+        if (lines[i].block_type != .paragraph) continue;
+        const open = fenceRunShape(bytes, lines[i]) orelse continue;
+        if (open.indent_w < 4) continue;
+        if (open.char == '`' and open.info_backtick) continue;
+        const owner = enclosingListMarker(bytes, lines, i) orelse continue;
+        const need = markerContentNeed(bytes, lines[owner]);
+        if (open.indent_w < need or open.indent_w > need + 3) continue;
+        if (!nestedFencePrevOwned(bytes, lines, i, owner)) continue;
+        const close = nestedFenceClose(bytes, lines, i, need, open) orelse continue;
+        lines[i].block_type = .code_fence_start;
+        var j = i + 1;
+        while (j < close) : (j += 1) {
+            if (lines[j].block_type != .blank) lines[j].block_type = .code_line;
+        }
+        lines[close].block_type = .code_fence_end;
+        i = close;
+    }
+}
+
+test "nested fences: levels 1-2 promote with owner and close" {
+    const doc =
+        \\- zero:
+        \\  ```
+        \\  echo zero
+        \\  ```
+        \\  - one:
+        \\    ```
+        \\    echo one
+        \\    ```
+        \\    - two:
+        \\      ```
+        \\      echo two
+        \\      ```
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(@as(usize, 12), n);
+    // Scanner owns the level-0 fence; nested markers stay paragraphs.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.paragraph, lines[5].block_type);
+    try std.testing.expectEqual(simd.BlockType.paragraph, lines[9].block_type);
+    promoteNestedFences(doc, lines);
+    // Level-1 region promotes with the level-1 marker as owner.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[5].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_line, lines[6].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[7].block_type);
+    try std.testing.expectEqual(@as(?usize, 4), fencedCodeMarker(doc, lines, 5));
+    // Level-2 region promotes with the level-2 marker as owner.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[9].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_line, lines[10].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[11].block_type);
+    try std.testing.expectEqual(@as(?usize, 8), fencedCodeMarker(doc, lines, 9));
+    // The scanner fence is untouched.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[1].block_type);
+}
+
+test "nested fences: top-level indented backticks stay literal" {
+    const doc =
+        \\para
+        \\
+        \\    ```
+        \\    not a fence
+        \\    ```
+    ;
+    var lines_buf: [8]simd.Line = undefined;
+    var fstate: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fstate);
+    const lines = lines_buf[0..n];
+    const before = lines[2].block_type;
+    try std.testing.expect(before != .code_fence_start);
+    promoteNestedFences(doc, lines);
+    try std.testing.expectEqual(before, lines[2].block_type);
+    try std.testing.expectEqual(before, lines[3].block_type);
+    try std.testing.expectEqual(before, lines[4].block_type);
+}
+
+test "nested fences: unclosed and dedented regions stay literal" {
+    const unclosed =
+        \\- item:
+        \\    ```
+        \\    echo hi
+    ;
+    var ubuf: [8]simd.Line = undefined;
+    var uf: simd.FenceState = .{};
+    const un = simd.scanLines(unclosed, &ubuf, &uf);
+    const ulines = ubuf[0..un];
+    promoteNestedFences(unclosed, ulines);
+    try std.testing.expect(ulines[1].block_type != .code_fence_start);
+    const dedented =
+        \\- item:
+        \\    ```
+        \\    echo hi
+        \\```
+        \\tail
+    ;
+    var dbuf: [8]simd.Line = undefined;
+    var df: simd.FenceState = .{};
+    const dn = simd.scanLines(dedented, &dbuf, &df);
+    const dlines = dbuf[0..dn];
+    // The col-0 fence is the scanner's; the nested open must not promote.
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, dlines[3].block_type);
+    promoteNestedFences(dedented, dlines);
+    try std.testing.expect(dlines[1].block_type != .code_fence_start);
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, dlines[3].block_type);
+}
+
+test "nested fences: info strings and tildes promote, backtick info does not" {
+    const doc =
+        \\- item:
+        \\    ```js
+        \\    const x = 1;
+        \\    ```
+        \\    ~~~
+        \\    wave
+        \\    ~~~
+    ;
+    var lines_buf: [12]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    promoteNestedFences(doc, lines);
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[1].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[3].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_start, lines[4].block_type);
+    try std.testing.expectEqual(simd.BlockType.code_fence_end, lines[6].block_type);
+    try std.testing.expectEqual(@as(?usize, 0), fencedCodeMarker(doc, lines, 1));
+    const bad =
+        \\- item2:
+        \\    ```a`b
+        \\    literal
+        \\    ```
+    ;
+    var bbuf: [8]simd.Line = undefined;
+    var bf: simd.FenceState = .{};
+    const bn = simd.scanLines(bad, &bbuf, &bf);
+    const blines = bbuf[0..bn];
+    promoteNestedFences(bad, blines);
+    try std.testing.expect(blines[1].block_type != .code_fence_start);
+    try std.testing.expect(blines[3].block_type != .code_fence_end);
+}
+
+test "nested fences: trailers after in-item fences stay item paragraphs" {
+    const doc =
+        \\- zero:
+        \\  ```
+        \\  echo zero
+        \\  ```
+        \\  trailing zero.
+        \\  - one:
+        \\    ```
+        \\    echo one
+        \\    ```
+        \\    trailing one.
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(@as(usize, 10), n);
+    promoteNestedFences(doc, lines);
+    // Both trailers stay owned by their items, never top-level code.
+    try std.testing.expectEqual(@as(?usize, 0), enclosingListMarker(doc, lines, 4));
+    try std.testing.expectEqual(@as(?usize, 5), enclosingListMarker(doc, lines, 9));
+    try std.testing.expect(indentedCodeLeader(doc, lines, 4) == null);
+    try std.testing.expect(indentedCodeLeader(doc, lines, 9) == null);
+    // Sanity: genuine top-level code after a fence still claims.
+    const top =
+        \\```
+        \\fence
+        \\```
+        \\    top code
+    ;
+    var tbuf: [8]simd.Line = undefined;
+    var tf: simd.FenceState = .{};
+    const tn = simd.scanLines(top, &tbuf, &tf);
+    const tlines = tbuf[0..tn];
+    promoteNestedFences(top, tlines);
+    try std.testing.expect(indentedCodeLeader(top, tlines, 3) != null);
+}
+
+test "list hanging indent: sub-4sp continuations stay owned by the item" {
+    const doc =
+        \\1. Tests + strict benchmarks green:
+        \\   ```bash
+        \\   zig build test -Doptimize=ReleaseFast --summary all
+        \\   ```
+        \\   100% of tests must pass the targets.
+        \\   Never loosen the target.
+        \\
+        \\- Bullet lead with text:
+        \\  Two-space bullet continuation owned.
+    ;
+    var lines_buf: [32]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(@as(usize, 9), n);
+    // The 3-space paragraph after the in-item fence still belongs to `1. `.
+    try std.testing.expectEqual(@as(?usize, 0), enclosingListMarker(doc, lines, 4));
+    // Its lazy follower rides along.
+    try std.testing.expectEqual(@as(?usize, 0), enclosingListMarker(doc, lines, 5));
+    // A 2-space continuation satisfies a `- ` marker.
+    try std.testing.expectEqual(@as(?usize, 7), enclosingListMarker(doc, lines, 8));
+}
+
+test "list hanging indent: under-indented post-blank lines end the item" {
+    const doc =
+        \\1. Ordered lead.
+        \\
+        \\  Two spaces cannot satisfy a one-digit ordered marker.
+        \\
+        \\- [ ] Task lead.
+        \\
+        \\    Four spaces cannot satisfy a task marker.
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(@as(usize, 7), n);
+    try std.testing.expect(enclosingListMarker(doc, lines, 2) == null);
+    try std.testing.expect(enclosingListMarker(doc, lines, 6) == null);
+}
+
+test "list hanging indent: marker content indent table" {
+    const doc =
+        \\- b
+        \\1. o
+        \\10. t
+        \\100. h
+        \\2) p
+        \\- [ ] u
+        \\- [x] c
+        \\  - n
+        \\1.   wide
+        \\1.     five
+        \\-
+    ;
+    // `- ` -> 2, `1. ` -> 3, `10. ` -> 4, `100. ` -> 5, `2) ` -> 3,
+    // task boxes -> 6, nested `  - ` -> 4, triple-space pad -> 5,
+    // five-space pad collapses to marker + 1, bare marker -> 2.
+    const want = [_]usize{ 2, 3, 4, 5, 3, 6, 6, 4, 5, 3, 2 };
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(want.len, n);
+    for (want, 0..) |w, idx| {
+        try std.testing.expectEqual(w, markerContentNeed(doc, lines[idx]));
+    }
+}
+
+test "list hanging indent: wide markers and task boxes" {
+    const doc =
+        \\10. Tenth lead.
+        \\
+        \\    Four-space continuation owned by `10. `.
+        \\
+        \\   Three spaces end a `10. ` item.
+        \\
+        \\- [x] Done task.
+        \\
+        \\      Six-space continuation owned by the task box.
+        \\
+        \\- outer
+        \\  - nested
+        \\
+        \\  Rejoining the outer item past a blank is a known limitation:
+        \\  the short run fails the nested need and stays top-level
+        \\  instead of risking a wrong claim.
+    ;
+    var lines_buf: [32]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    try std.testing.expectEqual(@as(usize, 16), n);
+    try std.testing.expectEqual(@as(?usize, 0), enclosingListMarker(doc, lines, 2));
+    try std.testing.expect(enclosingListMarker(doc, lines, 4) == null);
+    try std.testing.expectEqual(@as(?usize, 6), enclosingListMarker(doc, lines, 8));
+    try std.testing.expect(enclosingListMarker(doc, lines, 13) == null);
+    try std.testing.expect(enclosingListMarker(doc, lines, 14) == null);
+}
+
+test "list hanging indent: continuation rows share the lead row x" {
+    const doc =
+        \\1. Lead words here then more words to fill:
+        \\   ```bash
+        \\   zig build test
+        \\   ```
+        \\   100% continuation words must align under lead.
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
+    const count = layoutViewport(doc, lines, config, &cmds);
+    var lead_x: ?f32 = null;
+    var cont_x: ?f32 = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind != .text_run) continue;
+        if (std.mem.eql(u8, c.text, "Lead")) lead_x = c.rect.x;
+        if (std.mem.eql(u8, c.text, "100%")) cont_x = c.rect.x;
+    }
+    try std.testing.expect(lead_x != null);
+    try std.testing.expect(cont_x != null);
+    try std.testing.expectEqual(lead_x.?, cont_x.?);
+}
+
+test "list hanging indent: in-item fence card indents with its text" {
+    const doc =
+        \\```top
+        \\hi
+        \\```
+        \\
+        \\1. Lead words here then more words to fill:
+        \\   ```bash
+        \\   zig build test
+        \\   ```
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    // Resolver: top-level fence unowned, in-item fence owned by `1. `.
+    try std.testing.expectEqual(@as(?usize, null), fencedCodeMarker(doc, lines, 0));
+    try std.testing.expectEqual(@as(?usize, 4), fencedCodeMarker(doc, lines, 5));
+    // A 2-space fence cannot satisfy `1. ` (need 3).
+    const short =
+        \\1. Lead:
+        \\  ```
+        \\  x
+        \\  ```
+    ;
+    var short_buf: [8]simd.Line = undefined;
+    var short_fence: simd.FenceState = .{};
+    const sn = simd.scanLines(short, &short_buf, &short_fence);
+    try std.testing.expectEqual(@as(?usize, null), fencedCodeMarker(short, short_buf[0..sn], 1));
+    // Strip helper: need columns, tab stops, short lines, no-op at 0.
+    try std.testing.expectEqualStrings("zig build test", stripFenceIndent("   zig build test", 3));
+    try std.testing.expectEqualStrings("  code", stripFenceIndent("     code", 3));
+    try std.testing.expectEqualStrings("x", stripFenceIndent("  x", 9));
+    try std.testing.expectEqualStrings("   raw", stripFenceIndent("   raw", 0));
+    // Render (PR #324 review, GitHub-like card model): card left edges sit
+    // exactly on the same-indent text column, code 12px inside. Window 800
+    // -> content_x 100: top card at 100 with code at 112; in-item card at
+    // the ordered item's text column 130 with code at 142.
+    var cmds: [512]DrawCommand = undefined;
+    const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
+    const count = layoutViewport(doc, lines, config, &cmds);
+    var top_bg: ?f32 = null;
+    var item_bg: ?f32 = null;
+    var code_x: ?f32 = null;
+    var top_code_x: ?f32 = null;
+    var code_text: ?[]const u8 = null;
+    var seen_bg: usize = 0;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .code_block_bg) {
+            seen_bg += 1;
+            if (seen_bg == 1) top_bg = c.rect.x;
+            if (seen_bg == 2) item_bg = c.rect.x;
+        }
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "hi")) {
+            top_code_x = c.rect.x;
+        }
+        if (c.kind == .text_run and std.mem.eql(u8, c.text, "zig build test")) {
+            code_x = c.rect.x;
+            code_text = c.text;
+        }
+    }
+    try std.testing.expect(top_bg != null);
+    try std.testing.expect(item_bg != null);
+    try std.testing.expect(code_text != null);
+    try std.testing.expect(top_code_x != null);
+    try std.testing.expect(item_bg.? > top_bg.?);
+    try std.testing.expectEqual(@as(f32, 100.0), top_bg.?);
+    try std.testing.expectEqual(@as(f32, 130.0), item_bg.?);
+    try std.testing.expectEqual(top_bg.? + 12.0, top_code_x.?);
+    try std.testing.expectEqual(item_bg.? + 12.0, code_x.?);
+}
+
+test "list bullets: centered dots with equal side spacing; card flush with text" {
+    // PR #324 review, GitHub-like model: 14px dot centered in its 22px
+    // gutter (4px each side); code cards sit flush on the same-indent text
+    // column with code 12px inside. Window 800 -> content_x 100.
+    const doc =
+        \\```
+        \\code1
+        \\```
+        \\
+        \\- level1
+        \\  ```
+        \\  code2
+        \\  ```
+        \\  - level2
+    ;
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    var cmds: [512]DrawCommand = undefined;
+    const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
+    const count = layoutViewport(doc, lines, config, &cmds);
+    var dots: [4]f32 = undefined;
+    var ndot: usize = 0;
+    var lead_x: ?f32 = null;
+    var code1_x: ?f32 = null;
+    var code2_x: ?f32 = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind != .text_run) continue;
+        if (std.mem.eql(u8, c.text, "•")) {
+            if (ndot < dots.len) {
+                dots[ndot] = c.rect.x;
+                ndot += 1;
+            }
+        }
+        if (std.mem.eql(u8, c.text, "level1")) lead_x = c.rect.x;
+        if (std.mem.eql(u8, c.text, "code1")) code1_x = c.rect.x;
+        if (std.mem.eql(u8, c.text, "code2")) code2_x = c.rect.x;
+    }
+    try std.testing.expectEqual(@as(usize, 2), ndot);
+    try std.testing.expect(lead_x != null);
+    try std.testing.expect(code1_x != null);
+    try std.testing.expect(code2_x != null);
+    // Level-0 dot centered: 8px from content edge, 8px to its text.
+    try std.testing.expectEqual(@as(f32, 108.0), dots[0]);
+    try std.testing.expectEqual(@as(f32, 130.0), lead_x.?);
+    try std.testing.expectEqual(dots[0] - 100.0, lead_x.? - (dots[0] + 14.0));
+    // Nested dot padded right of the parent text column (GitHub-like),
+    // never flush under it: 2-space step lands 36px over, ~14px past lead.
+    try std.testing.expectEqual(@as(f32, 144.0), dots[1]);
+    try std.testing.expect(dots[1] > lead_x.?);
+    // Cards flush on the same-indent text column, code 12px inside:
+    // top card under the plain comparison paragraph, in-item card under
+    // the level-0 lead text.
+    try std.testing.expectEqual(@as(f32, 112.0), code1_x.?);
+    try std.testing.expectEqual(@as(f32, 142.0), code2_x.?);
 }
 
 /// Measurement context for height/refine passes: empty command buffer, no
@@ -3204,7 +3962,11 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
     if (info.block_type == .bullet_list) {
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        bullet_x = ux.content_x + indent_level * 10.0;
+        // PR #324 review: the 14px bullet glyph sits centered in its 30px
+        // gutter (8px each side), so the dot has equal spacing left/right
+        // with airy GitHub-like padding. 18px per source column (see
+        // itemContentX) keeps nested dots padded right of parent text.
+        bullet_x = ux.content_x + indent_level * 18.0 + 8.0;
         var text_start: usize = 1; // past the marker; skip all padding
         text_start += skipSpaces(text_slice[@min(text_start, text_slice.len)..]);
         item_text = text_slice[@min(text_start, text_slice.len)..];
@@ -3221,10 +3983,11 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         }
         ux.ord_active = false;
     } else {
-        // Ordered item: parse marker, resolve corrected number.
+        // Ordered item: parse marker, resolve corrected number. Same +8
+        // origin and 18px columns as bullets so both flavors agree.
         var indent_level: f32 = @floatFromInt(info.indent);
         if (indent_level > 32) indent_level = 32;
-        bullet_x = ux.content_x + indent_level * 10.0;
+        bullet_x = ux.content_x + indent_level * 18.0 + 8.0;
         var prefix_len: usize = 0;
         while (prefix_len < text_slice.len and text_slice[prefix_len] != ' ' and text_slice[prefix_len] != '\t') : (prefix_len += 1) {}
         if (prefix_len < text_slice.len) prefix_len += 1;
@@ -3248,7 +4011,10 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         }
     }
 
-    const list_tx = bullet_x + 18.0;
+    // Both flavors share one 30px cell: bullets center 8px each side of
+    // the 14px dot; ordered markers sit at the same column with the text
+    // 22px past the marker origin, so bullet and ordered columns agree.
+    const list_tx = bullet_x + 22.0;
     const list_tw = textRight(ux) - list_tx;
     const list_rtl = leadParaDirection(ux, item_text, i + 1);
     const list_rtx = if (list_rtl) mirrorX(list_tx, list_tw, ux) else list_tx;
@@ -3405,15 +4171,19 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
     ctx.rtl = rtl;
     // Cross-line reference joints only in top-level runs (list/quote-owned
     // followers absorb paragraph lines only, and unitStartAt agrees).
-    const allow_joint = ux.config.join_buf != null and
-        enclosingListMarker(ux.bytes, ux.lines, i) == null and
-        quoteLeader(ux.bytes, ux.lines, i) == null;
+    // Owned first lines strip their source indent: the unit already starts
+    // at the item/quote column, so kept spaces would double-indent
+    // (hanging-indent fault: only the first line looked correct before the
+    // strip, everything after it already stripped).
+    const list_owned = enclosingListMarker(ux.bytes, ux.lines, i) != null;
+    const quote_owned = quoteLeader(ux.bytes, ux.lines, i) != null;
+    const allow_joint = ux.config.join_buf != null and !list_owned and !quote_owned;
     var j = i + 1;
     if (allow_joint) {
         j = flowParaLineJoint(ux, &pen, ctx, i, false);
     } else {
         const first = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
-        flowSourceLine(first, false, false, false, &pen, ctx);
+        flowSourceLine(first, list_owned or quote_owned, false, false, &pen, ctx);
     }
     while (j < ux.lines.len and
         ((ux.lines[j].block_type == .paragraph and
@@ -3455,6 +4225,25 @@ fn stripCodeIndent(raw: []const u8) []const u8 {
     return if (col >= 4) rest else raw;
 }
 
+/// Strips up to `need` source columns (space = 1, tab = stops of 4) from
+/// a fenced code line inside a list item: the item content indent is item
+/// structure, not code. Lines indented less than the need lose what indent
+/// they have; `need == 0` (top-level) returns the line untouched.
+fn stripFenceIndent(raw: []const u8, need: usize) []const u8 {
+    var rest = raw;
+    var col: usize = 0;
+    while (rest.len > 0 and col < need) {
+        if (rest[0] == ' ') {
+            col += 1;
+            rest = rest[1..];
+        } else if (rest[0] == '\t') {
+            col += 4 - (col % 4);
+            rest = rest[1..];
+        } else break;
+    }
+    return rest;
+}
+
 /// Lays out an indented code block: card background (with copy text),
 /// one mono row per line, blank rows preserved inside. No horizontal-scroll
 /// registration (fixed card, clipped). `base_x` is content_x top-level or
@@ -3487,7 +4276,10 @@ fn layoutIndentedCodeUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) Unit
     const n = j - i;
     const row_h = ux.config.line_height * 0.88;
     const card_h = @as(f32, @floatFromInt(n)) * row_h + 24.0;
-    const card_x = base_x - 12.0;
+    // PR #324 review, GitHub-like card model: the card's left edge sits
+    // exactly on the same-indent text column (no overhang); code rides
+    // 12px inside.
+    const card_x = base_x;
     const card_w = textRight(ux) - card_x;
     if (start_y + card_h >= 0 and start_y <= ux.vp_bottom) {
         const slice = ux.bytes[ux.lines[i].offset..][0 .. ux.lines[j - 1].offset + ux.lines[j - 1].len - ux.lines[i].offset];
@@ -3511,7 +4303,7 @@ fn layoutIndentedCodeUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) Unit
                 }
                 emitCmd(ux, .{
                     .kind = .text_run,
-                    .rect = .{ .x = base_x, .y = row_y, .w = card_w, .h = row_h },
+                    .rect = .{ .x = base_x + 12.0, .y = row_y, .w = card_w, .h = row_h },
                     .color = ux.theme.text,
                     .text = row_text,
                     .font_size = ux.config.base_font_size * 0.88,
@@ -3803,12 +4595,33 @@ pub fn renderViewportCore(
             const block_id = next_block_id;
             next_block_id += 1;
 
+            // Fenced code (issue #324 review, GitHub-like card model): the
+            // card's left edge sits exactly on the same-indent normal text
+            // column — content_x top-level, the owning item's text column
+            // in-item — with no overhang, and the right edge is flush with
+            // the content column too. Code rides 12px inside the card.
+            // Stripping still uses the owner's content need.
+            const fence_owner = fencedCodeMarker(bytes, lines, i);
+            const fence_card_x = if (fence_owner) |m|
+                itemContentX(lines[m], content_x)
+            else
+                content_x;
+            const fence_base = fence_card_x + 12.0;
+            const fence_strip: usize = if (fence_owner) |m|
+                markerContentNeed(bytes, lines[m])
+            else
+                0;
+            const fence_card_w = content_x + content_width - fence_card_x;
+
             if (block_bottom >= 0 and block_top <= vp_bottom) {
-                // Find longest line to determine max_scroll_x
+                // Find longest line to determine max_scroll_x (displayed
+                // text: the item indent is stripped, mirroring draw).
                 var max_code_line_w: f32 = 0;
                 var measure_i = i + 1;
                 while (measure_i < scan_i and measure_i < lines.len) : (measure_i += 1) {
-                    const c_len = lines[measure_i].len;
+                    const m_line = lines[measure_i];
+                    const m_raw = bytes[m_line.offset..][0..m_line.len];
+                    const c_len = stripFenceIndent(m_raw, fence_strip).len;
                     const line_w = @as(f32, @floatFromInt(c_len)) * (config.base_font_size * 0.88 * 0.60);
                     if (line_w > max_code_line_w) max_code_line_w = line_w;
                 }
@@ -3830,9 +4643,9 @@ pub fn renderViewportCore(
                 commands_out[cmd_count] = .{
                     .kind = .code_block_bg,
                     .rect = .{
-                        .x = content_x - 12.0,
+                        .x = fence_card_x,
                         .y = cur_y,
-                        .w = content_width + 24.0,
+                        .w = fence_card_w,
                         .h = code_block_h,
                     },
                     .color = theme.code_bg,
@@ -3845,9 +4658,9 @@ pub fn renderViewportCore(
                     commands_out[cmd_count] = .{
                         .kind = .register_scrollable_block,
                         .rect = .{
-                            .x = content_x - 12.0,
+                            .x = fence_card_x,
                             .y = cur_y,
-                            .w = content_width + 24.0,
+                            .w = fence_card_w,
                             .h = code_block_h,
                         },
                         .scrollable_id = @intCast(block_id),
@@ -3861,9 +4674,9 @@ pub fn renderViewportCore(
                     commands_out[cmd_count] = .{
                         .kind = .begin_clip,
                         .rect = .{
-                            .x = content_x - 12.0,
+                            .x = fence_card_x,
                             .y = cur_y,
-                            .w = content_width + 24.0,
+                            .w = fence_card_w,
                             .h = code_block_h,
                         },
                     };
@@ -3906,7 +4719,10 @@ pub fn renderViewportCore(
                     // Reserve room for scroll shadows + end clip below.
                     if (cmd_count >= commands_out.len - 16) break;
                     const c_line = lines[draw_i];
-                    const c_bytes = bytes[c_line.offset..][0..c_line.len];
+                    const c_raw = bytes[c_line.offset..][0..c_line.len];
+                    // In-item fence: the item content indent is structure,
+                    // not code (stripped; top-level strip is a no-op).
+                    const c_bytes = stripFenceIndent(c_raw, fence_strip);
 
                     if (code_y + 20.0 >= 0 and code_y <= vp_bottom) {
                         var seg_buf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
@@ -3918,7 +4734,7 @@ pub fn renderViewportCore(
                             commands_out[cmd_count] = .{
                                 .kind = .text_run,
                                 .rect = .{
-                                    .x = content_x - cur_scroll_x,
+                                    .x = fence_base - cur_scroll_x,
                                     .y = code_y,
                                     .w = content_width,
                                     .h = config.line_height * 0.88,
@@ -3933,7 +4749,7 @@ pub fn renderViewportCore(
                         for (runs) |run| {
                             if (cmd_count >= commands_out.len - 16) break;
                             const run_text = c_bytes[run.start..run.end];
-                            const run_x = content_x - cur_scroll_x +
+                            const run_x = fence_base - cur_scroll_x +
                                 @as(f32, @floatFromInt(run.start)) * mono_advance;
                             commands_out[cmd_count] = .{
                                 .kind = .text_run,
@@ -3958,9 +4774,9 @@ pub fn renderViewportCore(
                 emitScrollShadows(
                     commands_out,
                     &cmd_count,
-                    content_x - 12.0,
+                    fence_card_x,
                     cur_y,
-                    content_width + 24.0,
+                    fence_card_w,
                     code_block_h,
                     cur_scroll_x,
                     max_scroll_x,
@@ -5548,10 +6364,10 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
     }
     try std.testing.expect(max_scroll > 1.0);
 
-    // Block card: content_x=100, content_width=600 -> x=88, right edge=712.
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 712.0, false, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 0));
+    // Block card: content_x=100, content_width=600 -> x=100, right edge=700.
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 700.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 100.0, true, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 700.0, false, 0));
 
     // Rounded ends, straight on the clip edge: the brightest (outermost)
     // strip runs full height while the dimmest (innermost) recedes.
@@ -5560,7 +6376,7 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
     for (cmds[0..count]) |c| {
         if (c.kind != .fill_rect or c.color.r != 255 or c.color.g != 255 or c.color.b != 255) continue;
         if (@abs(c.rect.w - scroll_shadow_strip_w) > 0.01) continue;
-        if (@abs((c.rect.x + c.rect.w) - 712.0) > 12.01) continue;
+        if (@abs((c.rect.x + c.rect.w) - 700.0) > 12.01) continue;
         if (outer == null or c.color.a > outer.?.color.a) outer = c;
         if (inner == null or c.color.a < inner.?.color.a) inner = c;
     }
@@ -5589,9 +6405,9 @@ test "scroll shadows: scrolled-right code block shows left-edge fade, no right f
     config.block_scroll_x[0] = 1e9; // clamped to max inside layout
     const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
 
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 88.0, true, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 0));
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 100.0, true, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 700.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 100.0, true, 0));
 }
 
 test "scroll shadows: fitting code block shows no fade" {
@@ -5676,9 +6492,9 @@ test "scroll shadows: light theme uses a dark overlay" {
     const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
 
     // Dark strips at the right edge, no light strips anywhere near the block.
-    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 712.0, false, 0));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 712.0, false, 255));
-    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 88.0, true, 0));
+    try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 700.0, false, 0));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 700.0, false, 255));
+    try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 100.0, true, 0));
 }
 
 test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {

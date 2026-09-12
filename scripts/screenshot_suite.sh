@@ -25,6 +25,20 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # Case 3: Code blocks, syntax background card, copy button, task checkboxes, lists
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks.png" test_cases/code_and_tasks.md
 
+# Case 3b: Hanging-indent continuations at the end of the SAME doc (no new
+# test case): scrolled viewport frames the section so reviewers see sub-4sp
+# continuations aligned under the lead text, never the marker.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_hanging_indent.png" --scroll 800 test_cases/code_and_tasks.md
+
+# Cases 3c/3d: Multi-level indenting 0-5 in dedicated files (PR #324
+# review: split from code_and_tasks.md so each frame shows one clean
+# section). A no-indent comparison paragraph (3c) / fence (3d) heads each
+# file; 3c covers bullets 0-5 plus ordered 0-2 continuations, 3d the
+# nested-fence code levels 0-5 (nested fence promotion + relative
+# code-level cutoff).
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/list_indent_text.png" test_cases/list_indent_text.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/list_indent_code.png" test_cases/list_indent_code.md
+
 # Case 4: Table structure, cell padding, column alignment, dividers
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/tables_formatting.png" test_cases/tables_formatting.md
 

@@ -22,3 +22,18 @@ pub fn main() void {
 1. Memory map file zero-copy
 2. Scan vector line breaks
 3. Layout visible viewport elements
+
+### Hanging Indent Continuations
+
+1. Ordered lead with fence and paragraph:
+   ```bash
+   zig build test
+   ```
+   100% of continuation lines align under the lead text, never the marker.
+   Lazy followers ride along at the same column.
+
+- Bullet lead with a fence and paragraph:
+  ```
+  echo bullet
+  ```
+  Two-space continuations stay inside the bullet item.

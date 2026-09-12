@@ -1167,6 +1167,8 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     var in_fence: simd.FenceState = .{};
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
     g_app.lines = g_lines_buffer[0..g_app.line_count];
+    // Nested in-item fences (issue #324): once per open, cold.
+    layout.promoteNestedFences(g_app.bytes, g_app.lines);
     g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
     for (&g_app.block_scroll_x) |*s| s.* = 0.0;
     for (&g_app.block_max_scroll_x) |*s| s.* = 0.0;
@@ -2419,6 +2421,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Index lines with SIMD scanner
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
     g_app.lines = g_lines_buffer[0..g_app.line_count];
+    // Nested in-item fences (issue #324): once per open, cold.
+    layout.promoteNestedFences(g_app.bytes, g_app.lines);
     // Reference definitions once per load (cold; geometry depends on them).
     g_refdef_count = simd.scanRefDefs(g_app.bytes, g_app.lines, &g_refdefs);
 
