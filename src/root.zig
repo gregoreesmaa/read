@@ -14,6 +14,7 @@ pub const bidi = @import("core/bidi.zig");
 pub const glyph_cache = @import("platform/glyph_cache.zig");
 pub const strict_benchmarks = @import("core/strict_benchmarks.zig");
 pub const plugin_cache = @import("core/plugin_cache.zig");
+pub const math_fence = @import("core/math_fence.zig");
 pub const controls_test = @import("tests/controls_test.zig");
 pub const spec_compliance_test = @import("tests/spec_compliance_test.zig");
 pub const commonmark_harness = @import("tests/commonmark_harness.zig");
@@ -32,6 +33,7 @@ test {
     _ = damage;
     _ = glyph_cache;
     _ = plugin_cache;
+    _ = math_fence;
 }
 
 test "simd line scanner and block classification" {

@@ -100,10 +100,15 @@ Three layers, one direction of knowledge:
    - d2: `d2 SRC OUT`
    - graphviz: `dot -Tpng SRC -o OUT`
    - plantuml: `plantuml -tpng -o OUTDIR SRC`
-   - math: first present of `katex`, `mjpage`, `mathjax` with that
-     tool's file→PNG flags; none present → nonzero exit (fallback).
-     Rationale: no canonical PNG CLI exists for TeX math; the
-     pipeline is real for all six, math lights up with user tools.
+   - math: SUPERSEDED by the native ZaTeX direction (zatex issue
+     #12): math fences consult the dynamically loaded subset engine
+     (`src/core/math_fence.zig`); subset-accepted fences go native
+     (display arm: read#348), everything else keeps the code-card
+     fallback. No external math CLI is ever probed or launched.
+     (Original plan kept below for history: first present of `katex`,
+     `mjpage`, `mathjax` with that tool's file→PNG flags; none
+     present → nonzero exit. Rationale at the time: no canonical PNG
+     CLI exists for TeX math.)
 
 ## 4. Layout integration
 
@@ -163,9 +168,11 @@ Six PRs, each closing ONE issue, each stacked on the previous:
    helper, indicator, tests, docs) + mermaid wiring.
 2. #330 D2, 3. #329 Graphviz, 4. #328 PlantUML: one renderer row
    each (table + helper stanza + tests). Small by construction.
-3. #326 KaTeX, 6. #327 MathJax: math-renderer rows against the
-   shared `math` slot (probe-first; code fallback where the user has
-   no math CLI — the pipeline is the deliverable, tools are user env).
+3. #326 KaTeX, 6. #327 MathJax: SUPERSEDED — the shared `math`
+   slot goes native via ZaTeX (zatex issue #12, `src/core/math_fence.zig`;
+   display arm: read#348) instead of external CLI rows. (Original plan:
+   math-renderer rows against the shared `math` slot, probe-first with
+   code fallback where the user has no math CLI.)
 
 Each PR rebases onto its parent at merge time (suite-case numbering,
 `spec.md`, screenshots); each carries its own fixture + skeleton
