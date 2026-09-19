@@ -265,9 +265,12 @@ static ZatexInkBox zatex_ink_bounds(const void *ctx, uint16_t font, uint16_t gly
     (void)ctx;
     (void)font;
     ZatexInkBox b = { 0, 0, 0, 0 };
-    if (!zatex_font) return b;
+    // No null-font guard: every engine path reaches hooks through the
+    // advance hook (which ensures the font; layout aborts without one),
+    // same accepted precondition as zatex_glyph_id. CGRect needs no
+    // zero-init: CoreText fully writes it for any glyph value.
     CGGlyph g = (CGGlyph)glyph;
-    CGRect r = CGRectZero;
+    CGRect r;
     CTFontGetBoundingRectsForGlyphs(zatex_font, kCTFontOrientationHorizontal, &g, &r, 1);
     b.x0 = (int32_t)floor((double)r.origin.x * 10.0);
     b.y0 = (int32_t)floor((double)r.origin.y * 10.0);
@@ -354,6 +357,14 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         ZatexRule *rl = &zatex_rules[i];
         CGRect rr = CGRectMake((float)(x + rl->x * s), (float)(y_top + rl->y * s),
                                (float)(rl->w * s), (float)(rl->h * s));
+        // All engine rules are horizontal bars (fraction, vinculum,
+        // over/underline): snap y to device pixels so subpixel bars
+        // draw crisp instead of fringing across two rows. x/width stay
+        // exact (centering must not shift); height covers at least the
+        // original span.
+        double y0 = floor(rr.origin.y);
+        rr.size.height = ceil(rr.origin.y + rr.size.height) - y0;
+        rr.origin.y = y0;
         CGContextFillRect(ctx, rr);
     }
     // Runs: one flipped frame per run, mirroring platform_draw_text
