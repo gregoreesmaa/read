@@ -308,26 +308,28 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
                                (float)(rl->w * s), (float)(rl->h * s));
         CGContextFillRect(ctx, rr);
     }
-    // Runs: batch glyph draw per run at its own size (script sizes ride
-    // size_units, per-mille of ambient). Glyph origins accumulate the
-    // SAME integer advances the engine laid out with (units, exact),
-    // converted once to px — ink lands exactly where layout put it,
-    // with no float-drift between the size query and the draw.
+    // Runs: one flipped frame per run, mirroring platform_draw_text
+    // (Translate to the run baseline origin, Scale(1,-1), draw at
+    // relative offsets). Each run draws at its own size (script sizes
+    // ride size_units, per-mille of ambient) via an exact-size font
+    // copy — drawing with the shared 100-unit font would scale ink by
+    // 100/font_px. Offsets accumulate the SAME integer advances the
+    // engine laid out with (units, exact), converted once to px, so ink
+    // lands exactly where layout put it.
     static CGPoint zatex_pos[256];
     for (uint32_t i = 0; i < lo.nruns; i++) {
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
         double run_px = (double)font_px * (double)rn->size_units / 1000.0;
         if (run_px <= 0 || !zatex_font) continue;
-        // Same-size fast path keeps the shared font; odd sizes copy it.
-        CTFontRef rf = zatex_font;
-        CTFontRef owned = NULL;
-        if (rn->size_units != 1000) {
-            owned = CTFontCreateCopyWithAttributes(zatex_font, (CGFloat)run_px, NULL, NULL);
-            if (owned) rf = owned;
-        }
+        CTFontRef rf = CTFontCreateCopyWithAttributes(zatex_font, (CGFloat)run_px, NULL, NULL);
+        if (!rf) continue;
+        double s_run = run_px / 1000.0;
+        CGContextSaveGState(ctx);
+        CGContextTranslateCTM(ctx, (CGFloat)(x + rn->x * s), (CGFloat)(y_top + rn->baseline_y * s));
+        CGContextScaleCTM(ctx, 1.0, -1.0);
+        CGContextSetTextPosition(ctx, 0, 0);
         uint32_t n = rn->glyph_count;
-        double base = y_top + rn->baseline_y * s;
         int64_t acc = 0;
         uint32_t done = 0;
         while (done < n) {
@@ -337,12 +339,13 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
             for (uint32_t k = 0; k < m; k++) {
                 uint16_t g = zatex_glyphs[rn->glyph_start + done + k];
                 gbuf[k] = (CGGlyph)g;
-                zatex_pos[k] = CGPointMake((float)(x + (rn->x + acc) * s), base);
+                zatex_pos[k] = CGPointMake((float)(acc * s_run), 0);
                 acc += zatex_advance(NULL, rn->font_id, g);
             }
             CTFontDrawGlyphs(rf, gbuf, zatex_pos, (CFIndex)m, ctx);
             done += m;
         }
-        if (owned) CFRelease(owned);
+        CGContextRestoreGState(ctx);
+        CFRelease(rf);
     }
 }
