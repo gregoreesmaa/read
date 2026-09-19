@@ -20,9 +20,10 @@
 //   math coverage, no bundled fonts).
 // - Optional hooks: true glyph extents are supplied (CoreText, v4 C
 //   surface) so box geometry — the sqrt junction included — uses real
-//   outlines; ink bounds stay NULL (v3 start, measured 2px shy of full
-//   overlap) with variants and italic/kerning corrections: the core is
-//   correct without them (deterministic fallbacks). Big-delimiter
+//   outlines, and MATH-table italic corrections are supplied so accents
+//   center on slanted nuclei; ink bounds stay NULL (v3 start, measured
+//   2px shy of full overlap) with variants and kerning corrections: the
+//   core is correct without them (deterministic fallbacks). Big-delimiter
 //   growth is the known v1 fidelity gap, documented in docs/spec.md.
 // - The frozen C surface projects filled rects only (cabi.zig): diagonal
 //   `cancel` strikes never arrive (skipped engine-side, never misdrawn)
@@ -166,19 +167,6 @@ static CTFontRef zatex_font = NULL;
 static void zatex_ensure_font(void) {
     if (zatex_font) return;
     zatex_font = CTFontCreateWithName(CFSTR("STIXTwoMath"), ZATEX_FONT_PX, NULL);
-    if (!zatex_font) {
-        CFStringRef path = CFSTR("/System/Library/Fonts/Supplemental/STIXTwoMath.otf");
-        CFURLRef url = CFURLCreateWithFileSystemPath(NULL, path, kCFURLPOSIXPathStyle, false);
-        if (url) {
-            CFArrayRef ds = CTFontManagerCreateFontDescriptorsFromURL(url);
-            if (ds && CFArrayGetCount(ds) > 0) {
-                CTFontDescriptorRef d = (CTFontDescriptorRef)CFArrayGetValueAtIndex(ds, 0);
-                zatex_font = CTFontCreateWithFontDescriptor(d, ZATEX_FONT_PX, NULL);
-                CFRelease(ds);
-            }
-            CFRelease(url);
-        }
-    }
 }
 
 // One UTF-8 codepoint; invalid bytes yield U+FFFD (missing glyph downstream).
@@ -287,11 +275,91 @@ static ZatexExtents zatex_extents(const void *ctx, uint16_t font, uint16_t glyph
     return z;
 }
 
+// MATH-table italic corrections (accent centering, issue #350 review).
+// STIX Two Math ships UPM 1000, so raw values are already thousandths.
+static CFDataRef zatex_math_data = NULL;
+static const uint8_t *zatex_math_bytes = NULL;
+static size_t zatex_math_len = 0;
+static size_t zatex_math_ici = 0;
+static int zatex_math_ready = 0;
+
+static uint32_t zatex_u16(const uint8_t *p) {
+    return (uint32_t)(((uint32_t)p[0] << 8) | p[1]);
+}
+
+static void zatex_ensure_math_table(void) {
+    if (zatex_math_ready) return;
+    zatex_math_ready = 1;
+    zatex_ensure_font();
+    if (!zatex_font) return;
+    CFDataRef d = CTFontCopyTable(zatex_font, (CTFontTableTag)'MATH', 0);
+    if (!d) return;
+    size_t n = (size_t)CFDataGetLength(d);
+    const uint8_t *b = CFDataGetBytePtr(d);
+    size_t gi = 0, ic_rel = 0, sub = 0;
+    if (!b || n < 10) goto fail;
+    gi = ((size_t)b[6] << 8) | b[7];
+    if (gi == 0 || gi + 8 > n) goto fail;
+    ic_rel = ((size_t)b[gi] << 8) | b[gi + 1];
+    if (ic_rel == 0) goto fail;
+    sub = gi + ic_rel;
+    if (sub + 4 > n) goto fail;
+    zatex_math_data = d;
+    zatex_math_bytes = b;
+    zatex_math_len = n;
+    zatex_math_ici = sub;
+    return;
+fail:
+    CFRelease(d);
+}
+
+static int32_t zatex_italic_correction(const void *ctx, uint16_t font, uint16_t glyph) {
+    (void)ctx;
+    (void)font;
+    if (glyph == 0) return 0;
+    zatex_ensure_math_table();
+    if (!zatex_math_bytes) return 0;
+    const uint8_t *b = zatex_math_bytes;
+    size_t n = zatex_math_len, sub = zatex_math_ici;
+    size_t cov = sub + zatex_u16(b + sub);
+    size_t count = zatex_u16(b + sub + 2);
+    if (cov + 4 > n) return 0;
+    uint32_t fmt = zatex_u16(b + cov);
+    uint32_t nn = zatex_u16(b + cov + 2);
+    uint32_t idx = UINT32_MAX;
+    if (fmt == 1) {
+        if (cov + 4 + (size_t)nn * 2 > n) return 0;
+        for (uint32_t i = 0; i < nn; i++) {
+            if (zatex_u16(b + cov + 4 + (size_t)i * 2) == glyph) {
+                idx = i;
+                break;
+            }
+        }
+    } else if (fmt == 2) {
+        if (cov + 4 + (size_t)nn * 6 > n) return 0;
+        for (uint32_t i = 0; i < nn; i++) {
+            uint32_t first = zatex_u16(b + cov + 4 + (size_t)i * 6);
+            uint32_t last = zatex_u16(b + cov + 6 + (size_t)i * 6);
+            uint32_t sci = zatex_u16(b + cov + 8 + (size_t)i * 6);
+            if (glyph >= first && glyph <= last) {
+                idx = sci + ((uint32_t)glyph - first);
+                break;
+            }
+        }
+    } else {
+        return 0;
+    }
+    if (idx == UINT32_MAX || idx >= count) return 0;
+    size_t rec = sub + 4 + (size_t)idx * 4;
+    if (rec + 2 > n) return 0;
+    return (int32_t)(int16_t)zatex_u16(b + rec);
+}
+
 static const ZatexMetrics zatex_metrics = {
-    NULL, zatex_glyph_id, zatex_advance, NULL, NULL, NULL, NULL,
+    NULL, zatex_glyph_id, zatex_advance, NULL, NULL, zatex_italic_correction, NULL,
     // ink_bounds deliberately NULL (v3 start): extents alone close the
     // sqrt junction to 2px (measured render diff); wiring ink buys
-    // nothing visible at current budgets — revisit with accent work.
+    // nothing visible at current budgets.
     zatex_extents, NULL,
 };
 
@@ -375,7 +443,8 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
     // 100/font_px. Offsets accumulate the SAME integer advances the
     // engine laid out with (units, exact), converted once to px, so ink
     // lands exactly where layout put it.
-    static CGPoint zatex_pos[256];
+    static CGPoint zatex_pos[4096];
+    static CGGlyph zatex_gbuf[4096];
     for (uint32_t i = 0; i < lo.nruns; i++) {
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
@@ -390,20 +459,13 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         CGContextSetTextPosition(ctx, 0, 0);
         uint32_t n = rn->glyph_count;
         int64_t acc = 0;
-        uint32_t done = 0;
-        while (done < n) {
-            uint32_t m = n - done;
-            if (m > 256) m = 256;
-            CGGlyph gbuf[256];
-            for (uint32_t k = 0; k < m; k++) {
-                uint16_t g = zatex_glyphs[rn->glyph_start + done + k];
-                gbuf[k] = (CGGlyph)g;
-                zatex_pos[k] = CGPointMake((float)(acc * s_run), 0);
-                acc += zatex_advance(NULL, rn->font_id, g);
-            }
-            CTFontDrawGlyphs(rf, gbuf, zatex_pos, (CFIndex)m, ctx);
-            done += m;
+        for (uint32_t k = 0; k < n; k++) {
+            uint16_t g = zatex_glyphs[rn->glyph_start + k];
+            zatex_gbuf[k] = (CGGlyph)g;
+            zatex_pos[k] = CGPointMake((float)(acc * s_run), 0);
+            acc += zatex_advance(NULL, rn->font_id, g);
         }
+        CTFontDrawGlyphs(rf, zatex_gbuf, zatex_pos, (CFIndex)n, ctx);
         CGContextRestoreGState(ctx);
         CFRelease(rf);
     }

@@ -17,6 +17,15 @@ Accents center on their nuclei: $\tilde{x}$ and $\hat{y}$ with $\vec{v}$
 and $\dot{z}$ beside them. Overline spans: $\overline{AB}$ and
 $\underline{AB}$ underline below.
 
+Dots, bars, and wedges ride along: $\dot{x}$ and $\ddot{y}$ with $\bar{z}$,
+$\check{a}$, $\breve{e}$, $\acute{o}$, $\grave{u}$ inline.
+
+Wide accents stretch over their span: $\widetilde{AB}$ and $\widehat{AB}$,
+with $\overline{x + y}$ over a sum beside them.
+
+Accents on capitals take the full skew: $\hat{M}$ and $\tilde{M}$ inline,
+and scripts stack on accented nuclei: $\tilde{x}^2$ with $\hat{y}_i$ below.
+
 ## Delimiters
 
 Fences wrap tall content:
@@ -25,9 +34,14 @@ $$\left(\frac{a}{b}\right) + \left[ x^2 \right] + |z|$$
 
 Binomial coefficients: $\binom{n}{k} = \frac{n!}{k!(n-k)!}$ inline.
 
+Angle brackets and floors scale too: $\left\langle x \right\rangle$ with
+$\left\lfloor \frac{a}{b} \right\rfloor$ inline.
+
 ## Display blocks
 
 $$\sum_{k=1}^{n} k^2 = \frac{n(n+1)(2n+1)}{6}$$
+
+$$\tilde{x} + \hat{y} = \vec{v}$$
 
 $$\lim_{x \to 0} \frac{\sin x}{x} = 1 \qquad \int_0^\infty e^{-x^2}\,dx = \sqrt{\pi}$$
 
