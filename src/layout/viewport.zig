@@ -1833,11 +1833,11 @@ fn emitMath(pen_x: f32, ink_top: f32, box: MathBox, tex: []const u8, color: Colo
 
 /// Flows one inline island span at the pen as an unbreakable box on the
 /// text baseline (baseline = row top + 0.85em, the text_run convention).
-/// Inline boxes sit on the text baseline. A box taller than one row
-/// shrinks uniformly to fit the row (same linear-shrink trick as the
-/// width-fit paths), so tall inline formulae never overlap neighboring
-/// rows; wrap and visibility match flowWord so measurement agrees
-/// bit-for-bit.
+/// Inline boxes sit on the text baseline at their natural size. Ink
+/// taller than one row takes room from the neighboring rows' leading
+/// space — the above-baseline extent borrows from the row above, the
+/// below-baseline extent from the row below. Wrap and visibility match
+/// flowWord so measurement agrees bit-for-bit.
 /// Fallback (engine off/failure): the whole island flows as literal text.
 fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) void {
     const tex = math_detect.stripIsland(island) orelse {
@@ -1848,34 +1848,25 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
         flowSpans(island, .{}, null, pen, ctx, false);
         return;
     };
-    var fit = box;
-    const h = box.above + box.below;
-    if (h > ctx.line_h and h > 0) {
-        const k = ctx.line_h / h;
-        fit.w *= k;
-        fit.above *= k;
-        fit.below *= k;
-        fit.font_px *= k;
-    }
     if (ctx.rtl) {
-        if (pen.x - fit.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
+        if (pen.x - box.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
             pen.y += ctx.line_h;
             pen.x = ctx.start_x + ctx.max_w;
         }
-    } else if (pen.x + fit.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
+    } else if (pen.x + box.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
         pen.y += ctx.line_h;
         pen.x = ctx.start_x;
     }
     const baseline = pen.y + ctx.font_size * 0.85;
-    const ink_top = baseline - fit.above;
-    if (ink_top + fit.above + fit.below >= 0 and ink_top <= ctx.vp_bottom) {
-        const run_x = if (ctx.rtl) pen.x - fit.w else pen.x;
-        emitMath(run_x, ink_top, fit, tex, ctx.default_color, ctx);
+    const ink_top = baseline - box.above;
+    if (ink_top + box.above + box.below >= 0 and ink_top <= ctx.vp_bottom) {
+        const run_x = if (ctx.rtl) pen.x - box.w else pen.x;
+        emitMath(run_x, ink_top, box, tex, ctx.default_color, ctx);
     }
     if (ctx.rtl) {
-        pen.x -= fit.w;
+        pen.x -= box.w;
     } else {
-        pen.x += fit.w;
+        pen.x += box.w;
     }
 }
 
@@ -1978,9 +1969,9 @@ pub fn flowSourceLine(
         var txt = span.text;
         var tgt = span.link_target;
         // Math islands flow as ZaTeX boxes: inline islands sit on the
-        // baseline (shrinking to the row when taller), while display
-        // islands always break out as centered blocks, even mid-line, so
-        // tall formulae never overlap neighboring rows. Block code and
+        // baseline at natural size (tall ink borrows the neighboring
+        // rows' leading space), while display islands always break out
+        // as centered blocks, even mid-line. Block code and
         // headings keep the island literal (v1 limit), and twin builds
         // never form islands, so both fall back identically (the comptime
         // gate strips the box path from the twin).
@@ -9332,7 +9323,7 @@ test "math: mid-line display island breaks out as a centered block" {
     try std.testing.expectApproxEqAbs(@as(f32, 29.75 + 18.7), pen.y, 0.01);
 }
 
-test "math: tall inline box shrinks to the row, never overlapping" {
+test "math: tall inline box keeps natural size, borrowing neighbor rows" {
     if (comptime core_options.plugin_stub) return;
     const Stub = struct {
         fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
@@ -9367,9 +9358,12 @@ test "math: tall inline box shrinks to the row, never overlapping" {
     flowSourceLine("see $x$ now", false, false, false, &pen, ctx);
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(DrawCommandKind.math, cmds[1].kind);
-    // 51px of ink scales by 29.75/51 to exactly one row.
-    try std.testing.expectApproxEqAbs(@as(f32, 29.75), cmds[1].rect.h, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 34.0 * 29.75 / 51.0), cmds[1].rect.w, 0.01);
+    // Natural size, no shrink: full 51px of ink on the 0.85em baseline,
+    // borrowing the neighboring rows' leading space above and below.
+    try std.testing.expectApproxEqAbs(@as(f32, 51.0), cmds[1].rect.h, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 34.0), cmds[1].rect.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0 * 0.85 - 34.0), cmds[1].rect.y, 0.01);
+    try std.testing.expect(cmds[1].rect.y < 0.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.01);
 }
 

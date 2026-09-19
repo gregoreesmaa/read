@@ -42,11 +42,12 @@ and skips diagonal strikes (never misdrawn).
 Fallback is sourcetelling, never silent: engine absent or refusing (invalid
 input, over 64 KiB, too deep, expansion limit) renders fences as plain code
 cards and islands as literal text, byte-identical to the pre-math reader.
-v1 limits: inline boxes taller than one row shrink to fit (display
-style mid-line instead breaks out as a block, never overlapping); math is
-not selectable, not find-highlighted, and not copyable; math inside link
-text, headings, and block code stays literal; display delimiters spanning
-source lines need fence form. Fixture: `test_cases/math.md`.
+v1 limits: tall inline ink takes room from the neighboring rows'
+leading space (split by the baseline); display style always breaks out
+as a block instead, even mid-line; math is not selectable, not
+find-highlighted, and not copyable; math inside link text, headings,
+and block code stays literal; display delimiters spanning source lines
+need fence form. Fixture: `test_cases/math.md`.
 
 ## Heavy features
 
