@@ -1833,8 +1833,11 @@ fn emitMath(pen_x: f32, ink_top: f32, box: MathBox, tex: []const u8, color: Colo
 
 /// Flows one inline island span at the pen as an unbreakable box on the
 /// text baseline (baseline = row top + 0.85em, the text_run convention).
-/// Tall boxes may overlap neighboring rows (documented v1 limit); wrap
-/// and visibility match flowWord so measurement agrees bit-for-bit.
+/// Inline boxes sit on the text baseline. A box taller than one row
+/// shrinks uniformly to fit the row (same linear-shrink trick as the
+/// width-fit paths), so tall inline formulae never overlap neighboring
+/// rows; wrap and visibility match flowWord so measurement agrees
+/// bit-for-bit.
 /// Fallback (engine off/failure): the whole island flows as literal text.
 fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) void {
     const tex = math_detect.stripIsland(island) orelse {
@@ -1845,32 +1848,41 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
         flowSpans(island, .{}, null, pen, ctx, false);
         return;
     };
+    var fit = box;
+    const h = box.above + box.below;
+    if (h > ctx.line_h and h > 0) {
+        const k = ctx.line_h / h;
+        fit.w *= k;
+        fit.above *= k;
+        fit.below *= k;
+        fit.font_px *= k;
+    }
     if (ctx.rtl) {
-        if (pen.x - box.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
+        if (pen.x - fit.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
             pen.y += ctx.line_h;
             pen.x = ctx.start_x + ctx.max_w;
         }
-    } else if (pen.x + box.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
+    } else if (pen.x + fit.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
         pen.y += ctx.line_h;
         pen.x = ctx.start_x;
     }
     const baseline = pen.y + ctx.font_size * 0.85;
-    const ink_top = baseline - box.above;
-    if (ink_top + box.above + box.below >= 0 and ink_top <= ctx.vp_bottom) {
-        const run_x = if (ctx.rtl) pen.x - box.w else pen.x;
-        emitMath(run_x, ink_top, box, tex, ctx.default_color, ctx);
+    const ink_top = baseline - fit.above;
+    if (ink_top + fit.above + fit.below >= 0 and ink_top <= ctx.vp_bottom) {
+        const run_x = if (ctx.rtl) pen.x - fit.w else pen.x;
+        emitMath(run_x, ink_top, fit, tex, ctx.default_color, ctx);
     }
     if (ctx.rtl) {
-        pen.x -= box.w;
+        pen.x -= fit.w;
     } else {
-        pen.x += box.w;
+        pen.x += fit.w;
     }
 }
 
-/// Flows a whole-line display island (`$$...$$`) as a centered block on
-/// its own visual rows. True when rendered (caller returns); false falls
-/// back to normal literal flow. Breaks the row before/after like a hard
-/// break, so mid-paragraph display lines just work.
+/// Flows a display island (`$$...$$`) as a centered block on its own
+/// visual rows, whole-line or mid-line alike. True when rendered (caller
+/// returns); false falls back to normal literal flow. Breaks the row
+/// before/after like a hard break, so mid-paragraph islands just work.
 fn flowMathDisplay(tex: []const u8, pen: *FlowPen, ctx: FlowCtx) bool {
     const box = mathBox(tex, true, ctx.font_size, ctx.math_size_fn) orelse return false;
     if (pen.x > ctx.start_x or (ctx.rtl and pen.x < ctx.start_x + ctx.max_w)) {
@@ -1965,13 +1977,20 @@ pub fn flowSourceLine(
         }
         var txt = span.text;
         var tgt = span.link_target;
-        // Math islands flow as ZaTeX boxes (inline on the baseline;
-        // display-style islands keep display metrics even mid-line).
-        // Block code and headings keep the island literal (v1 limit), and
-        // twin builds never form islands, so both fall back identically
-        // (the comptime gate strips the box path from the twin).
+        // Math islands flow as ZaTeX boxes: inline islands sit on the
+        // baseline (shrinking to the row when taller), while display
+        // islands always break out as centered blocks, even mid-line, so
+        // tall formulae never overlap neighboring rows. Block code and
+        // headings keep the island literal (v1 limit), and twin builds
+        // never form islands, so both fall back identically (the comptime
+        // gate strips the box path from the twin).
         if (comptime !math_stub) {
             if (style.math and !line_force_code and !force_heading) {
+                if (style.math_display) {
+                    if (math_detect.stripIsland(span.text)) |tex| {
+                        if (flowMathDisplay(tex, pen, line_ctx)) continue;
+                    }
+                }
                 flowMathSpan(span.text, style.math_display, pen, line_ctx);
                 continue;
             }
@@ -9265,6 +9284,95 @@ test "math: whole-line display centers a block, fallback stays literal" {
     try std.testing.expectApproxEqAbs(@as(f32, 18.7), pen.y, 0.01);
 }
 
+test "math: mid-line display island breaks out as a centered block" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    var cmds: [16]DrawCommand = undefined;
+    var n: usize = 0;
+    var pen = FlowPen{ .x = 0, .y = 0 };
+    const ctx = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds,
+        .cmd_count = &n,
+        .math_size_fn = Stub.size,
+    };
+    flowSourceLine("see $$x^2$$ now", false, false, false, &pen, ctx);
+    // Leading text, centered block, trailing text on a fresh row.
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(DrawCommandKind.text_run, cmds[0].kind);
+    try std.testing.expectEqual(DrawCommandKind.math, cmds[1].kind);
+    try std.testing.expectEqual(DrawCommandKind.text_run, cmds[2].kind);
+    try std.testing.expect(cmds[1].style.math_display);
+    try std.testing.expectEqualStrings("x^2", cmds[1].text);
+    try std.testing.expectApproxEqAbs((600.0 - 34.0) / 2.0, cmds[1].rect.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 29.75), cmds[1].rect.y, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 18.7), cmds[1].rect.h, 0.01);
+    // One text row plus the block height; the block never overlaps rows.
+    try std.testing.expect(cmds[1].rect.y >= 29.75);
+    try std.testing.expectApproxEqAbs(@as(f32, 29.75 + 18.7), pen.y, 0.01);
+}
+
+test "math: tall inline box shrinks to the row, never overlapping" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            w.* = px * 2.0;
+            ab.* = px * 2.0;
+            bl.* = px * 1.0;
+            return 0;
+        }
+    };
+    var cmds: [16]DrawCommand = undefined;
+    var n: usize = 0;
+    var pen = FlowPen{ .x = 0, .y = 0 };
+    const ctx = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds,
+        .cmd_count = &n,
+        .math_size_fn = Stub.size,
+    };
+    flowSourceLine("see $x$ now", false, false, false, &pen, ctx);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(DrawCommandKind.math, cmds[1].kind);
+    // 51px of ink scales by 29.75/51 to exactly one row.
+    try std.testing.expectApproxEqAbs(@as(f32, 29.75), cmds[1].rect.h, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 34.0 * 29.75 / 51.0), cmds[1].rect.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.01);
+}
+
 test "math: fence renders native block with stub engine, card without" {
     if (comptime core_options.plugin_stub) return;
     const Stub = struct {
@@ -9321,4 +9429,38 @@ test "math: fence renders native block with stub engine, card without" {
     };
     const count2 = layoutViewport(test_doc, lines_buf[0..line_count], config2, &cmds2);
     for (cmds2[0..count2]) |c| try std.testing.expect(c.kind != .math);
+}
+
+test "math: tex/latex/katex fences stay highlighted code, never math" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    const test_doc =
+        "```tex\n" ++
+        "\\frac{a}{b}\n" ++
+        "```\n";
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+    try std.testing.expectEqual(@as(usize, 3), line_count);
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .math_size_fn = Stub.size,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    // Even with a live engine: highlighted code card, zero math commands.
+    try std.testing.expect(count > 0);
+    for (cmds[0..count]) |c| try std.testing.expect(c.kind != .math);
 }

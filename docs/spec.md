@@ -14,15 +14,17 @@ HTML rendering is intentionally unsupported. Numbers for speed and size live onl
 - GFM tables with column measurement, cell alignment, and dividers
 - Plugin diagrams (mermaid; cached async render, code fallback)
 - YAML frontmatter (`---` … `---`/`...` at byte 0 with a `key: value` line): hidden, renders nothing
-- Math blocks via ZaTeX: fenced `math`/`tex`/`latex`/`katex`, and whole-line
-  `$$...$$` display formulae (single line; multi-line display uses fences)
+- Math blocks via ZaTeX: fenced `math`, and whole-line `$$...$$`
+  display formulae (single line; multi-line display uses fences).
+  `tex`/`latex`/`katex` fences stay LaTeX syntax-highlighted code blocks
 
 ## Inlines
 
 - Code spans, emphasis (`*`, `_`), strong (`**`, `__`), triple (`***`, `___`)
 - Strikethrough (`~~`), inline links (`[text](url)`), autolinks (`<https://…>`, `<email>`), bare `http(s)://` URLs (GFM), images
-- Math islands via ZaTeX (`$...$` inline; `$$...$$` keeps display metrics even
-  mid-line). Currency guards: `$100`, `$5.99`, `$ `, and unclosed dollars
+- Math islands via ZaTeX (`$...$` inline on the baseline; `$$...$$`
+  always centers as a block, even mid-line). Currency guards: `$100`,
+  `$5.99`, `$ `, and unclosed dollars
   stay literal; code spans mask islands; backslash forms stay literal
   (CommonMark escape precedence)
 - Backslash escapes (`\*`, `\_`, …)
@@ -40,10 +42,11 @@ and skips diagonal strikes (never misdrawn).
 Fallback is sourcetelling, never silent: engine absent or refusing (invalid
 input, over 64 KiB, too deep, expansion limit) renders fences as plain code
 cards and islands as literal text, byte-identical to the pre-math reader.
-v1 limits: tall inline boxes may overlap neighboring rows; math is not
-selectable, not find-highlighted, and not copyable; math inside link text,
-headings, and block code stays literal; display delimiters spanning source
-lines need fence form. Fixture: `test_cases/math.md`.
+v1 limits: inline boxes taller than one row shrink to fit (display
+style mid-line instead breaks out as a block, never overlapping); math is
+not selectable, not find-highlighted, and not copyable; math inside link
+text, headings, and block code stays literal; display delimiters spanning
+source lines need fence form. Fixture: `test_cases/math.md`.
 
 ## Heavy features
 

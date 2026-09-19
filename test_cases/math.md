@@ -5,7 +5,9 @@ mathematics centers on its own rows:
 
 $$\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$$
 
-Fenced mathematics renders as a display block in every alias spelling:
+Fenced mathematics renders as a display block with the `math` info
+string; the `tex`, `latex`, and `katex` spellings stay LaTeX
+syntax-highlighted source code:
 
 ```math
 \sum_{i=1}^{n} i = \frac{n(n+1)}{2}
@@ -34,9 +36,9 @@ $$\frac{d}{dx} e^x = e^x$$
 
 $$a^2 + b^2 = c^2$$
 
-Mid-line display keeps display metrics and stays in the text flow
-instead of centering as a block: $$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$
-right here, and $$x$$ tail likewise never breaks the paragraph.
+Display islands always center as blocks, even mid-line — the quadratic
+$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$ breaks the paragraph above and
+below, and $$x$$ likewise takes its own rows.
 
 ## Literal gallery
 

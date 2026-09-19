@@ -164,16 +164,13 @@ pub fn rangeInSpan(start: usize, end: usize, span_start: usize, span_end: usize)
     return start < span_end and end > span_start;
 }
 
-/// Fenced math aliases: exact info-string tokens routed to ZaTeX
-/// (`math`, plus the `tex`/`latex`/`katex` spellings from the async
-/// plugin spec's shared math slot). Case-sensitive like the fence
-/// registry; unknown tokens stay code blocks.
+/// Fenced math: only the exact `math` info-string token routes to ZaTeX.
+/// The `tex`/`latex`/`katex` spellings stay LaTeX syntax-highlighted code
+/// blocks (highlight.Lang.latex), never plugin renders. Case-sensitive
+/// like the fence registry; unknown tokens stay code blocks.
 pub fn isMathFenceToken(token: []const u8) bool {
     if (token.len == 0) return false;
     if (std.mem.eql(u8, token, "math")) return true;
-    if (std.mem.eql(u8, token, "tex")) return true;
-    if (std.mem.eql(u8, token, "latex")) return true;
-    if (std.mem.eql(u8, token, "katex")) return true;
     return false;
 }
 
@@ -239,9 +236,10 @@ test "math: display $$ islands; backslash forms stay literal" {
 
 test "math: fence tokens and display lines" {
     try std.testing.expect(isMathFenceToken("math"));
-    try std.testing.expect(isMathFenceToken("tex"));
-    try std.testing.expect(isMathFenceToken("latex"));
-    try std.testing.expect(isMathFenceToken("katex"));
+    // tex/latex/katex are highlighted code, never plugin renders.
+    try std.testing.expect(!isMathFenceToken("tex"));
+    try std.testing.expect(!isMathFenceToken("latex"));
+    try std.testing.expect(!isMathFenceToken("katex"));
     try std.testing.expect(!isMathFenceToken("mermaid"));
     try std.testing.expect(!isMathFenceToken("Math"));
     try std.testing.expect(!isMathFenceToken(""));

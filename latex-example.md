@@ -17,12 +17,13 @@ $$\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$$
 
 $$\int_0^1 x\,dx = \frac{1}{2}$$
 
-Display style also works mid-line, keeping display metrics: the identity
-$$e^{i\pi} + 1 = 0$$ right here in prose.
+A display island also works mid-line: the identity $$e^{i\pi} + 1 = 0$$
+breaks out as a centered block with display metrics, right here in prose.
 
 ## Fenced blocks
 
-All four fence aliases route to ZaTeX as display blocks.
+The `math` fence routes to ZaTeX as a display block, while `tex`,
+`latex`, and `katex` stay LaTeX syntax-highlighted source code.
 
 ```math
 \sqrt{x^2 + y^2}
