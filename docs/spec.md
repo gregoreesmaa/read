@@ -35,13 +35,16 @@ All formulae lay out through the ZaTeX engine, loaded at runtime from
 `libzatex.dylib` (app-bundle `Resources/` or `/usr/local/lib`) via `dlopen`
 — never linked, so the binary keeps its budgets with the engine absent.
 Metrics come from the system STIX Two Math font; optional engine refinements
-(taller delimiter variants, italic/kerning corrections, ink extents) are
-unwired in v1. The frozen C surface drops per-run color (ambient paint)
+(taller delimiter variants, italic/kerning corrections) are unwired in v1. The frozen C surface drops per-run color (ambient paint)
 and skips diagonal strikes (never misdrawn).
 
 Fallback is sourcetelling, never silent: engine absent or refusing (invalid
 input, over 64 KiB, too deep, expansion limit) renders fences as plain code
 cards and islands as literal text, byte-identical to the pre-math reader.
+True glyph extents feed the engine over the v4 C surface (sqrt junction
+included; ink bounds stay NULL — measured 2px shy of full overlap);
+taller delimiter variants and italic/kerning corrections stay unwired
+in v1.
 v1 limits: inline boxes taller than one row shrink to fit it
 (mid-line display included — never an overlap, never a paragraph
 break); math is not selectable, not

@@ -18,16 +18,19 @@
 // - Glyph identity + advances come from the host font (system STIX Two
 //   Math; all 14 FontIds resolve to it in v1 — uniform metrics, complete
 //   math coverage, no bundled fonts).
-// - Optional hooks (variants, italic/kerning corrections, extents, ink)
-//   stay NULL: the core is correct without them (deterministic
-//   fallbacks); big-delimiter growth and accent placement are the known
-//   v1 fidelity gap, documented in docs/spec.md.
+// - Optional hooks: true glyph extents are supplied (CoreText, v4 C
+//   surface) so box geometry — the sqrt junction included — uses real
+//   outlines; ink bounds stay NULL (v3 start, measured 2px shy of full
+//   overlap) with variants and italic/kerning corrections: the core is
+//   correct without them (deterministic fallbacks). Big-delimiter
+//   growth is the known v1 fidelity gap, documented in docs/spec.md.
 // - The frozen C surface projects filled rects only (cabi.zig): diagonal
 //   `cancel` strikes never arrive (skipped engine-side, never misdrawn)
 //   and per-run `\color` is dropped engine-side (runs take ambient).
 // - Rule thickness defaults to 40/1000 em for every kind (KaTeX default).
 
 #include <dlfcn.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -40,6 +43,14 @@
 // ---------------------------------------------------------------------------
 
 typedef struct {
+    int32_t ha, db;
+} ZatexExtents;
+
+typedef struct {
+    int32_t x0, y0, x1, y1;
+} ZatexInkBox;
+
+typedef struct {
     const void *ctx;
     uint16_t (*glyph_id)(const void *ctx, uint16_t font, uint32_t cp);
     int32_t (*advance)(const void *ctx, uint16_t font, uint16_t glyph);
@@ -47,6 +58,8 @@ typedef struct {
     uint16_t (*glyph_variant)(const void *ctx, uint16_t font, uint16_t glyph, int32_t min_height);
     int32_t (*italic_correction)(const void *ctx, uint16_t font, uint16_t glyph);
     int32_t (*kern_correction)(const void *ctx, uint16_t font, uint16_t glyph, int32_t height, uint32_t corner);
+    ZatexExtents (*extents)(const void *ctx, uint16_t font, uint16_t glyph);
+    ZatexInkBox (*ink_bounds)(const void *ctx, uint16_t font, uint16_t glyph);
 } ZatexMetrics;
 
 typedef struct {
@@ -240,8 +253,43 @@ static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
     return units > 0 ? units : 500;
 }
 
+// v4 hooks over the same 100-unit font (×10 thousandths), mirroring
+// zatex-png's cg_backend. One CoreText probe serves both: ink bounds
+// are floored/ceiled to thousandths (y up, unclipped; blank glyphs
+// report zeros), and extents derive from the same box — -floor(x) is
+// ceil(-x), so the values match separate rounding exactly while the
+// two hooks can never disagree. No ensure call: every engine path
+// reaches these through the advance hook first (which ensures), and
+// the null-font guard degrades gracefully regardless.
+static ZatexInkBox zatex_ink_bounds(const void *ctx, uint16_t font, uint16_t glyph) {
+    (void)ctx;
+    (void)font;
+    ZatexInkBox b = { 0, 0, 0, 0 };
+    if (!zatex_font) return b;
+    CGGlyph g = (CGGlyph)glyph;
+    CGRect r = CGRectZero;
+    CTFontGetBoundingRectsForGlyphs(zatex_font, kCTFontOrientationHorizontal, &g, &r, 1);
+    b.x0 = (int32_t)floor((double)r.origin.x * 10.0);
+    b.y0 = (int32_t)floor((double)r.origin.y * 10.0);
+    b.x1 = (int32_t)ceil((double)(r.origin.x + r.size.width) * 10.0);
+    b.y1 = (int32_t)ceil((double)(r.origin.y + r.size.height) * 10.0);
+    return b;
+}
+
+static ZatexExtents zatex_extents(const void *ctx, uint16_t font, uint16_t glyph) {
+    ZatexInkBox b = zatex_ink_bounds(ctx, font, glyph);
+    ZatexExtents z = { 0, 0 };
+    if (b.y1 > 0) z.ha = b.y1;
+    if (b.y0 < 0) z.db = -b.y0;
+    return z;
+}
+
 static const ZatexMetrics zatex_metrics = {
     NULL, zatex_glyph_id, zatex_advance, NULL, NULL, NULL, NULL,
+    // ink_bounds deliberately NULL (v3 start): extents alone close the
+    // sqrt junction to 2px (measured render diff); wiring ink buys
+    // nothing visible at current budgets — revisit with accent work.
+    zatex_extents, NULL,
 };
 
 // ---------------------------------------------------------------------------
