@@ -68,6 +68,10 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # stays the single scrolled-viewport case): --scroll 400 frames the Display
 # gallery heading plus both display lines for reviewers.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_scrolled.png" --scroll 400 test_cases/math.md
+# Case 4d4: Same-file bottom frame: --scroll 700 frames the guards tail,
+# the full Display gallery, and the Literal gallery through the document
+# end for reviewers.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_scrolled_bottom.png" --scroll 700 test_cases/math.md
 
 # Case 4e: Mermaid rendered image (issue #323) — read-test never probes or
 # launches, so the suite pre-seeds the cache PNG for the fixture fence and
