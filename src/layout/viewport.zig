@@ -1870,10 +1870,11 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
     }
 }
 
-/// Flows a display island (`$$...$$`) as a centered block on its own
-/// visual rows, whole-line or mid-line alike. True when rendered (caller
-/// returns); false falls back to normal literal flow. Breaks the row
-/// before/after like a hard break, so mid-paragraph islands just work.
+/// Flows a whole-line display island (`$$...$$`) as a centered block on
+/// its own visual rows. True when rendered (caller returns); false falls
+/// back to normal literal flow. Breaks the row before/after like a hard
+/// break, so mid-paragraph display lines just work. Mid-line islands never
+/// reach this path: they stay in the text flow via flowMathSpan.
 fn flowMathDisplay(tex: []const u8, pen: *FlowPen, ctx: FlowCtx) bool {
     const box = mathBox(tex, true, ctx.font_size, ctx.math_size_fn) orelse return false;
     if (pen.x > ctx.start_x or (ctx.rtl and pen.x < ctx.start_x + ctx.max_w)) {
@@ -1968,20 +1969,17 @@ pub fn flowSourceLine(
         }
         var txt = span.text;
         var tgt = span.link_target;
-        // Math islands flow as ZaTeX boxes: inline islands sit on the
-        // baseline at natural size (tall ink borrows the neighboring
-        // rows' leading space), while display islands always break out
-        // as centered blocks, even mid-line. Block code and
-        // headings keep the island literal (v1 limit), and twin builds
-        // never form islands, so both fall back identically (the comptime
-        // gate strips the box path from the twin).
+        // Math islands flow as ZaTeX boxes at natural size on the
+        // baseline: `$...$` inline, and `$$...$$` with display metrics
+        // even mid-line (tall ink borrows the neighboring rows' leading
+        // space, split by the baseline — never a paragraph break). Only
+        // whole-line display islands center as blocks (flowMathDisplay
+        // above). Block code and headings keep the island literal (v1
+        // limit), and twin builds never form islands, so both fall back
+        // identically (the comptime gate strips the box path from the
+        // twin).
         if (comptime !math_stub) {
             if (style.math and !line_force_code and !force_heading) {
-                if (style.math_display) {
-                    if (math_detect.stripIsland(span.text)) |tex| {
-                        if (flowMathDisplay(tex, pen, line_ctx)) continue;
-                    }
-                }
                 flowMathSpan(span.text, style.math_display, pen, line_ctx);
                 continue;
             }
@@ -9275,7 +9273,7 @@ test "math: whole-line display centers a block, fallback stays literal" {
     try std.testing.expectApproxEqAbs(@as(f32, 18.7), pen.y, 0.01);
 }
 
-test "math: mid-line display island breaks out as a centered block" {
+test "math: mid-line display island stays in the text flow" {
     if (comptime core_options.plugin_stub) return;
     const Stub = struct {
         fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
@@ -9308,19 +9306,18 @@ test "math: mid-line display island breaks out as a centered block" {
         .math_size_fn = Stub.size,
     };
     flowSourceLine("see $$x^2$$ now", false, false, false, &pen, ctx);
-    // Leading text, centered block, trailing text on a fresh row.
+    // Leading text, inline box, trailing text: one row, no paragraph break.
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(DrawCommandKind.text_run, cmds[0].kind);
     try std.testing.expectEqual(DrawCommandKind.math, cmds[1].kind);
     try std.testing.expectEqual(DrawCommandKind.text_run, cmds[2].kind);
     try std.testing.expect(cmds[1].style.math_display);
     try std.testing.expectEqualStrings("x^2", cmds[1].text);
-    try std.testing.expectApproxEqAbs((600.0 - 34.0) / 2.0, cmds[1].rect.x, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 29.75), cmds[1].rect.y, 0.01);
+    // Display metrics on the text baseline, exactly like an inline box.
+    try std.testing.expectApproxEqAbs(@as(f32, 34.0), cmds[1].rect.w, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 18.7), cmds[1].rect.h, 0.01);
-    // One text row plus the block height; the block never overlaps rows.
-    try std.testing.expect(cmds[1].rect.y >= 29.75);
-    try std.testing.expectApproxEqAbs(@as(f32, 29.75 + 18.7), pen.y, 0.01);
+    try std.testing.expectApproxEqAbs(17.0 * 0.85 - 17.0 * 0.8, cmds[1].rect.y, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.01);
 }
 
 test "math: tall inline box keeps natural size, borrowing neighbor rows" {

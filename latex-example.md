@@ -18,7 +18,7 @@ $$\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$$
 $$\int_0^1 x\,dx = \frac{1}{2}$$
 
 A display island also works mid-line: the identity $$e^{i\pi} + 1 = 0$$
-breaks out as a centered block with display metrics, right here in prose.
+keeps display metrics right here in prose, never breaking the paragraph.
 
 ## Fenced blocks
 

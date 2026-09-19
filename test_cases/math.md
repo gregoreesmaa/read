@@ -36,9 +36,10 @@ $$\frac{d}{dx} e^x = e^x$$
 
 $$a^2 + b^2 = c^2$$
 
-Display islands always center as blocks, even mid-line — the quadratic
-$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$ breaks the paragraph above and
-below, and $$x$$ likewise takes its own rows.
+A whole-line `$$...$$` island centers as a block, while a display
+island mid-line keeps display metrics and stays in the text flow: the
+quadratic $$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$ right here borrows
+the neighboring rows, and $$x$$ likewise never breaks the paragraph.
 
 ## Literal gallery
 
