@@ -72,6 +72,14 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # the full Display gallery, and the Literal gallery through the document
 # end for reviewers.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_scrolled_bottom.png" --scroll 700 test_cases/math.md
+# Case 4d5/4d6/4d7: Math gallery (test_cases/math_gallery.md), LIVE renders
+# like the trio above (same scratch-live procedure, never committed): a
+# wider sweep — nesting, accents, delimiters, display blocks, matrix —
+# for spotting renderer issues. Same fallback warning applies; do NOT
+# shoot these with a live full-suite run for the same reason as 4d2.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_gallery.png" test_cases/math_gallery.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_gallery_scrolled.png" --scroll 500 test_cases/math_gallery.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_gallery_bottom.png" --scroll 950 test_cases/math_gallery.md
 
 # Case 4e: Mermaid rendered image (issue #323) — read-test never probes or
 # launches, so the suite pre-seeds the cache PNG for the fixture fence and
