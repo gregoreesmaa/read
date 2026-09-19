@@ -1833,11 +1833,12 @@ fn emitMath(pen_x: f32, ink_top: f32, box: MathBox, tex: []const u8, color: Colo
 
 /// Flows one inline island span at the pen as an unbreakable box on the
 /// text baseline (baseline = row top + 0.85em, the text_run convention).
-/// Inline boxes sit on the text baseline at their natural size. Ink
-/// taller than one row takes room from the neighboring rows' leading
-/// space — the above-baseline extent borrows from the row above, the
-/// below-baseline extent from the row below. Wrap and visibility match
-/// flowWord so measurement agrees bit-for-bit.
+/// Inline boxes sit on the text baseline. A box that would spill past
+/// the row top or bottom shrinks uniformly until it fits inside the row
+/// around its baseline anchor (same linear-shrink trick as the width-fit
+/// paths), so inline formulae — `$...$` and mid-line `$$...$$` alike —
+/// never overlap neighboring rows and never force a paragraph break.
+/// Wrap and visibility match flowWord so measurement agrees bit-for-bit.
 /// Fallback (engine off/failure): the whole island flows as literal text.
 fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) void {
     const tex = math_detect.stripIsland(island) orelse {
@@ -1848,25 +1849,39 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
         flowSpans(island, .{}, null, pen, ctx, false);
         return;
     };
+    // Fit inside the row around the 0.85em baseline anchor: each side
+    // scales against its own budget (row top above, row bottom below).
+    var fit = box;
+    const avail_above = ctx.font_size * 0.85;
+    const avail_below = ctx.line_h - avail_above;
+    var k: f32 = 1.0;
+    if (box.above > avail_above and box.above > 0 and avail_above > 0) k = @min(k, avail_above / box.above);
+    if (box.below > avail_below and box.below > 0 and avail_below > 0) k = @min(k, avail_below / box.below);
+    if (k < 1.0) {
+        fit.w *= k;
+        fit.above *= k;
+        fit.below *= k;
+        fit.font_px *= k;
+    }
     if (ctx.rtl) {
-        if (pen.x - box.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
+        if (pen.x - fit.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
             pen.y += ctx.line_h;
             pen.x = ctx.start_x + ctx.max_w;
         }
-    } else if (pen.x + box.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
+    } else if (pen.x + fit.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
         pen.y += ctx.line_h;
         pen.x = ctx.start_x;
     }
     const baseline = pen.y + ctx.font_size * 0.85;
-    const ink_top = baseline - box.above;
-    if (ink_top + box.above + box.below >= 0 and ink_top <= ctx.vp_bottom) {
-        const run_x = if (ctx.rtl) pen.x - box.w else pen.x;
-        emitMath(run_x, ink_top, box, tex, ctx.default_color, ctx);
+    const ink_top = baseline - fit.above;
+    if (ink_top + fit.above + fit.below >= 0 and ink_top <= ctx.vp_bottom) {
+        const run_x = if (ctx.rtl) pen.x - fit.w else pen.x;
+        emitMath(run_x, ink_top, fit, tex, ctx.default_color, ctx);
     }
     if (ctx.rtl) {
-        pen.x -= box.w;
+        pen.x -= fit.w;
     } else {
-        pen.x += box.w;
+        pen.x += fit.w;
     }
 }
 
@@ -1969,15 +1984,14 @@ pub fn flowSourceLine(
         }
         var txt = span.text;
         var tgt = span.link_target;
-        // Math islands flow as ZaTeX boxes at natural size on the
-        // baseline: `$...$` inline, and `$$...$$` with display metrics
-        // even mid-line (tall ink borrows the neighboring rows' leading
-        // space, split by the baseline — never a paragraph break). Only
-        // whole-line display islands center as blocks (flowMathDisplay
-        // above). Block code and headings keep the island literal (v1
-        // limit), and twin builds never form islands, so both fall back
-        // identically (the comptime gate strips the box path from the
-        // twin).
+        // Math islands flow as ZaTeX boxes on the baseline: `$...$`
+        // inline, and `$$...$$` with display metrics even mid-line
+        // (over-height boxes shrink to fit the row — never an overlap,
+        // never a paragraph break). Only whole-line display islands
+        // center as blocks (flowMathDisplay above). Block code and
+        // headings keep the island literal (v1 limit), and twin builds
+        // never form islands, so both fall back identically (the comptime
+        // gate strips the box path from the twin).
         if (comptime !math_stub) {
             if (style.math and !line_force_code and !force_heading) {
                 flowMathSpan(span.text, style.math_display, pen, line_ctx);
@@ -9320,7 +9334,7 @@ test "math: mid-line display island stays in the text flow" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.01);
 }
 
-test "math: tall inline box keeps natural size, borrowing neighbor rows" {
+test "math: tall inline box shrinks to fit the row" {
     if (comptime core_options.plugin_stub) return;
     const Stub = struct {
         fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
@@ -9355,12 +9369,13 @@ test "math: tall inline box keeps natural size, borrowing neighbor rows" {
     flowSourceLine("see $x$ now", false, false, false, &pen, ctx);
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(DrawCommandKind.math, cmds[1].kind);
-    // Natural size, no shrink: full 51px of ink on the 0.85em baseline,
-    // borrowing the neighboring rows' leading space above and below.
-    try std.testing.expectApproxEqAbs(@as(f32, 51.0), cmds[1].rect.h, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 34.0), cmds[1].rect.w, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 17.0 * 0.85 - 34.0), cmds[1].rect.y, 0.01);
-    try std.testing.expect(cmds[1].rect.y < 0.0);
+    // 34px above against a 14.45px budget scales everything by
+    // 14.45/34: the box lands inside the row (top at the row top, bottom
+    // above the row bottom) — no overlap, no paragraph break, pen stays.
+    try std.testing.expectApproxEqAbs(@as(f32, 14.45), cmds[1].rect.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 51.0 * 14.45 / 34.0), cmds[1].rect.h, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), cmds[1].rect.y, 0.01);
+    try std.testing.expect(cmds[1].rect.y + cmds[1].rect.h <= 29.75 + 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.01);
 }
 
