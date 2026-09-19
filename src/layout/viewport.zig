@@ -4,7 +4,27 @@ const parser = @import("../core/parser.zig");
 const highlight = @import("../core/highlight.zig");
 const bidi = @import("../core/bidi.zig");
 const plugin_cache = @import("../core/plugin_cache.zig");
+const math_detect = @import("../core/math_detect.zig");
 const core_options = @import("core_options");
+
+// Twin gate (AGENTS.md §7): with -Dplugin_stub=true every math branch
+// below folds away at comptime, so the twin's __TEXT delta is exactly the
+// math-attributable layout code.
+const math_stub = core_options.plugin_stub;
+
+/// Synchronous ZaTeX size query (platform Math backend,
+/// src/platform/macos_zatex.m). Mirrors image_size_fn: null (the default,
+/// and every headless/test caller) keeps today's rendering bit-identical.
+/// Status: 0 laid out (dims valid), otherwise fallback to literal source.
+pub const MathSizeFn = *const fn (
+    tex: [*]const u8,
+    tex_len: c_int,
+    display: c_int,
+    font_px: f32,
+    out_w: *f32,
+    out_above: *f32,
+    out_below: *f32,
+) callconv(.c) c_int;
 
 // Calibrated ASCII advance widths for IBM Plex Serif Regular (in 1/1000 em)
 pub const SERIF_FONT_WIDTHS = [128]u16{
@@ -778,6 +798,13 @@ pub const DrawCommandKind = enum {
     begin_clip,
     end_clip,
     image,
+    /// ZaTeX math box: `text` borrows the raw TeX content (delimiters
+    /// stripped), `font_size` the ambient px, `style.math_display` the
+    /// display flag. The platform re-lays out synchronously and draws
+    /// glyph runs + rule rects; `rect` is the ink box (x, ink top, w,
+    /// above+below) derived from the same size query, so size and draw
+    /// always agree. Never selected, never linked.
+    math,
 };
 
 /// Horizontal-rule vertical rhythm (issue #26): 2em total (1em each side
@@ -1022,6 +1049,11 @@ pub const ViewportConfig = struct {
     /// no cap is enforced here, so overlong tables are honored, never
     /// silently cut).
     plugins: ?[]const PluginEntry = null,
+    /// ZaTeX size query for math boxes (inline islands, display lines,
+    /// math fences). Null keeps literal/code-card rendering bit-identical;
+    /// set only on the live ship path (headless tests leave it null so
+    /// screenshots stay deterministic with no dylib seeded).
+    math_size_fn: ?MathSizeFn = null,
 };
 
 /// One layout-facing plugin row: the fence anchor plus what the fence
@@ -1369,6 +1401,9 @@ pub const FlowCtx = struct {
     cmd_count: *usize,
     defs: []const simd.RefDef = &.{},
     entities: ?*EntityStore = null,
+    /// ZaTeX size query, threaded from ViewportConfig (null keeps math
+    /// literal/code-card). Measurement and render share it, so boxes agree.
+    math_size_fn: ?MathSizeFn = null,
     /// RTL paragraph flow (issue #50): the pen tracks the RIGHT edge and
     /// words lay right-to-left. Defaults false: the LTR path below is
     /// byte-identical to the historical layout.
@@ -1757,6 +1792,108 @@ test "design #23: inline code pill geometry + atomic wrap" {
     try std.testing.expectApproxEqAbs(cmds3[0].font_size, 17.0, 0.001);
 }
 
+/// Measured math box from one raw-TeX query. Null when the engine is
+/// unavailable (null size fn, twin builds) or refuses the formula: the
+/// caller falls back to literal source rendering, byte-identical to the
+/// pre-math reader. `font_px` is the ambient size; dims scale linearly.
+const MathBox = struct {
+    w: f32,
+    above: f32,
+    below: f32,
+    font_px: f32,
+    display: bool,
+};
+
+fn mathBox(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSizeFn) ?MathBox {
+    const q = size_fn orelse return null;
+    if (comptime math_stub) return null;
+    if (tex.len == 0 or tex.len > 65536 or font_px <= 0) return null;
+    var w: f32 = 0;
+    var above: f32 = 0;
+    var below: f32 = 0;
+    const st = q(tex.ptr, @intCast(tex.len), if (display) 1 else 0, font_px, &w, &above, &below);
+    if (st != 0 or w <= 0 or above + below <= 0) return null;
+    return .{ .w = w, .above = above, .below = below, .font_px = font_px, .display = display };
+}
+
+/// Emits one math command when capacity remains (measurement passes share
+/// the pen math with zero emissions, exactly like flowWord).
+fn emitMath(pen_x: f32, ink_top: f32, box: MathBox, tex: []const u8, color: Color, ctx: FlowCtx) void {
+    if (ctx.cmd_count.* >= ctx.commands_out.len) return;
+    ctx.commands_out[ctx.cmd_count.*] = .{
+        .kind = .math,
+        .rect = .{ .x = pen_x, .y = ink_top, .w = box.w, .h = box.above + box.below },
+        .color = color,
+        .text = tex,
+        .font_size = box.font_px,
+        .style = .{ .math = true, .math_display = box.display },
+    };
+    ctx.cmd_count.* += 1;
+}
+
+/// Flows one inline island span at the pen as an unbreakable box on the
+/// text baseline (baseline = row top + 0.85em, the text_run convention).
+/// Tall boxes may overlap neighboring rows (documented v1 limit); wrap
+/// and visibility match flowWord so measurement agrees bit-for-bit.
+/// Fallback (engine off/failure): the whole island flows as literal text.
+fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) void {
+    const tex = math_detect.stripIsland(island) orelse {
+        flowSpans(island, .{}, null, pen, ctx, false);
+        return;
+    };
+    const box = mathBox(tex, display, ctx.font_size, ctx.math_size_fn) orelse {
+        flowSpans(island, .{}, null, pen, ctx, false);
+        return;
+    };
+    if (ctx.rtl) {
+        if (pen.x - box.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
+            pen.y += ctx.line_h;
+            pen.x = ctx.start_x + ctx.max_w;
+        }
+    } else if (pen.x + box.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
+        pen.y += ctx.line_h;
+        pen.x = ctx.start_x;
+    }
+    const baseline = pen.y + ctx.font_size * 0.85;
+    const ink_top = baseline - box.above;
+    if (ink_top + box.above + box.below >= 0 and ink_top <= ctx.vp_bottom) {
+        const run_x = if (ctx.rtl) pen.x - box.w else pen.x;
+        emitMath(run_x, ink_top, box, tex, ctx.default_color, ctx);
+    }
+    if (ctx.rtl) {
+        pen.x -= box.w;
+    } else {
+        pen.x += box.w;
+    }
+}
+
+/// Flows a whole-line display island (`$$...$$`) as a centered block on
+/// its own visual rows. True when rendered (caller returns); false falls
+/// back to normal literal flow. Breaks the row before/after like a hard
+/// break, so mid-paragraph display lines just work.
+fn flowMathDisplay(tex: []const u8, pen: *FlowPen, ctx: FlowCtx) bool {
+    const box = mathBox(tex, true, ctx.font_size, ctx.math_size_fn) orelse return false;
+    if (pen.x > ctx.start_x or (ctx.rtl and pen.x < ctx.start_x + ctx.max_w)) {
+        pen.y += ctx.line_h;
+        pen.x = if (ctx.rtl) ctx.start_x + ctx.max_w else ctx.start_x;
+    }
+    const w = @min(box.w, ctx.max_w);
+    const bx = if (ctx.rtl) ctx.start_x + ctx.max_w - w else ctx.start_x + (ctx.max_w - w) / 2.0;
+    // Width-fit shrink keeps the aspect: dims scale linearly with px.
+    const k = if (box.w > 0) w / box.w else 1.0;
+    var fit = box;
+    fit.w = w;
+    fit.above *= k;
+    fit.below *= k;
+    fit.font_px *= k;
+    if (pen.y + fit.above + fit.below >= 0 and pen.y <= ctx.vp_bottom) {
+        emitMath(bx, pen.y, fit, tex, ctx.default_color, ctx);
+    }
+    pen.y += fit.above + fit.below;
+    pen.x = if (ctx.rtl) ctx.start_x + ctx.max_w else ctx.start_x;
+    return true;
+}
+
 /// Flows one raw source line at the pen. Trims leading whitespace when
 /// `strip_leading` (continuation lines of a flowed run) and always trims
 /// trailing whitespace; the caller emits the single soft-break space between
@@ -1777,6 +1914,16 @@ pub fn flowSourceLine(
     }
     while (text.len > 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) : (text = text[0 .. text.len - 1]) {}
     if (text.len == 0) return;
+    // Whole-line display math (`$$...$$`, `\[...\]`) renders as a centered
+    // block; anything else (including engine-off/failure) flows literally.
+    // Block code and headings keep literal rendering (documented v1 limit).
+    if (comptime !math_stub) {
+        if (!force_code and !force_heading) {
+            if (math_detect.displayLineContent(text)) |tex| {
+                if (flowMathDisplay(tex, pen, ctx)) return;
+            }
+        }
+    }
     // Fast path: text with no inline-significant byte parses to exactly one
     // default-style span, so skip the full inline parser and flow it
     // directly. The common case for quotes, bullets, and plain paragraphs.
@@ -1818,10 +1965,22 @@ pub fn flowSourceLine(
         }
         var txt = span.text;
         var tgt = span.link_target;
+        // Math islands flow as ZaTeX boxes (inline on the baseline;
+        // display-style islands keep display metrics even mid-line).
+        // Block code and headings keep the island literal (v1 limit), and
+        // twin builds never form islands, so both fall back identically
+        // (the comptime gate strips the box path from the twin).
+        if (comptime !math_stub) {
+            if (style.math and !line_force_code and !force_heading) {
+                flowMathSpan(span.text, style.math_display, pen, line_ctx);
+                continue;
+            }
+        }
         // Entities decode in rendered text (never in code spans, whose
-        // `&amp;` is literal). Measurement flows the same decoded slices,
+        // `&amp;` is literal, and never in math islands, whose `&` is
+        // alignment). Measurement flows the same decoded slices,
         // so wrap geometry always matches the draw.
-        if (!style.code and line_ctx.entities != null) {
+        if (!style.code and !style.math and line_ctx.entities != null) {
             if (simd.findByte(txt, 0, '&') != null) {
                 if (line_ctx.entities.?.decodeInto(txt)) |d| txt = d;
             }
@@ -1835,7 +1994,8 @@ pub fn flowSourceLine(
 
 /// True when `text` holds a byte that can open an inline construct:
 /// code span (`` ` ``), emphasis (`*`, `_`), link/image/ref (`[`),
-/// autolink (`<`), entity (`&`), escape (`\`), strikethrough (`~`), or a
+/// autolink (`<`), entity (`&`), escape (`\`), strikethrough (`~`), math
+/// island (`$`, confirmed by scan so currency stays fast), or a
 /// GFM bare URL (`http://`, `https://` at a non-alphanumeric boundary).
 /// Every construct needs one of these openers, so text without any of them
 /// always parses to a single default-style span and flowSourceLine can skip
@@ -1843,6 +2003,14 @@ pub fn flowSourceLine(
 /// opener is present; block-level markers (`>`, `#`, `-`, `|`) are literal
 /// in text or stripped upstream, so they never force the slow path.
 fn hasInlineMarkup(text: []const u8) bool {
+    // `$` opens math only as a guarded island (currency stays literal):
+    // confirm before leaving the fast path, so price lines keep
+    // single-span speed while `$x$` parses fully. First so the per-byte
+    // loop below never sees the dollar (statement form: the comptime
+    // gate strips cleanly from the twin).
+    if (comptime !math_stub) {
+        if (std.mem.indexOfScalar(u8, text, '$') != null and math_detect.hasMathIsland(text)) return true;
+    }
     var k: usize = 0;
     for (text) |c| {
         switch (c) {
@@ -2592,6 +2760,7 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .cmd_count = ux.cmd_count,
         .defs = ux.config.ref_defs,
         .entities = ux.config.entities,
+        .math_size_fn = ux.config.math_size_fn,
     };
 }
 
@@ -4440,6 +4609,44 @@ fn pluginFenceGeom(entries: ?[]const PluginEntry, i: usize) PluginFenceGeom {
     return .{};
 }
 
+/// ZaTeX math-fence geometry (```math|tex|latex|katex): the synchronous
+/// native block shared by render, height, and refine so all three agree
+/// bit-for-bit (same role as pluginFenceGeom for async fences). Null when
+/// the fence token is not a math alias or the engine is off/refuses it —
+/// callers fall through to today's code card. Width-fit shrink keeps the
+/// aspect (dims scale linearly with px), mirroring the display-line path.
+const MathFenceGeom = struct {
+    tex: []const u8,
+    box: MathBox,
+    x: f32,
+};
+
+fn mathFenceGeom(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    i: usize,
+    config: ViewportConfig,
+    content_x: f32,
+    content_width: f32,
+) ?MathFenceGeom {
+    if (comptime math_stub) return null;
+    if (i >= lines.len or lines[i].block_type != .code_fence_start) return null;
+    const info = lines[i];
+    const tok = highlight.fenceToken(bytes[info.offset..][0..info.len]);
+    if (!math_detect.isMathFenceToken(tok)) return null;
+    const tex = plugin_cache.fenceSource(bytes, lines, i);
+    if (tex.len == 0) return null;
+    const box = mathBox(tex, true, config.base_font_size, config.math_size_fn) orelse return null;
+    const w = @min(box.w, content_width);
+    const k = if (box.w > 0) w / box.w else 1.0;
+    var fit = box;
+    fit.w = w;
+    fit.above *= k;
+    fit.below *= k;
+    fit.font_px *= k;
+    return .{ .tex = tex, .box = fit, .x = content_x + (content_width - w) / 2.0 };
+}
+
 /// scrollable block ids from `start_block_id`.
 /// Zero heap allocations: writes directly into `commands_out`.
 /// Both `layoutViewport` (checkpoint seek) and `layoutViewportJIT`
@@ -4539,6 +4746,30 @@ pub fn renderViewportCore(
             var scan_i = i + 1;
             while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
                 code_line_count += 1;
+            }
+
+            // ZaTeX math fence (```math|tex|latex|katex): synchronous
+            // native block, centered with image margins. Engine off or
+            // refusing falls through to today's code card below.
+            if (mathFenceGeom(bytes, lines, i, config, content_x, content_width)) |mfg| {
+                const mh = mfg.box.above + mfg.box.below;
+                const m_margin: f32 = 18.0;
+                cur_y += m_margin;
+                if (cur_y + mh >= 0 and cur_y <= vp_bottom and cmd_count < commands_out.len) {
+                    commands_out[cmd_count] = .{
+                        .kind = .math,
+                        .rect = .{ .x = mfg.x, .y = cur_y, .w = mfg.box.w, .h = mh },
+                        .color = theme.text,
+                        .text = mfg.tex,
+                        .font_size = mfg.box.font_px,
+                        .style = .{ .math = true, .math_display = true },
+                    };
+                    cmd_count += 1;
+                }
+                cur_y += mh + m_margin;
+                next_block_id += 1;
+                i = scan_i; // Skip past code_fence_end
+                continue;
             }
 
             // Plugin fence decision (issue #323, PR-1 Task 4/5): one shared
@@ -5405,6 +5636,15 @@ pub fn computeDocumentHeightEx(
             var scan_i = i + 1;
             while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
                 code_line_count += 1;
+            }
+            // ZaTeX math fence mirror: the same mathFenceGeom decision
+            // the render branch draws, so the document height tracks
+            // native math blocks exactly. Falls through to the card.
+            if (mathFenceGeom(bytes, lines, i, config, content_x, content_width)) |mfg| {
+                cur_y += 18.0 + mfg.box.above + mfg.box.below + 18.0;
+                next_block_id += 1;
+                i = scan_i;
+                continue;
             }
             // Plugin fence mirror (issue #323, PR-1 Task 5 F1): the same
             // pluginFenceGeom decision the render branch draws, so the
@@ -7017,6 +7257,11 @@ pub fn refineLineHeight(
             // converges to the drawn box, never the stale card.
             const plugin_geom = pluginFenceGeom(config.plugins, idx);
             const consumed = if (j < lines.len) j - idx + 1 else lines.len - idx;
+            // ZaTeX math fence mirror: same mathFenceGeom decision as
+            // render/height so JIT refine converges to the native block.
+            if (mathFenceGeom(bytes, lines, idx, config, content_x, content_width)) |mfg| {
+                return .{ .height = 18.0 + mfg.box.above + mfg.box.below + 18.0, .consumed = consumed };
+            }
             if (plugin_geom.state == .ready and plugin_geom.path != null) {
                 var nat_w: f32 = 0.0;
                 var nat_h: f32 = 0.0;
@@ -8888,4 +9133,192 @@ test "scroll illusion: O(1) fraction jump resolves inside deep-scroll budget" {
         .checkpoints = cps[0..cp_count],
     }, &cmds);
     try std.testing.expect(n_cmds > 0);
+}
+
+test "math: inline island flows as baseline box, fallback stays literal" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    // Live engine: text, math box, text. Baseline = row top + 0.85em.
+    var cmds: [16]DrawCommand = undefined;
+    var n: usize = 0;
+    var pen = FlowPen{ .x = 0, .y = 0 };
+    const ctx = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds,
+        .cmd_count = &n,
+        .math_size_fn = Stub.size,
+    };
+    flowSourceLine("see $x$ now", false, false, false, &pen, ctx);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(DrawCommandKind.text_run, cmds[0].kind);
+    try std.testing.expectEqual(DrawCommandKind.math, cmds[1].kind);
+    try std.testing.expectEqual(DrawCommandKind.text_run, cmds[2].kind);
+    try std.testing.expectEqualStrings("x", cmds[1].text);
+    try std.testing.expect(!cmds[1].style.math_display);
+    try std.testing.expectApproxEqAbs(@as(f32, 34.0), cmds[1].rect.w, 0.01);
+    try std.testing.expectApproxEqAbs(17.0 * 0.85 - 17.0 * 0.8, cmds[1].rect.y, 0.01);
+    try std.testing.expectApproxEqAbs(17.0 * 1.1, cmds[1].rect.h, 0.01);
+    // Fallback (null fn): the island stays literal text, no math command.
+    var cmds2: [16]DrawCommand = undefined;
+    var n2: usize = 0;
+    var pen2 = FlowPen{ .x = 0, .y = 0 };
+    const ctx2 = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds2,
+        .cmd_count = &n2,
+    };
+    flowSourceLine("see $x$ now", false, false, false, &pen2, ctx2);
+    try std.testing.expect(n2 > 0);
+    for (cmds2[0..n2]) |c| try std.testing.expect(c.kind != .math);
+    // Currency never forms a box even with a live engine.
+    var cmds3: [16]DrawCommand = undefined;
+    var n3: usize = 0;
+    var pen3 = FlowPen{ .x = 0, .y = 0 };
+    const ctx3 = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds3,
+        .cmd_count = &n3,
+        .math_size_fn = Stub.size,
+    };
+    flowSourceLine("pay $100 now", false, false, false, &pen3, ctx3);
+    for (cmds3[0..n3]) |c| try std.testing.expect(c.kind != .math);
+}
+
+test "math: whole-line display centers a block, fallback stays literal" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            std.debug.assert(display == 1);
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    var cmds: [16]DrawCommand = undefined;
+    var n: usize = 0;
+    var pen = FlowPen{ .x = 0, .y = 0 };
+    const ctx = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds,
+        .cmd_count = &n,
+        .math_size_fn = Stub.size,
+    };
+    flowSourceLine("$$x^2$$", false, false, false, &pen, ctx);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(DrawCommandKind.math, cmds[0].kind);
+    try std.testing.expect(cmds[0].style.math_display);
+    try std.testing.expectEqualStrings("x^2", cmds[0].text);
+    try std.testing.expectApproxEqAbs((600.0 - 34.0) / 2.0, cmds[0].rect.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 18.7), pen.y, 0.01);
+}
+
+test "math: fence renders native block with stub engine, card without" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    const test_doc =
+        "```math\n" ++
+        "x^2\n" ++
+        "```\n";
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
+    try std.testing.expectEqual(@as(usize, 3), line_count);
+    var cmds: [256]DrawCommand = undefined;
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .math_size_fn = Stub.size,
+    };
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    var found: ?DrawCommand = null;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .math) {
+            try std.testing.expect(found == null);
+            found = c;
+        }
+    }
+    const m = found orelse return error.MathBlockMissing;
+    try std.testing.expectEqualStrings("x^2", m.text);
+    try std.testing.expect(m.style.math_display);
+    // Centered in the 600px column: x = 100 + (600 - 34) / 2.
+    try std.testing.expectApproxEqAbs(@as(f32, 383.0), m.rect.x, 0.01);
+    // 18px margins + 18.7px ink, from the 50px document top.
+    try std.testing.expectApproxEqAbs(@as(f32, 68.0), m.rect.y, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 18.7), m.rect.h, 0.01);
+    // Height pass agrees with render (50px top pad + block + 50px bottom).
+    const h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], config, null, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 50.0 + 18.0 + 18.7 + 18.0 + 50.0), h, 0.05);
+    // Without the engine the same fence is today's code card: no math.
+    var cmds2: [256]DrawCommand = undefined;
+    const config2 = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+    };
+    const count2 = layoutViewport(test_doc, lines_buf[0..line_count], config2, &cmds2);
+    for (cmds2[0..count2]) |c| try std.testing.expect(c.kind != .math);
 }

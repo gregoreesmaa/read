@@ -94,6 +94,15 @@ var g_remote_seen: bool = false;
 /// loader is never asked (`platform_get_image_size` is what kicks async
 /// loads, so gating here means no fetch is ever started for blocked
 /// content). Local content passes straight through.
+/// ZaTeX size query for live rendering (ship only): headless test builds
+/// leave it null so math fences/islands fall back deterministically with
+/// no dylib seeded (mirrors the launcher-callback-null pattern for async
+/// plugins). Twin builds compile the math paths out regardless.
+fn liveMathSizeFn() ?layout.MathSizeFn {
+    if (build_options.test_hooks) return null;
+    return bridge.platform_math_size;
+}
+
 fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void {
     out_w.* = 0;
     out_h.* = 0;
@@ -983,6 +992,7 @@ fn updateDocumentMetrics() void {
         // Size-class re-wrap here (metrics) and in onDraw below.
         .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
+        .math_size_fn = liveMathSizeFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1126,6 +1136,7 @@ fn anchorTargetY(frag: []const u8) ?f32 {
         .scroll_y = 0.0,
         .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
+        .math_size_fn = liveMathSizeFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1147,6 +1158,7 @@ fn measureConfig() layout.ViewportConfig {
         .window_height = g_app.window_height,
         .scroll_y = 0.0,
         .image_size_fn = gatedImageSize,
+        .math_size_fn = liveMathSizeFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1315,6 +1327,7 @@ fn findMatchY(offset: usize) ?f32 {
         .scroll_y = 0.0,
         .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
+        .math_size_fn = liveMathSizeFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1633,6 +1646,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .is_dark_theme = g_app.is_dark_theme,
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
         .image_size_fn = gatedImageSize,
+        .math_size_fn = liveMathSizeFn(),
         .ordered_markers = &g_markers,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
@@ -1870,6 +1884,26 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     cmd.rect.h,
                     cmd.text.ptr,
                     @intCast(cmd.text.len),
+                );
+            },
+            .math => {
+                // ZaTeX native box (LaTeX math plugin): never selected,
+                // never linked — pixels only, like images. The platform
+                // re-lays out synchronously from the same content bytes
+                // the size query measured, so draw always matches layout.
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) continue;
+                if (cmd.text.len == 0) continue;
+                bridge.platform_draw_math(
+                    cmd.text.ptr,
+                    @intCast(cmd.text.len),
+                    if (cmd.style.math_display) 1 else 0,
+                    cmd.font_size,
+                    cmd.rect.x,
+                    cmd.rect.y,
+                    cmd.color.r,
+                    cmd.color.g,
+                    cmd.color.b,
+                    cmd.color.a,
                 );
             },
             .inline_code_bg => {

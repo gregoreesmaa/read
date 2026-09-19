@@ -54,6 +54,12 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # as plain code blocks, source intact.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_fallback.png" test_cases/plugin_fallback.md
 
+# Case 4d2: Math via ZaTeX — read-test leaves the size query null (no dylib
+# seeded), so the suite screenshots the byte-identical literal/code-card
+# fallback deterministically; live rendering is covered by unit tests with
+# a stub engine plus the backend oracle (see src/platform/macos_zatex.m).
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math.png" test_cases/math.md
+
 # Case 4e: Mermaid rendered image (issue #323) — read-test never probes or
 # launches, so the suite pre-seeds the cache PNG for the fixture fence and
 # the headless open resolves it to ready via the shipped stat-exists path
