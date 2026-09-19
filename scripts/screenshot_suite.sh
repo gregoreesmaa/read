@@ -59,6 +59,10 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # fallback deterministically; live rendering is covered by unit tests with
 # a stub engine plus the backend oracle (see src/platform/macos_zatex.m).
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math.png" test_cases/math.md
+# Case 4d3: Same-file scrolled frame (no new test case, scrollable_doc.md
+# stays the single scrolled-viewport case): --scroll 400 frames the Display
+# gallery heading plus both display lines for reviewers.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_scrolled.png" --scroll 400 test_cases/math.md
 
 # Case 4e: Mermaid rendered image (issue #323) — read-test never probes or
 # launches, so the suite pre-seeds the cache PNG for the fixture fence and
