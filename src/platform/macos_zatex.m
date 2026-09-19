@@ -18,13 +18,13 @@
 // - Glyph identity + advances come from the host font (system STIX Two
 //   Math; all 14 FontIds resolve to it in v1 — uniform metrics, complete
 //   math coverage, no bundled fonts).
-// - Optional hooks: true glyph extents are supplied (CoreText, v4 C
-//   surface) so box geometry — the sqrt junction included — uses real
-//   outlines, and MATH-table italic corrections are supplied so accents
-//   center on slanted nuclei; ink bounds stay NULL (v3 start, measured
-//   2px shy of full overlap) with variants and kerning corrections: the
-//   core is correct without them (deterministic fallbacks). Big-delimiter
-//   growth is the known v1 fidelity gap, documented in docs/spec.md.
+// - Optional hooks: true glyph extents and ink bounds are supplied
+//   (CoreText, v4 C surface) so box geometry — the sqrt junction
+//   included — uses real outlines, and MATH-table italic corrections
+//   are supplied so accents center on slanted nuclei; variants and
+//   kerning corrections stay NULL (deterministic fallbacks — the core
+//   is correct without them). Big-delimiter growth is the known v1
+//   fidelity gap, documented in docs/spec.md.
 // - The frozen C surface projects filled rects only (cabi.zig): diagonal
 //   `cancel` strikes never arrive (skipped engine-side, never misdrawn)
 //   and per-run `\color` is dropped engine-side (runs take ambient).
@@ -229,6 +229,10 @@ static uint16_t zatex_glyph_id(const void *ctx, uint16_t font, uint32_t cp) {
 }
 
 // Advance in thousandths of an em (engine unit).
+// CoreText reports no advance (rc 0) exactly for zero-width glyphs —
+// full-font survey 2026-09-20 vs hmtx: 6760/6760 agree (6564 direct,
+// 196 zero-width, including every combining accent) — so those report
+// 0 like the file. Missing glyphs (id 0) keep the 500 fallback above.
 static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
     (void)ctx;
     (void)font;
@@ -236,7 +240,7 @@ static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
     if (!zatex_font || glyph == 0) return 500;
     CGGlyph g = glyph;
     CGSize adv;
-    if (CTFontGetAdvancesForGlyphs(zatex_font, kCTFontOrientationHorizontal, &g, &adv, 1) == 0) return 500;
+    if (CTFontGetAdvancesForGlyphs(zatex_font, kCTFontOrientationHorizontal, &g, &adv, 1) == 0) return 0;
     int32_t units = (int32_t)(adv.width / (double)ZATEX_FONT_PX * 1000.0 + 0.5);
     return units > 0 ? units : 500;
 }
@@ -357,10 +361,12 @@ static int32_t zatex_italic_correction(const void *ctx, uint16_t font, uint16_t 
 
 static const ZatexMetrics zatex_metrics = {
     NULL, zatex_glyph_id, zatex_advance, NULL, NULL, zatex_italic_correction, NULL,
-    // ink_bounds deliberately NULL (v3 start): extents alone close the
-    // sqrt junction to 2px (measured render diff); wiring ink buys
-    // nothing visible at current budgets.
-    zatex_extents, NULL,
+    // ink_bounds wired (issue #350 review, round 2): the engine centers
+    // zero-advance combining marks by ink, not advance (U+20D7 ink hangs
+    // left of its origin), and lifts low accents off the nucleus by ink
+    // clearance — without it accents sit off-center. Same probe, same
+    // thousandths; blank glyphs report zeros and degrade gracefully.
+    zatex_extents, zatex_ink_bounds,
 };
 
 // ---------------------------------------------------------------------------

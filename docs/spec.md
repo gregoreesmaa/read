@@ -43,10 +43,11 @@ and skips diagonal strikes (never misdrawn).
 Fallback is sourcetelling, never silent: engine absent or refusing (invalid
 input, over 64 KiB, too deep, expansion limit) renders fences as plain code
 cards and islands as literal text, byte-identical to the pre-math reader.
-True glyph extents feed the engine over the v4 C surface (sqrt junction
-included; ink bounds stay NULL — measured 2px shy of full overlap);
-MATH-table italic corrections are supplied (accent centering); taller
-delimiter variants and kerning corrections stay unwired in v1.
+True glyph extents and ink bounds feed the engine over the v4 C
+surface (sqrt junction included); MATH-table italic corrections are
+supplied and zero-width combining advances report 0 like the file, so
+accents center by ink on slanted nuclei. Taller delimiter variants
+and kerning corrections stay unwired in v1.
 v1 limits: inline boxes taller than one row shrink to fit it
 (mid-line display included — never an overlap, never a paragraph
 break); math is not selectable, not
