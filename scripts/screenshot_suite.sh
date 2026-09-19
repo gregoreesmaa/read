@@ -54,10 +54,15 @@ echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..
 # as plain code blocks, source intact.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_fallback.png" test_cases/plugin_fallback.md
 
-# Case 4d2: Math via ZaTeX — read-test leaves the size query null (no dylib
-# seeded), so the suite screenshots the byte-identical literal/code-card
-# fallback deterministically; live rendering is covered by unit tests with
-# a stub engine plus the backend oracle (see src/platform/macos_zatex.m).
+# Case 4d2/4d3: Math via ZaTeX, LIVE renders (not fallback). These two shots
+# are generated with libzatex.dylib installed (/usr/local/lib; temporarily
+# force liveMathSizeFn on in a scratch build — never committed — or run a
+# live ship build) and committed so reviewers see real typeset output.
+# Regenerating without the dylib silently downgrades both shots to the
+# literal/code-card fallback: unit tests (stub engine) plus the backend
+# oracle still pin the fallback path. Do NOT run the full suite with a
+# live engine: highlight.md, plugin_fallback.md and others contain `$` or
+# ```math fences whose committed shots must stay fallback-pinned.
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math.png" test_cases/math.md
 # Case 4d3: Same-file scrolled frame (no new test case, scrollable_doc.md
 # stays the single scrolled-viewport case): --scroll 400 frames the Display
