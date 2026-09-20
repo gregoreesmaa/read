@@ -285,6 +285,7 @@ static CFDataRef zatex_math_data = NULL;
 static const uint8_t *zatex_math_bytes = NULL;
 static size_t zatex_math_len = 0;
 static size_t zatex_math_ici = 0;
+static size_t zatex_math_consts = 0; // MathConstants offset, 0 = absent
 static int zatex_math_ready = 0;
 
 static uint32_t zatex_u16(const uint8_t *p) {
@@ -302,6 +303,8 @@ static void zatex_ensure_math_table(void) {
     const uint8_t *b = CFDataGetBytePtr(d);
     size_t gi = 0, ic_rel = 0, sub = 0;
     if (!b || n < 10) goto fail;
+    size_t mc = ((size_t)b[4] << 8) | b[5]; // MathConstants, table start
+    if (mc != 0) zatex_math_consts = mc; // bounds checked per read
     gi = ((size_t)b[6] << 8) | b[7];
     if (gi == 0 || gi + 8 > n) goto fail;
     ic_rel = ((size_t)b[gi] << 8) | b[gi + 1];
@@ -359,8 +362,28 @@ static int32_t zatex_italic_correction(const void *ctx, uint16_t font, uint16_t 
     return (int32_t)(int16_t)zatex_u16(b + rec);
 }
 
+// Rule thickness in thousandths of an em, from MATH MathConstants
+// (fraction/radical/overbar/underbar; STIX reports 68 for all four).
+// Offsets derive from the OT order: 8 header bytes, then 4-byte
+// MathValueRecords — fraction 34, overbar 40, underbar 43, radical 47
+// (RadicalVerticalGap sits between underbarExtraDescender and the
+// display gap; verified against raw STIX bytes). Unknown kinds and
+// absent/truncated tables keep the KaTeX 40 default (pre-hook behavior).
+static const uint16_t zatex_rule_off[4] = { 144, 196, 168, 180 };
+
+static int32_t zatex_rule_thickness(const void *ctx, uint16_t font, uint32_t kind) {
+    (void)ctx;
+    (void)font;
+    if (kind > 3) return 40;
+    zatex_ensure_math_table();
+    if (!zatex_math_bytes || zatex_math_consts == 0) return 40;
+    size_t rec = zatex_math_consts + zatex_rule_off[kind];
+    if (rec + 2 > zatex_math_len) return 40;
+    return (int32_t)(int16_t)zatex_u16(zatex_math_bytes + rec);
+}
+
 static const ZatexMetrics zatex_metrics = {
-    NULL, zatex_glyph_id, zatex_advance, NULL, NULL, zatex_italic_correction, NULL,
+    NULL, zatex_glyph_id, zatex_advance, zatex_rule_thickness, NULL, zatex_italic_correction, NULL,
     // ink_bounds wired (issue #350 review, round 2): the engine centers
     // zero-advance combining marks by ink, not advance (U+20D7 ink hangs
     // left of its origin), and lifts low accents off the nucleus by ink

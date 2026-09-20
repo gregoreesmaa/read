@@ -46,7 +46,8 @@ cards and islands as literal text, byte-identical to the pre-math reader.
 True glyph extents and ink bounds feed the engine over the v4 C
 surface (sqrt junction included); MATH-table italic corrections are
 supplied and zero-width combining advances report 0 like the file, so
-accents center by ink on slanted nuclei. Taller delimiter variants
+accents center by ink on slanted nuclei; rule thickness follows the
+MATH constants (fraction/radical/over/under). Taller delimiter variants
 and kerning corrections stay unwired in v1.
 v1 limits: inline boxes taller than one row shrink to fit it
 (mid-line display included — never an overlap, never a paragraph
