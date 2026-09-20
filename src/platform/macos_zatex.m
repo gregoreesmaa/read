@@ -481,7 +481,19 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         if (!rf) continue;
         double s_run = run_px / 1000.0;
         CGContextSaveGState(ctx);
-        CGContextTranslateCTM(ctx, (CGFloat)(x + rn->x * s), (CGFloat)(y_top + rn->baseline_y * s));
+        // Snap the run origin to the device grid, mirroring
+        // platform_draw_text: a fractional origin resamples every glyph
+        // mask (soft edges); a snapped origin rasterizes 1:1 (crisp).
+        // Intra-run pen advances stay exact, so spacing never drifts;
+        // only the origin quantizes (at most half a device px per run).
+        double ox = x + rn->x * s;
+        double oy = y_top + rn->baseline_y * s;
+        if (g_output_scale > 0.0f) {
+            double q = (double)g_output_scale;
+            ox = floor(ox * q + 0.5) / q;
+            oy = floor(oy * q + 0.5) / q;
+        }
+        CGContextTranslateCTM(ctx, (CGFloat)ox, (CGFloat)oy);
         CGContextScaleCTM(ctx, 1.0, -1.0);
         CGContextSetTextPosition(ctx, 0, 0);
         uint32_t n = rn->glyph_count;
