@@ -285,7 +285,6 @@ static CFDataRef zatex_math_data = NULL;
 static const uint8_t *zatex_math_bytes = NULL;
 static size_t zatex_math_len = 0;
 static size_t zatex_math_ici = 0;
-static size_t zatex_math_consts = 0; // MathConstants offset, 0 = absent
 static int zatex_math_ready = 0;
 
 static uint32_t zatex_u16(const uint8_t *p) {
@@ -303,8 +302,6 @@ static void zatex_ensure_math_table(void) {
     const uint8_t *b = CFDataGetBytePtr(d);
     size_t gi = 0, ic_rel = 0, sub = 0;
     if (!b || n < 10) goto fail;
-    size_t mc = ((size_t)b[4] << 8) | b[5]; // MathConstants, table start
-    if (mc != 0) zatex_math_consts = mc; // bounds checked per read
     gi = ((size_t)b[6] << 8) | b[7];
     if (gi == 0 || gi + 8 > n) goto fail;
     ic_rel = ((size_t)b[gi] << 8) | b[gi + 1];
@@ -362,24 +359,20 @@ static int32_t zatex_italic_correction(const void *ctx, uint16_t font, uint16_t 
     return (int32_t)(int16_t)zatex_u16(b + rec);
 }
 
-// Rule thickness in thousandths of an em, from MATH MathConstants
-// (fraction/radical/overbar/underbar; STIX reports 68 for all four).
-// Offsets derive from the OT order: 8 header bytes, then 4-byte
-// MathValueRecords — fraction 34, overbar 40, underbar 43, radical 47
-// (RadicalVerticalGap sits between underbarExtraDescender and the
-// display gap; verified against raw STIX bytes). Unknown kinds and
-// absent/truncated tables keep the KaTeX 40 default (pre-hook behavior).
-static const uint16_t zatex_rule_off[4] = { 144, 196, 168, 180 };
-
+// Rule thickness in thousandths of an em: KaTeX parity 40 for every
+// kind (engine RuleKind order is fraction, radical, overline,
+// underline — note it differs from the MATH table order).
+// Deliberately NOT the STIX file truth (68 for all four): the engine
+// pins KaTeX-numeric 0.04em parity for rule weights, and 68 draws a
+// 2-device-px vinculum at body size where 40 snaps to one crisp row
+// (measured on screenshots/math_gallery.png). File truth would also
+// widen every clearance the engine derives from the weight. Explicit
+// rather than NULL so the choice survives engine default changes.
 static int32_t zatex_rule_thickness(const void *ctx, uint16_t font, uint32_t kind) {
     (void)ctx;
     (void)font;
-    if (kind > 3) return 40;
-    zatex_ensure_math_table();
-    if (!zatex_math_bytes || zatex_math_consts == 0) return 40;
-    size_t rec = zatex_math_consts + zatex_rule_off[kind];
-    if (rec + 2 > zatex_math_len) return 40;
-    return (int32_t)(int16_t)zatex_u16(zatex_math_bytes + rec);
+    (void)kind;
+    return 40;
 }
 
 static const ZatexMetrics zatex_metrics = {
@@ -457,11 +450,16 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         // All engine rules are horizontal bars (fraction, vinculum,
         // over/underline): snap y to device pixels so subpixel bars
         // draw crisp instead of fringing across two rows. x/width stay
-        // exact (centering must not shift); height covers at least the
-        // original span.
-        double y0 = floor(rr.origin.y);
-        rr.size.height = ceil(rr.origin.y + rr.size.height) - y0;
+        // exact (centering must not shift). Round, never cover: a
+        // sub-pixel KaTeX weight (0.68px at body) must rasterize one
+        // row, not inflate to two; the 1px floor keeps hairlines from
+        // vanishing at small sizes. Position stays within half a pixel
+        // of layout, so bar-to-ink junctions still meet.
+        double y0 = floor(rr.origin.y + 0.5);
+        double y1 = floor(rr.origin.y + rr.size.height + 0.5);
+        if (y1 <= y0) y1 = y0 + 1.0;
         rr.origin.y = y0;
+        rr.size.height = y1 - y0;
         CGContextFillRect(ctx, rr);
     }
     // Runs: one flipped frame per run, mirroring platform_draw_text
