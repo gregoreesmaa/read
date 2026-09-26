@@ -643,15 +643,57 @@ pub fn measureTextEx(text: []const u8, font_size: f32, is_bold: bool, is_italic:
     // neighbor (runs shape independently on the native stack), every later ASCII
     // byte kerns against its predecessor exactly as drawn. Non-ASCII
     // bytes (UTF-8 multibyte) skip compensation, matching their
-    // space-width approximation above.
+    // space-width approximation below.
     var prev: u8 = 0;
-    for (text) |c| {
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        // Calibrated punctuation below keeps its true advance and stays
+        // kern-inert on both sides exactly as before (all bytes involved
+        // fall outside 32..126, so no pair ever applied).
+        if (c >= 0x80) {
+            const w = punctWidthPerMille(text[i..], is_bold, is_italic);
+            if (w != 0) {
+                total += @as(f32, @floatFromInt(w)) * font_size / 1000.0;
+                i += if (c == 0xE2) @as(usize, 3) else 2;
+                prev = 0;
+                continue;
+            }
+        }
         const idx = if (c < 128) c else 32;
         total += @as(f32, @floatFromInt(width_table[idx])) * font_size / 1000.0;
         if (prev >= 32) total += kernPairHalf(prev, c, font_size);
         prev = c;
+        i += 1;
     }
     return total;
+}
+
+/// Advance width in 1/1000 em for common typographic punctuation, per body
+/// face in Regular/Bold/Italic order. Calibrated against the system shaper
+/// like the width tables (typographic bounds on the bundled fonts at
+/// 100pt, ligatures on, as drawn). The generic path counts UTF-8 bytes as
+/// spaces, which visibly mistracks these: U+2014 as 3 spaces (696 vs 783
+/// Regular, ~1.5px tight per dash), U+2013 likewise (696 vs 587), U+00B7
+/// as 2 spaces (464 vs 324, ~2.4px loose), U+00B5 as 2 (464 vs 619,
+/// ~2.6px tight), U+2264/U+2265 as 3 (696 vs 600). Zero means "outside
+/// the set": the caller keeps the byte-wise space approximation. Every
+/// listed sequence kerns exactly zero with ASCII and space neighbors by
+/// probe, so no pair table is needed.
+inline fn punctWidthPerMille(seq: []const u8, is_bold: bool, is_italic: bool) u16 {
+    const face: u8 = if (is_bold) 1 else if (is_italic) 2 else 0;
+    if (seq[0] == 0xE2) {
+        if (seq.len < 3) return 0;
+        if (seq[1] == 0x80 and seq[2] == 0x94) return ([_]u16{ 783, 788, 740 })[face]; // U+2014 EM DASH
+        if (seq[1] == 0x80 and seq[2] == 0x93) return ([_]u16{ 587, 592, 557 })[face]; // U+2013 EN DASH
+        if (seq[1] == 0x89 and seq[2] == 0xA4) return ([_]u16{ 600, 600, 550 })[face]; // U+2264 LESS-THAN OR EQUAL TO
+        if (seq[1] == 0x89 and seq[2] == 0xA5) return ([_]u16{ 600, 600, 550 })[face]; // U+2265 GREATER-THAN OR EQUAL TO
+    } else if (seq[0] == 0xC2) {
+        if (seq.len < 2) return 0;
+        if (seq[1] == 0xB7) return ([_]u16{ 324, 356, 301 })[face]; // U+00B7 MIDDLE DOT
+        if (seq[1] == 0xB5) return ([_]u16{ 619, 652, 565 })[face]; // U+00B5 MICRO SIGN
+    }
+    return 0;
 }
 
 /// Kern compensation for ASCII pair (a, b) at font_size points, from
@@ -678,6 +720,24 @@ test "kern pairs: measured runs match shaped widths (issue #332)" {
     try std.testing.expectApproxEqAbs(@as(f32, 139.910), measureTextEx("tilted office of cards", 17, false, true, false, false), tol);
     // Spot pair: `//` kerns -120/1000 em, stored halved.
     try std.testing.expectApproxEqAbs(@as(f32, -2.04), kernPairHalf('/', '/', 17), 0.02);
+    // U+2014 EM DASH: true per-face advance (783/788/740), not 3 spaces.
+    // Shaper truth at 17pt, same probe as above.
+    try std.testing.expectApproxEqAbs(@as(f32, 13.311), measureTextEx("—", 17, false, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 13.396), measureTextEx("—", 17, true, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 12.580), measureTextEx("—", 17, false, true, false, false), tol);
+    // Mixed runs with space-padded dashes (zero kern across " "/dash by probe).
+    try std.testing.expectApproxEqAbs(@as(f32, 40.647), measureTextEx("a — b", 17, false, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 87.227), measureTextEx("runs — live", 17, false, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 108.239), measureTextEx("CLIs — knows", 17, false, false, false, false), tol);
+    // Calibrated punctuation: true per-face advance, not byte-count spaces.
+    // Shaper truth at 17pt, same probe (all pairs with ASCII/space kern zero).
+    try std.testing.expectApproxEqAbs(@as(f32, 9.979), measureTextEx("–", 17, false, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.064), measureTextEx("–", 17, true, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.508), measureTextEx("·", 17, false, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.117), measureTextEx("·", 17, false, true, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 18.819), measureTextEx("µs", 17, false, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 34.544), measureTextEx("≤ 18", 17, false, false, false, false), tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 50.779), measureTextEx("15–35", 17, false, false, false, false), tol);
     // Mono and heading paths bypass the table.
     try std.testing.expectApproxEqAbs(@as(f32, 193.8), measureTextEx("https://example.com", 17, false, false, true, false), 0.01);
 }
