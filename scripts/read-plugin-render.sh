@@ -10,6 +10,7 @@ tool_for() {
     case "$1" in
         mermaid) echo "mmdc" ;;
         d2) echo "d2" ;;
+        graphviz) echo "dot" ;;
         *) echo "" ;;
     esac
 }
@@ -31,6 +32,7 @@ if [ "${1:-}" = "render" ]; then
     case "$renderer" in
         mermaid) "$tool" -i "$src" -o "$out.tmp" ;;
         d2) "$tool" "$src" "$out.tmp" ;;
+        graphviz) "$tool" -Tpng "$src" -o "$out.tmp" ;;
     esac
     [ -f "$out.tmp" ] && mv "$out.tmp" "$out"
     exit 0

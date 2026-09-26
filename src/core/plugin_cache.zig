@@ -23,13 +23,15 @@ const highlight = @import("highlight.zig");
 /// Zero heap allocations throughout: every function borrows slices of the
 /// caller's document/scan buffers or writes into a caller-owned `out` span.
 
-pub const Renderer = enum { mermaid, d2 };
+pub const Renderer = enum { mermaid, d2, graphviz };
 pub const MAX_PLUGIN_JOBS: usize = 16;
 
 pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
     if (comptime core_options.plugin_stub) return null;
     if (std.mem.eql(u8, info_token, "mermaid")) return .mermaid;
     if (std.mem.eql(u8, info_token, "d2")) return .d2;
+    if (std.mem.eql(u8, info_token, "dot")) return .graphviz;
+    if (std.mem.eql(u8, info_token, "graphviz")) return .graphviz;
     return null;
 }
 
@@ -51,6 +53,7 @@ fn rendererName(r: Renderer) []const u8 {
     return switch (r) {
         .mermaid => "mermaid",
         .d2 => "d2",
+        .graphviz => "graphviz",
     };
 }
 
@@ -194,6 +197,8 @@ test "plugin: mermaid info token maps, others do not" {
     if (comptime core_options.plugin_stub) return;
     try std.testing.expectEqual(Renderer.mermaid, pluginRendererOf("mermaid").?);
     try std.testing.expectEqual(Renderer.d2, pluginRendererOf("d2").?);
+    try std.testing.expectEqual(Renderer.graphviz, pluginRendererOf("dot").?);
+    try std.testing.expectEqual(Renderer.graphviz, pluginRendererOf("graphviz").?);
     try std.testing.expect(pluginRendererOf("foobar") == null);
     try std.testing.expect(pluginRendererOf("") == null);
 }
@@ -269,11 +274,21 @@ test "plugin: collect stops at 16 with 17 fences, unknown tokens skip slots" {
 
 test "plugin: d2 info token maps + cache path shape" {
     try std.testing.expectEqual(Renderer.d2, pluginRendererOf("d2").?);
-    try std.testing.expect(pluginRendererOf("dot") == null);
     var buf: [256]u8 = undefined;
     const h = fenceHash(.d2, "a -> b: opens\n");
     const p = cachePath("/tmp/C", .d2, h, &buf).?;
     var expect_buf: [128]u8 = undefined;
     const expect = try std.fmt.bufPrint(&expect_buf, "/tmp/C/read/plugins/d2/{x:0>16}.png", .{h});
+    try std.testing.expectEqualStrings(expect, p);
+}
+
+test "plugin: graphviz info tokens map + cache path shape" {
+    try std.testing.expectEqual(Renderer.graphviz, pluginRendererOf("dot").?);
+    try std.testing.expectEqual(Renderer.graphviz, pluginRendererOf("graphviz").?);
+    var buf: [256]u8 = undefined;
+    const h = fenceHash(.graphviz, "digraph { a -> b; }\n");
+    const p = cachePath("/tmp/C", .graphviz, h, &buf).?;
+    var expect_buf: [128]u8 = undefined;
+    const expect = try std.fmt.bufPrint(&expect_buf, "/tmp/C/read/plugins/graphviz/{x:0>16}.png", .{h});
     try std.testing.expectEqualStrings(expect, p);
 }
