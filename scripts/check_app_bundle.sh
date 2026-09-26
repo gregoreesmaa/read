@@ -22,6 +22,10 @@ val() { plutil -extract "$1" raw "$APP/Contents/Info.plist" 2>/dev/null || echo 
 [ "$(val CFBundlePackageType)" = "APPL" ] || fail "CFBundlePackageType != APPL"
 [ -n "$(val CFBundleIdentifier)" ] || fail "CFBundleIdentifier empty"
 [ -n "$(val CFBundleShortVersionString)" ] || fail "CFBundleShortVersionString empty"
+[ "$(val CFBundleDocumentTypes.0.CFBundleTypeRole)" = "Viewer" ] || fail "CFBundleDocumentTypes.0 role != Viewer"
+grep -q "public.markdown" "$APP/Contents/Info.plist" || fail "missing public.markdown document type"
+grep -q "net.daringfireball.markdown" "$APP/Contents/Info.plist" || fail "missing net.daringfireball.markdown document type"
+grep -q "UTImportedTypeDeclarations" "$APP/Contents/Info.plist" || fail "missing UTImportedTypeDeclarations (mdown/mkd/mkdn)"
 sips -g pixelWidth "$APP/Contents/Resources/Read.icns" >/dev/null || fail "Read.icns unreadable"
 
 echo "PASS: $APP bundle valid ($(val CFBundleShortVersionString))"
