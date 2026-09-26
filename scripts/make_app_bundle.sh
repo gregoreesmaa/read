@@ -45,6 +45,46 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<string>12.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Markdown</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.markdown</string>
+				<string>net.daringfireball.markdown</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>md</string>
+				<string>markdown</string>
+				<string>mdown</string>
+				<string>mkd</string>
+				<string>mkdn</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>net.daringfireball.markdown</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>mdown</string>
+					<string>mkd</string>
+					<string>mkdn</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>
 EOF
