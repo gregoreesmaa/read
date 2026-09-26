@@ -8,8 +8,8 @@ const std = @import("std");
 /// renderer, preserving virtualized rendering.
 ///
 /// Minimal cut, documented limits:
-/// - Top-20 families (below) plus a few common aliases, exact
-///   case-sensitive match on the first info-string token. Anything else
+/// - Top-20 families plus LaTeX (below) plus a few common aliases,
+///   exact case-sensitive match on the first info-string token. Anything else
 ///   (including missing info string) returns null and renders exactly as
 ///   today (single mono run).
 /// - Per-line tokenization: a `/*` (or `<!--`) opened but not closed on
@@ -44,6 +44,7 @@ pub const Lang = enum {
     css,
     sql,
     lua,
+    latex,
 };
 
 pub const Class = enum {
@@ -109,6 +110,7 @@ pub fn langFromFenceLine(line: []const u8) Lang {
     if (std.mem.eql(u8, token, "css")) return .css;
     if (std.mem.eql(u8, token, "sql")) return .sql;
     if (std.mem.eql(u8, token, "lua")) return .lua;
+    if (std.mem.eql(u8, token, "latex") or std.mem.eql(u8, token, "tex") or std.mem.eql(u8, token, "katex")) return .latex;
     return .none;
 }
 
@@ -176,7 +178,9 @@ fn blobFor(lang: Lang) []const u8 {
         .css => css_keywords,
         .sql => sql_keywords,
         .lua => lua_keywords,
-        .none, .diff => "",
+        // LaTeX commands are structural (`\name`), not lexical: the
+        // dedicated tokenizer below needs no keyword blob.
+        .none, .diff, .latex => "",
     };
 }
 
@@ -268,6 +272,7 @@ pub fn tokenize(lang: Lang, line: []const u8, out: []Segment) ?[]Segment {
         if (c == '\t' or c >= 0x80) return null;
     }
     if (lang == .diff) return tokenizeDiff(line, out);
+    if (lang == .latex) return tokenizeLatex(line, out);
 
     const c_like = lang == .zig or lang == .c or lang == .js or lang == .ts or
         lang == .rust or lang == .go or lang == .java or lang == .swift or
@@ -419,6 +424,43 @@ pub fn tokenize(lang: Lang, line: []const u8, out: []Segment) ?[]Segment {
     return t.segments();
 }
 
+/// LaTeX tinting: backslash commands (`\name`, plus one-char escapes
+/// like `\\`, `\%`, `\{`) read as keywords, `%` starts a comment to
+/// end-of-line, everything else stays plain. Braces, math shifts, and
+/// environments get no special treatment: a family approximation, like
+/// every lexer above. The backslash check runs before the comment check
+/// so `\%` never starts a comment.
+fn tokenizeLatex(line: []const u8, out: []Segment) ?[]Segment {
+    if (out.len == 0) return null;
+    var t = Tokenizer{ .line = line, .out = out };
+    var p: usize = 0;
+    while (p < line.len) {
+        const c = line[p];
+        if (c == '\\' and p + 1 < line.len) {
+            const n = line[p + 1];
+            var q = p + 2;
+            if ((n >= 'a' and n <= 'z') or (n >= 'A' and n <= 'Z')) {
+                while (q < line.len and ((line[q] >= 'a' and line[q] <= 'z') or (line[q] >= 'A' and line[q] <= 'Z'))) : (q += 1) {}
+            }
+            if (!t.pushRun(p, .keyword)) return null;
+            t.seg_class = .keyword;
+            if (!t.pushRun(q, .plain)) return null;
+            t.seg_class = .plain;
+            p = q;
+            continue;
+        }
+        if (c == '%') {
+            if (!t.pushRun(p, .comment)) return null;
+            t.seg_class = .comment;
+            p = line.len;
+            break;
+        }
+        p += 1;
+    }
+    if (!t.finish()) return null;
+    return t.segments();
+}
+
 /// Diff tinting by first character: `+` additions, `-` removals, `@@`
 /// hunk headers, file headers muted. No keyword table.
 fn tokenizeDiff(line: []const u8, out: []Segment) ?[]Segment {
@@ -491,6 +533,37 @@ test "fence info string top-20 detection and aliases" {
     // Unknown languages still fall back to the plain run.
     try std.testing.expectEqual(Lang.none, langFromFenceLine("```haskell"));
     try std.testing.expectEqual(Lang.none, langFromFenceLine("```RUST"));
+    // LaTeX spellings resolve to the latex family (highlighted code,
+    // never a math plugin render).
+    try std.testing.expectEqual(Lang.latex, langFromFenceLine("```latex"));
+    try std.testing.expectEqual(Lang.latex, langFromFenceLine("```tex"));
+    try std.testing.expectEqual(Lang.latex, langFromFenceLine("```katex"));
+    try std.testing.expectEqual(Lang.none, langFromFenceLine("```LATEX"));
+}
+
+test "latex tints commands and comments" {
+    var out: [MAX_SEGMENTS]Segment = undefined;
+    // \frac is a keyword, the rest plain.
+    const segs = tokenize(.latex, "\\frac{a}{b}", &out).?;
+    try std.testing.expectEqual(@as(usize, 2), segs.len);
+    try std.testing.expectEqual(Class.keyword, segs[0].class);
+    try std.testing.expectEqual(@as(u32, 0), segs[0].start);
+    try std.testing.expectEqual(@as(u32, 5), segs[0].end);
+    try std.testing.expectEqual(Class.plain, segs[1].class);
+    // One-char escape is a keyword; \% never starts a comment, while a
+    // bare % does.
+    const line2 = "a \\% b % hi";
+    const segs2 = tokenize(.latex, line2, &out).?;
+    try std.testing.expectEqual(Class.keyword, segs2[1].class);
+    try std.testing.expectEqual(@as(u32, 2), segs2[1].start);
+    try std.testing.expectEqual(@as(u32, 4), segs2[1].end);
+    try std.testing.expectEqual(Class.comment, segs2[segs2.len - 1].class);
+    try std.testing.expectEqualStrings("% hi", line2[segs2[segs2.len - 1].start..segs2[segs2.len - 1].end]);
+    // Trailing backslash stays plain, empty line yields no segments.
+    const segs3 = tokenize(.latex, "x\\", &out).?;
+    try std.testing.expectEqual(@as(usize, 1), segs3.len);
+    try std.testing.expectEqual(Class.plain, segs3[0].class);
+    try std.testing.expectEqual(@as(usize, 0), tokenize(.latex, "", &out).?.len);
 }
 
 test "ts/cpp share base blobs plus extras" {

@@ -149,6 +149,39 @@ pub extern "c" fn platform_get_image_size(
     out_h: *f32,
 ) void;
 
+/// ZaTeX runtime math backend (LaTeX math plugin, src/platform/macos_zatex.m).
+/// Synchronous microsecond layout over caller buffers; dlopen only, never
+/// linked. Status: 0 laid out (dims valid), 1 engine unavailable (no dylib),
+/// 2 fallback (bad input or engine refused it — render source literally).
+/// `display` selects display mode; dims are px at `font_px`.
+pub extern "c" fn platform_math_size(
+    tex: [*]const u8,
+    tex_len: c_int,
+    display: c_int,
+    font_px: f32,
+    out_w: *f32,
+    out_above: *f32,
+    out_below: *f32,
+) c_int;
+
+/// Draw a laid-out formula with its ink top at (x, y_top); the caller
+/// derives y_top from the same dims platform_math_size reported, so size
+/// and draw always agree. No-op when layout fails (the caller falls back
+/// to literal source rendering on nonzero size status, never reaching here
+/// with a failing formula).
+pub extern "c" fn platform_draw_math(
+    tex: [*]const u8,
+    tex_len: c_int,
+    display: c_int,
+    font_px: f32,
+    x: f32,
+    y_top: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+) void;
+
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;

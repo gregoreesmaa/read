@@ -1,5 +1,12 @@
 const std = @import("std");
 const simd = @import("hot");
+const math_detect = @import("math_detect.zig");
+const core_options = @import("core_options");
+
+// Twin gate (AGENTS.md §7): with -Dplugin_stub=true every math branch
+// below folds away at comptime and islands never form, so the twin's
+// __TEXT delta is exactly the math-attributable parser code.
+const math_stub = core_options.plugin_stub;
 
 pub const SpanStyle = packed struct {
     bold: bool = false,
@@ -20,7 +27,13 @@ pub const SpanStyle = packed struct {
     // span that carries them.
     line_break: bool = false,
     html_tag: bool = false,
-    _pad: u3 = 0,
+    // LaTeX math island (ZaTeX plugin): the span text is the whole island
+    // including delimiters; the viewport strips to raw TeX for layout.
+    // `math_display` marks `$$`/`\[` islands (display style even inline).
+    // Endpoint bits like line_break: set only on the island span itself.
+    math: bool = false,
+    math_display: bool = false,
+    _pad: u1 = 0,
 };
 
 pub const InlineSpan = struct {
@@ -231,6 +244,44 @@ fn inheritTagBits(st: *SpanStyle, holder: SpanStyle) void {
     st.sub = holder.sub;
     st.sup = holder.sup;
     st.mark = holder.mark;
+}
+
+/// Math islands per line for the ZaTeX plugin (see math_detect.zig):
+/// bounded, document-order, code-span-filtered. Zero heap allocations.
+pub const MAX_MATH_ISLANDS = 8;
+
+/// Collect line math islands minus any overlapping code spans (code wins,
+/// matching auto-render's text-node split: `` `$x$` `` stays literal).
+/// `out` takes up to `out.len` islands in document order.
+fn collectMathIslands(line: []const u8, out: []math_detect.Island) usize {
+    var n = math_detect.collectIslands(line, out);
+    // Walk code spans with the matched-length closer and drop islands
+    // touching any of them. Both lists are ordered; survivors keep
+    // document order.
+    var p: usize = 0;
+    while (p < line.len) {
+        if (line[p] != '`') {
+            p += 1;
+            continue;
+        }
+        var run: usize = 0;
+        while (p + run < line.len and line[p + run] == '`') : (run += 1) {}
+        if (codeSpanClose(line, p + run, run)) |cs| {
+            var w: usize = 0;
+            var r: usize = 0;
+            while (r < n) : (r += 1) {
+                if (!math_detect.rangeInSpan(out[r].open_start, out[r].close_end, p, cs.close_end)) {
+                    out[w] = out[r];
+                    w += 1;
+                }
+            }
+            n = w;
+            p = cs.close_end;
+        } else {
+            p += run;
+        }
+    }
+    return n;
 }
 
 /// High-speed inline parser for viewport lines.
@@ -1369,16 +1420,62 @@ pub fn parseInlinesWithDefs(
     else
         0;
     var match_cursor: usize = 0;
+    // Math islands join the crossing mask as non-link segments: emphasis
+    // pairs never straddle an island boundary, and pairs fully inside an
+    // island are harmless (the island span carries an explicit style and
+    // the main loop jumps over its interior runs). Merged after the link
+    // segs so heavy link lines can never crowd islands out of masking.
+    var isl_buf: [MAX_MATH_ISLANDS]math_detect.Island = undefined;
+    var n_isl: usize = 0;
+    if (comptime !math_stub) {
+        if (std.mem.indexOfScalar(u8, line, '$') != null)
+            n_isl = collectMathIslands(line, isl_buf[0..]);
+    }
+    var mask_buf: [MAX_LINK_SEGS + MAX_MATH_ISLANDS]LinkSeg = undefined;
+    @memcpy(mask_buf[0..n_segs], seg_buf[0..n_segs]);
+    var n_mask = n_segs;
+    for (isl_buf[0..n_isl]) |isl| {
+        mask_buf[n_mask] = .{ .start = isl.open_start, .end = isl.close_end, .angle = false };
+        n_mask += 1;
+    }
     var run_buf: [MAX_RUNS]DelimRun = undefined;
-    const n_runs = collectRunsMasked(line, run_buf[0..], seg_buf[0..n_segs]);
+    const n_runs = collectRunsMasked(line, run_buf[0..], mask_buf[0..n_mask]);
     var pair_buf: [MAX_PAIRS]EmPair = undefined;
     var n_pairs = matchRuns(run_buf[0..n_runs], n_runs, pair_buf[0..]);
-    n_pairs = filterCrossingPairs(run_buf[0..n_runs], pair_buf[0..n_pairs], n_pairs, seg_buf[0..n_segs]);
+    n_pairs = filterCrossingPairs(run_buf[0..n_runs], pair_buf[0..n_pairs], n_pairs, mask_buf[0..n_mask]);
     const pairs = pair_buf[0..n_pairs];
     var run_cursor: usize = 0;
+    var isl_cursor: usize = 0;
 
     while (i < line.len and span_count < spans_out.len) {
         const c = line[i];
+
+        // Math islands (ZaTeX plugin) win positionally at their opener —
+        // ahead of escapes, code, emphasis, and links — and the main loop
+        // jumps over their interiors, so no inner byte ever dispatches.
+        // Islands skipped by a link jump (math inside link text) stay
+        // literal, matching the link-wins rule.
+        while (isl_cursor < n_isl and isl_buf[isl_cursor].close_end <= i) : (isl_cursor += 1) {}
+        if (isl_cursor < n_isl and isl_buf[isl_cursor].open_start == i) {
+            const isl = isl_buf[isl_cursor];
+            isl_cursor += 1;
+            if (i > span_start) {
+                spans_out[span_count] = .{
+                    .text = line[span_start..i],
+                    .style = segStyle(run_buf[0..n_runs], pairs, span_start, cur_style),
+                };
+                span_count += 1;
+                if (span_count >= spans_out.len) break;
+            }
+            spans_out[span_count] = .{
+                .text = line[isl.open_start..isl.close_end],
+                .style = .{ .math = true, .math_display = isl.kind == .display_math },
+            };
+            span_count += 1;
+            i = isl.close_end;
+            span_start = i;
+            continue;
+        }
 
         // Backslash escape for Markdown punctuation: \* \_ \[ \] \` etc.
         if (c == '\\' and i + 1 < line.len) {
@@ -2510,3 +2607,52 @@ test "refdefs: amps document yields two definitions" {
     try std.testing.expectEqualStrings("2", defs[1].label);
 }
 
+test "math: islands emit explicit spans, currency stays literal" {
+    if (comptime math_stub) return;
+    var spans: [8]InlineSpan = undefined;
+    const n = parseInlines("see $x^2$ now", &spans);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("see ", spans[0].text);
+    try std.testing.expect(!spans[0].style.math);
+    try std.testing.expectEqualStrings("$x^2$", spans[1].text);
+    try std.testing.expect(spans[1].style.math);
+    try std.testing.expect(!spans[1].style.math_display);
+    try std.testing.expectEqualStrings(" now", spans[2].text);
+    // Currency and bare dollars parse to plain text with no math span.
+    var c: [4]InlineSpan = undefined;
+    const nc = parseInlines("pay $100 or $5.99", &c);
+    for (c[0..nc]) |sp| try std.testing.expect(!sp.style.math);
+    var u: [4]InlineSpan = undefined;
+    const nu = parseInlines("half $x + 1", &u);
+    for (u[0..nu]) |sp| try std.testing.expect(!sp.style.math);
+}
+
+test "math: display islands, escapes, code wins, crossing pairs die" {
+    if (comptime math_stub) return;
+    var spans: [8]InlineSpan = undefined;
+    const n = parseInlines("a $$\\frac{a}{b}$$ b", &spans);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expect(spans[1].style.math and spans[1].style.math_display);
+    // Backslash escapes keep CommonMark precedence (ex 12): paren forms
+    // stay literal text, never islands.
+    var e: [8]InlineSpan = undefined;
+    const ne = parseInlines("see \\(y\\) end", &e);
+    for (e[0..ne]) |sp| try std.testing.expect(!sp.style.math);
+    // Code spans mask islands.
+    var k: [8]InlineSpan = undefined;
+    const nk = parseInlines("`$x$` code", &k);
+    for (k[0..nk]) |sp| try std.testing.expect(!sp.style.math);
+    // Emphasis never straddles an island: `*a $b*c$ d*` keeps no pairs.
+    var x: [8]InlineSpan = undefined;
+    const nx = parseInlines("*a $b*c$ d*", &x);
+    var saw_math = false;
+    for (x[0..nx]) |sp| {
+        if (sp.style.math) {
+            saw_math = true;
+            try std.testing.expectEqualStrings("$b*c$", sp.text);
+        } else {
+            try std.testing.expect(!sp.style.bold and !sp.style.italic);
+        }
+    }
+    try std.testing.expect(saw_math);
+}

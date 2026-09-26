@@ -59,7 +59,7 @@ static void plugin_copy512(char dst[512], const char* src) {
 }
 static void plugin_hist_record(const char* outfile, int ok) {
     plugin_copy512(plugin_hist_out[plugin_hist_pos], outfile);
-    plugin_hist_ok[plugin_hist_pos] = ok ? 1 : 0;
+    plugin_hist_ok[plugin_hist_pos] = ok;
     plugin_hist_pos = (plugin_hist_pos + 1) % PLUGIN_HIST;
 }
 // Outcome query for Task 5: 1 clean render (exit 0 + outfile validated),
@@ -68,7 +68,7 @@ static void plugin_hist_record(const char* outfile, int ok) {
 int pluginOutcomeFor(const char* outfile) {
     if (!outfile || !*outfile) return -1;
     for (int i = 0; i < PLUGIN_HIST; i++)
-        if (plugin_hist_out[i][0] && strcmp(plugin_hist_out[i], outfile) == 0)
+        if (strcmp(plugin_hist_out[i], outfile) == 0)
             return plugin_hist_ok[i];
     return -1;
 }
@@ -79,23 +79,11 @@ int pluginOutcomeFor(const char* outfile) {
 static int plugin_spawnq(const char* file, char* const argv[], pid_t* pid) {
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    for (int fd = 1; fd <= 2; fd++)
+        posix_spawn_file_actions_addopen(&actions, fd, "/dev/null", O_WRONLY, 0);
     int rc = posix_spawnp(pid, file, &actions, NULL, argv, *_NSGetEnviron());
     posix_spawn_file_actions_destroy(&actions);
     return rc;
-}
-
-// `which` semantics for a renderer: slash paths are checked directly,
-// bare names must resolve on PATH. 1 when executable, else 0.
-static int plugin_which_ok(const char* renderer) {
-    if (strchr(renderer, '/') != NULL) return access(renderer, X_OK) == 0 ? 1 : 0;
-    pid_t pid = 0;
-    char* const argv[] = { (char*)"which", (char*)renderer, NULL };
-    if (plugin_spawnq("/usr/bin/which", argv, &pid) != 0) return 0;
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return 0;
-    return status == 0 ? 1 : 0;
 }
 
 // Non-blocking launch of `renderer srcfile outfile`. Returns 1 active
@@ -109,10 +97,6 @@ int launchPluginRender(const char* renderer, const char* srcfile, const char* ou
         // format call pulls _fwrite into the binary for one line. stderr
         // is unbuffered, so bytes hit the fd in order either way.
         (void)write(STDERR_FILENO, "read: plugin render path too long\n", sizeof("read: plugin render path too long\n") - 1);
-        return -1;
-    }
-    if (!plugin_which_ok(renderer)) {
-        fprintf(stderr, "read: plugin renderer missing: %s\n", renderer);
         return -1;
     }
     int slot = -1;
@@ -156,8 +140,6 @@ int pollPluginCompletions(void) {
         plugin_pid[i] = 0;
         drained++;
         unlink(plugin_src[i]);
-        plugin_src[i][0] = '\0';
-        plugin_out[i][0] = '\0';
     }
     return drained;
 }

@@ -61,7 +61,7 @@ block and its full source. Fixture: `test_cases/plugin_fallback.md`.
 | Candidate | Verdict | Rationale |
 |---|---|---|
 | Mermaid (` ```mermaid `) | OUT of ship binary forever; registry name reserved | A diagram engine needs graph layout + vector rendering — orders of magnitude over the size/alloc budget. Revisit only as an external pre-render cache tool; no IPC in the reader. Fallback: source as code. |
-| Math (` ```math `, `$…$`) | OUT of ship binary forever | KaTeX/MathJax-class typesetting needs fonts + layout engine (JS or large tables). Inline `$…$` additionally collides with currency text; stays literal. Fallback: source as code. |
+| Math (` ```math `, `$…$`) | IN via the ZaTeX plugin (lays out natively through the `libzatex.dylib` runtime engine — still nothing math-shaped linked into the ship binary) | Superseded 2026-09-19: ZaTeX is a native zero-dependency engine, so the old JS-or-large-tables premise no longer holds. `$…$` keeps currency guards and stays literal where they trip; backslash forms keep CommonMark escape precedence. Fallback unchanged: source as code / literal text. See `docs/spec.md`. |
 | Footnotes (`[^1]`) | IN SCOPE as core, not a plugin (future issue) | GFM-adjacent, single-pass renderable, no registry needed. |
 | Admonitions, GitHub-alert form (`> [!NOTE]`) | IN SCOPE as core styling (future issue) | Blockquote-prefix form; table-driven tint, no new block syntax. |
 | Admonitions, container form (`:::note`) | OUT | New block syntax + layout risk for little gain over the alert form. |

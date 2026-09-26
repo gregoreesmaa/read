@@ -100,10 +100,10 @@ Three layers, one direction of knowledge:
    - d2: `d2 SRC OUT`
    - graphviz: `dot -Tpng SRC -o OUT`
    - plantuml: `plantuml -tpng -o OUTDIR SRC`
-   - math: first present of `katex`, `mjpage`, `mathjax` with that
-     tool's file→PNG flags; none present → nonzero exit (fallback).
-     Rationale: no canonical PNG CLI exists for TeX math; the
-     pipeline is real for all six, math lights up with user tools.
+   - math: SUPERSEDED 2026-09-19 by the ZaTeX plugin (native runtime
+     engine via `dlopen`, no CLI tools, no PNG pipeline — see
+     `docs/spec.md` "Math rendering"). The katex/mjpage/mathjax mapping
+     below stays as the rejected alternative for the record.
 
 ## 4. Layout integration
 

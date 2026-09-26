@@ -398,7 +398,7 @@ test "damage: redraw-region verification against real layout output" {
     var culled: usize = 0;
     for (cmds[0..count]) |c| {
         switch (c.kind) {
-            .fill_rect, .text_run, .line, .code_block_bg, .image => {
+            .fill_rect, .text_run, .line, .code_block_bg, .image, .math => {
                 if (dmg.keeps(c.rect.x, c.rect.y, c.rect.w, c.rect.h)) {
                     try std.testing.expect(DirtyRect.intersects(
                         dmg.rect,
@@ -420,7 +420,7 @@ test "damage: redraw-region verification against real layout output" {
     const full = Damage.fullView(800.0, 600.0, .resize);
     for (cmds[0..count]) |c| {
         switch (c.kind) {
-            .fill_rect, .text_run, .line, .code_block_bg, .image => {
+            .fill_rect, .text_run, .line, .code_block_bg, .image, .math => {
                 try std.testing.expect(full.keeps(c.rect.x, c.rect.y, c.rect.w, c.rect.h));
             },
             else => {},

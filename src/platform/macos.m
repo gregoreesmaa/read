@@ -4115,3 +4115,13 @@ static void read_find_show(void) {
 #else
 #include "macos_plugin.m"
 #endif
+
+// ZaTeX runtime math backend (LaTeX math plugin) lives in macos_zatex.m
+// and is included here — one TU, same outliner discipline as the plugin
+// launcher above (AGENTS.md §7). READ_PLUGIN_STUB=1 includes the empty
+// stub instead; same TU, same flags. dlopen only, never linked.
+#if READ_PLUGIN_STUB
+#include "macos_zatex_stub.m"
+#else
+#include "macos_zatex.m"
+#endif
