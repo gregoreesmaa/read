@@ -23,7 +23,7 @@ const highlight = @import("highlight.zig");
 /// Zero heap allocations throughout: every function borrows slices of the
 /// caller's document/scan buffers or writes into a caller-owned `out` span.
 
-pub const Renderer = enum { mermaid, d2, graphviz };
+pub const Renderer = enum { mermaid, d2, graphviz, plantuml };
 pub const MAX_PLUGIN_JOBS: usize = 16;
 
 pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
@@ -32,6 +32,8 @@ pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
     if (std.mem.eql(u8, info_token, "d2")) return .d2;
     if (std.mem.eql(u8, info_token, "dot")) return .graphviz;
     if (std.mem.eql(u8, info_token, "graphviz")) return .graphviz;
+    if (std.mem.eql(u8, info_token, "plantuml")) return .plantuml;
+    if (std.mem.eql(u8, info_token, "puml")) return .plantuml;
     return null;
 }
 
@@ -54,6 +56,7 @@ fn rendererName(r: Renderer) []const u8 {
         .mermaid => "mermaid",
         .d2 => "d2",
         .graphviz => "graphviz",
+        .plantuml => "plantuml",
     };
 }
 
@@ -199,6 +202,8 @@ test "plugin: mermaid info token maps, others do not" {
     try std.testing.expectEqual(Renderer.d2, pluginRendererOf("d2").?);
     try std.testing.expectEqual(Renderer.graphviz, pluginRendererOf("dot").?);
     try std.testing.expectEqual(Renderer.graphviz, pluginRendererOf("graphviz").?);
+    try std.testing.expectEqual(Renderer.plantuml, pluginRendererOf("plantuml").?);
+    try std.testing.expectEqual(Renderer.plantuml, pluginRendererOf("puml").?);
     try std.testing.expect(pluginRendererOf("foobar") == null);
     try std.testing.expect(pluginRendererOf("") == null);
 }
@@ -290,5 +295,16 @@ test "plugin: graphviz info tokens map + cache path shape" {
     const p = cachePath("/tmp/C", .graphviz, h, &buf).?;
     var expect_buf: [128]u8 = undefined;
     const expect = try std.fmt.bufPrint(&expect_buf, "/tmp/C/read/plugins/graphviz/{x:0>16}.png", .{h});
+    try std.testing.expectEqualStrings(expect, p);
+}
+
+test "plugin: plantuml info tokens map + cache path shape" {
+    try std.testing.expectEqual(Renderer.plantuml, pluginRendererOf("plantuml").?);
+    try std.testing.expectEqual(Renderer.plantuml, pluginRendererOf("puml").?);
+    var buf: [256]u8 = undefined;
+    const h = fenceHash(.plantuml, "@startuml\na -> b\n@enduml\n");
+    const p = cachePath("/tmp/C", .plantuml, h, &buf).?;
+    var expect_buf: [128]u8 = undefined;
+    const expect = try std.fmt.bufPrint(&expect_buf, "/tmp/C/read/plugins/plantuml/{x:0>16}.png", .{h});
     try std.testing.expectEqualStrings(expect, p);
 }

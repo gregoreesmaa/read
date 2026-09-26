@@ -11,6 +11,7 @@ tool_for() {
         mermaid) echo "mmdc" ;;
         d2) echo "d2" ;;
         graphviz) echo "dot" ;;
+        plantuml) echo "plantuml" ;;
         *) echo "" ;;
     esac
 }
@@ -33,6 +34,14 @@ if [ "${1:-}" = "render" ]; then
         mermaid) "$tool" -i "$src" -o "$out.tmp" ;;
         d2) "$tool" "$src" "$out.tmp" ;;
         graphviz) "$tool" -Tpng "$src" -o "$out.tmp" ;;
+        plantuml)
+            # plantuml names its output after the input stem inside
+            # OUTDIR, so render there and promote the stem PNG atomically.
+            dest_dir=$(dirname "$out.tmp")
+            "$tool" -tpng -o "$dest_dir" "$src"
+            stem=$(basename "$src"); stem=${stem%.*}
+            [ -f "$dest_dir/$stem.png" ] && mv "$dest_dir/$stem.png" "$out.tmp"
+            ;;
     esac
     [ -f "$out.tmp" ] && mv "$out.tmp" "$out"
     exit 0
