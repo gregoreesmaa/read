@@ -2836,9 +2836,19 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
         var pw: f32 = 0;
         var pabove: f32 = 0;
         var pbelow: f32 = 0;
-        try t.expectEqual(@as(c_int, 0), bridge.platform_math_size(
+        const probe_rc = bridge.platform_math_size(
             probe_tex.ptr, @intCast(probe_tex.len), 0, 17.0, &pw, &pabove, &pbelow,
-        ));
+        );
+        // Status contract (src/platform/macos_zatex.m): 1 = engine
+        // unavailable (no libzatex.dylib on this host, e.g. CI runners), 2
+        // = engine refused the input. Without the engine every formula
+        // falls back to source text, so there is no raster to reuse and
+        // nothing to pin — trivial pass, same stance as the stub twin.
+        if (probe_rc == 1) {
+            std.debug.print("\n[MATH355] skipped: libzatex unavailable, nothing to pin\n", .{});
+            return;
+        }
+        try t.expectEqual(@as(c_int, 0), probe_rc);
         try t.expect(pw > 0 and pabove > 0);
 
         var h0: u64 = 0;
