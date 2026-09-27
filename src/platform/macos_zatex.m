@@ -393,6 +393,165 @@ static const ZatexMetrics zatex_metrics = {
 static ZatexRun zatex_runs[ZATEX_RUNS_CAP];
 static ZatexRule zatex_rules[ZATEX_RULES_CAP];
 static uint16_t zatex_glyphs[ZATEX_GLYPHS_CAP];
+// Draw scratch (BSS; main thread only): shared by the direct run loop and
+// the atlas rasterizer below — one owner, sequential use, no nesting.
+static CGPoint zatex_pos[4096];
+static CGGlyph zatex_gbuf[4096];
+
+// ---------------------------------------------------------------------------
+// Formula atlas (issue #355): Retina pre-raster for math runs, mirroring
+// platform_draw_text. Body text blits pre-rasterized 2x atlas slices at
+// snapped origins; math drew direct via CTFontDrawGlyphs every frame (a
+// full vector re-raster per frame while scrolling). Now each unique
+// formula — TeX bytes + font size + display mode (masks rasterize at one
+// exact size; display lays out differently from the same inline bytes) —
+// rasterizes ONCE into the shared 2x coverage atlas and blits thereafter:
+// steady-state draws are one ClipToMask + FillRect with no shaping, no
+// copy, no allocation. Rules stay direct fills (already device-snapped);
+// intra-run advances stay exact (never rounded — the known non-fix in
+// #355); only the blit origin snaps, exactly like the body blit.
+// ---------------------------------------------------------------------------
+
+#define ZATEX_ATLAS_CAP 64
+// Cacheable TeX length: the key hashes every byte per draw, so pathological
+// inputs skip the cache and draw direct (mirrors the body >510B
+// uncacheable path at formula granularity).
+#define ZATEX_ATLAS_TEX_CAP 4096
+
+typedef struct {
+    uint64_t key; // FNV-1a(tex bytes, font bits, display); cf. mathRunKey
+    uint64_t gen; // g_atlas_flushes at rasterize; mismatch = stale
+    CGImageRef slice; // retained no-copy view into g_atlas_img, NULL = cold
+    int len; // > 0 once inserted (cold slots are BSS-zero: no occupied flag)
+    char head[8]; // first bytes (cheap collision guard, like ShapedEntry)
+    short ax, ay, aw, ah; // atlas UV rect in device px
+} ZatexAtlasEntry;
+
+static ZatexAtlasEntry zatex_atlas[ZATEX_ATLAS_CAP]; // BSS: no binary cost
+
+// Key byte order mirrors mathRunKey in glyph_cache.zig (pinned there in
+// cross-platform tests): tex bytes, then font-bits LE, then display byte.
+static uint64_t zatex_atlas_key(const char *tex, int len, float font_px, int display) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < len; i++) {
+        h ^= (unsigned char)tex[i];
+        h *= 0x100000001b3ULL;
+    }
+    uint32_t fb = 0;
+    memcpy(&fb, &font_px, 4);
+    uint8_t tail[5];
+    tail[0] = (uint8_t)(fb & 0xff);
+    tail[1] = (uint8_t)((fb >> 8) & 0xff);
+    tail[2] = (uint8_t)((fb >> 16) & 0xff);
+    tail[3] = (uint8_t)((fb >> 24) & 0xff);
+    tail[4] = display ? (uint8_t)1 : (uint8_t)0;
+    for (int i = 0; i < 5; i++) {
+        h ^= tail[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Generational flush hook, called from atlas_flush in macos.m (forward
+// declared there): shape-cache evictions must never leave stale math
+// slices viewing zeroed atlas pixels. Entries keep key identity and
+// re-rasterize lazily via the gen mismatch.
+void zatex_drop_math_rasters(void) {
+    for (int i = 0; i < ZATEX_ATLAS_CAP; i++) {
+        if (zatex_atlas[i].slice) {
+            CGImageRelease(zatex_atlas[i].slice);
+            zatex_atlas[i].slice = NULL;
+        }
+    }
+}
+
+// One retained slice blit at the snapped formula origin. Dest size is the
+// mask size exactly (never the laid-out advance — no sub-pixel stretch),
+// mirroring the body blit in platform_draw_text.
+static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, float y_top,
+                              unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+    float q = g_output_scale;
+    CGRect dest = CGRectMake(roundf(x * q) / q, roundf(y_top * q) / q,
+                             (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
+    CGContextSaveGState(ctx);
+    // Bilinear, not None like the body blit: the headless harness bitmap
+    // is 1x, so forced-2x masks downsample there — nearest mangles thin
+    // STIX stems in that configuration (measured 143.8 vs 189.5 bilinear
+    // on the same masks) while bilinear reads true mask quality. On live
+    // Retina the blit is snapped 1:1, where no resampling happens either
+    // way, so this changes no ship pixel — and the shared crisp budget in
+    // the #355 test pins the choice (None fails it, Default clears it).
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationDefault);
+    CGContextClipToMask(ctx, dest, e->slice);
+    CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+    CGContextFillRect(ctx, dest);
+    CGContextRestoreGState(ctx);
+}
+
+// Rasterize a laid-out formula into the shared 2x coverage atlas (white
+// ink, like shape_rasterize_entry) and cut the entry's slice. Mirrored
+// storage: the atlas ctx is y-down, so glyphs rasterize unflipped at
+// absolute device coords and the ClipToMask blit in the flipped view maps
+// them upright — the same trick as the body path. Returns 1 with a live
+// slice, 0 to draw direct.
+static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, float font_px) {
+    int pw = (int)ceil((double)lo->width * s * RASTER_SCALE);
+    int ph = (int)ceil(((double)lo->height_above + (double)lo->depth_below) * s * RASTER_SCALE);
+    // Larger than the atlas: draw direct every frame — a flush could never
+    // fit it, and retrying would evict the body working set per frame.
+    if (pw <= 0 || ph <= 0 || pw > ATLAS_PX || ph > ATLAS_PX) return 0;
+    atlas_ensure();
+    if (!g_atlas_ctx) return 0;
+    short ax = 0, ay = 0;
+    if (!atlas_alloc(pw, ph, &ax, &ay)) {
+        atlas_flush(); // drops our slices too via zatex_drop_math_rasters
+        if (!atlas_alloc(pw, ph, &ax, &ay)) return 0;
+    }
+    // White ink in the atlas's native gray space.
+    CGContextSetGrayFillColor(g_atlas_ctx, 1.0, 1.0);
+    for (uint32_t i = 0; i < lo->nruns; i++) {
+        ZatexRun *rn = &zatex_runs[i];
+        if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
+        double run_px = (double)font_px * (double)rn->size_units / 1000.0;
+        if (run_px <= 0 || !zatex_font) continue;
+        CTFontRef rf = CTFontCreateCopyWithAttributes(zatex_font, (CGFloat)(run_px * RASTER_SCALE), NULL, NULL);
+        if (!rf) continue;
+        double s_run = run_px / 1000.0;
+        // Snap the raster origin to integer device px, mirroring the
+        // screen snap and the body rasterizer (a fractional baseline
+        // bakes straddled coverage edges into the mask — soft on every
+        // blit thereafter). Intra-run advances stay exact; only the
+        // origin quantizes, at most half a device px per run.
+        double bx = floor((double)ax + (double)rn->x * s * RASTER_SCALE + 0.5);
+        double by = floor((double)ay + (double)rn->baseline_y * s * RASTER_SCALE + 0.5);
+        // CTFontDrawGlyphs consults and advances the context text position,
+        // so drawing runs flat in one frame drifts every run right by the
+        // pen left over from previous draws — resetting it per run pins
+        // every run at its absolute device coords (same user-space points
+        // the direct path's per-run Translate frame produces, without the
+        // flip: the atlas ctx is y-down, so unflipped draws store mirrored
+        // and the ClipToMask blit maps them upright, the same trick as
+        // shape_rasterize_entry).
+        CGContextSetTextPosition(g_atlas_ctx, 0, 0);
+        uint32_t n = rn->glyph_count;
+        int64_t acc = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            uint16_t gl = zatex_glyphs[rn->glyph_start + k];
+            zatex_gbuf[k] = (CGGlyph)gl;
+            zatex_pos[k] = CGPointMake((float)(bx + acc * s_run * RASTER_SCALE), (float)by);
+            acc += zatex_advance(NULL, rn->font_id, gl);
+        }
+        CTFontDrawGlyphs(rf, zatex_gbuf, zatex_pos, (CFIndex)n, g_atlas_ctx);
+        CFRelease(rf);
+    }
+    e->ax = ax;
+    e->ay = ay;
+    e->aw = (short)pw;
+    e->ah = (short)ph;
+    e->gen = g_atlas_flushes;
+    e->slice = g_atlas_img ? CGImageCreateWithImageInRect(g_atlas_img, CGRectMake(ax, ay, pw, ph)) : NULL;
+    return e->slice != NULL;
+}
 
 static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLayout *out) {
     if (!tex || tex_len <= 0 || tex_len > ZATEX_INPUT_CAP) return ZATEX_FALLBACK;
@@ -405,6 +564,18 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
                               zatex_glyphs, ZATEX_GLYPHS_CAP, out);
     return rc == 0 ? ZATEX_OK : ZATEX_FALLBACK;
 }
+
+// Formula-raster counters (issue #355): hits are textured-quad blits with
+// zero shaping, misses are layout + 2x rasterize. BSS storage (no binary
+// cost); the reader is TEST_HOOKS-only, same gate as
+// platform_glyph_cache_stats in macos.m.
+static uint64_t zatex_atlas_hits = 0, zatex_atlas_misses = 0;
+#ifdef TEST_HOOKS
+void platform_math_atlas_stats(uint64_t *hits, uint64_t *misses) {
+    if (hits) *hits = zatex_atlas_hits;
+    if (misses) *misses = zatex_atlas_misses;
+}
+#endif
 
 // Synchronous size query for the Zig box path (mirrors image_size_fn):
 // dims are px at font_px (units are thousandths of an em).
@@ -470,8 +641,38 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
     // 100/font_px. Offsets accumulate the SAME integer advances the
     // engine laid out with (units, exact), converted once to px, so ink
     // lands exactly where layout put it.
-    static CGPoint zatex_pos[4096];
-    static CGGlyph zatex_gbuf[4096];
+    // Formula atlas (issue #355): on 2x destinations a cached raster
+    // blits 1:1 at the snapped formula origin; everywhere else (1x, or
+    // uncacheable input) the legacy direct path below draws — the same
+    // scale policy as platform_draw_text, so 1x screenshots never
+    // downsample 2x art.
+    if (g_output_scale > 1.5f && tex_len <= ZATEX_ATLAS_TEX_CAP) {
+        uint64_t key = zatex_atlas_key(tex, tex_len, font_px, display);
+        ZatexAtlasEntry *e = &zatex_atlas[key % ZATEX_ATLAS_CAP];
+        int hl = tex_len < 8 ? tex_len : 8;
+        if (e->slice && e->gen == g_atlas_flushes &&
+            e->key == key && e->len == tex_len &&
+            memcmp(e->head, tex, (size_t)hl) == 0) {
+            zatex_blit_cached(ctx, e, x, y_top, r, g, b, a);
+            zatex_atlas_hits++;
+            return;
+        }
+        // Miss: evict the collision (if any) and take the slot. The rect
+        // and slice arrive in zatex_rasterize; a failed rasterize leaves
+        // the slot cold (NULL slice) and draws direct below.
+        if (e->slice) {
+            CGImageRelease(e->slice);
+            e->slice = NULL;
+        }
+        e->key = key;
+        e->len = tex_len;
+        memcpy(e->head, tex, (size_t)hl);
+        if (zatex_rasterize(e, &lo, s, font_px)) {
+            zatex_blit_cached(ctx, e, x, y_top, r, g, b, a);
+            zatex_atlas_misses++;
+            return;
+        }
+    }
     for (uint32_t i = 0; i < lo.nruns; i++) {
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
