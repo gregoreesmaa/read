@@ -27,5 +27,16 @@ grep -q "public.markdown" "$APP/Contents/Info.plist" || fail "missing public.mar
 grep -q "net.daringfireball.markdown" "$APP/Contents/Info.plist" || fail "missing net.daringfireball.markdown document type"
 grep -q "UTImportedTypeDeclarations" "$APP/Contents/Info.plist" || fail "missing UTImportedTypeDeclarations (mdown/mkd/mkdn)"
 sips -g pixelWidth "$APP/Contents/Resources/Read.icns" >/dev/null || fail "Read.icns unreadable"
+# Engine assertion (issue #367): a vendored libzatex is the version that
+# release ships. Soft gate: present must be a Mach-O dylib; absent is a
+# NOTE, not a failure — engine-less bundles still assemble and run, with
+# math falling back to source text (see docs/engine.md).
+if [ -f "$APP/Contents/Resources/libzatex.dylib" ]; then
+    file "$APP/Contents/Resources/libzatex.dylib" | grep -q "Mach-O" || fail "Resources/libzatex.dylib is not a Mach-O binary"
+    file "$APP/Contents/Resources/libzatex.dylib" | grep -q "shared library" || fail "Resources/libzatex.dylib is not a shared library"
+    echo "NOTE: vendored engine present (Resources/libzatex.dylib)"
+else
+    echo "NOTE: Resources/libzatex.dylib absent — math falls back to source text (see docs/engine.md)"
+fi
 
 echo "PASS: $APP bundle valid ($(val CFBundleShortVersionString))"

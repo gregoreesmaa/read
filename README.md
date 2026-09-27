@@ -51,6 +51,7 @@ no number here is repeated anywhere else in the repo.
 - [docs/spec.md](docs/spec.md) — supported Markdown inventory
 - [docs/keys.md](docs/keys.md) — selection, scrolling, keybindings
 - [docs/privacy.md](docs/privacy.md) — remote-image policy (indicator, `i` toggle, HTTPS-only)
+- [docs/engine.md](docs/engine.md) — math engine setup (`libzatex`: load path, install, supported spellings)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — pre-commit protocol (tests, screenshots, gates)
 - [AGENTS.md](AGENTS.md) — contributor contract and immutable targets
 

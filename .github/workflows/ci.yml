@@ -40,6 +40,10 @@ jobs:
         run: zig build test -Doptimize=ReleaseFast --summary all
       - name: Parser short fuzz (malformed + huge inputs, issue #34)
         run: sh scripts/fuzz_parser.sh
+      - name: Math test-double (scripted libzatex_test when a zatex checkout is present, issue #378)
+        run: sh scripts/math_testdouble.sh
+      - name: Math parity harness (host-parity corpus when vendored, local otherwise, issue #381)
+        run: sh scripts/math_parity.sh ./zig-out/bin/read-test
       - name: Release build
         run: zig build -Doptimize=ReleaseFast
       - name: Binary size budget (ship binary, see AGENTS.md §1)

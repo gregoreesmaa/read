@@ -26,14 +26,23 @@ const highlight = @import("highlight.zig");
 pub const Renderer = enum { mermaid, d2, graphviz, plantuml };
 pub const MAX_PLUGIN_JOBS: usize = 16;
 
+/// Renderer token registry: exact case-sensitive match. One table + one
+/// mem.eql codegen site instead of six inline compares; identical match
+/// set (tokens are distinct, so order is irrelevant).
+const renderer_tokens = [_]struct { name: []const u8, renderer: Renderer }{
+    .{ .name = "mermaid", .renderer = .mermaid },
+    .{ .name = "d2", .renderer = .d2 },
+    .{ .name = "dot", .renderer = .graphviz },
+    .{ .name = "graphviz", .renderer = .graphviz },
+    .{ .name = "plantuml", .renderer = .plantuml },
+    .{ .name = "puml", .renderer = .plantuml },
+};
+
 pub fn pluginRendererOf(info_token: []const u8) ?Renderer {
     if (comptime core_options.plugin_stub) return null;
-    if (std.mem.eql(u8, info_token, "mermaid")) return .mermaid;
-    if (std.mem.eql(u8, info_token, "d2")) return .d2;
-    if (std.mem.eql(u8, info_token, "dot")) return .graphviz;
-    if (std.mem.eql(u8, info_token, "graphviz")) return .graphviz;
-    if (std.mem.eql(u8, info_token, "plantuml")) return .plantuml;
-    if (std.mem.eql(u8, info_token, "puml")) return .plantuml;
+    for (renderer_tokens) |e| {
+        if (std.mem.eql(u8, info_token, e.name)) return e.renderer;
+    }
     return null;
 }
 
@@ -52,12 +61,8 @@ pub fn fenceHash(renderer: Renderer, source: []const u8) u64 {
 }
 
 fn rendererName(r: Renderer) []const u8 {
-    return switch (r) {
-        .mermaid => "mermaid",
-        .d2 => "d2",
-        .graphviz => "graphviz",
-        .plantuml => "plantuml",
-    };
+    const names = [_][]const u8{ "mermaid", "d2", "graphviz", "plantuml" };
+    return names[@intFromEnum(r)];
 }
 
 /// Lowercase 16-hex of a hash for cache/sidecar names. Manual nibbles:

@@ -63,6 +63,12 @@ jobs:
         run: |
           codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
             --options runtime --timestamp -v zig-out/bin/read
+          # Nested-first: the vendored engine (issue #367) signs before
+          # its enclosing bundle, when present.
+          if [ -f zig-out/Read.app/Contents/Resources/libzatex.dylib ]; then
+            codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
+              --options runtime --timestamp -v zig-out/Read.app/Contents/Resources/libzatex.dylib
+          fi
           codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
             --options runtime --timestamp -v zig-out/Read.app
           codesign -vv zig-out/bin/read zig-out/Read.app
@@ -115,6 +121,11 @@ jobs:
             fi
           } > dist/NOTES.md
           cat dist/NOTES.md
+
+      - name: Homebrew formula bump gate (issue #369)
+        run: |
+          DIST="read-$TAG-macos-arm64"
+          sh scripts/check_homebrew_formula.sh "$TAG" "dist/$DIST.tar.gz" "dist/$DIST.tar.gz.sha256"
 
       - name: Publish GitHub release
         env:

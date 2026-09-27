@@ -19,6 +19,23 @@ chmod +x "$APP/Contents/MacOS/Read"
 cp "$ROOT/assets/icon/Read.icns" "$APP/Contents/Resources/Read.icns"
 cp "$ROOT/scripts/read-plugin-render.sh" "$APP/Contents/Resources/read-plugin-render.sh"
 chmod +x "$APP/Contents/Resources/read-plugin-render.sh"
+# Engine vendoring (issue #367): bundle Resources/libzatex.dylib is FIRST
+# in the runtime load path (src/platform/macos_zatex.m), so a vendored
+# engine is the version that release ships. Source: $4, then
+# $LIBZATEX_PATH, then the documented install path. Absent = graceful
+# fallback (math renders as source text; see docs/engine.md) — never fail
+# the bundle: CI runners and engine-less checkouts must still assemble.
+LIBZATEX_SRC="${4:-${LIBZATEX_PATH:-}}"
+if [ -z "$LIBZATEX_SRC" ] && [ -f "/usr/local/lib/libzatex.dylib" ]; then
+    LIBZATEX_SRC="/usr/local/lib/libzatex.dylib"
+fi
+if [ -n "$LIBZATEX_SRC" ]; then
+    [ -f "$LIBZATEX_SRC" ] || { echo "bundle: libzatex not found: $LIBZATEX_SRC" >&2; exit 1; }
+    cp "$LIBZATEX_SRC" "$APP/Contents/Resources/libzatex.dylib"
+    echo "bundle: vendored libzatex from $LIBZATEX_SRC"
+else
+    echo "bundle: no libzatex source (arg \$4 / LIBZATEX_PATH / /usr/local/lib) — ships without engine, math falls back to source text (see docs/engine.md)"
+fi
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

@@ -29,8 +29,12 @@ CORE_BUDGET=$((200 * 1024))
 # rounded up to a whole KiB; bumped to 13 KiB by owner decision 2026-09-20
 # (§7 5%: 12*1.05=12.6, round up) for the MATH rule-thickness hook;
 # bumped to 15 KiB by owner decision 2026-09-27 (§7 5%: 13*1.05=13.65,
-# round up to 14, but measured 14508 needs 15) for the #355 Retina formula atlas.
-PLUGIN_BUDGET_KIB=15
+# round up to 14, but measured 14508 needs 15) for the #355 Retina formula atlas;
+# bumped to 16 KiB by coordinator decision 2026-09-28 (§7 5%: 15*1.05=15.75,
+# round up) for #348 native math/ARM after exhausted honest diet (residual 694 B
+# plugin over: 4 area agents + whole-view ±0 + round-2/round-3/finisher/micro-diet
+# with measured probes, lean audit clean, small-loss evaluated, nothing qualifying).
+PLUGIN_BUDGET_KIB=16
 PLUGIN_BUDGET=$((PLUGIN_BUDGET_KIB * 1024))
 
 # Build both accounts; zig-cache incrementality makes this a fast no-op

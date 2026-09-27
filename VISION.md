@@ -15,7 +15,8 @@ than the eye can perceive, using the absolute minimum of computer resources.
    threads/workers cost more total resources and break scroll feel. Concurrency must
    prove a net resource win or it doesn't ship.
 3. **Spec-compliant** — CommonMark + GFM tables/task lists (Daring Fireball syntax);
-   HTML rendering intentionally unsupported. Heavy features that threaten the
+   HTML rendering intentionally unsupported. Math is render-only, never
+   authoring. Heavy features that threaten the
    zero-alloc/microsecond architecture are discussed BEFORE implementation.
 4. **Most premium-feeling** — hand-picked fonts (IBM Plex Serif body, Space Grotesk
    headings, JetBrains Mono code), 1.75 line height, 600px column, dark

@@ -26,6 +26,20 @@ pub const MathSizeFn = *const fn (
     out_below: *f32,
 ) callconv(.c) c_int;
 
+/// Typed math-failure latch query (issues #366/#377, implemented in
+/// src/platform/macos_zatex.m): after a nonzero size query, returns 1 with
+/// the failing formula's byte offset (into tex) and engine err_code when
+/// tex/display match the latched failure, else 0. Threaded like
+/// MathSizeFn (null keeps fallbacks byte-identical); viewport must stay
+/// extern-free so the platform-independent test binary links.
+pub const MathErrorFn = *const fn (
+    tex: [*]const u8,
+    tex_len: c_int,
+    display: c_int,
+    out_offset: *u32,
+    out_code: *c_int,
+) callconv(.c) c_int;
+
 // Calibrated ASCII advance widths for IBM Plex Serif Regular (in 1/1000 em)
 pub const SERIF_FONT_WIDTHS = [128]u16{
     0,   464, 464, 464, 464, 464, 464, 464,
@@ -952,6 +966,10 @@ pub const ViewportConfig = struct {
     /// set only on the live ship path (headless tests leave it null so
     /// screenshots stay deterministic with no dylib seeded).
     math_size_fn: ?MathSizeFn = null,
+    /// ZaTeX typed-error latch query for fallback marks (issues #366/#377).
+    /// Null keeps fallbacks byte-identical; set beside math_size_fn on the
+    /// live ship path.
+    math_error_fn: ?MathErrorFn = null,
 };
 
 /// One layout-facing plugin row: the fence anchor plus what the fence
@@ -1320,6 +1338,10 @@ pub const FlowCtx = struct {
     /// ZaTeX size query, threaded from ViewportConfig (null keeps math
     /// literal/code-card). Measurement and render share it, so boxes agree.
     math_size_fn: ?MathSizeFn = null,
+    /// ZaTeX typed-error latch query, threaded from ViewportConfig (null
+    /// keeps fallbacks byte-identical). Names the failure byte for the
+    /// accent mark; geometry never depends on it.
+    math_error_fn: ?MathErrorFn = null,
     /// RTL paragraph flow (issue #50): the pen tracks the RIGHT edge and
     /// words lay right-to-left. Defaults false: the LTR path below is
     /// byte-identical to the historical layout.
@@ -1764,6 +1786,15 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
         return;
     };
     const box = mathBox(tex, display, ctx.font_size, ctx.math_size_fn) orelse {
+        // Typed-error mark (issue #377): the accent byte names the failure
+        // position; untyped failures flow plainly as before.
+        if (comptime !math_stub) {
+            if (mathErrorOffset(tex, display, ctx.math_error_fn)) |off| {
+                const base: usize = @intFromPtr(tex.ptr) - @intFromPtr(island.ptr);
+                flowLiteralWithMark(island, base + off, pen, ctx);
+                return;
+            }
+        }
         flowSpans(island, .{}, null, pen, ctx, false);
         return;
     };
@@ -1797,6 +1828,79 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
     if (extra > pen.row_extra) pen.row_extra = extra;
 }
 
+/// Typed math-error offset (issues #366/#377): byte offset into `tex` of
+/// the engine-reported failure, when the last-error latch matches this
+/// exact formula. Null without a typed error (engine off, old dylib, or a
+/// different formula failed last): fallbacks stay byte-identical to before.
+/// Single call site: inline drops the out-of-line copy (binary budget).
+inline fn mathErrorOffset(tex: []const u8, display: bool, err_fn: ?MathErrorFn) ?u32 {
+    if (comptime math_stub) return null;
+    const q = err_fn orelse return null;
+    if (tex.len == 0 or tex.len > 65536) return null;
+    var off: u32 = 0;
+    var code: c_int = 0;
+    const hit = q(
+        tex.ptr,
+        @intCast(tex.len),
+        if (display) 1 else 0,
+        &off,
+        &code,
+    );
+    if (hit == 0) return null;
+    if (off >= tex.len) return null;
+    return off;
+}
+
+/// Flows `literal` with the byte at `err_at` in the accent color (issue
+/// #377). Color-only: pen geometry matches the plain literal flow
+/// bit-for-bit, so measure and render agree.
+fn flowLiteralWithMark(literal: []const u8, err_at: usize, pen: *FlowPen, ctx: FlowCtx) void {
+    var mctx = ctx;
+    mctx.default_color = ctx.accent_color;
+    flowSpans(literal[0..err_at], .{}, null, pen, ctx, false);
+    const end = @min(err_at + 1, literal.len);
+    flowSpans(literal[err_at..end], .{}, null, pen, mctx, false);
+    flowSpans(literal[end..], .{}, null, pen, ctx, false);
+}
+
+/// Multiline display-math block geometry (issue #373): the `$$` opener
+/// line at `i` through its closer, as one centered display box over the
+/// document-borrowed TeX (newlines ride along as spaces). Width-fit shrink
+/// mirrors the single-line and fence paths. Null when no block opens here
+/// or the engine refuses it (caller flows the lines literally).
+const MathBlockGeom = struct {
+    tex: []const u8,
+    box: MathBox,
+    x: f32,
+    consumed: usize,
+};
+
+/// Width-fit shrink shared by the single-line, multiline, and fence math
+/// paths: dims scale linearly with px, so clamping the width keeps the
+/// aspect. One copy for all three (binary budget): noinline pins the
+/// single out-of-line copy instead of three inline expansions.
+noinline fn fitMathBox(box: MathBox, max_w: f32) MathBox {
+    const w = @min(box.w, max_w);
+    const k = if (box.w > 0) w / box.w else 1.0;
+    var fit = box;
+    fit.w = w;
+    fit.above *= k;
+    fit.below *= k;
+    fit.font_px *= k;
+    return fit;
+}
+
+fn mathBlockGeom(ux: *UnitCx, i: usize, base_x: f32, bw: f32) ?MathBlockGeom {
+    if (comptime math_stub) return null;
+    if (ux.config.math_size_fn == null) return null;
+    if (i >= ux.lines.len or ux.lines[i].block_type != .paragraph) return null;
+    const blk = math_detect.displayBlock(ux.bytes, ux.lines, i) orelse return null;
+    const box = mathBox(blk.tex, true, ux.config.base_font_size, ux.config.math_size_fn) orelse return null;
+    const fit = fitMathBox(box, bw);
+    // Centered: the RTL mirror is identical (symmetric about the middle).
+    return .{ .tex = blk.tex, .box = fit, .x = base_x + (bw - fit.w) / 2.0, .consumed = blk.close_idx - i + 1 };
+}
+
 /// Flows a whole-line display island (`$$...$$`) as a centered block on
 /// its own visual rows. True when rendered (caller returns); false falls
 /// back to normal literal flow. Breaks the row before/after like a hard
@@ -1808,15 +1912,9 @@ fn flowMathDisplay(tex: []const u8, pen: *FlowPen, ctx: FlowCtx) bool {
         advanceRow(pen, ctx.line_h);
         pen.x = if (ctx.rtl) ctx.start_x + ctx.max_w else ctx.start_x;
     }
-    const w = @min(box.w, ctx.max_w);
-    const bx = if (ctx.rtl) ctx.start_x + ctx.max_w - w else ctx.start_x + (ctx.max_w - w) / 2.0;
     // Width-fit shrink keeps the aspect: dims scale linearly with px.
-    const k = if (box.w > 0) w / box.w else 1.0;
-    var fit = box;
-    fit.w = w;
-    fit.above *= k;
-    fit.below *= k;
-    fit.font_px *= k;
+    const fit = fitMathBox(box, ctx.max_w);
+    const bx = if (ctx.rtl) ctx.start_x + ctx.max_w - fit.w else ctx.start_x + (ctx.max_w - fit.w) / 2.0;
     if (pen.y + fit.above + fit.below >= 0 and pen.y <= ctx.vp_bottom) {
         emitMath(bx, pen.y, fit, tex, ctx.default_color, ctx);
     }
@@ -2695,6 +2793,7 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .defs = ux.config.ref_defs,
         .entities = ux.config.entities,
         .math_size_fn = ux.config.math_size_fn,
+        .math_error_fn = ux.config.math_error_fn,
     };
 }
 
@@ -4281,6 +4380,23 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
     const list_owned = enclosingListMarker(ux.bytes, ux.lines, i) != null;
     const quote_owned = quoteLeader(ux.bytes, ux.lines, i) != null;
     const allow_joint = ux.config.join_buf != null and !list_owned and !quote_owned;
+    // Multiline display-math block (issue #373): one centered box for the
+    // whole opener..closer span, shared by render, height, and refine (all
+    // funnel through this unit). Top-level units only; list/quote-owned
+    // openers stay literal (v1 limit). Engine refusal falls through to the
+    // literal line flow below.
+    if (comptime !math_stub) {
+        if (!list_owned and !quote_owned) {
+            if (mathBlockGeom(ux, i, base_x, bw)) |mbg| {
+                var bctx = flowCtxFor(ux, base_x, bw, ux.config.base_font_size, ux.config.line_height, ux.theme.text);
+                bctx.rtl = rtl;
+                if (start_y + mbg.box.above + mbg.box.below >= 0 and start_y <= bctx.vp_bottom) {
+                    emitMath(mbg.x, start_y, mbg.box, mbg.tex, ux.theme.text, bctx);
+                }
+                return .{ .y = start_y + mbg.box.above + mbg.box.below + 4.0, .consumed = mbg.consumed };
+            }
+        }
+    }
     var j = i + 1;
     if (allow_joint) {
         j = flowParaLineJoint(ux, &pen, ctx, i, false);
@@ -4568,17 +4684,43 @@ fn mathFenceGeom(
     const info = lines[i];
     const tok = highlight.fenceToken(bytes[info.offset..][0..info.len]);
     if (!math_detect.isMathFenceToken(tok)) return null;
+    // No empty-source guard: mathBox nulls it below.
     const tex = plugin_cache.fenceSource(bytes, lines, i);
-    if (tex.len == 0) return null;
     const box = mathBox(tex, true, config.base_font_size, config.math_size_fn) orelse return null;
-    const w = @min(box.w, content_width);
-    const k = if (box.w > 0) w / box.w else 1.0;
-    var fit = box;
-    fit.w = w;
-    fit.above *= k;
-    fit.below *= k;
-    fit.font_px *= k;
-    return .{ .tex = tex, .box = fit, .x = content_x + (content_width - w) / 2.0 };
+    const fit = fitMathBox(box, content_width);
+    return .{ .tex = tex, .box = fit, .x = content_x + (content_width - fit.w) / 2.0 };
+}
+
+/// One monospace slice of a fenced-code row: the fence card's typed-error
+/// mark (issue #377) splits the failing row into plain/accent/plain
+/// slices at exact byte columns (monospace: no kerning, geometry exact).
+fn emitMonoSlice(
+    commands_out: []DrawCommand,
+    cmd_count: *usize,
+    text: []const u8,
+    col: usize,
+    x_base: f32,
+    y: f32,
+    h: f32,
+    adv: f32,
+    size: f32,
+    color: Color,
+) void {
+    if (cmd_count.* >= commands_out.len or text.len == 0) return;
+    commands_out[cmd_count.*] = .{
+        .kind = .text_run,
+        .rect = .{
+            .x = x_base + @as(f32, @floatFromInt(col)) * adv,
+            .y = y,
+            .w = @as(f32, @floatFromInt(text.len)) * adv,
+            .h = h,
+        },
+        .color = color,
+        .text = text,
+        .font_size = size,
+        .style = .{ .code = true },
+    };
+    cmd_count.* += 1;
 }
 
 /// scrollable block ids from `start_block_id`.
@@ -4857,6 +4999,41 @@ pub fn renderViewportCore(
                 const mono_size = config.base_font_size * 0.88;
                 const mono_advance = mono_size * 0.60;
 
+                // Typed-error mark for a failed ```math fence (issue #377):
+                // card row + byte column of the engine-reported failure.
+                // Stays unmarked without a latch match (engine off, old
+                // dylib, or another formula failed last): cards render
+                // exactly as before. Render-only: heights never see rows.
+                var math_err_row: usize = std.math.maxInt(usize);
+                var math_err_col: usize = 0;
+                if (comptime !math_stub) {
+                    if (math_detect.isMathFenceToken(highlight.fenceToken(fence_line))) {
+                        // No empty-source guard: mathErrorOffset nulls it.
+                        const ftex = plugin_cache.fenceSource(bytes, lines, i);
+                        if (mathErrorOffset(ftex, true, config.math_error_fn)) |foff| {
+                            var fr = i + 1;
+                            while (fr < scan_i) : (fr += 1) {
+                                const rstart = lines[fr].offset - lines[i + 1].offset;
+                                const rend = rstart + lines[fr].len;
+                                if (foff < rstart) break;
+                                if (foff < rend) {
+                                    const rraw = bytes[lines[fr].offset..][0..lines[fr].len];
+                                    const rstripped = stripFenceIndent(rraw, fence_strip);
+                                    const shift = rraw.len - rstripped.len;
+                                    const fcol = foff - rstart;
+                                    // foff < rend gives fcol < rraw.len, and
+                                    // rraw.len is shift + rstripped.len, so
+                                    // fcol >= shift alone bounds the column.
+                                    if (fcol >= shift) {
+                                        math_err_row = fr;
+                                        math_err_col = fcol - shift;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 var code_y = cur_y + 12.0;
                 // Pending plugin render: muted header-suffix run on the
                 // card's first line; code lines start one row lower.
@@ -4894,7 +5071,16 @@ pub fn renderViewportCore(
                         // Null (untokenizable) and empty runs share the one
                         // plain run below — identical pixels, one literal.
                         const runs: []highlight.Segment = if (highlight.tokenize(fence_lang, c_bytes, &seg_buf)) |r| r else &.{};
-                        if (runs.len == 0) {
+                        // Failed ```math row with a typed error (issue
+                        // #377): plain/accent/plain at the error column
+                        // instead of the tinted runs (error case only).
+                        if (draw_i == math_err_row and math_err_col < c_bytes.len) {
+                            const row_x = fence_base - cur_scroll_x;
+                            const row_h = config.line_height * 0.88;
+                            emitMonoSlice(commands_out, &cmd_count, c_bytes[0..math_err_col], 0, row_x, code_y, row_h, mono_advance, mono_size, theme.text);
+                            emitMonoSlice(commands_out, &cmd_count, c_bytes[math_err_col..][0..1], math_err_col, row_x, code_y, row_h, mono_advance, mono_size, theme.accent);
+                            emitMonoSlice(commands_out, &cmd_count, c_bytes[math_err_col + 1 ..], math_err_col + 1, row_x, code_y, row_h, mono_advance, mono_size, theme.text);
+                        } else if (runs.len == 0) {
                             // Empty line / fallback: same plain run as before.
                             commands_out[cmd_count] = .{
                                 .kind = .text_run,
@@ -4911,7 +5097,11 @@ pub fn renderViewportCore(
                             };
                             cmd_count += 1;
                         }
+                        // Marked rows already emitted above: skip the tinted
+                        // runs so the error row draws once.
+                        const skip_runs = draw_i == math_err_row and math_err_col < c_bytes.len;
                         for (runs) |run| {
+                            if (skip_runs) break;
                             if (cmd_count >= commands_out.len - 16) break;
                             const run_text = c_bytes[run.start..run.end];
                             const run_x = fence_base - cur_scroll_x +
@@ -9197,6 +9387,210 @@ test "math: whole-line display centers a block, fallback stays literal" {
     try std.testing.expectEqualStrings("x^2", cmds[0].text);
     try std.testing.expectApproxEqAbs((600.0 - 34.0) / 2.0, cmds[0].rect.x, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 18.7), pen.y, 0.01);
+}
+
+test "math: multiline display block centers one box, height agrees (issue #373)" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            std.debug.assert(display == 1);
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    const doc = "before\n\n$$\n\\frac{a}{b}\n$$\n\nafter\n";
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const lc = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..lc];
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .math_size_fn = Stub.size,
+    };
+    // Render: one centered math command over the borrowed TeX.
+    var cmds: [256]DrawCommand = undefined;
+    const count = layoutViewport(doc, lines, config, &cmds);
+    var nmath: usize = 0;
+    var math_h: f32 = 0;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .math and c.style.math_display) {
+            nmath += 1;
+            math_h = c.rect.h;
+            try std.testing.expectEqualStrings("\n\\frac{a}{b}\n", c.text);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), nmath);
+    try std.testing.expect(math_h > 0);
+    // Height: the shared paragraph unit reports the same box the render
+    // drew, so the document height tracks native blocks exactly.
+    const h = computeDocumentHeightEx(doc, lines, config, null, null);
+    try std.testing.expect(h > 50.0 + math_h);
+}
+
+test "math: unclosed multiline opener stays literal (issue #373)" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    const doc = "$$\nnever closes\n";
+    var lines_buf: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const lc = simd.scanLines(doc, &lines_buf, &fence);
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .math_size_fn = Stub.size,
+    };
+    var cmds: [256]DrawCommand = undefined;
+    const count = layoutViewport(doc, lines_buf[0..lc], config, &cmds);
+    for (cmds[0..count]) |c| try std.testing.expect(c.kind != .math);
+}
+
+test "math: typed-error mark splits the literal fallback, geometry kept (issue #377)" {
+    if (comptime core_options.plugin_stub) return;
+    const SizeStub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            _ = px;
+            w.* = 0;
+            ab.* = 0;
+            bl.* = 0;
+            return 2;
+        }
+    };
+    const ErrStub = struct {
+        fn query(tex: [*]const u8, len: c_int, display: c_int, off: *u32, code: *c_int) callconv(.c) c_int {
+            _ = display;
+            const s = tex[0..@intCast(len)];
+            if (std.mem.eql(u8, s, "x+y")) {
+                off.* = 1;
+                code.* = 1;
+                return 1;
+            }
+            return 0;
+        }
+    };
+    var cmds: [32]DrawCommand = undefined;
+    var n: usize = 0;
+    var pen = FlowPen{ .x = 0, .y = 0 };
+    const ctx = FlowCtx{
+        .font_size = 17.0,
+        .line_h = 29.75,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds,
+        .cmd_count = &n,
+        .math_size_fn = SizeStub.size,
+        .math_error_fn = ErrStub.query,
+    };
+    // Latched formula: the error byte (+) rides the accent color while the
+    // island text still joins back to the source bytes.
+    flowSourceLine("see $x+y$ now", false, false, false, &pen, ctx);
+    var saw_accent = false;
+    var joined_len: usize = 0;
+    for (cmds[0..n]) |c| {
+        try std.testing.expectEqual(DrawCommandKind.text_run, c.kind);
+        joined_len += c.text.len;
+        if (std.meta.eql(c.color, Theme.dark.accent)) {
+            saw_accent = true;
+            try std.testing.expectEqualStrings("+", c.text);
+        }
+    }
+    try std.testing.expect(saw_accent);
+    // Spaces emit no runs (pen advance only): words rejoin to the source
+    // minus its two spaces, so the mark split nothing and swallowed nothing.
+    try std.testing.expectEqual(@as(usize, "see $x+y$ now".len - 2), joined_len);
+    // Unlatched formula: plain literal flow, never accented.
+    var cmds2: [32]DrawCommand = undefined;
+    var n2: usize = 0;
+    var pen2 = FlowPen{ .x = 0, .y = 0 };
+    var ctx2 = ctx;
+    ctx2.commands_out = &cmds2;
+    ctx2.cmd_count = &n2;
+    flowSourceLine("see $ab$ now", false, false, false, &pen2, ctx2);
+    for (cmds2[0..n2]) |c| {
+        try std.testing.expect(!std.meta.eql(c.color, Theme.dark.accent));
+    }
+}
+
+test "math: failed math fence marks the error byte in its card (issue #377)" {
+    if (comptime core_options.plugin_stub) return;
+    const SizeStub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            _ = px;
+            w.* = 0;
+            ab.* = 0;
+            bl.* = 0;
+            return 2;
+        }
+    };
+    const ErrStub = struct {
+        fn query(tex: [*]const u8, len: c_int, display: c_int, off: *u32, code: *c_int) callconv(.c) c_int {
+            _ = display;
+            const s = tex[0..@intCast(len)];
+            if (std.mem.eql(u8, s, "\\bad{")) {
+                off.* = 0;
+                code.* = 1;
+                return 1;
+            }
+            return 0;
+        }
+    };
+    const doc = "```math\n\\bad{\n```\n";
+    var lines_buf: [8]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const lc = simd.scanLines(doc, &lines_buf, &fence);
+    const config = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 1000.0,
+        .scroll_y = 0.0,
+        .math_size_fn = SizeStub.size,
+        .math_error_fn = ErrStub.query,
+    };
+    var cmds: [256]DrawCommand = undefined;
+    const count = layoutViewport(doc, lines_buf[0..lc], config, &cmds);
+    // The card still draws its code rows, with the error byte accented.
+    var saw_card = false;
+    var saw_mark = false;
+    for (cmds[0..count]) |c| {
+        if (c.kind == .text_run and c.style.code) {
+            saw_card = true;
+            if (std.meta.eql(c.color, Theme.dark.accent)) {
+                saw_mark = true;
+                try std.testing.expectEqualStrings("\\", c.text);
+            }
+        }
+        try std.testing.expect(c.kind != .math);
+    }
+    try std.testing.expect(saw_card);
+    try std.testing.expect(saw_mark);
 }
 
 test "math: mid-line display island stays in the text flow" {
