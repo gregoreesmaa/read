@@ -2232,6 +2232,27 @@ test "pass2: parseLineStream slices one mmap line with zero copies" {
     try std.testing.expectEqual(@as(usize, 0), tokenSlice(doc, .{ .kind = .text, .start = 5000, .len = 10 }).len);
 }
 
+/// Named-entity registry for decodeEntityAfterAmp below (same table the
+/// CommonMark spec exercises; numeric references are handled inline).
+const named_entities = [_]struct { name: []const u8, value: []const u8 }{
+    .{ .name = "amp", .value = "&" },
+    .{ .name = "lt", .value = "<" },
+    .{ .name = "gt", .value = ">" },
+    .{ .name = "quot", .value = "\"" },
+    .{ .name = "apos", .value = "'" },
+    .{ .name = "nbsp", .value = " " },
+    .{ .name = "copy", .value = "©" },
+    .{ .name = "AElig", .value = "Æ" },
+    .{ .name = "Dcaron", .value = "Ď" },
+    .{ .name = "DifferentialD", .value = "ⅆ" },
+    .{ .name = "HilbertSpace", .value = "ℋ" },
+    .{ .name = "ClockwiseContourIntegral", .value = "∲" },
+    .{ .name = "frac34", .value = "¾" },
+    .{ .name = "ngE", .value = "≧̸" },
+    .{ .name = "ouml", .value = "ö" },
+    .{ .name = "auml", .value = "ä" },
+};
+
 /// Decodes one HTML entity starting right after the `&` (`rest[0]` is the
 /// first entity character; the trailing `;` must be inside `rest`).
 /// Writes UTF-8 into `out`, returns bytes written, or 0 when not an entity
@@ -2244,44 +2265,14 @@ pub fn decodeEntityAfterAmp(rest: []const u8, out: []u8) usize {
     const semi = simd.findByte(rest, 0, ';') orelse return 0;
     if (semi == 0 or semi > 32) return 0;
     const body = rest[0..semi];
-    const named: ?[]const u8 = if (std.mem.eql(u8, body, "amp"))
-        "&"
-    else if (std.mem.eql(u8, body, "lt"))
-        "<"
-    else if (std.mem.eql(u8, body, "gt"))
-        ">"
-    else if (std.mem.eql(u8, body, "quot"))
-        "\""
-    else if (std.mem.eql(u8, body, "apos"))
-        "'"
-    else if (std.mem.eql(u8, body, "nbsp"))
-        " "
-    else if (std.mem.eql(u8, body, "copy"))
-        "©"
-    else if (std.mem.eql(u8, body, "AElig"))
-        "Æ"
-    else if (std.mem.eql(u8, body, "Dcaron"))
-        "Ď"
-    else if (std.mem.eql(u8, body, "DifferentialD"))
-        "ⅆ"
-    else if (std.mem.eql(u8, body, "HilbertSpace"))
-        "ℋ"
-    else if (std.mem.eql(u8, body, "ClockwiseContourIntegral"))
-        "∲"
-    else if (std.mem.eql(u8, body, "frac34"))
-        "¾"
-    else if (std.mem.eql(u8, body, "ngE"))
-        "≧̸"
-    else if (std.mem.eql(u8, body, "ouml"))
-        "ö"
-    else if (std.mem.eql(u8, body, "auml"))
-        "ä"
-    else
-        null;
-    if (named) |s| {
-        if (out.len < s.len) return 0;
-        @memcpy(out[0..s.len], s);
-        return s.len;
+    // Named table: identical match set to the old eql chain, one mem.eql
+    // codegen site instead of sixteen.
+    for (named_entities) |e| {
+        if (std.mem.eql(u8, body, e.name)) {
+            if (out.len < e.value.len) return 0;
+            @memcpy(out[0..e.value.len], e.value);
+            return e.value.len;
+        }
     }
     // Numeric reference: &#123; (1-7 digits) or &#x1A; (1-6 hex digits,
     // case-insensitive x). NUL, surrogates, and overflow become U+FFFD.

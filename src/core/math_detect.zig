@@ -314,6 +314,42 @@ pub fn displayBlockTex(
     return tex;
 }
 
+/// Fused open..close+tex for the viewport block path: the displayBlockClose
+/// scan above with the displayBlockTex derivation folded into the closer
+/// arm, so ship emits one pass instead of the close-then-re-parse pair.
+/// Step-identical to calling displayBlockClose then displayBlockTex (same
+/// opener/closer/contiguity/content checks, no re-parse); the split pair
+/// stays for the unit tests below.
+pub const DisplayBlock = struct { close_idx: usize, tex: []const u8 };
+
+pub fn displayBlock(doc: []const u8, lines: []const simd.Line, open_idx: usize) ?DisplayBlock {
+    if (open_idx >= lines.len) return null;
+    if (lines[open_idx].block_type != .paragraph) return null;
+    const open_raw = doc[lines[open_idx].offset..][0..lines[open_idx].len];
+    const after_open = displayBlockOpener(open_raw) orelse return null;
+    var j = open_idx + 1;
+    while (j < lines.len) : (j += 1) {
+        if (lines[j].block_type != .paragraph) return null;
+        // Contiguity: the joint is exactly the newline the scan split on.
+        const prev = lines[j - 1];
+        const joint = lines[j].offset - (prev.offset + prev.len);
+        if (joint < 1 or joint > 2) return null;
+        if (doc[prev.offset + prev.len] == '\r') {
+            if (joint != 2 or doc[prev.offset + prev.len + 1] != '\n') return null;
+        } else if (joint != 1 or doc[prev.offset + prev.len] != '\n') return null;
+        const raw = doc[lines[j].offset..][0..lines[j].len];
+        if (displayBlockCloser(raw)) |at_close| {
+            const start = lines[open_idx].offset + after_open;
+            const end = lines[j].offset + at_close;
+            if (end <= start) return null;
+            const tex = doc[start..end];
+            if (!hasNonSpace(tex)) return null;
+            return .{ .close_idx = j, .tex = tex };
+        }
+    }
+    return null;
+}
+
 /// Display-math block content when `line` consists solely of one display
 /// island (leading/trailing whitespace allowed): the raw TeX between the
 /// delimiters. Null otherwise (embedded `$$` in prose stays literal in

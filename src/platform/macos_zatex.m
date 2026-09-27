@@ -824,19 +824,24 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
     // needs below stay zeroed on old space failures, which correctly read
     // as over-capacity (issue #366).
     memset(out, 0, sizeof(*out));
+    // Negotiated call (issues #354/#364/#365): the caps-word gate admits
+    // the CUR-byte stride (x_scale and color tails) via _ex; old dylibs
+    // take the frozen v1 stride-20 path, bit-identical to before (issue
+    // #354 acceptance on the installed dylib). One shared post-pass below
+    // normalizes tails (0 tail reads as identity/ambient, defensive).
     int32_t rc;
-    if (zatex_negotiated_ex) {
-        // Negotiated path (issues #354/#364/#365): caps-word gate admits
-        // the CUR-byte stride (x_scale and color tails); the host still
-        // normalizes once at this boundary (issue #374), so downstream
-        // keeps one view. A 0 tail reads as identity/ambient (defensive,
-        // never emitted).
+    if (zatex_negotiated_ex)
         rc = zatex_layout_ex(ntx, (size_t)nlen, display ? true : false, &zatex_metrics,
                              zatex_runs_x, ZATEX_RUNS_CAP, ZATEX_RUN_SIZE_CUR,
                              zatex_rules, ZATEX_RULES_CAP,
                              zatex_glyphs, ZATEX_GLYPHS_CAP, out);
-        if (rc == 0) {
-            uint32_t n = out->nruns < ZATEX_RUNS_CAP ? out->nruns : ZATEX_RUNS_CAP;
+    else
+        rc = zatex_layout(ntx, (size_t)nlen, display ? true : false, &zatex_metrics,
+                          zatex_runs, ZATEX_RUNS_CAP, zatex_rules, ZATEX_RULES_CAP,
+                          zatex_glyphs, ZATEX_GLYPHS_CAP, out);
+    if (rc == 0) {
+        uint32_t n = out->nruns < ZATEX_RUNS_CAP ? out->nruns : ZATEX_RUNS_CAP;
+        if (zatex_negotiated_ex) {
             int any = 0;
             for (uint32_t i = 0; i < n; i++) {
                 memcpy(&zatex_runs[i], &zatex_runs_x[i], sizeof(ZatexRun));
@@ -847,19 +852,10 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
                 if (c) any = 1;
             }
             zatex_has_color = any;
-        }
-    } else {
-        // Frozen v1 path: old dylib strides 20 and never writes tails —
-        // identity scale and ambient paint, bit-identical to before
-        // (issue #354 acceptance on the installed dylib).
-        rc = zatex_layout(ntx, (size_t)nlen, display ? true : false, &zatex_metrics,
-                          zatex_runs, ZATEX_RUNS_CAP, zatex_rules, ZATEX_RULES_CAP,
-                          zatex_glyphs, ZATEX_GLYPHS_CAP, out);
-        if (rc == 0) {
-            uint32_t n = out->nruns < ZATEX_RUNS_CAP ? out->nruns : ZATEX_RUNS_CAP;
+        } else {
             for (uint32_t i = 0; i < n; i++) zatex_xscale[i] = 1000;
+            zatex_has_color = 0;
         }
-        zatex_has_color = 0;
     }
     if (rc == 0) return ZATEX_OK;
     // Typed routing (issues #366/#377): latch the caller-identity failure
@@ -1065,12 +1061,10 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         CGContextTranslateCTM(ctx, (CGFloat)ox, (CGFloat)oy);
         // Stretched runs (issue #354): zatex.h recipe — scale x about
         // the run origin so ink AND pen stretch (positions below stay
-        // relative). Identity is the exact call as before (old dylib:
-        // always), keeping the fast path untouched.
-        if (zatex_xscale[i] != 1000)
-            CGContextScaleCTM(ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), -1.0);
-        else
-            CGContextScaleCTM(ctx, 1.0, -1.0);
+        // relative). Identity folds exactly (1000/1000.0 is 1.0), so the
+        // v1 path issues the identical call with no branch (old dylib:
+        // always 1000).
+        CGContextScaleCTM(ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), -1.0);
         CGContextSetTextPosition(ctx, 0, 0);
         uint32_t n = rn->glyph_count;
         int64_t acc = 0;

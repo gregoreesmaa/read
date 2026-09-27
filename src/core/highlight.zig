@@ -85,32 +85,49 @@ pub fn fenceToken(line: []const u8) []const u8 {
     return s[start..p];
 }
 
+/// Fence info-string registry: exact case-sensitive token match. One
+/// table + one mem.eql codegen site instead of ~29 inline compares;
+/// identical match set (tokens are distinct, so order is irrelevant).
+const lang_names = [_]struct { name: []const u8, lang: Lang }{
+    .{ .name = "zig", .lang = .zig },
+    .{ .name = "c", .lang = .c },
+    .{ .name = "python", .lang = .python },
+    .{ .name = "js", .lang = .js },
+    .{ .name = "javascript", .lang = .js },
+    .{ .name = "bash", .lang = .bash },
+    .{ .name = "sh", .lang = .bash },
+    .{ .name = "shell", .lang = .bash },
+    .{ .name = "diff", .lang = .diff },
+    .{ .name = "ts", .lang = .ts },
+    .{ .name = "typescript", .lang = .ts },
+    .{ .name = "rust", .lang = .rust },
+    .{ .name = "go", .lang = .go },
+    .{ .name = "java", .lang = .java },
+    .{ .name = "ruby", .lang = .ruby },
+    .{ .name = "swift", .lang = .swift },
+    .{ .name = "kotlin", .lang = .kotlin },
+    .{ .name = "php", .lang = .php },
+    .{ .name = "cpp", .lang = .cpp },
+    .{ .name = "c++", .lang = .cpp },
+    .{ .name = "csharp", .lang = .csharp },
+    .{ .name = "c#", .lang = .csharp },
+    .{ .name = "html", .lang = .html },
+    .{ .name = "css", .lang = .css },
+    .{ .name = "sql", .lang = .sql },
+    .{ .name = "lua", .lang = .lua },
+    .{ .name = "latex", .lang = .latex },
+    .{ .name = "tex", .lang = .latex },
+    .{ .name = "katex", .lang = .latex },
+};
+
 /// Language from a raw fence-start line: first info-string token via the
 /// shared fenceToken scanner, exact match.
 pub fn langFromFenceLine(line: []const u8) Lang {
     const token = fenceToken(line);
     if (token.len == 0) return .none;
-    if (std.mem.eql(u8, token, "zig")) return .zig;
-    if (std.mem.eql(u8, token, "c")) return .c;
-    if (std.mem.eql(u8, token, "python")) return .python;
-    if (std.mem.eql(u8, token, "js") or std.mem.eql(u8, token, "javascript")) return .js;
-    if (std.mem.eql(u8, token, "bash") or std.mem.eql(u8, token, "sh") or std.mem.eql(u8, token, "shell")) return .bash;
-    if (std.mem.eql(u8, token, "diff")) return .diff;
-    if (std.mem.eql(u8, token, "ts") or std.mem.eql(u8, token, "typescript")) return .ts;
-    if (std.mem.eql(u8, token, "rust")) return .rust;
-    if (std.mem.eql(u8, token, "go")) return .go;
-    if (std.mem.eql(u8, token, "java")) return .java;
-    if (std.mem.eql(u8, token, "ruby")) return .ruby;
-    if (std.mem.eql(u8, token, "swift")) return .swift;
-    if (std.mem.eql(u8, token, "kotlin")) return .kotlin;
-    if (std.mem.eql(u8, token, "php")) return .php;
-    if (std.mem.eql(u8, token, "cpp") or std.mem.eql(u8, token, "c++")) return .cpp;
-    if (std.mem.eql(u8, token, "csharp") or std.mem.eql(u8, token, "c#")) return .csharp;
-    if (std.mem.eql(u8, token, "html")) return .html;
-    if (std.mem.eql(u8, token, "css")) return .css;
-    if (std.mem.eql(u8, token, "sql")) return .sql;
-    if (std.mem.eql(u8, token, "lua")) return .lua;
-    if (std.mem.eql(u8, token, "latex") or std.mem.eql(u8, token, "tex") or std.mem.eql(u8, token, "katex")) return .latex;
+    for (lang_names) |e| {
+        if (std.mem.eql(u8, token, e.name)) return e.lang;
+    }
     return .none;
 }
 

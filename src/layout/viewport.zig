@@ -1832,7 +1832,8 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
 /// the engine-reported failure, when the last-error latch matches this
 /// exact formula. Null without a typed error (engine off, old dylib, or a
 /// different formula failed last): fallbacks stay byte-identical to before.
-fn mathErrorOffset(tex: []const u8, display: bool, err_fn: ?MathErrorFn) ?u32 {
+/// Single call site: inline drops the out-of-line copy (binary budget).
+inline fn mathErrorOffset(tex: []const u8, display: bool, err_fn: ?MathErrorFn) ?u32 {
     if (comptime math_stub) return null;
     const q = err_fn orelse return null;
     if (tex.len == 0 or tex.len > 65536) return null;
@@ -1876,8 +1877,9 @@ const MathBlockGeom = struct {
 
 /// Width-fit shrink shared by the single-line, multiline, and fence math
 /// paths: dims scale linearly with px, so clamping the width keeps the
-/// aspect. One copy for all three (binary budget).
-fn fitMathBox(box: MathBox, max_w: f32) MathBox {
+/// aspect. One copy for all three (binary budget): noinline pins the
+/// single out-of-line copy instead of three inline expansions.
+noinline fn fitMathBox(box: MathBox, max_w: f32) MathBox {
     const w = @min(box.w, max_w);
     const k = if (box.w > 0) w / box.w else 1.0;
     var fit = box;
@@ -1892,12 +1894,11 @@ fn mathBlockGeom(ux: *UnitCx, i: usize, base_x: f32, bw: f32) ?MathBlockGeom {
     if (comptime math_stub) return null;
     if (ux.config.math_size_fn == null) return null;
     if (i >= ux.lines.len or ux.lines[i].block_type != .paragraph) return null;
-    const close = math_detect.displayBlockClose(ux.bytes, ux.lines, i) orelse return null;
-    const tex = math_detect.displayBlockTex(ux.bytes, ux.lines, i, close) orelse return null;
-    const box = mathBox(tex, true, ux.config.base_font_size, ux.config.math_size_fn) orelse return null;
+    const blk = math_detect.displayBlock(ux.bytes, ux.lines, i) orelse return null;
+    const box = mathBox(blk.tex, true, ux.config.base_font_size, ux.config.math_size_fn) orelse return null;
     const fit = fitMathBox(box, bw);
     // Centered: the RTL mirror is identical (symmetric about the middle).
-    return .{ .tex = tex, .box = fit, .x = base_x + (bw - fit.w) / 2.0, .consumed = close - i + 1 };
+    return .{ .tex = blk.tex, .box = fit, .x = base_x + (bw - fit.w) / 2.0, .consumed = blk.close_idx - i + 1 };
 }
 
 /// Flows a whole-line display island (`$$...$$`) as a centered block on
@@ -4683,8 +4684,8 @@ fn mathFenceGeom(
     const info = lines[i];
     const tok = highlight.fenceToken(bytes[info.offset..][0..info.len]);
     if (!math_detect.isMathFenceToken(tok)) return null;
+    // No empty-source guard: mathBox nulls it below.
     const tex = plugin_cache.fenceSource(bytes, lines, i);
-    if (tex.len == 0) return null;
     const box = mathBox(tex, true, config.base_font_size, config.math_size_fn) orelse return null;
     const fit = fitMathBox(box, content_width);
     return .{ .tex = tex, .box = fit, .x = content_x + (content_width - fit.w) / 2.0 };
@@ -5007,25 +5008,27 @@ pub fn renderViewportCore(
                 var math_err_col: usize = 0;
                 if (comptime !math_stub) {
                     if (math_detect.isMathFenceToken(highlight.fenceToken(fence_line))) {
+                        // No empty-source guard: mathErrorOffset nulls it.
                         const ftex = plugin_cache.fenceSource(bytes, lines, i);
-                        if (ftex.len > 0) {
-                            if (mathErrorOffset(ftex, true, config.math_error_fn)) |foff| {
-                                var fr = i + 1;
-                                while (fr < scan_i) : (fr += 1) {
-                                    const rstart = lines[fr].offset - lines[i + 1].offset;
-                                    const rend = rstart + lines[fr].len;
-                                    if (foff < rstart) break;
-                                    if (foff < rend) {
-                                        const rraw = bytes[lines[fr].offset..][0..lines[fr].len];
-                                        const rstripped = stripFenceIndent(rraw, fence_strip);
-                                        const shift = rraw.len - rstripped.len;
-                                        const fcol = foff - rstart;
-                                        if (fcol >= shift and fcol - shift < rstripped.len) {
-                                            math_err_row = fr;
-                                            math_err_col = fcol - shift;
-                                        }
-                                        break;
+                        if (mathErrorOffset(ftex, true, config.math_error_fn)) |foff| {
+                            var fr = i + 1;
+                            while (fr < scan_i) : (fr += 1) {
+                                const rstart = lines[fr].offset - lines[i + 1].offset;
+                                const rend = rstart + lines[fr].len;
+                                if (foff < rstart) break;
+                                if (foff < rend) {
+                                    const rraw = bytes[lines[fr].offset..][0..lines[fr].len];
+                                    const rstripped = stripFenceIndent(rraw, fence_strip);
+                                    const shift = rraw.len - rstripped.len;
+                                    const fcol = foff - rstart;
+                                    // foff < rend gives fcol < rraw.len, and
+                                    // rraw.len is shift + rstripped.len, so
+                                    // fcol >= shift alone bounds the column.
+                                    if (fcol >= shift) {
+                                        math_err_row = fr;
+                                        math_err_col = fcol - shift;
                                     }
+                                    break;
                                 }
                             }
                         }

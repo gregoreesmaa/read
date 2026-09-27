@@ -515,87 +515,67 @@ fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe:
 fn pluginLaunchProbe(r: usize) void {
     const renderer: plugin_cache.Renderer = @enumFromInt(r);
     const name = @tagName(renderer);
-    const helper = pluginHelperPath(g_plugin_helper_buf[0..]) orelse {
-        pluginMarkNaive(r);
-        return;
-    };
-    const root = g_plugin_root_buf[0..g_plugin_root_len];
-    var dbuf: [512]u8 = undefined;
-    const dir = pluginRendererDir(root, name, &dbuf) orelse {
-        pluginMarkNaive(r);
-        return;
-    };
-    if (!pluginStoreNul(g_plugin_dir_bufs[r][0..], &g_plugin_dir_lens[r], dir)) {
-        pluginMarkNaive(r);
-        return;
-    }
-    if (!pluginMkdirAll(root, dir)) {
-        pluginMarkNaive(r);
-        return;
-    }
-    if (!pluginWriteShim(dir, name, helper, false, g_plugin_shim_render[r][0..], &g_plugin_shim_render_len[r])) {
-        pluginMarkNaive(r);
-        return;
-    }
-    if (!pluginWriteShim(dir, name, helper, true, g_plugin_probe_shim[r][0..], &g_plugin_probe_shim_len[r])) {
-        pluginMarkNaive(r);
-        return;
-    }
-    // Unique sentinel leaves per launch (see g_plugin_probe_seq): never
-    // reuse a path within the session. Drop the superseded outfile, if any.
-    if (g_plugin_probe_out_len[r] > 0) {
-        const prev_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
-        _ = std.c.unlink(prev_z);
-        g_plugin_probe_out_len[r] = 0;
-    }
-    const seq = g_plugin_probe_seq[r];
-    g_plugin_probe_seq[r] +|= 1;
-    // One stem for both `probe-<hh>.<ext>` sentinel leaves (src/out differ
-    // only in the extension): half the literal setup of two full leaves.
-    const hexdig = "0123456789abcdef";
-    var stem: [9]u8 = .{ 'p', 'r', 'o', 'b', 'e', '-', 0, 0, '.' };
-    stem[6] = hexdig[seq >> 4];
-    stem[7] = hexdig[seq & 15];
-    var src_leaf: [12]u8 = undefined;
-    @memcpy(src_leaf[0..9], stem[0..]);
-    @memcpy(src_leaf[9..12], "src");
-    var out_leaf: [12]u8 = undefined;
-    @memcpy(out_leaf[0..9], stem[0..]);
-    @memcpy(out_leaf[9..12], "out");
-    var tmp: [1024:0]u8 = [_:0]u8{0} ** 1024;
-    const src = pluginChildPath(dir, src_leaf[0..], tmp[0..512]) orelse {
-        pluginMarkNaive(r);
-        return;
-    };
-    tmp[src.len] = 0;
-    const src_z: [*:0]const u8 = @ptrCast(&tmp[0]);
-    if (!pluginWriteFile(src_z, "probe\n")) {
-        pluginMarkNaive(r);
-        return;
-    }
-    const out = pluginChildPath(dir, out_leaf[0..], tmp[512..]) orelse {
+    // Every setup failure demotes identically with no later side effect,
+    // so all arms break to one shared tail (binary budget) instead of
+    // each carrying its own demote call.
+    fail: {
+        const helper = pluginHelperPath(g_plugin_helper_buf[0..]) orelse break :fail;
+        const root = g_plugin_root_buf[0..g_plugin_root_len];
+        var dbuf: [512]u8 = undefined;
+        const dir = pluginRendererDir(root, name, &dbuf) orelse break :fail;
+        if (!pluginStoreNul(g_plugin_dir_bufs[r][0..], &g_plugin_dir_lens[r], dir)) break :fail;
+        if (!pluginMkdirAll(root, dir)) break :fail;
+        if (!pluginWriteShim(dir, name, helper, false, g_plugin_shim_render[r][0..], &g_plugin_shim_render_len[r])) break :fail;
+        if (!pluginWriteShim(dir, name, helper, true, g_plugin_probe_shim[r][0..], &g_plugin_probe_shim_len[r])) break :fail;
+        // Unique sentinel leaves per launch (see g_plugin_probe_seq): never
+        // reuse a path within the session. Drop the superseded outfile, if any.
+        if (g_plugin_probe_out_len[r] > 0) {
+            const prev_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
+            _ = std.c.unlink(prev_z);
+            g_plugin_probe_out_len[r] = 0;
+        }
+        const seq = g_plugin_probe_seq[r];
+        g_plugin_probe_seq[r] +|= 1;
+        // One leaf buffer for both `probe-<hh>.<ext>` sentinels (src/out
+        // differ only in the extension): the src path lands in tmp first,
+        // so patching the tail for out cannot disturb it. Hex via the
+        // shared hex16 (a sub-256 value renders as 14 zeros + 2 digits).
+        var hex: [16]u8 = undefined;
+        plugin_cache.hex16(seq, &hex);
+        var leaf: [12]u8 = .{ 'p', 'r', 'o', 'b', 'e', '-', 0, 0, '.', 's', 'r', 'c' };
+        leaf[6] = hex[14];
+        leaf[7] = hex[15];
+        var tmp: [1024:0]u8 = [_:0]u8{0} ** 1024;
+        const src = pluginChildPath(dir, leaf[0..], tmp[0..512]) orelse break :fail;
+        tmp[src.len] = 0;
+        const src_z: [*:0]const u8 = @ptrCast(&tmp[0]);
+        if (!pluginWriteFile(src_z, "probe\n")) break :fail;
+        leaf[9] = 'o';
+        leaf[10] = 'u';
+        leaf[11] = 't';
+        const out = pluginChildPath(dir, leaf[0..], tmp[512..]) orelse {
+            _ = std.c.unlink(src_z);
+            break :fail;
+        };
+        if (!pluginStoreNul(g_plugin_probe_out[r][0..], &g_plugin_probe_out_len[r], out)) {
+            _ = std.c.unlink(src_z);
+            break :fail;
+        }
+        const shim_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_shim[r][0]);
+        const out_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
+        const rc = bridge.launchPluginRender(shim_z, src_z, out_z);
+        if (rc == 1) {
+            g_plugin_probe_pending[r] = true;
+            g_plugin_inflight += 1;
+            return;
+        }
         _ = std.c.unlink(src_z);
-        pluginMarkNaive(r);
-        return;
-    };
-    if (!pluginStoreNul(g_plugin_probe_out[r][0..], &g_plugin_probe_out_len[r], out)) {
-        _ = std.c.unlink(src_z);
-        pluginMarkNaive(r);
-        return;
+        _ = std.c.unlink(out_z);
+        // 0: table momentarily full; jobs stay queued and the next drain
+        // retries the probe structurally. -1: shim unlaunchable, demote.
+        if (rc == 0) return;
     }
-    const shim_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_shim[r][0]);
-    const out_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
-    const rc = bridge.launchPluginRender(shim_z, src_z, out_z);
-    if (rc == 1) {
-        g_plugin_probe_pending[r] = true;
-        g_plugin_inflight += 1;
-        return;
-    }
-    _ = std.c.unlink(src_z);
-    _ = std.c.unlink(out_z);
-    // -1: shim unlaunchable, demote now. 0: table momentarily full; jobs
-    // stay queued and the next drain retries the probe structurally.
-    if (rc != 0) pluginMarkNaive(r);
+    pluginMarkNaive(r);
 }
 
 /// Launch queued renders FIFO while in flight stays under the cap. Stages
