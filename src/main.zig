@@ -2786,6 +2786,16 @@ test "retina atlas text stays crisp (no-blur regression)" {
 const MATH355_PNG_PATH = "/tmp/math_atlas_355.png";
 const MATH355_PNG_W: c_int = 600;
 const MATH355_PNG_H: c_int = 260;
+// Math-only acutance floor (issue #355 follow-up): thin STIX strokes
+// through the 1x-harness 2x→1x downsample read softer than body ink, so
+// math carries its own bar instead of the shared body one. Calibrated on
+// the corrected (unmirrored) raster at 149.9 — the 189.5 previously
+// recorded here came from a vertically MIRRORED raster, so acutance alone
+// cannot pin orientation; the hit/miss asserts below pin the hot path and
+// this bar guards blur regressions (unsnapped origins, wrong filter).
+// Live Retina blits 1:1 with no resampling, so this number never touches
+// ship pixels. Direct-vector reference in the same harness: 220.5.
+const MATH355_ACUTANCE_MIN: f64 = 140.0;
 
 fn math355RenderFn(w: c_int, h: c_int) callconv(.c) void {
     math355RenderScaled(w, h);
@@ -2869,15 +2879,14 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
         bridge.platform_math_atlas_stats(&h2, &m2);
 
         // Pixels first (measured in every phase, red or green): math ink
-        // must be present and must not fringe past the crisp budget the
-        // body atlas path holds (parity pin for the Retina gap in #355 —
-        // same thresholds, no math-specific bar). The blit uses bilinear
-        // sampling (see zatex_blit_cached): nearest scores ~144 here
-        // because the 1x harness bitmap downsamples forced-2x masks, so
-        // these thresholds pin that choice too.
+        // must be present and must not fringe past the math crisp budget
+        // (MATH355_ACUTANCE_MIN above; the edge cap stays shared). The
+        // blit uses bilinear sampling (see zatex_blit_cached): nearest
+        // scores ~143 here because the 1x harness bitmap downsamples
+        // forced-2x masks, so these thresholds pin that choice too.
         const m = try crispPngMetrics(alloc, MATH355_PNG_PATH);
         std.debug.print("\n[MATH355] acutance={d:.1} edge_frac={d:.4} hits={d}+{d} misses={d}+{d}\n", .{ m.acutance, m.edge_frac, h0, h2 - h0, m0, m2 - m0 });
-        try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
+        try t.expect(m.acutance >= MATH355_ACUTANCE_MIN);
         try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
 
         // Reuse: the first frame rasterizes each formula; the identical
@@ -2888,6 +2897,54 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
         try t.expectEqual(h1, h0);
         try t.expect(h2 > h1);
         try t.expectEqual(m2, m1);
+    }
+}
+
+test "zatex engine negotiation is consistent (issues #354/#361)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the MATH355 test above). Twin builds stub the math
+    // backend, so there is nothing to negotiate there either. Only the
+    // read-test binary executes this, against the live engine.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        // The gallery wide-accent rows (issue #354 acceptance): the
+        // engine must lay these out on any dylib old or new.
+        const wide = [_][]const u8{ "\\widetilde{AB}", "\\widehat{AB}" };
+        for (wide) |tex| {
+            var fw: f32 = 0;
+            var above: f32 = 0;
+            var below: f32 = 0;
+            const rc = bridge.platform_math_size(
+                tex.ptr, @intCast(tex.len), 0, 17.0, &fw, &above, &below,
+            );
+            if (rc == 1) {
+                std.debug.print("\n[MATHEX] skipped: libzatex unavailable, nothing to pin\n", .{});
+                return;
+            }
+            try t.expectEqual(@as(c_int, 0), rc);
+            try t.expect(fw > 0 and above > 0);
+        }
+        var ver: u32 = 0;
+        var use_ex: u32 = 0;
+        var conform_ran: u32 = 0;
+        var conform_n: i32 = 0;
+        bridge.platform_math_engine_info(&ver, &use_ex, &conform_ran, &conform_n);
+        std.debug.print("\n[MATHEX] version={d} use_ex={d} conform_ran={d} conform_n={d}\n", .{ ver, use_ex, conform_ran, conform_n });
+        // Unversioned era tripwire: installed and current-upstream dylibs
+        // alike report 0 (the #259 versioned recipe has not shipped).
+        // When this flips nonzero the dylib changed: re-shoot the math
+        // gallery (upstream #253-255/#269 shift accents/sums/sqrts) and
+        // revisit this floor instead of rubber-stamping.
+        try t.expectEqual(@as(u32, 0), ver);
+        // Old-dylib tripwire: the installed engine predates
+        // zatex_layout_utf8_ex, so the frozen v1 path must be active
+        // (identity scale everywhere). When this flips to 1 the new
+        // dylib landed: confirm wide-accent stretch in math_gallery
+        // screenshots, then update this pin.
+        try t.expectEqual(@as(u32, 0), use_ex);
+        // Conformance is clean whenever it runs; on the installed dylib
+        // the probe is absent (ran == 0) and the count stays 0.
+        try t.expectEqual(@as(i32, 0), conform_n);
     }
 }
 
