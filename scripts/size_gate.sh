@@ -27,8 +27,10 @@ OPTIMIZE="${SIZE_GATE_OPTIMIZE:-ReleaseFast}"
 CORE_BUDGET=$((200 * 1024))
 # Plugin account: twin-measured 8062 bytes on 2026-09-12 + 4 KiB headroom,
 # rounded up to a whole KiB; bumped to 13 KiB by owner decision 2026-09-20
-# (§7 5%: 12*1.05=12.6, round up) for the MATH rule-thickness hook.
-PLUGIN_BUDGET_KIB=13
+# (§7 5%: 12*1.05=12.6, round up) for the MATH rule-thickness hook;
+# bumped to 15 KiB by owner decision 2026-09-27 (§7 5%: 13*1.05=13.65,
+# round up to 14, but measured 14508 needs 15) for the #355 Retina formula atlas.
+PLUGIN_BUDGET_KIB=15
 PLUGIN_BUDGET=$((PLUGIN_BUDGET_KIB * 1024))
 
 # Build both accounts; zig-cache incrementality makes this a fast no-op

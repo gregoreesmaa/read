@@ -141,3 +141,4 @@ The ship binary carries two size accounts, enforced by `scripts/size_gate.sh`:
 - Plugin account split out (twin mechanism); initial `PLUGIN_BUDGET` = measured plugin `__TEXT` + 4 KiB headroom — value set by the implementing agent below, recorded in `size_gate.sh`:
   - `PLUGIN_BUDGET = 12 KiB, measured 2026-09-12` (twin-measured 8062 bytes + 4 KiB headroom).
   - `PLUGIN_BUDGET = 13 KiB, owner decision 2026-09-20` (§7 5% bump for the MATH rule-thickness hook: honest diet capped ~100B (Coverage-fmt2 cut) vs 190B need with the principled file-truth implementation; plugin measured 12478).
+  - `PLUGIN_BUDGET = 15 KiB, owner decision 2026-09-27` (§7 5% bump for the #355 Retina formula atlas: diet recovered only ~128B of the 1404B overrun (flanking-table pack + macos_zatex.m diet); plugin measured 14508, headroom 852B).
