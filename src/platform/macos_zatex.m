@@ -178,10 +178,8 @@ typedef int32_t (*ZatexLayoutFn)(const char *, size_t, bool, const ZatexMetrics 
 typedef int32_t (*ZatexLayoutExFn)(const char *, size_t, bool, const ZatexMetrics *,
                                    void *, size_t, size_t, ZatexRule *, size_t,
                                    uint16_t *, size_t, ZatexLayout *);
-typedef uint32_t (*ZatexVersionFn)(void);
-// Metrics conformance probe (upstream #194): diagnostics against the
-// host provider at a font id; 0 is a clean pass.
-typedef int32_t (*ZatexConformFn)(const ZatexMetrics *, uint16_t, char *, size_t);
+// DIET: the version and conformance-probe typedefs retired with their
+// call sites (zatex_version / zatex_conform_metrics no longer resolved).
 // Capability word (upstream #262, issue #364): negotiated once via
 // zatex_capabilities(); absent on unversioned-era dylibs (v1 fallback).
 typedef uint32_t (*ZatexCapsFn)(void);
@@ -193,8 +191,8 @@ typedef uint32_t (*ZatexCapsFn)(void);
 static void *zatex_handle = NULL;
 static ZatexLayoutFn zatex_layout = NULL;
 static ZatexLayoutExFn zatex_layout_ex = NULL;
-static ZatexVersionFn zatex_version_fn = NULL;
-static ZatexConformFn zatex_conform_fn = NULL;
+// DIET: version query retired (see ZATEX_ADOPT); no version static remains.
+
 // Negotiated caps (issue #364): valid only when zatex_has_caps (the
 // dylib exports zatex_capabilities); otherwise the v1 baseline below,
 // never a gate — per-symbol presence stays authoritative (issue #361).
@@ -204,11 +202,9 @@ static int zatex_has_caps = 0;
 // when offered, per-symbol presence otherwise — use sites read one int
 // instead of re-branching.
 static int zatex_negotiated_ex = 0;
-// Packed engine version (major << 16 | minor << 8 | patch); 0 is the
-// unversioned era (installed and current-upstream dylibs alike predate
-// the #259 versioned recipe), so 0 selects the v1 baseline, never a
-// gate — symbol presence stays authoritative for _ex (issue #361).
-static uint32_t zatex_engine_version = 0;
+// DIET: version reporting retired — engine_info reports 0 permanently
+// (every shippable dylib to date cuts 0.0.0; the use_ex/caps tripwires
+// still detect engine upgrades).
 static int zatex_tried_load = 0;
 static int zatex_missing_noticed = 0;
 
@@ -224,8 +220,6 @@ static int zatex_missing_noticed = 0;
         zatex_handle = h; \
         zatex_layout = fn; \
         zatex_layout_ex = (ZatexLayoutExFn)dlsym(h, "zatex_layout_utf8_ex"); \
-        zatex_version_fn = (ZatexVersionFn)dlsym(h, "zatex_version"); \
-        zatex_conform_fn = (ZatexConformFn)dlsym(h, "zatex_conform_metrics"); \
         ZatexCapsFn cf = (ZatexCapsFn)dlsym(h, "zatex_capabilities"); \
         zatex_engine_caps = 0; \
         zatex_has_caps = 0; \
@@ -233,7 +227,6 @@ static int zatex_missing_noticed = 0;
             zatex_engine_caps = cf(); \
             zatex_has_caps = 1; \
         } \
-        if (zatex_version_fn) zatex_engine_version = zatex_version_fn(); \
         zatex_negotiated_ex = zatex_layout_ex != NULL && \
             (!zatex_has_caps || (zatex_engine_caps & ZATEX_CAP_X_SCALE) != 0); \
     } \
@@ -320,39 +313,9 @@ static void zatex_ensure_font(void) {
     zatex_font = CTFontCreateWithName(CFSTR("STIXTwoMath"), ZATEX_FONT_PX, NULL);
 }
 
-// One UTF-8 codepoint; invalid bytes yield U+FFFD (missing glyph downstream).
-static uint32_t zatex_decode(const char *s, int left, int *used) {
-    unsigned char c0 = (unsigned char)s[0];
-    if (c0 < 0x80) {
-        *used = 1;
-        return c0;
-    }
-    if ((c0 & 0xE0) == 0xC0 && left >= 2) {
-        unsigned char c1 = (unsigned char)s[1];
-        if ((c1 & 0xC0) == 0x80) {
-            *used = 2;
-            uint32_t cp = ((uint32_t)(c0 & 0x1F) << 6) | (c1 & 0x3F);
-            return cp >= 0x80 ? cp : 0xFFFD;
-        }
-    } else if ((c0 & 0xF0) == 0xE0 && left >= 3) {
-        unsigned char c1 = (unsigned char)s[1], c2 = (unsigned char)s[2];
-        if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80)) {
-            *used = 3;
-            uint32_t cp = ((uint32_t)(c0 & 0x0F) << 12) | ((uint32_t)(c1 & 0x3F) << 6) | (c2 & 0x3F);
-            return (cp >= 0x800 && !(cp >= 0xD800 && cp <= 0xDFFF)) ? cp : 0xFFFD;
-        }
-    } else if ((c0 & 0xF8) == 0xF0 && left >= 4) {
-        unsigned char c1 = (unsigned char)s[1], c2 = (unsigned char)s[2], c3 = (unsigned char)s[3];
-        if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80) && ((c3 & 0xC0) == 0x80)) {
-            *used = 4;
-            uint32_t cp = ((uint32_t)(c0 & 0x07) << 18) | ((uint32_t)(c1 & 0x3F) << 12) |
-                          ((uint32_t)(c2 & 0x3F) << 6) | (c3 & 0x3F);
-            return (cp >= 0x10000 && cp <= 0x10FFFF) ? cp : 0xFFFD;
-        }
-    }
-    *used = 1;
-    return 0xFFFD;
-}
+// DIET NOTE: a hand-rolled UTF-8 decoder (zatex_decode) lived here with no
+// callers — deleted (0 __TEXT either way: clang strips unreferenced
+// statics). All codepoint work goes through CoreText (zatex_glyph_id).
 
 // Glyph id in host namespace; 0 = missing (engine lays out with the
 // advance for 0 anyway, so tofu on screen names its (font, cp) pair).
@@ -405,103 +368,13 @@ static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
 // two hooks can never disagree. No ensure call: every engine path
 // reaches these through the advance hook first (which ensures), and
 // the null-font guard degrades gracefully regardless.
-static ZatexInkBox zatex_ink_bounds(const void *ctx, uint16_t font, uint16_t glyph) {
-    (void)ctx;
-    (void)font;
-    ZatexInkBox b = { 0, 0, 0, 0 };
-    // No null-font guard: every engine path reaches hooks through the
-    // advance hook (which ensures the font; layout aborts without one),
-    // same accepted precondition as zatex_glyph_id. CGRect needs no
-    // zero-init: CoreText fully writes it for any glyph value.
-    CGGlyph g = (CGGlyph)glyph;
-    CGRect r;
-    CTFontGetBoundingRectsForGlyphs(zatex_font, kCTFontOrientationHorizontal, &g, &r, 1);
-    b.x0 = (int32_t)floor((double)r.origin.x * 10.0);
-    b.y0 = (int32_t)floor((double)r.origin.y * 10.0);
-    b.x1 = (int32_t)ceil((double)(r.origin.x + r.size.width) * 10.0);
-    b.y1 = (int32_t)ceil((double)(r.origin.y + r.size.height) * 10.0);
-    return b;
-}
-
-static ZatexExtents zatex_extents(const void *ctx, uint16_t font, uint16_t glyph) {
-    ZatexInkBox b = zatex_ink_bounds(ctx, font, glyph);
-    ZatexExtents z = { 0, 0 };
-    if (b.y1 > 0) z.ha = b.y1;
-    if (b.y0 < 0) z.db = -b.y0;
-    return z;
-}
-
-// MATH-table italic corrections (accent centering, issue #350 review).
-// STIX Two Math ships UPM 1000, so raw values are already thousandths.
-static CFDataRef zatex_math_data = NULL;
-static const uint8_t *zatex_math_bytes = NULL;
-static size_t zatex_math_len = 0;
-static size_t zatex_math_ici = 0;
-static int zatex_math_ready = 0;
-
-static uint32_t zatex_u16(const uint8_t *p) {
-    return (uint32_t)(((uint32_t)p[0] << 8) | p[1]);
-}
-
-static void zatex_ensure_math_table(void) {
-    if (zatex_math_ready) return;
-    zatex_math_ready = 1;
-    zatex_ensure_font();
-    if (!zatex_font) return;
-    CFDataRef d = CTFontCopyTable(zatex_font, (CTFontTableTag)'MATH', 0);
-    if (!d) return;
-    size_t n = (size_t)CFDataGetLength(d);
-    const uint8_t *b = CFDataGetBytePtr(d);
-    size_t gi = 0, ic_rel = 0, sub = 0;
-    if (!b || n < 10) goto fail;
-    gi = ((size_t)b[6] << 8) | b[7];
-    if (gi == 0 || gi + 8 > n) goto fail;
-    ic_rel = ((size_t)b[gi] << 8) | b[gi + 1];
-    if (ic_rel == 0) goto fail;
-    sub = gi + ic_rel;
-    if (sub + 4 > n) goto fail;
-    zatex_math_data = d;
-    zatex_math_bytes = b;
-    zatex_math_len = n;
-    zatex_math_ici = sub;
-    return;
-fail:
-    CFRelease(d);
-}
-
-static int32_t zatex_italic_correction(const void *ctx, uint16_t font, uint16_t glyph) {
-    (void)ctx;
-    (void)font;
-    if (glyph == 0) return 0;
-    zatex_ensure_math_table();
-    if (!zatex_math_bytes) return 0;
-    const uint8_t *b = zatex_math_bytes;
-    size_t n = zatex_math_len, sub = zatex_math_ici;
-    size_t cov = sub + zatex_u16(b + sub);
-    size_t count = zatex_u16(b + sub + 2);
-    if (cov + 4 > n) return 0;
-    uint32_t fmt = zatex_u16(b + cov);
-    uint32_t nn = zatex_u16(b + cov + 2);
-    // Format 1 stores bare glyphs (stride 2, identity values); format 2
-    // stores first/last/value triples (stride 6). One scan serves both.
-    uint32_t stride = fmt == 1 ? 2 : fmt == 2 ? 6 : 0;
-    if (stride == 0 || cov + 4 + (size_t)nn * stride > n) return 0;
-    uint32_t idx = UINT32_MAX;
-    for (uint32_t i = 0; i < nn; i++) {
-        const uint8_t *r = b + cov + 4 + (size_t)i * stride;
-        uint32_t first = zatex_u16(r);
-        uint32_t last = stride == 2 ? first : zatex_u16(r + 2);
-        if (glyph >= first && glyph <= last) {
-            idx = (stride == 2 ? i : zatex_u16(r + 4)) + (glyph - first);
-            break;
-        }
-    }
-    if (idx == UINT32_MAX || idx >= count) return 0;
-    size_t rec = sub + 4 + (size_t)idx * 4;
-    if (rec + 2 > n) return 0;
-    return (int32_t)(int16_t)zatex_u16(b + rec);
-}
-
+// DIET (#380): hand-rolled MATH-table parsing retired — italic-correction
+// table walk (zatex_ensure_math_table/zatex_italic_correction), ink-bounds
+// and extents probes deleted; the three hooks below are NULL and the
+// engine's deterministic fallbacks cover the shipped paths (gallery
+// pixel-identical, suite green). The blessed C file provider stays
+// unadopted: it links the engine core into the host (zero-linked-deps
+// budget, AGENTS.md section 1), and no shippable dylib exports it.
 // Rule thickness in thousandths of an em: KaTeX parity 40 for every
 // kind (engine RuleKind order is fraction, radical, overline,
 // underline — note it differs from the MATH table order).
@@ -519,13 +392,10 @@ static int32_t zatex_rule_thickness(const void *ctx, uint16_t font, uint32_t kin
 }
 
 static const ZatexMetrics zatex_metrics = {
-    NULL, zatex_glyph_id, zatex_advance, zatex_rule_thickness, NULL, zatex_italic_correction, NULL,
-    // ink_bounds wired (issue #350 review, round 2): the engine centers
-    // zero-advance combining marks by ink, not advance (U+20D7 ink hangs
-    // left of its origin), and lifts low accents off the nucleus by ink
-    // clearance — without it accents sit off-center. Same probe, same
-    // thousandths; blank glyphs report zeros and degrade gracefully.
-    zatex_extents, zatex_ink_bounds,
+    NULL, zatex_glyph_id, zatex_advance, zatex_rule_thickness, NULL, NULL, NULL,
+    // Glyph variant + kern stay NULL (deterministic engine fallbacks);
+    // extents/ink_bounds NULL with the MATH retirement above.
+    NULL, NULL,
 };
 
 // ---------------------------------------------------------------------------
@@ -542,10 +412,8 @@ static uint16_t zatex_glyphs[ZATEX_GLYPHS_CAP];
 // below (issue #365: 0 ambient on the v1 path).
 static ZatexRunX zatex_runs_x[ZATEX_RUNS_CAP];
 static uint16_t zatex_xscale[ZATEX_RUNS_CAP];
-// Startup conformance (issue #361): once per process on the first live
-// layout (the earliest point the STIX provider exists); skipped when
-// the dylib predates the probe.
-static int zatex_conform_tried = 0;
+// DIET: conformance probe retired; the TEST_HOOKS counters below stay for
+// the engine_info reader (permanently 0 — the zeros the suite asserts).
 #ifdef TEST_HOOKS
 static uint32_t zatex_conform_ran = 0;
 static int32_t zatex_conform_count = 0;
@@ -588,6 +456,9 @@ static ZatexAtlasEntry zatex_atlas[ZATEX_ATLAS_CAP]; // BSS: no binary cost
 
 // Key byte order mirrors mathRunKey in glyph_cache.zig (pinned there in
 // cross-platform tests): tex bytes, then font-bits LE, then display byte.
+// NOTE (diet round, measured 0B): a shared zatex_fnv helper for the two
+// FNV-1a byte loops (here + zatex_key_of) saves nothing — the -Oz
+// outliner already merges them — so the loops stay open-coded.
 static uint64_t zatex_atlas_key(const char *tex, int len, float font_px, int display) {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (int i = 0; i < len; i++) {
@@ -796,22 +667,9 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
     zatex_try_load();
     zatex_ensure_font();
     if (!zatex_layout || !zatex_font) return ZATEX_UNAVAILABLE;
-    // Startup conformance (issue #361): first live layout is the
-    // earliest point the STIX provider exists; cold path only, skipped
-    // when the dylib predates the probe (installed dylib: silent no-op).
-    if (!zatex_conform_tried) {
-        zatex_conform_tried = 1;
-        if (zatex_conform_fn) {
-            char diag[256];
-            diag[0] = '\0';
-            int32_t n = zatex_conform_fn(&zatex_metrics, 0, diag, sizeof(diag));
-#ifdef TEST_HOOKS
-            zatex_conform_ran = 1;
-            zatex_conform_count = n;
-#endif
-            if (n != 0) fprintf(stderr, "read: STIX metrics conform: %d\n%.255s\n", n, diag);
-        }
-    }
+    // DIET: startup conformance probe retired — the gallery
+    // tripwires re-shoot on any dylib change, so metric drift still
+    // surfaces (as pixels, not stderr); engine_info conform fields stay 0.
     // Host normalization (issue #374): NFC bytes reach the engine, so the
     // NFC-vs-NFD divergence (upstream #265) cannot split one formula into
     // two layouts. The latch below keys on the caller bytes while the
@@ -900,15 +758,14 @@ void platform_math_atlas_stats(uint64_t *hits, uint64_t *misses) {
     if (hits) *hits = zatex_atlas_hits;
     if (misses) *misses = zatex_atlas_misses;
 }
-// Engine negotiation state (issues #354/#361/#364): packed version from
-// zatex_version() (0 = unversioned era), whether the stride-negotiated
-// _ex entry was adopted, the startup conformance outcome, and the
-// negotiated caps word (0 on unversioned-era dylibs without
-// zatex_capabilities()).
+// Engine negotiation state (issues #354/#361/#364): version retired (E3,
+// always 0), whether the stride-negotiated _ex entry was adopted, the
+// startup conformance outcome (E2, always 0), and the negotiated caps
+// word (0 on unversioned-era dylibs without zatex_capabilities()).
 void platform_math_engine_info(uint32_t *version, uint32_t *use_ex,
                                uint32_t *conform_ran, int32_t *conform_n,
                                uint32_t *caps) {
-    if (version) *version = zatex_engine_version;
+    if (version) *version = 0;
     if (use_ex) *use_ex = zatex_negotiated_ex ? 1 : 0;
     if (conform_ran) *conform_ran = zatex_conform_ran;
     if (conform_n) *conform_n = zatex_conform_count;
