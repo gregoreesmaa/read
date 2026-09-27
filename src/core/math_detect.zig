@@ -30,7 +30,7 @@ const simd = @import("hot");
 //
 // Normalization owner (issue #374): the HOST normalizes, once, at the
 // engine-call boundary (src/platform/macos_zatex.m, ASCII fast path plus
-// NSString NFC for non-ASCII) — never at island parse, never per frame.
+// platform-provided NFC for non-ASCII) — never at island parse, never per frame.
 // The engine performs no normalization (upstream issue #265,
 // docs/unicode.md: NFC and NFD are different inputs and lay out
 // differently), so logically identical input must reach it as identical
