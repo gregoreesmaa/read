@@ -1277,7 +1277,25 @@ pub fn layoutWrappedSpans(
 pub const FlowPen = struct {
     x: f32,
     y: f32,
+    /// KaTeX/CSS-like grow-row extra (#351): how far the current visual row
+    /// extends past `line_h` to contain overheight inline math ink. Holds the
+    /// row max across every math box on the row; consumed (and reset) by
+    /// `advanceRow` on every row break and by `rowBottom` at paragraph ends.
+    /// Zero on rows without math, so text-only layout is bit-identical.
+    row_extra: f32 = 0,
 };
+
+/// Next visual row below a (possibly math-grown) row (#351): steps past the
+/// grown row and opens a fresh one. Zero hot-path allocations.
+fn advanceRow(pen: *FlowPen, line_h: f32) void {
+    pen.y += line_h + pen.row_extra;
+    pen.row_extra = 0;
+}
+
+/// Bottom edge of the current (possibly math-grown) row.
+fn rowBottom(pen: FlowPen, line_h: f32) f32 {
+    return pen.y + line_h + pen.row_extra;
+}
 
 /// Emission context for the word-flow helpers. When `commands_out` is empty
 /// (height/refine measurement) nothing is emitted but the pen advances
@@ -1386,15 +1404,15 @@ pub fn flowWord(
     if (ctx.rtl) {
         const right_x = ctx.start_x + ctx.max_w;
         if (pen.x - word_w < ctx.start_x and pen.x < right_x) {
-            pen.y += ctx.line_h;
+            advanceRow(pen, ctx.line_h);
             pen.x = right_x;
         }
     } else if (pen.x + word_w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
-        pen.y += ctx.line_h;
+        advanceRow(pen, ctx.line_h);
         pen.x = ctx.start_x;
     }
 
-    if (pen.y + ctx.line_h >= 0 and pen.y <= ctx.vp_bottom and
+    if (rowBottom(pen.*, ctx.line_h) >= 0 and pen.y <= ctx.vp_bottom and
         ctx.cmd_count.* < ctx.commands_out.len)
     {
         // Issue #40 <mark>: highlight wash behind the word, then the word
@@ -1472,7 +1490,7 @@ pub fn flowSpans(
     // Issue #40 <br>: forced line break. Measure and render share this
     // path, so wrapped heights match bit-for-bit.
     if (style.line_break) {
-        pen.y += ctx.line_h;
+        advanceRow(pen, ctx.line_h);
         pen.x = ctx.start_x;
         return;
     }
@@ -1532,12 +1550,12 @@ fn flowCodeSpan(
     // the preceding word space ends instead of eating into it.
     const box_w = total + inline_code_pad_x * 2.0;
     if (pen.x + box_w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
-        pen.y += ctx.line_h;
+        advanceRow(pen, ctx.line_h);
         pen.x = ctx.start_x;
     }
     pen.x += inline_code_pad_x;
 
-    const can_emit = pen.y + ctx.line_h >= 0 and pen.y <= ctx.vp_bottom and
+    const can_emit = rowBottom(pen.*, ctx.line_h) >= 0 and pen.y <= ctx.vp_bottom and
         ctx.cmd_count.* < ctx.commands_out.len;
     if (can_emit) {
         const pill_h = @min(fs * inline_code_pill_h_em, ctx.line_h);
@@ -1570,7 +1588,7 @@ fn flowCodeSpan(
         while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
         const word = span_text[w_start..i];
         const word_w = measureTextEx(word, fs, style.bold, style.italic, true, style.heading);
-        if (pen.y + ctx.line_h >= 0 and pen.y <= ctx.vp_bottom and
+        if (rowBottom(pen.*, ctx.line_h) >= 0 and pen.y <= ctx.vp_bottom and
             ctx.cmd_count.* < ctx.commands_out.len)
         {
             const span_color = if (style.link) ctx.accent_color else ctx.default_color;
@@ -1731,12 +1749,14 @@ fn emitMath(pen_x: f32, ink_top: f32, box: MathBox, tex: []const u8, color: Colo
 
 /// Flows one inline island span at the pen as an unbreakable box on the
 /// text baseline (baseline = row top + 0.85em, the text_run convention).
-/// Inline boxes sit on the text baseline. A box that would spill past
-/// the row top or bottom shrinks uniformly until it fits inside the row
-/// around its baseline anchor (same linear-shrink trick as the width-fit
-/// paths), so inline formulae — `$...$` and mid-line `$$...$$` alike —
-/// never overlap neighboring rows and never force a paragraph break.
-/// Wrap and visibility match flowWord so measurement agrees bit-for-bit.
+/// KaTeX/CSS-like grow-row (#351): full-size ink on the shared baseline,
+/// never a uniform shrink — the line box grows to the CSS height (max
+/// ascent + max descent) so following rows never overlap the ink, and the
+/// row never forces a paragraph break. Wrap and visibility match flowWord
+/// so measurement agrees bit-for-bit. Single-pass limit: the shared
+/// baseline never shifts, so a box taller above than the 0.85em anchor
+/// extends into the previous leading on non-first rows (following rows
+/// are exact). Zero hot-path allocations.
 /// Fallback (engine off/failure): the whole island flows as literal text.
 fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) void {
     const tex = math_detect.stripIsland(island) orelse {
@@ -1747,27 +1767,14 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
         flowSpans(island, .{}, null, pen, ctx, false);
         return;
     };
-    // Fit inside the row around the 0.85em baseline anchor: each side
-    // scales against its own budget (row top above, row bottom below).
-    var fit = box;
-    const avail_above = ctx.font_size * 0.85;
-    const avail_below = ctx.line_h - avail_above;
-    var k: f32 = 1.0;
-    if (box.above > avail_above and box.above > 0 and avail_above > 0) k = @min(k, avail_above / box.above);
-    if (box.below > avail_below and box.below > 0 and avail_below > 0) k = @min(k, avail_below / box.below);
-    if (k < 1.0) {
-        fit.w *= k;
-        fit.above *= k;
-        fit.below *= k;
-        fit.font_px *= k;
-    }
+    const fit = box;
     if (ctx.rtl) {
         if (pen.x - fit.w < ctx.start_x and pen.x < ctx.start_x + ctx.max_w) {
-            pen.y += ctx.line_h;
+            advanceRow(pen, ctx.line_h);
             pen.x = ctx.start_x + ctx.max_w;
         }
     } else if (pen.x + fit.w > ctx.start_x + ctx.max_w and pen.x > ctx.start_x) {
-        pen.y += ctx.line_h;
+        advanceRow(pen, ctx.line_h);
         pen.x = ctx.start_x;
     }
     const baseline = pen.y + ctx.font_size * 0.85;
@@ -1781,6 +1788,13 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
     } else {
         pen.x += fit.w;
     }
+    // Grow the line box to the CSS height. The row keeps the row max, so
+    // several tall boxes share one grown row and measurement (which runs
+    // this same code with an empty buffer) agrees bit-for-bit.
+    const avail_above = ctx.font_size * 0.85;
+    const avail_below = ctx.line_h - avail_above;
+    const extra = @max(avail_above, fit.above) + @max(avail_below, fit.below) - ctx.line_h;
+    if (extra > pen.row_extra) pen.row_extra = extra;
 }
 
 /// Flows a whole-line display island (`$$...$$`) as a centered block on
@@ -1791,7 +1805,7 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
 fn flowMathDisplay(tex: []const u8, pen: *FlowPen, ctx: FlowCtx) bool {
     const box = mathBox(tex, true, ctx.font_size, ctx.math_size_fn) orelse return false;
     if (pen.x > ctx.start_x or (ctx.rtl and pen.x < ctx.start_x + ctx.max_w)) {
-        pen.y += ctx.line_h;
+        advanceRow(pen, ctx.line_h);
         pen.x = if (ctx.rtl) ctx.start_x + ctx.max_w else ctx.start_x;
     }
     const w = @min(box.w, ctx.max_w);
@@ -1884,8 +1898,8 @@ pub fn flowSourceLine(
         var tgt = span.link_target;
         // Math islands flow as ZaTeX boxes on the baseline: `$...$`
         // inline, and `$$...$$` with display metrics even mid-line
-        // (over-height boxes shrink to fit the row — never an overlap,
-        // never a paragraph break). Only whole-line display islands
+        // (over-height boxes grow the row — never an overlap with the
+        // rows below, never a paragraph break). Only whole-line display islands
         // center as blocks (flowMathDisplay above). Block code and
         // headings keep the island literal (v1 limit), and twin builds
         // never form islands, so both fall back identically (the comptime
@@ -2919,7 +2933,7 @@ fn flowLeadPara(
         flowSourceLine(lb, true, false, false, &pen, ctx);
         j += 1;
     }
-    return .{ .y = pen.y + ux.config.line_height, .next = j };
+    return .{ .y = rowBottom(pen, ux.config.line_height), .next = j };
 }
 
 /// Base direction over one lazy run starting at `from` (issue #50).
@@ -2971,7 +2985,7 @@ fn flowListSubParagraphs(
             flowSourceLine(lb, true, false, false, &pen, ctx);
             j += 1;
         }
-        yy = pen.y + ux.config.line_height + 4.0;
+        yy = rowBottom(pen, ux.config.line_height) + 4.0;
     }
     return .{ .y = yy, .next = j };
 }
@@ -3851,7 +3865,7 @@ fn flowAlertFollowers(ux: *UnitCx, tx: f32, tw: f32, y: f32, rtl: bool, from: us
     // next unit exactly at the label's quarter-line gap instead of a full
     // phantom row below it.
     if (first_follower) return .{ .y = pen.y, .next = j };
-    return .{ .y = pen.y + ux.config.line_height, .next = j };
+    return .{ .y = rowBottom(pen, ux.config.line_height), .next = j };
 }
 
 fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
@@ -3949,7 +3963,7 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
             var ctx = flowCtxFor(ux, ttx, tw - 18.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
             ctx.rtl = quote_rtl;
             flowSourceLine(item_text, false, false, false, &pen, ctx);
-            y = pen.y + ux.config.line_height;
+            y = rowBottom(pen, ux.config.line_height);
             ux.qord_active = false;
         },
         .ordered => {
@@ -3973,7 +3987,7 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
             var ctx = flowCtxFor(ux, ttx, tw - 18.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
             ctx.rtl = quote_rtl;
             flowSourceLine(item_text, false, false, false, &pen, ctx);
-            y = pen.y + ux.config.line_height;
+            y = rowBottom(pen, ux.config.line_height);
         },
         .task => {
             const tp = @min(body.prefix_len, sq.body.len);
@@ -3986,7 +4000,7 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
             var ctx = flowCtxFor(ux, ttx, tw - 28.0, ux.config.base_font_size, ux.config.line_height, ux.theme.muted);
             ctx.rtl = quote_rtl;
             flowSourceLine(item_text, false, false, false, &pen, ctx);
-            y = pen.y + ux.config.line_height;
+            y = rowBottom(pen, ux.config.line_height);
             ux.qord_active = false;
         },
     }
@@ -4294,7 +4308,7 @@ fn layoutParagraphUnit(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut
             j += 1;
         }
     }
-    return .{ .y = pen.y + ux.config.line_height + 4.0, .consumed = j - i };
+    return .{ .y = rowBottom(pen, ux.config.line_height) + 4.0, .consumed = j - i };
 }
 
 /// Strips one indent level (up to 4 columns; tabs stop at multiples of 4)
@@ -9232,7 +9246,7 @@ test "math: mid-line display island stays in the text flow" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.01);
 }
 
-test "math: tall inline box shrinks to fit the row" {
+test "math: tall inline box grows the row" {
     if (comptime core_options.plugin_stub) return;
     const Stub = struct {
         fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
@@ -9267,14 +9281,71 @@ test "math: tall inline box shrinks to fit the row" {
     flowSourceLine("see $x$ now", false, false, false, &pen, ctx);
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(DrawCommandKind.math, cmds[1].kind);
-    // 34px above against a 14.45px budget scales everything by
-    // 14.45/34: the box lands inside the row (top at the row top, bottom
-    // above the row bottom) — no overlap, no paragraph break, pen stays.
-    try std.testing.expectApproxEqAbs(@as(f32, 14.45), cmds[1].rect.w, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 51.0 * 14.45 / 34.0), cmds[1].rect.h, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), cmds[1].rect.y, 0.01);
-    try std.testing.expect(cmds[1].rect.y + cmds[1].rect.h <= 29.75 + 0.01);
+    // KaTeX/CSS-like grow-row (#351): full 34x51 ink at ambient size on
+    // the shared baseline — no shrink, no paragraph break, pen stays.
+    try std.testing.expectApproxEqAbs(@as(f32, 34.0), cmds[1].rect.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 51.0), cmds[1].rect.h, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0), cmds[1].font_size, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0 * 0.85 - 34.0), cmds[1].rect.y, 0.01);
+    // Row grows to max ascent 34 + max descent 17 = 51 and contains the
+    // ink bottom, so the following row never overlaps.
+    try std.testing.expectApproxEqAbs(@as(f32, 21.25), pen.row_extra, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 51.0), rowBottom(pen, ctx.line_h), 0.01);
+    try std.testing.expect(cmds[1].rect.y + cmds[1].rect.h <= rowBottom(pen, ctx.line_h) + 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.01);
+}
+
+test "flowMathSpan.overheight_inline_grows_row" {
+    if (comptime core_options.plugin_stub) return;
+    const Stub = struct {
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            _ = px;
+            w.* = 60;
+            ab.* = 24;
+            bl.* = 16;
+            return 0;
+        }
+    };
+    var cmds: [16]DrawCommand = undefined;
+    var n: usize = 0;
+    var pen = FlowPen{ .x = 0, .y = 0 };
+    const ctx = FlowCtx{
+        .font_size = 16.0,
+        .line_h = 28.0,
+        .default_color = Theme.dark.text,
+        .accent_color = Theme.dark.accent,
+        .code_bg = Theme.dark.code_bg,
+        .code_border = Theme.dark.code_border,
+        .muted = Theme.dark.muted,
+        .mark_color = Theme.dark.mark_bg,
+        .start_x = 0,
+        .max_w = 600,
+        .vp_bottom = 2000,
+        .commands_out = &cmds,
+        .cmd_count = &n,
+        .math_size_fn = Stub.size,
+    };
+    // Overheight box: 24 above + 16 below = 40 total > 28 row.
+    flowMathSpan("$x$", false, &pen, ctx);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(DrawCommandKind.math, cmds[0].kind);
+    // KaTeX/CSS-like grow-row: no uniform shrink, full ink at ambient size.
+    try std.testing.expectApproxEqAbs(@as(f32, 60.0), cmds[0].rect.w, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 40.0), cmds[0].rect.h, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0), cmds[0].font_size, 0.001);
+    // Shared text baseline: ink top hangs above the row top (single-pass:
+    // the baseline never shifts), ink bottom stays inside the grown row.
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0 * 0.85 - 24.0), cmds[0].rect.y, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0 * 0.85 + 16.0), cmds[0].rect.y + cmds[0].rect.h, 0.01);
+    // Row grows to the CSS height (max ascent 24 + max descent 16 = 40),
+    // so the following row starts past the ink: never an overlap.
+    try std.testing.expectApproxEqAbs(@as(f32, 12.0), pen.row_extra, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 40.0), rowBottom(pen, ctx.line_h), 0.01);
+    try std.testing.expect(cmds[0].rect.y + cmds[0].rect.h <= rowBottom(pen, ctx.line_h) + 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), pen.y, 0.001);
 }
 
 test "math: fence renders native block with stub engine, card without" {
