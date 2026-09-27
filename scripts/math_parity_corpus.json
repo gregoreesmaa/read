@@ -1,0 +1,125 @@
+{
+ "_provenance": "Slimmed from upstream zatex tools/host-parity/corpus.json (24 canonical rows; expect/face fields dropped: Read draws through system STIX, so Latin-Modern reference PNGs do not apply - see scripts/math_parity.sh). Re-vendor via the freshness check in math_parity.sh when upstream adds rows.",
+ "rows": [
+  {
+   "id": "sup",
+   "tex": "x^2",
+   "display": false
+  },
+  {
+   "id": "frac",
+   "tex": "\\frac{1}{2}",
+   "display": false
+  },
+  {
+   "id": "frac-display",
+   "tex": "\\frac{a}{b}",
+   "display": true
+  },
+  {
+   "id": "sqrt",
+   "tex": "\\sqrt{2}",
+   "display": false
+  },
+  {
+   "id": "sqrt-n",
+   "tex": "\\sqrt[3]{x}",
+   "display": false
+  },
+  {
+   "id": "sum-display",
+   "tex": "\\sum_{i=1}^{n} i",
+   "display": true
+  },
+  {
+   "id": "int",
+   "tex": "\\int_0^1 x\\,dx",
+   "display": false
+  },
+  {
+   "id": "lim",
+   "tex": "\\lim_{x\\to 0} f(x)",
+   "display": false
+  },
+  {
+   "id": "leftright",
+   "tex": "\\left(\\frac12\\right)",
+   "display": false
+  },
+  {
+   "id": "pmatrix",
+   "tex": "\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}",
+   "display": false
+  },
+  {
+   "id": "aligned",
+   "tex": "\\begin{aligned} a &= b + c \\\\ d &= e \\end{aligned}",
+   "display": true
+  },
+  {
+   "id": "cases",
+   "tex": "f(x) = \\begin{cases} 1 & x > 0 \\\\ 0 & x = 0 \\end{cases}",
+   "display": false
+  },
+  {
+   "id": "hat",
+   "tex": "\\hat{x} + \\hat\\xi",
+   "display": false
+  },
+  {
+   "id": "overline",
+   "tex": "\\overline{AB}",
+   "display": false
+  },
+  {
+   "id": "accents",
+   "tex": "\\check{a}\\grave{a}\\acute{a}\\tilde{a}\\bar{a}\\breve{a}",
+   "display": false
+  },
+  {
+   "id": "braces",
+   "tex": "\\overbrace{a+b}^{n} + \\underbrace{c}_{m}",
+   "display": false
+  },
+  {
+   "id": "arrows",
+   "tex": "\\overrightarrow{AB} + \\overleftarrow{CD}",
+   "display": false
+  },
+  {
+   "id": "binom",
+   "tex": "\\binom{n}{k}",
+   "display": false
+  },
+  {
+   "id": "textbb",
+   "tex": "\\text{for all } x \\in \\mathbb{R}",
+   "display": false
+  },
+  {
+   "id": "spacing",
+   "tex": "a\\,b\\:c\\;d\\!e\\quad f\\qquad g",
+   "display": false
+  },
+  {
+   "id": "greek",
+   "tex": "\\alpha\\beta\\gamma\\delta\\epsilon",
+   "display": false
+  },
+  {
+   "id": "cancel",
+   "tex": "\\cancel{x}",
+   "display": false
+  },
+  {
+   "id": "rule",
+   "tex": "\\rule{1em}{2pt}",
+   "display": false
+  },
+  {
+   "id": "bigdelim",
+   "tex": "\\bigl(\\frac12\\Bigr)",
+   "display": false
+  }
+ ]
+}

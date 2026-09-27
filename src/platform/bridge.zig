@@ -152,7 +152,11 @@ pub extern "c" fn platform_get_image_size(
 /// ZaTeX runtime math backend (LaTeX math plugin, src/platform/macos_zatex.m).
 /// Synchronous microsecond layout over caller buffers; dlopen only, never
 /// linked. Status: 0 laid out (dims valid), 1 engine unavailable (no dylib),
-/// 2 fallback (bad input or engine refused it — render source literally).
+/// 2 fallback (bad input or engine refused it — render source literally),
+/// 3 overflow (space/limit: needs exceed engine ceilings, growing buffers
+/// cannot help — render source literally, diagnostic on stderr), 4
+/// unsupported (engine lacks the command — render source literally).
+/// Nonzero always falls back literally; the code only tunes the diagnostic.
 /// `display` selects display mode; dims are px at `font_px`.
 pub extern "c" fn platform_math_size(
     tex: [*]const u8,
@@ -162,6 +166,21 @@ pub extern "c" fn platform_math_size(
     out_w: *f32,
     out_above: *f32,
     out_below: *f32,
+) c_int;
+
+/// Typed math-failure latch (issues #366/#377): after a nonzero
+/// platform_math_size, returns 1 with the failing formula's byte offset
+/// (into tex) and engine err_code when tex/display match the latched
+/// failure, else 0 (stale or absent latch, including engine-unavailable).
+/// Lets fallback rendering mark the error position color-only, without
+/// changing geometry. Threaded into layout as MathErrorFn; the twin stub
+/// answers 0 so the twin falls back byte-identically.
+pub extern "c" fn platform_math_last_error(
+    tex: [*]const u8,
+    tex_len: c_int,
+    display: c_int,
+    out_offset: *u32,
+    out_code: *c_int,
 ) c_int;
 
 /// Draw a laid-out formula with its ink top at (x, y_top); the caller
@@ -188,13 +207,14 @@ pub extern "c" fn platform_draw_math(
 /// only referenced under test_hooks, so ship never links it.
 pub extern "c" fn platform_math_atlas_stats(hits: *u64, misses: *u64) void;
 
-/// Engine negotiation state (issues #354/#361, TEST_HOOKS reader in
+/// Engine negotiation state (issues #354/#361/#364, TEST_HOOKS reader in
 /// macos_zatex.m): packed zatex_version() (0 = unversioned era),
-/// whether the stride-negotiated _ex entry was adopted, and the
-/// startup conformance outcome. Same gate pattern as
-/// platform_math_atlas_stats: only referenced under test_hooks, so
+/// whether the stride-negotiated _ex entry was adopted, the startup
+/// conformance outcome, and the negotiated zatex_capabilities() word
+/// (0 on unversioned-era dylibs without the entry). Same gate pattern
+/// as platform_math_atlas_stats: only referenced under test_hooks, so
 /// ship never links it.
-pub extern "c" fn platform_math_engine_info(version: *u32, use_ex: *u32, conform_ran: *u32, conform_n: *i32) void;
+pub extern "c" fn platform_math_engine_info(version: *u32, use_ex: *u32, conform_ran: *u32, conform_n: *i32, caps: *u32) void;
 
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;

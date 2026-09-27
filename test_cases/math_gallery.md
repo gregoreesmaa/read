@@ -47,6 +47,16 @@ $$\lim_{x \to 0} \frac{\sin x}{x} = 1 \qquad \int_0^\infty e^{-x^2}\,dx = \sqrt{
 
 Greek soup: $\alpha\beta\gamma\Delta\Omega$ with $\pm \times \div$.
 
+## Multiline display
+
+A display block may span source lines, from its opening line through its
+closing line, and lays out as one centered block:
+
+$$
+\sum_{k=1}^{n} k^2
+= \frac{n(n+1)(2n+1)}{6}
+$$
+
 ```math
 \begin{matrix} a & b \\ c & d \end{matrix}
 ```

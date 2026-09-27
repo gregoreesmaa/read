@@ -7,6 +7,7 @@ const parser = @import("core/parser.zig");
 const layout = @import("layout/viewport.zig");
 const damage = @import("layout/damage.zig");
 const help_overlay = @import("layout/help_overlay.zig");
+const math_detect = @import("core/math_detect.zig");
 const remote_policy = @import("core/remote_policy.zig");
 const bridge = @import("platform/bridge.zig");
 const plugin_cache = @import("core/plugin_cache.zig");
@@ -101,6 +102,14 @@ var g_remote_seen: bool = false;
 fn liveMathSizeFn() ?layout.MathSizeFn {
     if (build_options.test_hooks) return null;
     return bridge.platform_math_size;
+}
+
+/// ZaTeX typed-error latch query for live rendering (issues #366/#377):
+/// same gating as the size query above — null in headless tests and
+/// compiled out in twin builds, so fallbacks stay deterministic there.
+fn liveMathErrorFn() ?layout.MathErrorFn {
+    if (build_options.test_hooks) return null;
+    return bridge.platform_math_last_error;
 }
 
 fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) callconv(.c) void {
@@ -993,6 +1002,7 @@ fn updateDocumentMetrics() void {
         .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
         .math_size_fn = liveMathSizeFn(),
+        .math_error_fn = liveMathErrorFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1137,6 +1147,7 @@ fn anchorTargetY(frag: []const u8) ?f32 {
         .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
         .math_size_fn = liveMathSizeFn(),
+        .math_error_fn = liveMathErrorFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1159,6 +1170,7 @@ fn measureConfig() layout.ViewportConfig {
         .scroll_y = 0.0,
         .image_size_fn = gatedImageSize,
         .math_size_fn = liveMathSizeFn(),
+        .math_error_fn = liveMathErrorFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1328,6 +1340,7 @@ fn findMatchY(offset: usize) ?f32 {
         .base_font_size = g_text_scale.effectiveBase(),
         .image_size_fn = gatedImageSize,
         .math_size_fn = liveMathSizeFn(),
+        .math_error_fn = liveMathErrorFn(),
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
         .join_buf = &g_joinbuf,
@@ -1647,6 +1660,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
         .image_size_fn = gatedImageSize,
         .math_size_fn = liveMathSizeFn(),
+        .math_error_fn = liveMathErrorFn(),
         .ordered_markers = &g_markers,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
@@ -2636,6 +2650,10 @@ fn crispRenderFn(w: c_int, h: c_int) callconv(.c) void {
 const CrispMetrics = struct {
     acutance: f64,
     edge_frac: f64,
+    /// Share of ink pixels that read red-dominant (issue #365): r bright
+    /// and ahead of g/b. Ink = channel distance over 90 from the corner
+    /// background — either theme scores, margins carry no ink either way.
+    red_frac: f64,
 };
 
 fn crispPngMetrics(allocator: std.mem.Allocator, path: []const u8) !CrispMetrics {
@@ -2691,6 +2709,8 @@ fn crispPngMetrics(allocator: std.mem.Allocator, path: []const u8) !CrispMetrics
     var edge_sum: f64 = 0;
     var edge_n: usize = 0;
     var total: usize = 0;
+    var total_red_numer: usize = 0;
+    var total_red_denom: usize = 0;
     const x0 = img_w / 4;
     const x1 = 3 * img_w / 4;
     const luma_prev_row = try allocator.alloc(u8, img_w);
@@ -2698,6 +2718,9 @@ fn crispPngMetrics(allocator: std.mem.Allocator, path: []const u8) !CrispMetrics
     @memset(luma_prev_row, 0);
     const luma_row = try allocator.alloc(u8, img_w);
     defer allocator.free(luma_row);
+    var bg_r: u8 = 0;
+    var bg_g: u8 = 0;
+    var bg_b: u8 = 0;
     var y: usize = 0;
     while (y < img_h) : (y += 1) {
         const f = raw[y * (stride + 1)];
@@ -2724,12 +2747,31 @@ fn crispPngMetrics(allocator: std.mem.Allocator, path: []const u8) !CrispMetrics
             line[i] = @intCast((@as(u16, line[i]) + filt) & 255);
         }
         @memcpy(prev, line);
+        if (y == 0 and stride >= 3) {
+            bg_r = line[0];
+            bg_g = line[1];
+            bg_b = line[2];
+        }
         var x: usize = 0;
         while (x < img_w) : (x += 1) {
             const r = line[ch * x];
             const g = line[ch * x + 1];
             const bl = line[ch * x + 2];
             luma_row[x] = @intCast((@as(u16, r) * 77 + @as(u16, g) * 150 + @as(u16, bl) * 29) >> 8);
+            // Issue #365 red-ink census: ink = far from the corner
+            // background (fullscreen fill first, so row-0 x=0 is bg);
+            // red = r bright and ahead of g/b. Central band only.
+            if (x >= x0 and x < x1) {
+                const dr: u16 = if (r >= bg_r) r - bg_r else bg_r - r;
+                const dg: u16 = if (g >= bg_g) g - bg_g else bg_g - g;
+                const db: u16 = if (bl >= bg_b) bl - bg_b else bg_b - bl;
+                if (dr + dg + db > 90) {
+                    total_red_denom += 1;
+                    if (r > 150 and @as(i16, r) - @as(i16, g) > 40 and @as(i16, r) - @as(i16, bl) > 40) {
+                        total_red_numer += 1;
+                    }
+                }
+            }
         }
         if (y > 0) {
             var x2: usize = x0;
@@ -2750,6 +2792,7 @@ fn crispPngMetrics(allocator: std.mem.Allocator, path: []const u8) !CrispMetrics
     return .{
         .acutance = edge_sum / @as(f64, @floatFromInt(edge_n)),
         .edge_frac = @as(f64, @floatFromInt(edge_n)) / @as(f64, @floatFromInt(total)),
+        .red_frac = if (total_red_denom == 0) 0.0 else @as(f64, @floatFromInt(total_red_numer)) / @as(f64, @floatFromInt(total_red_denom)),
     };
 }
 
@@ -2840,6 +2883,14 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
         const t = std.testing;
         const alloc = t.allocator;
 
+        // Under the scripted double (issue #378) only the fixed hello
+        // script lays out, so these gallery formulas cannot rasterize:
+        // skip here — the double's deterministic paths are pinned by
+        // the scripted-double test below instead.
+        if (std.c.getenv("ZATEX_TEST_DYLIB") != null) {
+            std.debug.print("\n[MATH355] skipped: scripted double speaks only its hello script\n", .{});
+            return;
+        }
         // The render below must exercise the real layout path: the engine
         // lays out the probe formula with nonzero dims.
         const probe_tex = "\\frac{a}{b}";
@@ -2900,13 +2951,287 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
     }
 }
 
-test "zatex engine negotiation is consistent (issues #354/#361)" {
+// ---------------------------------------------------------------------------
+// Math-fixture formula probe (issues #368/#371, read-test only).
+//
+// Collects the distinct TeX formulas a markdown doc feeds the ZaTeX box
+// path: `$...$`/`$$...$$` islands on plain lines plus ```math fence
+// bodies. Other fences (code, tex/latex/katex highlights) contribute
+// nothing, mirroring math_detect.isMathFenceToken; indented code and
+// code spans are out of scope by construction — both fixtures under test
+// (showcase.md, math_gallery.md) carry neither around a `$`, and the
+// minimum-count asserts below fail loudly if a fixture ever outgrows
+// this approximation instead of silently weakening the test.
+// Zero heap allocations: slices borrow the mapped doc, the caller owns
+// the out buffer.
+const FixtureFormula = struct {
+    tex: []const u8,
+    display: bool,
+};
+
+fn addFixtureFormula(out: []FixtureFormula, n: usize, tex: []const u8, display: bool) usize {
+    if (tex.len == 0 or tex.len > 4096) return n; // mirrors ZATEX_ATLAS_TEX_CAP
+    for (out[0..n]) |f| {
+        if (f.display == display and std.mem.eql(u8, f.tex, tex)) return n;
+    }
+    if (n >= out.len) return n;
+    out[n] = .{ .tex = tex, .display = display };
+    return n + 1;
+}
+
+fn collectFixtureFormulas(doc: []const u8, out: []FixtureFormula) usize {
+    var n: usize = 0;
+    var in_fence = false;
+    var fence_math = false;
+    var lines = std.mem.splitScalar(u8, doc, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "```")) {
+            if (!in_fence) {
+                in_fence = true;
+                fence_math = math_detect.isMathFenceToken(std.mem.trim(u8, trimmed[3..], " \t"));
+            } else {
+                in_fence = false;
+                fence_math = false;
+            }
+            continue;
+        }
+        if (in_fence) {
+            // Fence bodies render as display blocks.
+            if (fence_math and trimmed.len > 0) n = addFixtureFormula(out, n, line, true);
+            continue;
+        }
+        var ibuf: [8]math_detect.Island = undefined;
+        const m = math_detect.collectIslands(line, &ibuf);
+        for (ibuf[0..m]) |isl| {
+            n = addFixtureFormula(out, n, line[isl.content_start..isl.content_end], isl.kind == .display_math);
+        }
+    }
+    return n;
+}
+
+// Shared scroll-probe render state: the test sets the formula slice and
+// the scroll-shifted base y, then renders one PNG per scroll frame. Draw
+// positions shift per frame exactly like live scrolling; the atlas key
+// (tex bytes, font bits, display) must not follow them.
+var fixture_probe_formulas: []const FixtureFormula = &.{};
+var fixture_probe_dy: f32 = 0.0;
+
+const FIXTURE_PROBE_FONT_PX: f32 = 17.0; // body size, same as the #355 probe
+
+fn fixtureProbeRenderFn(w: c_int, h: c_int) callconv(.c) void {
+    bridge.platform_draw_rect(0, 0, @floatFromInt(w), @floatFromInt(h), 0x12, 0x12, 0x12, 255);
+    for (fixture_probe_formulas, 0..) |f, i| {
+        var fw: f32 = 0;
+        var above: f32 = 0;
+        var below: f32 = 0;
+        const disp: c_int = if (f.display) 1 else 0;
+        if (bridge.platform_math_size(f.tex.ptr, @intCast(f.tex.len), disp, FIXTURE_PROBE_FONT_PX, &fw, &above, &below) != 0) continue;
+        if (fw <= 0) continue;
+        const y = fixture_probe_dy + @as(f32, @floatFromInt(i)) * 64.0;
+        bridge.platform_draw_math(f.tex.ptr, @intCast(f.tex.len), disp, FIXTURE_PROBE_FONT_PX, 50.33, y, 0xE0, 0xE0, 0xE0, 255);
+    }
+}
+
+/// Draw the accepted formulas through one 2x atlas frame. Returns the new
+/// misses and hits since (h0, m0). Engine refusal (rc 1/2) draws nothing,
+/// exactly like the live box path falling back to source text.
+fn fixtureProbeFrame(path: []const u8, accepted: []const FixtureFormula, dy: f32, h0: u64, m0: u64) !struct { hits: u64, misses: u64 } {
+    fixture_probe_formulas = accepted;
+    fixture_probe_dy = dy;
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_z.len) return error.NameTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    try std.testing.expectEqual(@as(c_int, 0), bridge.platform_render_to_png(@ptrCast(&path_z), 600, 600, fixtureProbeRenderFn));
+    var h1: u64 = 0;
+    var m1: u64 = 0;
+    bridge.platform_math_atlas_stats(&h1, &m1);
+    return .{ .hits = h1 - h0, .misses = m1 - m0 };
+}
+
+test "showcase carries live math: smoke/fuzz/damage oracles see math (issue #368)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the #355 test above). Only the read-test binary executes
+    // this, against the live engine.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        var mapped = try mmap.MappedFile.open("showcase.md");
+        defer mapped.close();
+        var buf: [16]FixtureFormula = undefined;
+        const n = collectFixtureFormulas(mapped.bytes, &buf);
+        var inline_n: usize = 0;
+        var display_n: usize = 0;
+        for (buf[0..n]) |f| {
+            if (f.display) display_n += 1 else inline_n += 1;
+        }
+        std.debug.print("\n[SHOWMATH] formulas={d} inline={d} display={d}\n", .{ n, inline_n, display_n });
+        // The issue prescribes one inline island + one fence: pin both so
+        // the showcase (and every oracle driven off it) can never silently
+        // go math-blind again.
+        try t.expect(inline_n >= 1);
+        try t.expect(display_n >= 1);
+        // The engine must accept them: without the dylib (rc 1) there is
+        // no raster to pin — trivial pass, same stance as #355. Refused
+        // formulas (rc 2) fall back to source text and leave the counters
+        // alone, so the acceptance below runs on the accepted subset.
+        var h0: u64 = 0;
+        var m0: u64 = 0;
+        bridge.platform_math_atlas_stats(&h0, &m0);
+        var accepted: [16]FixtureFormula = undefined;
+        var na: usize = 0;
+        var ai: usize = 0;
+        var ad: usize = 0;
+        for (buf[0..n]) |f| {
+            var fw: f32 = 0;
+            var above: f32 = 0;
+            var below: f32 = 0;
+            const disp: c_int = if (f.display) 1 else 0;
+            const rc = bridge.platform_math_size(f.tex.ptr, @intCast(f.tex.len), disp, FIXTURE_PROBE_FONT_PX, &fw, &above, &below);
+            if (rc == 1) {
+                std.debug.print("\n[SHOWMATH] skipped: libzatex unavailable, nothing to pin\n", .{});
+                return;
+            }
+            if (rc != 0 or fw <= 0) continue;
+            accepted[na] = f;
+            na += 1;
+            if (f.display) ad += 1 else ai += 1;
+        }
+        try t.expect(ai >= 1);
+        try t.expect(ad >= 1);
+        bridge.platform_set_test_scale(2.0);
+        defer bridge.platform_set_test_scale(0.0);
+        const r = try fixtureProbeFrame("/tmp/showcase_math_368.png", accepted[0..na], 40.0, h0, m0);
+        std.debug.print("\n[SHOWMATH] accepted={d} new_hits={d} new_misses={d}\n", .{ na, r.hits, r.misses });
+        // Acceptance straight from the issue: the atlas counters move when
+        // smoke covers the showcase — every accepted formula consults the
+        // atlas (hit when an earlier test already rasterized it, miss when
+        // this frame is first), never the uncached direct path. The sum
+        // form keeps this order-independent across test filters.
+        try t.expect(r.hits + r.misses == @as(u64, na));
+    }
+}
+
+test "math gallery scroll keeps atlas misses bounded (issue #371)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the #355 test above). Only the read-test binary executes
+    // this, against the live engine.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        var mapped = try mmap.MappedFile.open("test_cases/math_gallery.md");
+        defer mapped.close();
+        var buf: [64]FixtureFormula = undefined;
+        const n = collectFixtureFormulas(mapped.bytes, &buf);
+        std.debug.print("\n[GALSCROLL] formulas={d}\n", .{n});
+        // The gallery is the wide sweep; a gutted fixture must fail loudly
+        // rather than pass vacuously on a handful of formulas.
+        try t.expect(n >= 10);
+        var accepted: [64]FixtureFormula = undefined;
+        var na: usize = 0;
+        for (buf[0..n]) |f| {
+            var fw: f32 = 0;
+            var above: f32 = 0;
+            var below: f32 = 0;
+            const disp: c_int = if (f.display) 1 else 0;
+            const rc = bridge.platform_math_size(f.tex.ptr, @intCast(f.tex.len), disp, FIXTURE_PROBE_FONT_PX, &fw, &above, &below);
+            if (rc == 1) {
+                std.debug.print("\n[GALSCROLL] skipped: libzatex unavailable, nothing to pin\n", .{});
+                return;
+            }
+            if (rc != 0 or fw <= 0) continue;
+            accepted[na] = f;
+            na += 1;
+        }
+        try t.expect(na >= 10);
+        bridge.platform_set_test_scale(2.0);
+        defer bridge.platform_set_test_scale(0.0);
+        // Scroll frames through a sliding viewport window: 12 consecutive
+        // formulas advancing 2 per frame, drawn at scroll-shifted y — the
+        // live swipe shape (culling keeps only the visible set resident,
+        // keys identical across frames). A scroll-varying key input (the
+        // float-font_px footgun class from the issue) would miss every
+        // visible formula on every frame: 12*8 = 96 misses. Measured
+        // 2026-09 on the installed dylib: 38 total (12 cold + 14 newly
+        // exposed + 12 collision churn across 8 frames); the 2x bound
+        // below holds that shape with headroom while the footgun level
+        // overshoots it 2:1.
+        const WIN: usize = 12;
+        const STEP: usize = 2;
+        const FRAMES: usize = 8;
+        try t.expect(na >= STEP * (FRAMES - 1) + WIN);
+        var frame_miss: [FRAMES]u64 = undefined;
+        var frame_hit: [FRAMES]u64 = undefined;
+        var h_prev: u64 = 0;
+        var m_prev: u64 = 0;
+        bridge.platform_math_atlas_stats(&h_prev, &m_prev);
+        var f: usize = 0;
+        while (f < FRAMES) : (f += 1) {
+            const start = f * STEP;
+            const r = try fixtureProbeFrame("/tmp/gallery_scroll_371.png", accepted[start..][0..WIN], 40.0 - @as(f32, @floatFromInt(f)) * 500.0, h_prev, m_prev);
+            frame_hit[f] = r.hits;
+            frame_miss[f] = r.misses;
+            h_prev += r.hits;
+            m_prev += r.misses;
+        }
+        const drawn: u64 = @as(u64, STEP * (FRAMES - 1) + WIN);
+        var total_miss: u64 = 0;
+        var steady_hit: u64 = 0;
+        for (frame_miss) |m| total_miss += m;
+        for (frame_hit[1..]) |hh| steady_hit += hh;
+        std.debug.print("\n[GALSCROLL] accepted={d} drawn={d} total_miss={d} frame0_miss={d} frameN_miss={d} steady_hits={d}\n", .{ na, drawn, total_miss, frame_miss[0], frame_miss[FRAMES - 1], steady_hit });
+        // Bounded: cold + newly-exposed + bounded churn stays far below a
+        // per-frame cache defeat.
+        try t.expect(total_miss <= 2 * drawn);
+        // Steady state never regresses past cold: scroll positions add no
+        // misses of their own.
+        try t.expect(frame_miss[FRAMES - 1] <= frame_miss[0]);
+        // The scroll actually rode the atlas: steady frames must blit-hit,
+        // or an all-direct fallback would pass the bounds above vacuously.
+        try t.expect(steady_hit > 0);
+    }
+}
+
+test "zatex engine negotiation is consistent (issues #354/#361/#364)" {
     // Ship builds carry no test hooks: trivially passes there (same gate
     // pattern as the MATH355 test above). Twin builds stub the math
     // backend, so there is nothing to negotiate there either. Only the
     // read-test binary executes this, against the live engine.
     if (build_options.test_hooks and !build_options.plugin_stub) {
         const t = std.testing;
+        // Under the scripted double (ZATEX_TEST_DYLIB, issue #378) only
+        // the double's fixed script lays out: pin the hello script plus
+        // the negotiated word instead of the gallery rows below.
+        if (std.c.getenv("ZATEX_TEST_DYLIB") != null) {
+            const hello = "\\frac{a}{b}+x^2";
+            var fw: f32 = 0;
+            var above: f32 = 0;
+            var below: f32 = 0;
+            const rc = bridge.platform_math_size(
+                hello.ptr, @intCast(hello.len), 0, 17.0, &fw, &above, &below,
+            );
+            if (rc == 1) {
+                std.debug.print("\n[MATHEX] skipped: double dylib unavailable, nothing to pin\n", .{});
+                return;
+            }
+            try t.expectEqual(@as(c_int, 0), rc);
+            try t.expect(fw > 0 and above > 0);
+            var ver: u32 = 0;
+            var use_ex: u32 = 0;
+            var conform_ran: u32 = 0;
+            var conform_n: i32 = 0;
+            var caps: u32 = 0;
+            bridge.platform_math_engine_info(&ver, &use_ex, &conform_ran, &conform_n, &caps);
+            std.debug.print("\n[MATHEX] double version={d} use_ex={d} conform_ran={d} conform_n={d} caps={d}\n", .{ ver, use_ex, conform_ran, conform_n, caps });
+            // The double cuts 0.0.0 with X_SCALE | RUN_COLOR |
+            // NEED_COUNTS scripted, so the negotiated _ex path must be
+            // active (issue #364 consistency under a caps dylib).
+            try t.expectEqual(@as(u32, 0), ver);
+            try t.expect((caps & 1) != 0);
+            try t.expectEqual(@as(u32, 1), use_ex);
+            try t.expectEqual(@as(i32, 0), conform_n);
+            return;
+        }
         // The gallery wide-accent rows (issue #354 acceptance): the
         // engine must lay these out on any dylib old or new.
         const wide = [_][]const u8{ "\\widetilde{AB}", "\\widehat{AB}" };
@@ -2928,8 +3253,9 @@ test "zatex engine negotiation is consistent (issues #354/#361)" {
         var use_ex: u32 = 0;
         var conform_ran: u32 = 0;
         var conform_n: i32 = 0;
-        bridge.platform_math_engine_info(&ver, &use_ex, &conform_ran, &conform_n);
-        std.debug.print("\n[MATHEX] version={d} use_ex={d} conform_ran={d} conform_n={d}\n", .{ ver, use_ex, conform_ran, conform_n });
+        var caps: u32 = 0;
+        bridge.platform_math_engine_info(&ver, &use_ex, &conform_ran, &conform_n, &caps);
+        std.debug.print("\n[MATHEX] version={d} use_ex={d} conform_ran={d} conform_n={d} caps={d}\n", .{ ver, use_ex, conform_ran, conform_n, caps });
         // Unversioned era tripwire: installed and current-upstream dylibs
         // alike report 0 (the #259 versioned recipe has not shipped).
         // When this flips nonzero the dylib changed: re-shoot the math
@@ -2937,14 +3263,216 @@ test "zatex engine negotiation is consistent (issues #354/#361)" {
         // revisit this floor instead of rubber-stamping.
         try t.expectEqual(@as(u32, 0), ver);
         // Old-dylib tripwire: the installed engine predates
-        // zatex_layout_utf8_ex, so the frozen v1 path must be active
-        // (identity scale everywhere). When this flips to 1 the new
-        // dylib landed: confirm wide-accent stretch in math_gallery
-        // screenshots, then update this pin.
+        // zatex_layout_utf8_ex and zatex_capabilities(), so the frozen
+        // v1 path must be active with a zero caps word (issue #364:
+        // per-symbol presence decides when no caps word is offered).
+        // When either flips the new dylib landed: confirm wide-accent
+        // stretch in math_gallery screenshots, then update this pin.
         try t.expectEqual(@as(u32, 0), use_ex);
+        try t.expectEqual(@as(u32, 0), caps);
         // Conformance is clean whenever it runs; on the installed dylib
         // the probe is absent (ran == 0) and the count stays 0.
         try t.expectEqual(@as(i32, 0), conform_n);
+    }
+}
+
+test "math host NFC converges NFC-vs-NFD inputs (issue #374)" {
+    // Only the read-test binary executes this, against the live engine.
+    // Owner per upstream #265: the HOST normalizes once at the
+    // engine-call boundary, so both byte forms below must take the same
+    // engine path with identical dims — without the handoff the engine
+    // lays them out differently (1 run/1 glyph vs 2 runs/2 glyphs).
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        const nfc = "caf\xc3\xa9"; // café, U+00E9 precomposed
+        const nfd = "cafe\xcc\x81"; // e + U+0301 combining acute
+        var w1: f32 = 0;
+        var a1: f32 = 0;
+        var b1: f32 = 0;
+        const rc1 = bridge.platform_math_size(nfc.ptr, @intCast(nfc.len), 0, 17.0, &w1, &a1, &b1);
+        if (rc1 == 1) {
+            std.debug.print("\n[MATHNFC] skipped: libzatex unavailable, nothing to pin\n", .{});
+            return;
+        }
+        var w2: f32 = 0;
+        var a2: f32 = 0;
+        var b2: f32 = 0;
+        const rc2 = bridge.platform_math_size(nfd.ptr, @intCast(nfd.len), 0, 17.0, &w2, &a2, &b2);
+        std.debug.print("\n[MATHNFC] rc={d}/{d} w={d:.2}/{d:.2}\n", .{ rc1, rc2, w1, w2 });
+        try t.expectEqual(rc1, rc2);
+        if (rc1 == 0) {
+            try t.expectEqual(w1, w2);
+            try t.expectEqual(a1, a2);
+            try t.expectEqual(b1, b2);
+        }
+    }
+}
+
+test "math typed failures latch offsets, overflow stays typed (issues #366/#377)" {
+    // Only the read-test binary executes this, against the live engine.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        // Invalid UTF-8 is Invalid on every engine era (upstream
+        // unicode.md): the bridge must report fallback AND latch the byte
+        // offset for the fallback mark (issue #377).
+        const bad = "a\xffb";
+        var w: f32 = 0;
+        var above: f32 = 0;
+        var below: f32 = 0;
+        const rc = bridge.platform_math_size(bad.ptr, @intCast(bad.len), 0, 17.0, &w, &above, &below);
+        if (rc == 1) {
+            std.debug.print("\n[MATHERR] skipped: libzatex unavailable, nothing to pin\n", .{});
+            return;
+        }
+        try t.expectEqual(@as(c_int, 2), rc);
+        var off: u32 = 9999;
+        var code: c_int = -1;
+        try t.expectEqual(@as(c_int, 1), bridge.platform_math_last_error(bad.ptr, @intCast(bad.len), 0, &off, &code));
+        try t.expect(off <= bad.len);
+        std.debug.print("\n[MATHERR] invalid latches off={d} code={d}\n", .{ off, code });
+        // An unrelated formula never matches the latch (stale guard).
+        const other = "x";
+        try t.expectEqual(@as(c_int, 0), bridge.platform_math_last_error(other.ptr, @intCast(other.len), 0, &off, &code));
+        // Oversized formulas never collapse blindly (issue #366): nonzero
+        // on every era — overflow (3) where the engine reports needs,
+        // fallback (2) on old dylibs.
+        var big_buf: [4096]u8 = undefined;
+        var big_len: usize = 0;
+        var k: usize = 0;
+        while (k < 300) : (k += 1) {
+            const piece = "\\frac{a}{b}+";
+            @memcpy(big_buf[big_len..][0..piece.len], piece);
+            big_len += piece.len;
+        }
+        const big = big_buf[0..big_len];
+        var bw: f32 = 0;
+        var ba: f32 = 0;
+        var bb: f32 = 0;
+        const rc_big = bridge.platform_math_size(big.ptr, @intCast(big.len), 0, 17.0, &bw, &ba, &bb);
+        std.debug.print("\n[MATHERR] oversized rc={d}\n", .{rc_big});
+        try t.expect(rc_big != 0);
+        try t.expect(rc_big == 2 or rc_big == 3);
+    }
+}
+
+const MATHCOLOR_PNG_PATH = "/tmp/math_color_365.png";
+const MATHCOLOR_AMBIENT_PATH = "/tmp/math_color_365_ambient.png";
+
+fn mathColorRenderFn(w: c_int, h: c_int) callconv(.c) void {
+    bridge.platform_draw_rect(0, 0, @floatFromInt(w), @floatFromInt(h), 0x12, 0x12, 0x12, 255);
+    const R: u8 = 0xE0;
+    const G: u8 = 0xE0;
+    const B: u8 = 0xE0;
+    const A: u8 = 255;
+    const tex = "\\color{red}{x} + y";
+    var fw: f32 = 0;
+    var above: f32 = 0;
+    var below: f32 = 0;
+    if (bridge.platform_math_size(tex.ptr, @intCast(tex.len), 0, 34.0, &fw, &above, &below) != 0) return;
+    bridge.platform_draw_math(tex.ptr, @intCast(tex.len), 0, 34.0, 200.0, 110.0 - above, R, G, B, A);
+}
+
+fn mathColorAmbientFn(w: c_int, h: c_int) callconv(.c) void {
+    bridge.platform_draw_rect(0, 0, @floatFromInt(w), @floatFromInt(h), 0x12, 0x12, 0x12, 255);
+    const tex = "x + y";
+    var fw: f32 = 0;
+    var above: f32 = 0;
+    var below: f32 = 0;
+    if (bridge.platform_math_size(tex.ptr, @intCast(tex.len), 0, 34.0, &fw, &above, &below) != 0) return;
+    bridge.platform_draw_math(tex.ptr, @intCast(tex.len), 0, 34.0, 200.0, 110.0 - above, 0xE0, 0xE0, 0xE0, 255);
+}
+
+test "math per-run color paints red on capable engines (issue #365)" {
+    // Only the read-test binary executes this. Old dylibs stride the
+    // frozen v1 prefix (ambient paint only): without the _ex entry there
+    // is no color to consume, so the test pins the ambient fallback there
+    // (red_frac near zero on a control render) and the red render where
+    // the entry exists.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        const alloc = t.allocator;
+        var ver: u32 = 0;
+        var use_ex: u32 = 0;
+        var cr: u32 = 0;
+        var cn: i32 = 0;
+        var caps: u32 = 0;
+        bridge.platform_math_engine_info(&ver, &use_ex, &cr, &cn, &caps);
+        const probe = "\\color{red}{x} + y";
+        var pw: f32 = 0;
+        var pa: f32 = 0;
+        var pb: f32 = 0;
+        const probe_rc = bridge.platform_math_size(probe.ptr, @intCast(probe.len), 0, 34.0, &pw, &pa, &pb);
+        if (probe_rc == 1) {
+            std.debug.print("\n[MATHCOLOR] skipped: libzatex unavailable, nothing to pin\n", .{});
+            return;
+        }
+        // Ambient control first: no red ink without a color run. Pinned on
+        // every era, including dylibs that refuse \color outright.
+        try t.expectEqual(@as(c_int, 0), bridge.platform_render_to_png(MATHCOLOR_AMBIENT_PATH, 600, 200, mathColorAmbientFn));
+        const m_amb = try crispPngMetrics(alloc, MATHCOLOR_AMBIENT_PATH);
+        std.debug.print("\n[MATHCOLOR] ambient red_frac={d:.4} use_ex={d} probe_rc={d}\n", .{ m_amb.red_frac, use_ex, probe_rc });
+        try t.expect(m_amb.red_frac < 0.02);
+        if (probe_rc != 0 or use_ex == 0) {
+            std.debug.print("[MATHCOLOR] pre-color dylib: ambient fallback pinned, no color to consume\n", .{});
+            return;
+        }
+        // Capable engine: the red run must actually paint red, direct at
+        // 1x and at 2x scale (painted formulas always draw direct: one
+        // white atlas raster cannot tint two paints).
+        try t.expectEqual(@as(c_int, 0), bridge.platform_render_to_png(MATHCOLOR_PNG_PATH, 600, 200, mathColorRenderFn));
+        const m = try crispPngMetrics(alloc, MATHCOLOR_PNG_PATH);
+        std.debug.print("\n[MATHCOLOR] red direct red_frac={d:.4}\n", .{m.red_frac});
+        try t.expect(m.red_frac > 0.05);
+        bridge.platform_set_test_scale(2.0);
+        defer bridge.platform_set_test_scale(0.0);
+        try t.expectEqual(@as(c_int, 0), bridge.platform_render_to_png(MATHCOLOR_PNG_PATH, 600, 200, mathColorRenderFn));
+        const m2 = try crispPngMetrics(alloc, MATHCOLOR_PNG_PATH);
+        std.debug.print("\n[MATHCOLOR] red atlas red_frac={d:.4}\n", .{m2.red_frac});
+        try t.expect(m2.red_frac > 0.05);
+    }
+}
+
+test "zatex scripted double covers OK + no_space + bad-input (issue #378)" {
+    // Ship builds carry no test hooks and twin builds stub the backend:
+    // trivially pass there (same gate pattern as above). Only the
+    // read-test binary executes this, and only when CI points
+    // ZATEX_TEST_DYLIB at a libzatex_test build (scripts/math_testdouble.sh):
+    // the double answers a fixed script, so inputs outside it would only
+    // prove the double stays silent — assert exactly the script.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        if (std.c.getenv("ZATEX_TEST_DYLIB") == null) {
+            std.debug.print("\n[MATHDBL] skipped: no ZATEX_TEST_DYLIB, nothing scripted to pin\n", .{});
+            return;
+        }
+        var w: f32 = 0;
+        var above: f32 = 0;
+        var below: f32 = 0;
+        // Scripted OK: fixed 3-run / 1-rule layout, nonzero dims.
+        // Single backslash: the script input is real TeX `\frac{a}{b}+x^2`
+        // (zatex_testdouble.h ZATEX_TD_HELLO).
+        const hello = "\\frac{a}{b}+x^2";
+        try t.expectEqual(
+            @as(c_int, 0),
+            bridge.platform_math_size(hello.ptr, @intCast(hello.len), 0, 17.0, &w, &above, &below),
+        );
+        try t.expect(w > 0 and above > 0);
+        // Forced no_space / limit / invalid all fall back to source text.
+        const nospace = "__ZATEX_TD_NOSPACE__";
+        try t.expectEqual(
+            @as(c_int, 2),
+            bridge.platform_math_size(nospace.ptr, @intCast(nospace.len), 0, 17.0, &w, &above, &below),
+        );
+        const limit = "__ZATEX_TD_LIMIT__";
+        try t.expectEqual(
+            @as(c_int, 2),
+            bridge.platform_math_size(limit.ptr, @intCast(limit.len), 0, 17.0, &w, &above, &below),
+        );
+        const bad = "__ZATEX_TD_BAD__";
+        try t.expectEqual(
+            @as(c_int, 2),
+            bridge.platform_math_size(bad.ptr, @intCast(bad.len), 0, 17.0, &w, &above, &below),
+        );
     }
 }
 
