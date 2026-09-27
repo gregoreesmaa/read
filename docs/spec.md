@@ -43,6 +43,7 @@ and skips diagonal strikes (never misdrawn).
 Fallback is sourcetelling, never silent: engine absent or refusing (invalid
 input, over 64 KiB, too deep, expansion limit) renders fences as plain code
 cards and islands as literal text, byte-identical to the pre-math reader.
+Setup, load path, and supported spellings: [engine.md](engine.md).
 True glyph extents and ink bounds feed the engine over the v4 C
 surface (sqrt junction included); MATH-table italic corrections are
 supplied and zero-width combining advances report 0 like the file, so

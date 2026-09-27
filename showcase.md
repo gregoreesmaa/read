@@ -151,3 +151,13 @@ Animated GIFs are loaded via native ImageIO. Source: Wikimedia Commons.
 
 ### Windows Bitmap (BMP)
 ![Uncompressed Raster BMP](assets/images/sample_bmp.bmp)
+
+---
+
+## 9. Mathematics
+
+Inline formulae like $E=mc^2$ render natively; display mathematics centers on its own rows:
+
+```math
+\sum_{i=1}^{n} i = \frac{n(n+1)}{2}
+```
