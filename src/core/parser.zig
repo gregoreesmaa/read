@@ -314,10 +314,11 @@ fn flankAscii(c: u8) FlankClass {
 }
 
 // Unicode General Categories P* and S* (non-ASCII), generated from
-// UCD 13.0.0 via Python unicodedata. Binary-searched, zero-alloc;
-// ~2.6 KiB. Replaces hand classification for flanking (CommonMark
-// "Unicode punctuation character").
-const WIDE_PUNCT: []const [2]u21 = &.{
+// UCD 13.0.0 via Python unicodedata. Binary-searched, zero-alloc.
+// The pair list is comptime-only (emits no bytes); the packed u32 table
+// below is the ~1.3 KiB runtime copy (was ~2.6 KiB). Replaces hand
+// classification for flanking (CommonMark "Unicode punctuation character").
+const wide_punct_pairs: []const [2]u21 = &.{
     .{ 0x000A1, 0x000A9 },
     .{ 0x000AB, 0x000AC },
     .{ 0x000AE, 0x000B1 },
@@ -648,7 +649,7 @@ const WIDE_PUNCT: []const [2]u21 = &.{
 };
 
 /// Unicode Zs (non-ASCII) whitespace for flanking.
-const WIDE_WS: []const [2]u21 = &.{
+const wide_ws_pairs: []const [2]u21 = &.{
     .{ 0x000A0, 0x000A0 },
     .{ 0x01680, 0x01680 },
     .{ 0x02000, 0x0200A },
@@ -657,12 +658,27 @@ const WIDE_WS: []const [2]u21 = &.{
     .{ 0x03000, 0x03000 },
 };
 
-fn inRanges(ranges: []const [2]u21, cp: u21) bool {
+/// Packs flanking ranges to one u32 each: low 21 bits are the base
+/// codepoint, bits 21..30 the (hi - lo) span. Every listed range
+/// round-trips bit-exact (max base 0x1FBCA < 2^21, max span 991 < 1024).
+fn packRanges(comptime pairs: []const [2]u21) [pairs.len]u32 {
+    var out: [pairs.len]u32 = undefined;
+    for (pairs, 0..) |r, i| out[i] = @as(u32, r[0]) | (@as(u32, r[1] - r[0]) << 21);
+    return out;
+}
+
+const WIDE_PUNCT: [wide_punct_pairs.len]u32 = packRanges(wide_punct_pairs);
+const WIDE_WS: [wide_ws_pairs.len]u32 = packRanges(wide_ws_pairs);
+
+fn inRanges(ranges: []const u32, cp: u21) bool {
+    const c: u32 = cp;
     var lo: usize = 0;
     var hi: usize = ranges.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (cp < ranges[mid][0]) { hi = mid; } else if (cp > ranges[mid][1]) { lo = mid + 1; } else return true;
+        const e = ranges[mid];
+        const base = e & 0x1F_FFFF;
+        if (c < base) { hi = mid; } else if (c > base + (e >> 21)) { lo = mid + 1; } else return true;
     }
     return false;
 }

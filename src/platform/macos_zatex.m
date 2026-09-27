@@ -209,7 +209,8 @@ static uint16_t zatex_glyph_id(const void *ctx, uint16_t font, uint32_t cp) {
     (void)ctx;
     (void)font;
     zatex_ensure_font();
-    if (!zatex_font) return 0;
+    // No null-font guard: layout_once gates every engine path on the font
+    // (same accepted precondition as the ink hook below).
     UniChar ustr[2];
     UniChar *up = ustr;
     CFIndex ulen = 0;
@@ -237,7 +238,7 @@ static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
     (void)ctx;
     (void)font;
     zatex_ensure_font();
-    if (!zatex_font || glyph == 0) return 500;
+    if (glyph == 0) return 500;
     CGGlyph g = glyph;
     CGSize adv;
     if (CTFontGetAdvancesForGlyphs(zatex_font, kCTFontOrientationHorizontal, &g, &adv, 1) == 0) return 0;
@@ -330,28 +331,19 @@ static int32_t zatex_italic_correction(const void *ctx, uint16_t font, uint16_t 
     if (cov + 4 > n) return 0;
     uint32_t fmt = zatex_u16(b + cov);
     uint32_t nn = zatex_u16(b + cov + 2);
+    // Format 1 stores bare glyphs (stride 2, identity values); format 2
+    // stores first/last/value triples (stride 6). One scan serves both.
+    uint32_t stride = fmt == 1 ? 2 : fmt == 2 ? 6 : 0;
+    if (stride == 0 || cov + 4 + (size_t)nn * stride > n) return 0;
     uint32_t idx = UINT32_MAX;
-    if (fmt == 1) {
-        if (cov + 4 + (size_t)nn * 2 > n) return 0;
-        for (uint32_t i = 0; i < nn; i++) {
-            if (zatex_u16(b + cov + 4 + (size_t)i * 2) == glyph) {
-                idx = i;
-                break;
-            }
+    for (uint32_t i = 0; i < nn; i++) {
+        const uint8_t *r = b + cov + 4 + (size_t)i * stride;
+        uint32_t first = zatex_u16(r);
+        uint32_t last = stride == 2 ? first : zatex_u16(r + 2);
+        if (glyph >= first && glyph <= last) {
+            idx = (stride == 2 ? i : zatex_u16(r + 4)) + (glyph - first);
+            break;
         }
-    } else if (fmt == 2) {
-        if (cov + 4 + (size_t)nn * 6 > n) return 0;
-        for (uint32_t i = 0; i < nn; i++) {
-            uint32_t first = zatex_u16(b + cov + 4 + (size_t)i * 6);
-            uint32_t last = zatex_u16(b + cov + 6 + (size_t)i * 6);
-            uint32_t sci = zatex_u16(b + cov + 8 + (size_t)i * 6);
-            if (glyph >= first && glyph <= last) {
-                idx = sci + ((uint32_t)glyph - first);
-                break;
-            }
-        }
-    } else {
-        return 0;
     }
     if (idx == UINT32_MAX || idx >= count) return 0;
     size_t rec = sub + 4 + (size_t)idx * 4;
@@ -439,16 +431,12 @@ static uint64_t zatex_atlas_key(const char *tex, int len, float font_px, int dis
     }
     uint32_t fb = 0;
     memcpy(&fb, &font_px, 4);
-    uint8_t tail[5];
-    tail[0] = (uint8_t)(fb & 0xff);
-    tail[1] = (uint8_t)((fb >> 8) & 0xff);
-    tail[2] = (uint8_t)((fb >> 16) & 0xff);
-    tail[3] = (uint8_t)((fb >> 24) & 0xff);
-    tail[4] = display ? (uint8_t)1 : (uint8_t)0;
-    for (int i = 0; i < 5; i++) {
-        h ^= tail[i];
+    for (int i = 0; i < 4; i++) {
+        h ^= (uint8_t)(fb >> (i * 8));
         h *= 0x100000001b3ULL;
     }
+    h ^= display ? (uint64_t)1 : (uint64_t)0;
+    h *= 0x100000001b3ULL;
     return h;
 }
 
@@ -469,7 +457,7 @@ void zatex_drop_math_rasters(void) {
 // mask size exactly (never the laid-out advance — no sub-pixel stretch),
 // mirroring the body blit in platform_draw_text.
 static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, float y_top,
-                              unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+                              double fr, double fg, double fb, double fa) {
     float q = g_output_scale;
     CGRect dest = CGRectMake(roundf(x * q) / q, roundf(y_top * q) / q,
                              (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
@@ -483,7 +471,7 @@ static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, flo
     // the #355 test pins the choice (None fails it, Default clears it).
     CGContextSetInterpolationQuality(ctx, kCGInterpolationDefault);
     CGContextClipToMask(ctx, dest, e->slice);
-    CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+    CGContextSetRGBFillColor(ctx, fr, fg, fb, fa);
     CGContextFillRect(ctx, dest);
     CGContextRestoreGState(ctx);
 }
@@ -513,7 +501,7 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
         double run_px = (double)font_px * (double)rn->size_units / 1000.0;
-        if (run_px <= 0 || !zatex_font) continue;
+        if (run_px <= 0) continue;
         CTFontRef rf = CTFontCreateCopyWithAttributes(zatex_font, (CGFloat)(run_px * RASTER_SCALE), NULL, NULL);
         if (!rf) continue;
         double s_run = run_px / 1000.0;
@@ -556,9 +544,8 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
 static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLayout *out) {
     if (!tex || tex_len <= 0 || tex_len > ZATEX_INPUT_CAP) return ZATEX_FALLBACK;
     zatex_try_load();
-    if (!zatex_layout) return ZATEX_UNAVAILABLE;
     zatex_ensure_font();
-    if (!zatex_font) return ZATEX_UNAVAILABLE;
+    if (!zatex_layout || !zatex_font) return ZATEX_UNAVAILABLE;
     int32_t rc = zatex_layout(tex, (size_t)tex_len, display ? true : false, &zatex_metrics,
                               zatex_runs, ZATEX_RUNS_CAP, zatex_rules, ZATEX_RULES_CAP,
                               zatex_glyphs, ZATEX_GLYPHS_CAP, out);
@@ -581,22 +568,26 @@ void platform_math_atlas_stats(uint64_t *hits, uint64_t *misses) {
 // dims are px at font_px (units are thousandths of an em).
 int platform_math_size(const char *tex, int tex_len, int display, float font_px,
                        float *out_w, float *out_above, float *out_below) {
-    if (out_w) *out_w = 0;
-    if (out_above) *out_above = 0;
-    if (out_below) *out_below = 0;
-    if (!tex || tex_len <= 0 || font_px <= 0) return ZATEX_FALLBACK;
-    ZatexLayout lo;
-    int st = zatex_layout_once(tex, tex_len, display, &lo);
-    if (st == ZATEX_UNAVAILABLE && !zatex_missing_noticed) {
-        zatex_missing_noticed = 1;
-        fprintf(stderr, "read: libzatex.dylib unavailable — math renders as source text\n");
+    float w = 0, above = 0, below = 0;
+    int st = ZATEX_FALLBACK;
+    if (tex && tex_len > 0 && font_px > 0) {
+        ZatexLayout lo;
+        st = zatex_layout_once(tex, tex_len, display, &lo);
+        if (st == ZATEX_UNAVAILABLE && !zatex_missing_noticed) {
+            zatex_missing_noticed = 1;
+            fprintf(stderr, "read: libzatex.dylib unavailable — math renders as source text\n");
+        }
+        if (st == ZATEX_OK) {
+            double s = (double)font_px / 1000.0;
+            w = (float)(lo.width * s);
+            above = (float)(lo.height_above * s);
+            below = (float)(lo.depth_below * s);
+        }
     }
-    if (st != ZATEX_OK) return st;
-    double s = (double)font_px / 1000.0;
-    if (out_w) *out_w = (float)(lo.width * s);
-    if (out_above) *out_above = (float)(lo.height_above * s);
-    if (out_below) *out_below = (float)(lo.depth_below * s);
-    return ZATEX_OK;
+    if (out_w) *out_w = w;
+    if (out_above) *out_above = above;
+    if (out_below) *out_below = below;
+    return st;
 }
 
 // Draw a laid-out formula: runs through CTFont glyph drawing at the
@@ -611,7 +602,10 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
     if (zatex_layout_once(tex, tex_len, display, &lo) != ZATEX_OK) return;
     CGContextRef ctx = g_current_cg_context;
     double s = (double)font_px / 1000.0;
-    CGContextSetRGBFillColor(ctx, r / 255.0, g / 255.0, b / 255.0, a / 255.0);
+    // Normalized once here and shared with the atlas blit below, so the
+    // blit reuses these exact doubles instead of re-dividing in float.
+    double fr = r / 255.0, fg = g / 255.0, fb = b / 255.0, fa = a / 255.0;
+    CGContextSetRGBFillColor(ctx, fr, fg, fb, fa);
     // Rules first (under ink, like fraction bars behind nothing — order
     // is irrelevant for disjoint rects; one fill color for all).
     for (uint32_t i = 0; i < lo.nrules; i++) {
@@ -653,7 +647,7 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         if (e->slice && e->gen == g_atlas_flushes &&
             e->key == key && e->len == tex_len &&
             memcmp(e->head, tex, (size_t)hl) == 0) {
-            zatex_blit_cached(ctx, e, x, y_top, r, g, b, a);
+            zatex_blit_cached(ctx, e, x, y_top, fr, fg, fb, fa);
             zatex_atlas_hits++;
             return;
         }
@@ -668,7 +662,7 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         e->len = tex_len;
         memcpy(e->head, tex, (size_t)hl);
         if (zatex_rasterize(e, &lo, s, font_px)) {
-            zatex_blit_cached(ctx, e, x, y_top, r, g, b, a);
+            zatex_blit_cached(ctx, e, x, y_top, fr, fg, fb, fa);
             zatex_atlas_misses++;
             return;
         }
@@ -677,7 +671,7 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
         double run_px = (double)font_px * (double)rn->size_units / 1000.0;
-        if (run_px <= 0 || !zatex_font) continue;
+        if (run_px <= 0) continue;
         CTFontRef rf = CTFontCreateCopyWithAttributes(zatex_font, (CGFloat)run_px, NULL, NULL);
         if (!rf) continue;
         double s_run = run_px / 1000.0;
@@ -687,13 +681,11 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         // mask (soft edges); a snapped origin rasterizes 1:1 (crisp).
         // Intra-run pen advances stay exact, so spacing never drifts;
         // only the origin quantizes (at most half a device px per run).
-        double ox = x + rn->x * s;
-        double oy = y_top + rn->baseline_y * s;
-        if (g_output_scale > 0.0f) {
-            double q = (double)g_output_scale;
-            ox = floor(ox * q + 0.5) / q;
-            oy = floor(oy * q + 0.5) / q;
-        }
+        // g_output_scale is always positive (clamped >= 1 at every setter),
+        // so the snap below never divides by zero.
+        double q = (double)g_output_scale;
+        double ox = floor((x + rn->x * s) * q + 0.5) / q;
+        double oy = floor((y_top + rn->baseline_y * s) * q + 0.5) / q;
         CGContextTranslateCTM(ctx, (CGFloat)ox, (CGFloat)oy);
         CGContextScaleCTM(ctx, 1.0, -1.0);
         CGContextSetTextPosition(ctx, 0, 0);
