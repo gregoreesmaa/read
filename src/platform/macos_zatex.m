@@ -464,11 +464,11 @@ static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, flo
     CGContextSaveGState(ctx);
     // Bilinear, not None like the body blit: the headless harness bitmap
     // is 1x, so forced-2x masks downsample there — nearest mangles thin
-    // STIX stems in that configuration (measured 143.8 vs 189.5 bilinear
-    // on the same masks) while bilinear reads true mask quality. On live
-    // Retina the blit is snapped 1:1, where no resampling happens either
-    // way, so this changes no ship pixel — and the shared crisp budget in
-    // the #355 test pins the choice (None fails it, Default clears it).
+    // STIX stems in that configuration (measured 142.8 vs 149.9 bilinear
+    // on the corrected raster) while bilinear reads true mask quality.
+    // On live Retina the blit is snapped 1:1, where no resampling happens
+    // either way, so this changes no ship pixel — and the math crisp
+    // budget in the #355 test pins the choice.
     CGContextSetInterpolationQuality(ctx, kCGInterpolationDefault);
     CGContextClipToMask(ctx, dest, e->slice);
     CGContextSetRGBFillColor(ctx, fr, fg, fb, fa);
@@ -478,10 +478,13 @@ static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, flo
 
 // Rasterize a laid-out formula into the shared 2x coverage atlas (white
 // ink, like shape_rasterize_entry) and cut the entry's slice. Mirrored
-// storage: the atlas ctx is y-down, so glyphs rasterize unflipped at
-// absolute device coords and the ClipToMask blit in the flipped view maps
-// them upright — the same trick as the body path. Returns 1 with a live
-// slice, 0 to draw direct.
+// storage, exactly like the body path: the flipped-view ClipToMask blit
+// maps image rows bottom-up, so the formula must be stored bottom-up
+// reversed — visual top at image bottom — with run baselines anchored
+// from the slice bottom (ay + ph - rel). An unmirrored (top-anchored)
+// raster stores the formula upright in the image and the same blit then
+// shows it vertically mirrored (numerators swap with denominators).
+// Returns 1 with a live slice, 0 to draw direct.
 static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, float font_px) {
     int pw = (int)ceil((double)lo->width * s * RASTER_SCALE);
     int ph = (int)ceil(((double)lo->height_above + (double)lo->depth_below) * s * RASTER_SCALE);
@@ -509,9 +512,12 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
         // screen snap and the body rasterizer (a fractional baseline
         // bakes straddled coverage edges into the mask — soft on every
         // blit thereafter). Intra-run advances stay exact; only the
-        // origin quantizes, at most half a device px per run.
+        // origin quantizes, at most half a device px per run. The
+        // baseline anchors from the slice BOTTOM (ay + ph - rel): image
+        // rows map bottom-up at the blit, so a top-anchored origin would
+        // store the formula upright and display it vertically mirrored.
         double bx = floor((double)ax + (double)rn->x * s * RASTER_SCALE + 0.5);
-        double by = floor((double)ay + (double)rn->baseline_y * s * RASTER_SCALE + 0.5);
+        double by = floor((double)ay + (double)ph - (double)rn->baseline_y * s * RASTER_SCALE + 0.5);
         // CTFontDrawGlyphs consults and advances the context text position,
         // so drawing runs flat in one frame drifts every run right by the
         // pen left over from previous draws — resetting it per run pins
