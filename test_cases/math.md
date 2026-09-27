@@ -38,7 +38,7 @@ $$a^2 + b^2 = c^2$$
 
 A whole-line `$$...$$` island centers as a block, while a display
 island mid-line keeps display metrics and stays in the text flow,
-shrinking to fit the row when taller: the quadratic
+growing the row when taller: the quadratic
 $$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$ right here never overlaps
 and never breaks the paragraph, and $$x$$ likewise fits inline. Grand
 expressions belong on their own display line.
