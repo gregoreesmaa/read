@@ -25,9 +25,13 @@
 //   kerning corrections stay NULL (deterministic fallbacks — the core
 //   is correct without them). Big-delimiter growth is the known v1
 //   fidelity gap, documented in docs/spec.md.
-// - The frozen C surface projects filled rects only (cabi.zig): diagonal
-//   `cancel` strikes never arrive (skipped engine-side, never misdrawn)
-//   and per-run `\color` is dropped engine-side (runs take ambient).
+// - The frozen C surface projects filled rects only: diagonal `cancel`
+//   strikes never arrive (skipped engine-side, never misdrawn).
+// - Wide-accent/brace stretch (issues #354/#361): the stride-negotiated
+//   `zatex_layout_utf8_ex` entry is adopted when the dylib exports it
+//   (28-byte stride admits x_scale); the old dylib keeps the frozen
+//   20-byte v1 path, identity everywhere. Per-run color tails are read
+//   but still render ambient (a future RUN_COLOR arm).
 // - Rule thickness defaults to 40/1000 em for every kind (KaTeX default).
 
 #include <dlfcn.h>
@@ -72,6 +76,25 @@ typedef struct {
     uint32_t glyph_count;
 } ZatexRun;
 
+// Stride-negotiated run (issues #354/#361): byte-identical to the
+// upstream zatex_run_t (zatex.h). The frozen 20-byte v1 prefix above is
+// what old dylibs stride; x_scale (bytes 20..22) stretches the run's
+// ink AND intra-run pen advances by x_scale/1000 about the run origin
+// (identity 1000); the pad at 22..24 is engine-untouched; color
+// (bytes 24..28, 0xRRGGBBAA, 0 = ambient) is read but not yet consumed
+// (ambient paint, exactly as before — a future RUN_COLOR arm).
+typedef struct {
+    uint16_t font_id;
+    uint16_t size_units;
+    int32_t x;
+    int32_t baseline_y;
+    uint32_t glyph_start;
+    uint32_t glyph_count;
+    uint16_t x_scale;
+    uint16_t _pad;
+    uint32_t color;
+} ZatexRunX;
+
 typedef struct {
     int32_t x, y;
     uint32_t w, h;
@@ -86,7 +109,10 @@ typedef struct {
     size_t err_msg_len;
 } ZatexLayout;
 
-_Static_assert(sizeof(ZatexRun) == 20, "ZatexRun must match cabi.zig CRun");
+_Static_assert(sizeof(ZatexRun) == 20, "ZatexRun must match zatex_run_v1_t");
+_Static_assert(sizeof(ZatexRunX) == 28, "ZatexRunX must match zatex_run_t");
+_Static_assert(__builtin_offsetof(ZatexRunX, x_scale) == 20, "x_scale at byte 20");
+_Static_assert(__builtin_offsetof(ZatexRunX, color) == 24, "color at byte 24");
 _Static_assert(sizeof(ZatexRule) == 16, "ZatexRule must match cabi.zig CRule");
 _Static_assert(sizeof(ZatexLayout) == 48, "ZatexLayout must match cabi.zig CLayout");
 
@@ -107,9 +133,27 @@ enum { ZATEX_OK = 0, ZATEX_UNAVAILABLE = 1, ZATEX_FALLBACK = 2 };
 typedef int32_t (*ZatexLayoutFn)(const char *, size_t, bool, const ZatexMetrics *,
                                  ZatexRun *, size_t, ZatexRule *, size_t,
                                  uint16_t *, size_t, ZatexLayout *);
+// Stride-negotiated entry (issue #203): runs elements are runs_stride
+// bytes wide; the engine writes the v1 prefix plus the x_scale/color
+// tails the stride admits, leaving the rest untouched.
+typedef int32_t (*ZatexLayoutExFn)(const char *, size_t, bool, const ZatexMetrics *,
+                                   void *, size_t, size_t, ZatexRule *, size_t,
+                                   uint16_t *, size_t, ZatexLayout *);
+typedef uint32_t (*ZatexVersionFn)(void);
+// Metrics conformance probe (upstream #194): diagnostics against the
+// host provider at a font id; 0 is a clean pass.
+typedef int32_t (*ZatexConformFn)(const ZatexMetrics *, uint16_t, char *, size_t);
 
 static void *zatex_handle = NULL;
 static ZatexLayoutFn zatex_layout = NULL;
+static ZatexLayoutExFn zatex_layout_ex = NULL;
+static ZatexVersionFn zatex_version_fn = NULL;
+static ZatexConformFn zatex_conform_fn = NULL;
+// Packed engine version (major << 16 | minor << 8 | patch); 0 is the
+// unversioned era (installed and current-upstream dylibs alike predate
+// the #259 versioned recipe), so 0 selects the v1 baseline, never a
+// gate — symbol presence stays authoritative for _ex (issue #361).
+static uint32_t zatex_engine_version = 0;
 static int zatex_tried_load = 0;
 static int zatex_missing_noticed = 0;
 
@@ -152,6 +196,14 @@ static void zatex_try_load(void) {
         }
         zatex_handle = h;
         zatex_layout = fn;
+        // Optional surface (issue #361): probed once, never required —
+        // an old dylib simply lacks them and the v1 path below stays
+        // bit-identical. The version is CHECKED (recorded for the
+        // startup note and the test-hooks reader), not just probed.
+        zatex_layout_ex = (ZatexLayoutExFn)dlsym(h, "zatex_layout_utf8_ex");
+        zatex_version_fn = (ZatexVersionFn)dlsym(h, "zatex_version");
+        zatex_conform_fn = (ZatexConformFn)dlsym(h, "zatex_conform_metrics");
+        if (zatex_version_fn) zatex_engine_version = zatex_version_fn();
         return;
     }
 }
@@ -385,6 +437,19 @@ static const ZatexMetrics zatex_metrics = {
 static ZatexRun zatex_runs[ZATEX_RUNS_CAP];
 static ZatexRule zatex_rules[ZATEX_RULES_CAP];
 static uint16_t zatex_glyphs[ZATEX_GLYPHS_CAP];
+// _ex scratch (issue #354): 28-byte slots the negotiated entry strides.
+// Downstream keeps reading zatex_runs (the normalized v1 prefix); the
+// tails land in zatex_xscale below, 1000 on the v1 path.
+static ZatexRunX zatex_runs_x[ZATEX_RUNS_CAP];
+static uint16_t zatex_xscale[ZATEX_RUNS_CAP];
+// Startup conformance (issue #361): once per process on the first live
+// layout (the earliest point the STIX provider exists); skipped when
+// the dylib predates the probe.
+static int zatex_conform_tried = 0;
+#ifdef TEST_HOOKS
+static uint32_t zatex_conform_ran = 0;
+static int32_t zatex_conform_count = 0;
+#endif
 // Draw scratch (BSS; main thread only): shared by the direct run loop and
 // the atlas rasterizer below — one owner, sequential use, no nesting.
 static CGPoint zatex_pos[4096];
@@ -521,15 +586,28 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
         // and the ClipToMask blit maps them upright, the same trick as
         // shape_rasterize_entry).
         CGContextSetTextPosition(g_atlas_ctx, 0, 0);
+        // Stretched runs (issue #354): zatex.h recipe — ink AND pen
+        // scale about the run origin (translate to bx, scale x), so
+        // positions below go relative. Identity keeps base == bx, the
+        // exact expression above (old dylib: always).
+        int stretch = zatex_xscale[i] != 1000;
+        double base = bx;
+        if (stretch) {
+            CGContextSaveGState(g_atlas_ctx);
+            CGContextTranslateCTM(g_atlas_ctx, (CGFloat)bx, 0);
+            CGContextScaleCTM(g_atlas_ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), 1.0);
+            base = 0.0;
+        }
         uint32_t n = rn->glyph_count;
         int64_t acc = 0;
         for (uint32_t k = 0; k < n; k++) {
             uint16_t gl = zatex_glyphs[rn->glyph_start + k];
             zatex_gbuf[k] = (CGGlyph)gl;
-            zatex_pos[k] = CGPointMake((float)(bx + acc * s_run * RASTER_SCALE), (float)by);
+            zatex_pos[k] = CGPointMake((float)(base + acc * s_run * RASTER_SCALE), (float)by);
             acc += zatex_advance(NULL, rn->font_id, gl);
         }
         CTFontDrawGlyphs(rf, zatex_gbuf, zatex_pos, (CFIndex)n, g_atlas_ctx);
+        if (stretch) CGContextRestoreGState(g_atlas_ctx);
         CFRelease(rf);
     }
     e->ax = ax;
@@ -546,9 +624,51 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
     zatex_try_load();
     zatex_ensure_font();
     if (!zatex_layout || !zatex_font) return ZATEX_UNAVAILABLE;
-    int32_t rc = zatex_layout(tex, (size_t)tex_len, display ? true : false, &zatex_metrics,
-                              zatex_runs, ZATEX_RUNS_CAP, zatex_rules, ZATEX_RULES_CAP,
-                              zatex_glyphs, ZATEX_GLYPHS_CAP, out);
+    // Startup conformance (issue #361): first live layout is the
+    // earliest point the STIX provider exists; cold path only, skipped
+    // when the dylib predates the probe (installed dylib: silent no-op).
+    if (!zatex_conform_tried) {
+        zatex_conform_tried = 1;
+        if (zatex_conform_fn) {
+            char diag[256];
+            diag[0] = '\0';
+            int32_t n = zatex_conform_fn(&zatex_metrics, 0, diag, sizeof(diag));
+#ifdef TEST_HOOKS
+            zatex_conform_ran = 1;
+            zatex_conform_count = n;
+#endif
+            if (n != 0) fprintf(stderr, "read: STIX metrics conform: %d\n%.255s\n", n, diag);
+        }
+    }
+    int32_t rc;
+    if (zatex_layout_ex) {
+        // Negotiated path (issue #354): 28-byte stride admits x_scale
+        // (and color, unread). Normalized below so downstream keeps one
+        // view; a 0 tail reads as identity (defensive, never emitted).
+        rc = zatex_layout_ex(tex, (size_t)tex_len, display ? true : false, &zatex_metrics,
+                             zatex_runs_x, ZATEX_RUNS_CAP, sizeof(ZatexRunX),
+                             zatex_rules, ZATEX_RULES_CAP,
+                             zatex_glyphs, ZATEX_GLYPHS_CAP, out);
+        if (rc == 0) {
+            uint32_t n = out->nruns < ZATEX_RUNS_CAP ? out->nruns : ZATEX_RUNS_CAP;
+            for (uint32_t i = 0; i < n; i++) {
+                memcpy(&zatex_runs[i], &zatex_runs_x[i], sizeof(ZatexRun));
+                uint16_t xs = zatex_runs_x[i].x_scale;
+                zatex_xscale[i] = xs ? xs : 1000;
+            }
+        }
+    } else {
+        // Frozen v1 path: old dylib strides 20 and never writes tails —
+        // identity everywhere, bit-identical to before (issue #354
+        // acceptance on the installed dylib).
+        rc = zatex_layout(tex, (size_t)tex_len, display ? true : false, &zatex_metrics,
+                          zatex_runs, ZATEX_RUNS_CAP, zatex_rules, ZATEX_RULES_CAP,
+                          zatex_glyphs, ZATEX_GLYPHS_CAP, out);
+        if (rc == 0) {
+            uint32_t n = out->nruns < ZATEX_RUNS_CAP ? out->nruns : ZATEX_RUNS_CAP;
+            for (uint32_t i = 0; i < n; i++) zatex_xscale[i] = 1000;
+        }
+    }
     return rc == 0 ? ZATEX_OK : ZATEX_FALLBACK;
 }
 
@@ -561,6 +681,16 @@ static uint64_t zatex_atlas_hits = 0, zatex_atlas_misses = 0;
 void platform_math_atlas_stats(uint64_t *hits, uint64_t *misses) {
     if (hits) *hits = zatex_atlas_hits;
     if (misses) *misses = zatex_atlas_misses;
+}
+// Engine negotiation state (issues #354/#361): packed version from
+// zatex_version() (0 = unversioned era), whether the stride-negotiated
+// _ex entry was adopted, and the startup conformance outcome.
+void platform_math_engine_info(uint32_t *version, uint32_t *use_ex,
+                               uint32_t *conform_ran, int32_t *conform_n) {
+    if (version) *version = zatex_engine_version;
+    if (use_ex) *use_ex = zatex_layout_ex ? 1 : 0;
+    if (conform_ran) *conform_ran = zatex_conform_ran;
+    if (conform_n) *conform_n = zatex_conform_count;
 }
 #endif
 
@@ -687,7 +817,14 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         double ox = floor((x + rn->x * s) * q + 0.5) / q;
         double oy = floor((y_top + rn->baseline_y * s) * q + 0.5) / q;
         CGContextTranslateCTM(ctx, (CGFloat)ox, (CGFloat)oy);
-        CGContextScaleCTM(ctx, 1.0, -1.0);
+        // Stretched runs (issue #354): zatex.h recipe — scale x about
+        // the run origin so ink AND pen stretch (positions below stay
+        // relative). Identity is the exact call as before (old dylib:
+        // always), keeping the fast path untouched.
+        if (zatex_xscale[i] != 1000)
+            CGContextScaleCTM(ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), -1.0);
+        else
+            CGContextScaleCTM(ctx, 1.0, -1.0);
         CGContextSetTextPosition(ctx, 0, 0);
         uint32_t n = rn->glyph_count;
         int64_t acc = 0;

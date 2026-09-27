@@ -2891,6 +2891,54 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
     }
 }
 
+test "zatex engine negotiation is consistent (issues #354/#361)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the MATH355 test above). Twin builds stub the math
+    // backend, so there is nothing to negotiate there either. Only the
+    // read-test binary executes this, against the live engine.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        // The gallery wide-accent rows (issue #354 acceptance): the
+        // engine must lay these out on any dylib old or new.
+        const wide = [_][]const u8{ "\\widetilde{AB}", "\\widehat{AB}" };
+        for (wide) |tex| {
+            var fw: f32 = 0;
+            var above: f32 = 0;
+            var below: f32 = 0;
+            const rc = bridge.platform_math_size(
+                tex.ptr, @intCast(tex.len), 0, 17.0, &fw, &above, &below,
+            );
+            if (rc == 1) {
+                std.debug.print("\n[MATHEX] skipped: libzatex unavailable, nothing to pin\n", .{});
+                return;
+            }
+            try t.expectEqual(@as(c_int, 0), rc);
+            try t.expect(fw > 0 and above > 0);
+        }
+        var ver: u32 = 0;
+        var use_ex: u32 = 0;
+        var conform_ran: u32 = 0;
+        var conform_n: i32 = 0;
+        bridge.platform_math_engine_info(&ver, &use_ex, &conform_ran, &conform_n);
+        std.debug.print("\n[MATHEX] version={d} use_ex={d} conform_ran={d} conform_n={d}\n", .{ ver, use_ex, conform_ran, conform_n });
+        // Unversioned era tripwire: installed and current-upstream dylibs
+        // alike report 0 (the #259 versioned recipe has not shipped).
+        // When this flips nonzero the dylib changed: re-shoot the math
+        // gallery (upstream #253-255/#269 shift accents/sums/sqrts) and
+        // revisit this floor instead of rubber-stamping.
+        try t.expectEqual(@as(u32, 0), ver);
+        // Old-dylib tripwire: the installed engine predates
+        // zatex_layout_utf8_ex, so the frozen v1 path must be active
+        // (identity scale everywhere). When this flips to 1 the new
+        // dylib landed: confirm wide-accent stretch in math_gallery
+        // screenshots, then update this pin.
+        try t.expectEqual(@as(u32, 0), use_ex);
+        // Conformance is clean whenever it runs; on the installed dylib
+        // the probe is absent (ran == 0) and the count stays 0.
+        try t.expectEqual(@as(i32, 0), conform_n);
+    }
+}
+
 test "native window tabbing enabled (two-call contract, #49)" {
     // Ship builds carry no test hooks: trivially passes there (same gate
     // pattern as the crisp test above). Only the read-test binary executes

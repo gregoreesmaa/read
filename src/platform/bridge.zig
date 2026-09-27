@@ -188,6 +188,14 @@ pub extern "c" fn platform_draw_math(
 /// only referenced under test_hooks, so ship never links it.
 pub extern "c" fn platform_math_atlas_stats(hits: *u64, misses: *u64) void;
 
+/// Engine negotiation state (issues #354/#361, TEST_HOOKS reader in
+/// macos_zatex.m): packed zatex_version() (0 = unversioned era),
+/// whether the stride-negotiated _ex entry was adopted, and the
+/// startup conformance outcome. Same gate pattern as
+/// platform_math_atlas_stats: only referenced under test_hooks, so
+/// ship never links it.
+pub extern "c" fn platform_math_engine_info(version: *u32, use_ex: *u32, conform_ran: *u32, conform_n: *i32) void;
+
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;
