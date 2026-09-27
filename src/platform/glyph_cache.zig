@@ -224,6 +224,67 @@ pub fn drawRun(
 }
 
 // ============================================================================
+// Math atlas contract (issue #355): formula-level cache identity + snapped
+// blit geometry, mirroring platform_draw_math in src/platform/macos_zatex.m
+// (same key byte order, same snap policy as platform_draw_text). Pure
+// arithmetic, zero heap allocations: no allocator parameter exists on any
+// function, so the hot path stays allocation-free by construction.
+// ============================================================================
+
+/// Formula cache key: FNV-1a 64 over the raw TeX bytes, then the font-size
+/// bits plus the display flag (tail mixing mirrors runHash above and
+/// shape_key in macos.m). Coverage masks rasterize at RASTER_SCALE for one
+/// exact size, and a display formula lays out differently from the same
+/// inline bytes — so size and mode are key identity, never raster metadata.
+pub fn mathRunKey(tex: []const u8, font_size: f32, display: bool) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (tex) |b| {
+        h ^= b;
+        h *%= 0x100000001b3;
+    }
+    const fbits: u32 = @bitCast(font_size);
+    const tail = [_]u8{
+        @intCast(fbits & 0xff),
+        @intCast((fbits >> 8) & 0xff),
+        @intCast((fbits >> 16) & 0xff),
+        @intCast((fbits >> 24) & 0xff),
+        if (display) 1 else 0,
+    };
+    for (tail) |b| {
+        h ^= b;
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
+
+/// Device-grid snap for a run/formula origin at the given output scale.
+/// The origin quantizes (at most half a device px); intra-run pen advances
+/// stay exact, so spacing never drifts. Positive doc-space only — matches
+/// the roundf policy in platform_draw_text.
+pub fn snapToGrid(v: f32, scale: f32) f32 {
+    return @round(v * scale) / scale;
+}
+
+/// Snapped blit destination for a cached formula raster: the origin snaps
+/// to the device grid and the size is the mask size exactly (never the
+/// shaped advance — no sub-pixel stretch), same contract as the body blit.
+pub const MathBlit = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+};
+
+pub fn mathBlitDest(x: f32, y_top: f32, w_px: f32, h_px: f32, scale: f32) MathBlit {
+    return .{
+        .x = snapToGrid(x, scale),
+        .y = snapToGrid(y_top, scale),
+        .w = @ceil(w_px * scale) / scale,
+        .h = @ceil(h_px * scale) / scale,
+    };
+}
+
+// ============================================================================
 // Tests. No allocator is referenced anywhere in this file: the cache owns
 // fixed storage and every test runs with zero heap allocations by
 // construction.
@@ -303,6 +364,43 @@ test "atlas packer: oversized rect rejected, flush recovers" {
     packer.reset();
     try std.testing.expect(packer.alloc(64, 16) != null);
     try std.testing.expectEqual(@as(u32, 1), packer.flushes);
+}
+
+test "math atlas: formula key identity covers bytes, size, display (issue #355)" {
+    // Same formula + size + display mode must hit one entry; any of the
+    // three changing must rasterize separately (a display formula lays out
+    // differently from the same inline bytes, and coverage masks are
+    // size-specific at RASTER_SCALE).
+    const k1 = mathRunKey("\\frac{x+1}{2}", 17.0, false);
+    const k2 = mathRunKey("\\frac{x+1}{2}", 17.0, false);
+    try std.testing.expectEqual(k1, k2);
+    try std.testing.expect(mathRunKey("\\frac{x+1}{2}", 17.0, true) != k1);
+    try std.testing.expect(mathRunKey("\\frac{x+1}{2}", 18.0, false) != k1);
+    try std.testing.expect(mathRunKey("\\frac{x+2}{2}", 17.0, false) != k1);
+}
+
+test "math atlas: origins snap to the device grid, advances stay exact (issue #355)" {
+    // Mirrors platform_draw_math / platform_draw_text: the run origin
+    // quantizes (at most half a device px per run) while intra-run pen
+    // advances stay exact, so spacing never drifts.
+    try std.testing.expectEqual(@as(f32, 50.5), snapToGrid(50.33, 2.0));
+    try std.testing.expectEqual(@as(f32, 50.0), snapToGrid(50.24, 2.0));
+    const v: f32 = 123.456;
+    const s = snapToGrid(v, 2.0);
+    try std.testing.expect(@abs(s - v) <= 0.25 + 1e-6);
+    // Snapped origin lands on an exact device pixel: 2x grid, no resample.
+    try std.testing.expectEqual(@as(f32, 0.0), @rem(s * 2.0, 1.0));
+}
+
+test "math atlas: blit dest is the mask size exactly, snapped (issue #355)" {
+    // Same contract as the body blit: dest size is the raster mask size
+    // (never the shaped advance — no sub-pixel stretch), positioned on
+    // the device grid.
+    const d = mathBlitDest(50.33, 40.67, 100.2, 24.6, 2.0);
+    try std.testing.expectEqual(@as(f32, 50.5), d.x);
+    try std.testing.expectEqual(@as(f32, 40.5), d.y);
+    try std.testing.expectEqual(@as(f32, 100.5), d.w); // ceil(100.2*2)/2
+    try std.testing.expectEqual(@as(f32, 25.0), d.h); // ceil(24.6*2)/2
 }
 
 test "shaping economy: repeated document shapes once per unique run" {

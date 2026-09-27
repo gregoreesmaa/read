@@ -2783,6 +2783,114 @@ test "retina atlas text stays crisp (no-blur regression)" {
     }
 }
 
+const MATH355_PNG_PATH = "/tmp/math_atlas_355.png";
+const MATH355_PNG_W: c_int = 600;
+const MATH355_PNG_H: c_int = 260;
+
+fn math355RenderFn(w: c_int, h: c_int) callconv(.c) void {
+    math355RenderScaled(w, h);
+}
+
+fn math355RenderScaled(w: c_int, h: c_int) void {
+    bridge.platform_draw_rect(0, 0, @floatFromInt(w), @floatFromInt(h), 0x12, 0x12, 0x12, 255);
+    const R: u8 = 0xE0;
+    const G: u8 = 0xE0;
+    const B: u8 = 0xE0;
+    const A: u8 = 255;
+    const Formula = struct {
+        tex: []const u8,
+        display: c_int,
+        x: f32,
+        baseline: f32,
+        size: f32,
+    };
+    // Fractional origins on purpose (same rationale as crispRenderFn):
+    // integer-aligned runs can look crisp even through a blurry path,
+    // which would neuter this test.
+    const formulas = [_]Formula{
+        .{ .tex = "E=mc^2", .display = 0, .x = 50.33, .baseline = 60.67, .size = 17.0 },
+        .{ .tex = "\\frac{a}{b}", .display = 0, .x = 50.71, .baseline = 110.29, .size = 17.0 },
+        .{ .tex = "\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}", .display = 1, .x = 50.17, .baseline = 190.83, .size = 17.0 },
+    };
+    for (formulas) |f| {
+        var fw: f32 = 0;
+        var above: f32 = 0;
+        var below: f32 = 0;
+        if (bridge.platform_math_size(f.tex.ptr, @intCast(f.tex.len), f.display, f.size, &fw, &above, &below) != 0) continue;
+        bridge.platform_draw_math(f.tex.ptr, @intCast(f.tex.len), f.display, f.size, f.x, f.baseline - above, R, G, B, A);
+    }
+}
+
+test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
+    // Ship builds carry no test hooks: trivially passes there (same gate
+    // pattern as the crisp test above). Twin builds stub the math backend
+    // (draws are no-ops), so there is nothing to pin there either. Only
+    // the read-test binary executes this, against the live engine.
+    if (build_options.test_hooks and !build_options.plugin_stub) {
+        const t = std.testing;
+        const alloc = t.allocator;
+
+        // The render below must exercise the real layout path: the engine
+        // lays out the probe formula with nonzero dims.
+        const probe_tex = "\\frac{a}{b}";
+        var pw: f32 = 0;
+        var pabove: f32 = 0;
+        var pbelow: f32 = 0;
+        const probe_rc = bridge.platform_math_size(
+            probe_tex.ptr, @intCast(probe_tex.len), 0, 17.0, &pw, &pabove, &pbelow,
+        );
+        // Status contract (src/platform/macos_zatex.m): 1 = engine
+        // unavailable (no libzatex.dylib on this host, e.g. CI runners), 2
+        // = engine refused the input. Without the engine every formula
+        // falls back to source text, so there is no raster to reuse and
+        // nothing to pin — trivial pass, same stance as the stub twin.
+        if (probe_rc == 1) {
+            std.debug.print("\n[MATH355] skipped: libzatex unavailable, nothing to pin\n", .{});
+            return;
+        }
+        try t.expectEqual(@as(c_int, 0), probe_rc);
+        try t.expect(pw > 0 and pabove > 0);
+
+        var h0: u64 = 0;
+        var m0: u64 = 0;
+        bridge.platform_math_atlas_stats(&h0, &m0);
+        bridge.platform_set_test_scale(2.0);
+        defer bridge.platform_set_test_scale(0.0);
+        // First frame rasterizes each formula; the identical second frame
+        // must reuse every raster with zero new misses (steady-state hot
+        // path: textured-quad blits only, no shaping, no allocation).
+        try t.expectEqual(@as(c_int, 0), bridge.platform_render_to_png(MATH355_PNG_PATH, MATH355_PNG_W, MATH355_PNG_H, math355RenderFn));
+        var h1: u64 = 0;
+        var m1: u64 = 0;
+        bridge.platform_math_atlas_stats(&h1, &m1);
+        try t.expectEqual(@as(c_int, 0), bridge.platform_render_to_png(MATH355_PNG_PATH, MATH355_PNG_W, MATH355_PNG_H, math355RenderFn));
+        var h2: u64 = 0;
+        var m2: u64 = 0;
+        bridge.platform_math_atlas_stats(&h2, &m2);
+
+        // Pixels first (measured in every phase, red or green): math ink
+        // must be present and must not fringe past the crisp budget the
+        // body atlas path holds (parity pin for the Retina gap in #355 —
+        // same thresholds, no math-specific bar). The blit uses bilinear
+        // sampling (see zatex_blit_cached): nearest scores ~144 here
+        // because the 1x harness bitmap downsamples forced-2x masks, so
+        // these thresholds pin that choice too.
+        const m = try crispPngMetrics(alloc, MATH355_PNG_PATH);
+        std.debug.print("\n[MATH355] acutance={d:.1} edge_frac={d:.4} hits={d}+{d} misses={d}+{d}\n", .{ m.acutance, m.edge_frac, h0, h2 - h0, m0, m2 - m0 });
+        try t.expect(m.acutance >= CRISP_ACUTANCE_MIN);
+        try t.expect(m.edge_frac <= CRISP_EDGE_FRAC_MAX);
+
+        // Reuse: the first frame rasterizes each formula; the identical
+        // second frame reuses every raster with zero new misses
+        // (steady-state hot path: textured-quad blits only, no shaping,
+        // no allocation).
+        try t.expect(m1 > m0);
+        try t.expectEqual(h1, h0);
+        try t.expect(h2 > h1);
+        try t.expectEqual(m2, m1);
+    }
+}
+
 test "native window tabbing enabled (two-call contract, #49)" {
     // Ship builds carry no test hooks: trivially passes there (same gate
     // pattern as the crisp test above). Only the read-test binary executes

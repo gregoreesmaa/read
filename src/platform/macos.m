@@ -509,12 +509,17 @@ static void shape_drop_raster(ShapedEntry* e) {
     e->ah = 0;
 }
 
+// Math formula slices (issue #355) view the same atlas pixels, so the
+// flush drops them too — defined in macos_zatex.m (or its stub twin),
+// forward declared here to keep the hook at the flush site.
+void zatex_drop_math_rasters(void);
 // Generational flush: wipe pixels, reset cursor, keep shaped lines cached
 // (they re-rasterize lazily via the aw==0 sentinel).
 static void atlas_flush(void) {
     if (g_atlas_px) memset(g_atlas_px, 0, (size_t)ATLAS_PX * ATLAS_PX);
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
     for (int i = 0; i < SHAPE_CACHE_CAP; i++) shape_drop_raster(&g_shape_cache[i]);
+    zatex_drop_math_rasters();
     g_atlas_flushes++;
 #ifdef TEST_HOOKS
     DBGLOG("EV atlas_flush t=%llu n=%llu", dbg_t_ms(), (unsigned long long)g_atlas_flushes);

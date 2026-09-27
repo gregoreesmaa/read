@@ -182,6 +182,12 @@ pub extern "c" fn platform_draw_math(
     a: u8,
 ) void;
 
+/// Math atlas counters (issue #355, TEST_HOOKS reader in macos_zatex.m):
+/// formula-raster hits (textured-quad blits, zero shaping) and misses
+/// (layout + 2x rasterize). Same gate pattern as platform_glyph_cache_stats:
+/// only referenced under test_hooks, so ship never links it.
+pub extern "c" fn platform_math_atlas_stats(hits: *u64, misses: *u64) void;
+
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;

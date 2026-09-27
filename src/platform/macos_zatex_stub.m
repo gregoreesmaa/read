@@ -14,6 +14,7 @@ int platform_math_size(const char* tex, int tex_len, int display, float font_px,
     if (out_below) *out_below = 0;
     return 1;
 }
+void zatex_drop_math_rasters(void) {}
 void platform_draw_math(const char* tex, int tex_len, int display, float font_px,
                         float x, float y_top,
                         unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
