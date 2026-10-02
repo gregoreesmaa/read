@@ -2143,7 +2143,7 @@ fn recordBlockRun(bytes_inner: []const u8, nl_pos: usize, out: []u32, n: *usize)
     n.* += 1;
 }
 
-/// Indexed block map for O(1) random-access jumps (todo/ideas.txt).
+/// Indexed block map for O(1) random-access jumps (docs/design-notes/ideas.txt).
 /// Records one u32 file offset per blank-line separator run (`\n\n`),
 /// pointing at the first byte of the next block. A 1MB book with ~5k
 /// paragraphs costs ~20KB. Zero heap allocations: caller provides `offsets_out`.

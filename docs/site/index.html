@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Read — microsecond-grade Markdown in pure Zig</title>
+<meta name="description" content="Ultra-minimalist zero-dependency Markdown reader in Zig — mmap + SIMD, microsecond rendering, native macOS CoreText.">
+<style>
+:root { color-scheme: dark light; --bg: #121212; --fg: #E0E0E0; --muted: #9a9a9a; --card: #1b1b1b; --accent: #7cc4ff; }
+@media (prefers-color-scheme: light) { :root { --bg: #FAFAFA; --fg: #1E2022; --muted: #666; --card: #fff; --accent: #0b5fff; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.75 Georgia, "IBM Plex Serif", serif; }
+.wrap { max-width: 680px; margin: 0 auto; padding: 64px 24px 96px; }
+h1, h2 { font-family: "Space Grotesk", system-ui, sans-serif; line-height: 1.2; }
+h1 { font-size: 44px; margin: 0 0 8px; }
+.sub { color: var(--muted); font-size: 19px; margin: 0 0 32px; }
+pre { background: var(--card); padding: 16px 18px; border-radius: 10px; overflow-x: auto; font: 14px/1.6 "JetBrains Mono", ui-monospace, monospace; }
+code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .9em; }
+table { width: 100%; border-collapse: collapse; margin: 24px 0; font-size: 15px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #3333; }
+.hero img { width: 100%; border-radius: 12px; margin: 24px 0; }
+.keys { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; background: var(--card); padding: 18px 20px; border-radius: 10px; }
+a { color: var(--accent); }
+.nav { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 28px 0; font-family: system-ui, sans-serif; font-size: 15px; }
+.cta { display: inline-block; margin-top: 12px; padding: 10px 22px; border-radius: 999px; background: var(--fg); color: var(--bg); text-decoration: none; font-family: system-ui, sans-serif; font-weight: 600; }
+footer { margin-top: 64px; color: var(--muted); font-size: 14px; font-family: system-ui, sans-serif; }
+kbd { background: var(--card); border: 1px solid #8885; border-radius: 6px; padding: 1px 8px; font-family: "JetBrains Mono", monospace; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Read</h1>
+  <p class="sub">The Markdown reader that opens before you blink. Pure Zig, zero dependencies, native macOS.</p>
+
+  <pre>zig build -Doptimize=ReleaseFast &amp;&amp; ./zig-out/bin/read showcase.md</pre>
+  <a class="cta" href="https://github.com/gregoreesmaa/read">Get it on GitHub</a>
+
+  <div class="hero"><img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/text_wrapping.png" alt="Read rendering Markdown"></div>
+
+  <div class="nav">
+    <a href="keys.html">Keybindings</a>
+    <a href="spec.html">Supported Markdown</a>
+    <a href="examples.html">Examples</a>
+    <a href="architecture.html">How it stays fast</a>
+    <a href="https://github.com/gregoreesmaa/read">GitHub</a>
+  </div>
+
+  <h2>Why</h2>
+  <table>
+    <tr><th></th><th>Electron app</th><th>Native reader</th><th>Read</th></tr>
+    <tr><td>Binary</td><td>~180 MB</td><td>~15–35 MB</td><td><strong>&lt; 200 KiB</strong></td></tr>
+    <tr><td>Open</td><td>350–1,200 ms</td><td>20–60 ms</td><td><strong>≤ 18 µs</strong></td></tr>
+    <tr><td>50k-line scan</td><td>~100 ms</td><td>15–25 ms</td><td><strong>≤ 400 µs</strong></td></tr>
+    <tr><td>Viewport layout</td><td>8–16 ms</td><td>1–3 ms</td><td><strong>≤ 8 µs</strong></td></tr>
+    <tr><td>Hot-path allocations</td><td>millions</td><td>thousands</td><td><strong>0</strong></td></tr>
+    <tr><td>Dependencies</td><td>hundreds</td><td>toolkits</td><td><strong>0</strong></td></tr>
+  </table>
+  <p>Every number is enforced in CI — a miss means the code gets faster, never the target lower.</p>
+
+  <h2>Keys</h2>
+  <div class="keys">
+    <span><kbd>j</kbd> / <kbd>k</kbd></span><span>scroll down / up</span>
+    <span><kbd>Space</kbd></span><span>page down</span>
+    <span><kbd>t</kbd></span><span>toggle dark / light</span>
+    <span><kbd>h</kbd> / <kbd>l</kbd></span><span>scroll hovered code block</span>
+    <span><kbd>Cmd</kbd>+<kbd>A</kbd> / <kbd>C</kbd></span><span>select all / copy</span>
+    <span><kbd>q</kbd></span><span>quit</span>
+  </div>
+  <p><a href="keys.html">Full keybindings &amp; gestures →</a></p>
+
+  <h2>Install</h2>
+  <p>macOS + Zig 0.16. Homebrew formula ships with each release:</p>
+  <pre>brew tap gregoreesmaa/read &amp;&amp; brew install read
+read my-notes.md</pre>
+
+  <footer>MIT © 2026 Gregor Eesmaa · <a href="https://github.com/gregoreesmaa/read">github.com/gregoreesmaa/read</a></footer>
+</div>
+</body>
+</html>

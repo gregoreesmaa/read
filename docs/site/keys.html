@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keybindings — Read docs</title>
+<meta name="description" content="Read keybindings, selection, and scrolling.">
+<style>
+:root { color-scheme: dark light; --bg: #121212; --fg: #E0E0E0; --muted: #9a9a9a; --card: #1b1b1b; --accent: #7cc4ff; }
+@media (prefers-color-scheme: light) { :root { --bg: #FAFAFA; --fg: #1E2022; --muted: #666; --card: #fff; --accent: #0b5fff; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.75 Georgia, "IBM Plex Serif", serif; }
+.wrap { max-width: 680px; margin: 0 auto; padding: 48px 24px 96px; }
+h1, h2 { font-family: "Space Grotesk", system-ui, sans-serif; }
+a { color: var(--accent); }
+nav { font-family: system-ui, sans-serif; font-size: 15px; margin-bottom: 32px; }
+table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 15px; font-family: system-ui, sans-serif; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #8883; }
+code, kbd { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .9em; }
+kbd { background: var(--card); border: 1px solid #8885; border-radius: 6px; padding: 1px 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav><a href="index.html">&larr; Read docs</a></nav>
+<h1>Keybindings</h1>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>j</kbd> / <kbd>Down</kbd></td><td>Scroll down (40px)</td></tr>
+<tr><td><kbd>k</kbd> / <kbd>Up</kbd></td><td>Scroll up (40px)</td></tr>
+<tr><td><kbd>Space</kbd></td><td>Page down (80% window height)</td></tr>
+<tr><td><kbd>h</kbd> / <kbd>l</kbd></td><td>Scroll hovered code block or table (30px)</td></tr>
+<tr><td><kbd>t</kbd></td><td>Toggle dark / light theme</td></tr>
+<tr><td><kbd>i</kbd></td><td>Toggle remote images (<a href="privacy.html">privacy</a>)</td></tr>
+<tr><td><kbd>?</kbd></td><td>Shortcut cheat sheet</td></tr>
+<tr><td><kbd>Esc</kbd></td><td>Dismiss cheat sheet</td></tr>
+<tr><td><kbd>Cmd+C</kbd></td><td>Copy selection</td></tr>
+<tr><td><kbd>Cmd+A</kbd></td><td>Select all</td></tr>
+<tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+</table>
+<h2>Selection</h2>
+<p>Drag to select across headings, paragraphs, lists, tables, and code. Double-click locks in a word; triple-click selects the line. Code blocks show a hover Copy button; links open in the browser.</p>
+<h2>Scrolling</h2>
+<p>Code blocks and tables scroll horizontally — hover-activated, independent per block, clamped so the content's right edge meets the container. Trackpad swipes glide 1:1; wheel notches glide via retarget.</p>
+</div>
+</body>
+</html>

@@ -7166,7 +7166,7 @@ test "design #21: heading tracking in -0.02..-0.01em, word space ~0.22em" {
 // Virtualized lazy layout: time-sliced amortized layout + Goldilocks buffer
 // + estimated heights with just-in-time refinement.
 //
-// Ideas implemented (todo/ideas.txt 9-11, todo/ideas2.txt 17-22):
+// Ideas implemented (docs/design-notes/ideas.txt 9-11, docs/design-notes/ideas2.txt 17-22):
 //   * Estimated heights: every off-screen block gets a cheap byte-length
 //     heuristic height; the sum drives the scrollbar without exact layout.
 //   * Goldilocks buffer: a sliding window of viewport + exactly 1 screen
@@ -9027,7 +9027,7 @@ test "virtualized: warm JIT viewport layout under 12us" {
 
 // ============================================================================
 // Scroll-illusion masking: heuristic estimate + indexed block map + anchoring.
-// (todo/ideas.txt lines 13-24.) The scrollbar is decoupled from pixel-perfect
+// (docs/design-notes/ideas.txt lines 13-24.) The scrollbar is decoupled from pixel-perfect
 // layout: at file-open a SIMD `\n` census times line-height yields an
 // estimated total height; a u32 offset index over `\n\n` gives O(1)
 // fraction jumps + O(log N) line resolution; scroll anchoring absorbs
