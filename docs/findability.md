@@ -58,3 +58,15 @@ Read — microsecond-grade Markdown in pure Zig.
 - [x] `https://github.com/gregoreesmaa/read` search-matches "zig markdown reader mmap simd".
 - [ ] Social card renders on the repo page and in link unfurls.
 - [ ] CI badge in README is green (`.github/workflows/ci.yml` on default branch).
+
+## 6. Follow-ups (need the polish PR merged first)
+
+- [ ] Pages deploy runs green (Docs-site workflow deploys `docs/site/` on merge to `main`).
+- [ ] Wiki: create the first page via the web UI (initializes the wiki repo —
+      the API/git push returns "Repository not found" until then), then push
+      the staged seed from `.tmp/wiki-seed/` (Home + 8 pages: Getting Started,
+      Keybindings, Supported Markdown, Examples, Math Engine, Privacy,
+      Architecture, FAQ).
+- [ ] Social preview: upload `screenshots/text_wrapping.png` at
+      Settings → Social preview with headline
+      `Read — microsecond-grade Markdown in pure Zig.`
