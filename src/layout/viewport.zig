@@ -9155,7 +9155,7 @@ test "virtualized: warm JIT viewport layout under 12us" {
 /// sizes, plugin render completions) batch into one metrics walk per frame
 /// instead of one walk per arrival. Zig accumulates the above-viewport
 /// height delta; the platform's per-arrival repaint requests coalesce
-/// through AppKit's `setNeedsDisplay:` (already idempotent). Pure, zero
+/// through the native view's invalidation (already idempotent). Pure, zero
 /// heap, test-pinned below.
 pub const MetricsCoalescer = struct {
     pending: bool = false,
@@ -9225,7 +9225,6 @@ pub fn countRowsBefore(text: []const u8, target: usize, start_x: f32, max_w: f32
         const w = measureTextEx(text[w_start..w_end], font_size, false, false, false, false);
         if (pen_x + w > start_x + max_w and pen_x > start_x) {
             pen_x = start_x;
-            if (w_start >= target) break;
             rows += 1;
         }
         pen_x += w;
