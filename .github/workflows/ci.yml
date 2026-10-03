@@ -75,14 +75,14 @@ jobs:
         run: ./scripts/fuzz_render.sh ./zig-out/bin/read-test showcase.md 2
       - name: test_cases discipline (exactly 1 scrollable-doc case)
         run: sh scripts/check_test_cases.sh
-      - name: Screenshot suite (visual regression captures)
-        run: ./scripts/screenshot_suite.sh screenshots
-      - name: Attach screenshots to the run
+      - name: Screenshot suite (slim visual regression set)
+        run: CI_SUITE=slim ./scripts/screenshot_suite.sh screenshots/macos
+      - name: Attach macOS screenshots to the run
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots
-          path: screenshots/
+          name: screenshots-macos
+          path: screenshots/macos/
           retention-days: 14
 
   # Portability check: core tests + build must also pass on Linux.
@@ -98,6 +98,11 @@ jobs:
           version: 0.16.0
       - name: Install X11/FreeType/fontconfig/libpng dev packages
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libfontconfig1-dev libfreetype6-dev libpng-dev xvfb
+      # Best-effort math face: STIX Two Math gives Linux the same metrics
+      # the macOS backend measures through. Absence is fine (the backend
+      # falls back to whatever fontconfig resolves); never fail the job.
+      - name: Install STIX math font (best effort)
+        run: sudo apt-get install -y fonts-stix || echo "no fonts-stix package; backend uses fontconfig fallback"
       # Math engine (third_party/zatex, pinned submodule): built per OS so
       # math shots render live everywhere. Runtime-loaded (dlopen), never
       # linked — outside the ship size budget.
@@ -120,6 +125,15 @@ jobs:
         run: sh scripts/ship_separation.sh ./zig-out/bin/read ./zig-out/bin/read-test showcase.md
       - name: Screenshot smoke test (headless, under Xvfb for fontconfig)
         run: xvfb-run -a ./zig-out/bin/read-test --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
+      - name: Screenshot suite (slim visual regression set, headless PNG writes need no display server)
+        run: CI_SUITE=slim ./scripts/screenshot_suite.sh screenshots/linux
+      - name: Attach Linux screenshots to the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-linux
+          path: screenshots/linux/
+          retention-days: 14
 
   # Windows portability: full test suite + release build must pass here.
   # (The Win32 backend links there; see build.zig.)
@@ -142,7 +156,9 @@ jobs:
         run: |
           git submodule update --init third_party/zatex
           cd third_party/zatex/packages/zatex && zig build
-          echo "READ_ZATEX_LIB=$PWD/zig-out/lib/zatex.dll" >> "$GITHUB_ENV"
+          # Zig installs Windows DLLs to zig-out/bin (next to executables),
+          # unlike .dylib/.so which land in zig-out/lib.
+          echo "READ_ZATEX_LIB=$PWD/zig-out/bin/zatex.dll" >> "$GITHUB_ENV"
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
       - name: Parser short fuzz (malformed + huge inputs, issue #34)
@@ -159,3 +175,12 @@ jobs:
         run: ./scripts/size_gate.sh zig-out/bin/read.exe
       - name: Screenshot smoke test (headless, no display server needed)
         run: ./zig-out/bin/read-test.exe --screenshot "$RUNNER_TEMP/smoke.png" showcase.md && ls -lh "$RUNNER_TEMP/smoke.png"
+      - name: Screenshot suite (slim visual regression set)
+        run: CI_SUITE=slim ./scripts/screenshot_suite.sh screenshots/windows
+      - name: Attach Windows screenshots to the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-windows
+          path: screenshots/windows/
+          retention-days: 14
