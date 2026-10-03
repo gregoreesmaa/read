@@ -503,15 +503,21 @@ static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, flo
     float q = g_output_scale;
     CGRect dest = CGRectMake(roundf(x * q) / q, roundf(y_top * q) / q,
                              (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
+    // #389 (GPU): None when the blit is snapped 1:1 (dest device size ==
+    // mask size: no resampling either way, so no pixel change on live
+    // Retina), Default only while actually downsampling (headless 1x
+    // harness drawing forced-2x masks: nearest mangles thin STIX stems,
+    // measured 142.8 vs 149.9 bilinear on the corrected raster). The math
+    // crisp budget in the #355 test pins both arms: it runs forced-scale
+    // (downsample arm) and would fail loudly if the 1:1 arm ever resampled.
+    // The snapped origin above is exact on the device grid by construction
+    // (roundf-then-divide), and the dest size is the mask size exactly, so
+    // the 1:1 arm is taken exactly when no resampling happens.
+    float dest_w_dev = dest.size.width * q;
+    float dest_h_dev = dest.size.height * q;
+    BOOL snapped_one_to_one = (dest_w_dev == (float)e->aw && dest_h_dev == (float)e->ah);
     CGContextSaveGState(ctx);
-    // Bilinear, not None like the body blit: the headless harness bitmap
-    // is 1x, so forced-2x masks downsample there — nearest mangles thin
-    // STIX stems in that configuration (measured 142.8 vs 149.9 bilinear
-    // on the corrected raster) while bilinear reads true mask quality.
-    // On live Retina the blit is snapped 1:1, where no resampling happens
-    // either way, so this changes no ship pixel — and the math crisp
-    // budget in the #355 test pins the choice.
-    CGContextSetInterpolationQuality(ctx, kCGInterpolationDefault);
+    CGContextSetInterpolationQuality(ctx, snapped_one_to_one ? kCGInterpolationNone : kCGInterpolationDefault);
     CGContextClipToMask(ctx, dest, e->slice);
     CGContextSetRGBFillColor(ctx, fr, fg, fb, fa);
     CGContextFillRect(ctx, dest);

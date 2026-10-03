@@ -2052,22 +2052,27 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
 }
 
 // Centered cheat-sheet overlay (issue #54): geometry comes from the same
-// table as the key handler (see help_overlay.emitOverlay). Painted after
-// the damage clip closes so the modal card is never partially culled;
-// pixels reuse platform_draw_text, which also records the runs in the
-// text model (selection and clipboard).
-fn drawHelpOverlay() void {
+// table as the key handler (see help_overlay.emitOverlay). Per-command
+// damage gating (the dmg parameter) culls off-region overlay pixels on
+// partial passes (#389 GPU: the card no longer re-rasterizes all 31 runs
+// when the damage is an unrelated line elsewhere); the dim fullscreen
+// rect still paints whenever any part of it is kept, so the modal card is
+// never left half-drawn. Pixels reuse platform_draw_text, which also
+// records the runs in the text model (selection and clipboard).
+fn drawHelpOverlay(dmg: damage.Damage) void {
     const theme = if (g_app.is_dark_theme) layout.Theme.dark else layout.Theme.light;
     var cmds: [32]layout.DrawCommand = undefined;
     const n = help_overlay.emitOverlay(&cmds, g_app.window_width, g_app.window_height, theme);
     for (cmds[0..n]) |cmd| {
         switch (cmd.kind) {
             .fill_rect => {
+                const r = dmg.clip(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h);
+                if (r.isEmpty()) continue;
                 bridge.platform_draw_rect(
-                    cmd.rect.x,
-                    cmd.rect.y,
-                    cmd.rect.w,
-                    cmd.rect.h,
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
                     cmd.color.r,
                     cmd.color.g,
                     cmd.color.b,
@@ -2075,6 +2080,27 @@ fn drawHelpOverlay() void {
                 );
             },
             .text_run => {
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) {
+                    // Record-only path (same contract as the main text_run
+                    // arm below): the selection/hover/link model must see
+                    // overlay runs even when their pixels are culled.
+                    bridge.platform_register_text_run(
+                        cmd.text.ptr,
+                        @intCast(cmd.text.len),
+                        cmd.rect.x,
+                        cmd.rect.y,
+                        cmd.rect.w,
+                        cmd.rect.h,
+                        cmd.font_size,
+                        1,
+                        0,
+                        0,
+                        0,
+                        null,
+                        0,
+                    );
+                    continue;
+                }
                 const is_bold: c_int = if (cmd.style.bold) 1 else 0;
                 bridge.platform_draw_text(
                     cmd.text.ptr,
@@ -2484,6 +2510,11 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     if (clipped_pass) {
         bridge.platform_end_clip();
     }
+    // #389 (GPU): close the fill-color batch the text-run loop opened.
+    // Idempotent: partial passes that never drew text close a never-opened
+    // batch (no-op), and the drawRect-side close below double-closes
+    // safely (live path calls onDraw through the same context).
+    bridge.platform_batch_end();
 
     // Find landing (issues #42/#386): scrollFindTo already snaps exactly
     // on the match's wrapped row, so no chase steps follow. The armed flag
@@ -2493,39 +2524,47 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         g_find_chase_armed = false;
     }
 
-    // Modal cheat sheet paints above everything, unclipped (see
-    // drawHelpOverlay: never culled by partial damage).
-    if (g_show_help) drawHelpOverlay();
+    // Modal cheat sheet paints above everything; per-command damage
+    // gating inside drawHelpOverlay culls off-region overlay pixels on
+    // partial passes (#389 GPU). The overlay is a modal card: any damage
+    // while it is visible repaints at least the card (full passes keep
+    // everything; partial passes keep exactly the intersected runs).
+    if (g_show_help) drawHelpOverlay(dmg);
     // Remote-image privacy indicator (issue #52): visible whenever the
-    // document contains remote content. Painted last and unclipped so a
-    // partial damage pass can never leave it half-drawn.
+    // document contains remote content. Painted last; damage-gated so a
+    // partial pass far from the top-right corner skips it, clipped to the
+    // damage when kept so it can never be left half-drawn.
     if (g_remote_seen) {
         const ind_on = g_app.remote_images;
         const ind_text = if (ind_on) "remote images on (i to block)" else "remote images off (i to allow)";
         const ind_fs: f32 = 12.0;
         const ind_w = layout.measureTextEx(ind_text, ind_fs, false, false, false, false);
         const ind_x = g_app.window_width - ind_w - 14.0;
-        const ind_color = if (g_app.is_dark_theme)
-            layout.Color{ .r = 140, .g = 140, .b = 145, .a = 255 }
-        else
-            layout.Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
-        bridge.platform_draw_text(
-            ind_text.ptr,
-            @intCast(ind_text.len),
-            ind_x,
-            8.0,
-            ind_fs,
-            0,
-            0,
-            0,
-            0,
-            ind_color.r,
-            ind_color.g,
-            ind_color.b,
-            ind_color.a,
-            null,
-            0,
-        );
+        if (!dmg.keeps(ind_x - 2.0, 6.0, ind_w + 4.0, ind_fs * 1.75 + 4.0)) {
+            // Off-damage: skip pixels entirely.
+        } else {
+            const ind_color = if (g_app.is_dark_theme)
+                layout.Color{ .r = 140, .g = 140, .b = 145, .a = 255 }
+            else
+                layout.Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
+            bridge.platform_draw_text(
+                ind_text.ptr,
+                @intCast(ind_text.len),
+                ind_x,
+                8.0,
+                ind_fs,
+                0,
+                0,
+                0,
+                0,
+                ind_color.r,
+                ind_color.g,
+                ind_color.b,
+                ind_color.a,
+                null,
+                0,
+            );
+        }
     }
 
     // First frame committed: image decodes may start now, off the startup
@@ -4419,9 +4458,11 @@ test "cheatsheet overlay: ? toggles, Esc dismisses, unknown keys no-op" {
     try std.testing.expect(!g_show_help);
     // Overlay paint path runs headless without crashing (platform draws
     // early-return with no live context; geometry is pinned in
-    // help_overlay.zig tests).
+    // help_overlay.zig tests). Partial damage culls off-region runs but
+    // records them, so the text model stays complete.
     g_show_help = true;
-    drawHelpOverlay();
+    drawHelpOverlay(damage.Damage.fullView(1200.0, 800.0, .unknown));
+    drawHelpOverlay(damage.Damage.partial(.{ .x = 0.0, .y = 0.0, .w = 80.0, .h = 60.0 }, .unknown));
 }
 
 test "remote images: i toggles through the shared key table" {

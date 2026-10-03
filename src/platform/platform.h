@@ -50,6 +50,9 @@ void platform_set_test_selection(float x1, float y1, float x2, float y2, int ena
 void platform_set_test_hover(float x, float y);
 void platform_test_button_damage(float bx, float by, float bw, float bh, float* ox, float* oy, float* ow, float* oh);
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len);
+// Fill-color batch close (#389 GPU): idempotent; ends the primed group the
+// text-run loop opens (same-save/restore pairing the run loop owns).
+void platform_batch_end(void);
 void platform_draw_image(const char* url, int url_len, float x, float y, float w, float h, const char* alt, int alt_len);
 void platform_open_url_external(const char* url, int url_len);
 void platform_set_document_dir(const char* path, int path_len);
