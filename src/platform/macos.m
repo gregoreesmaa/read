@@ -1041,8 +1041,13 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (fabsf(prev->doc_y - rec->doc_y) < 6.0f) {
                     float glo = fmaxf(prev->x + prev->w, span_lo);
                     float ghi = fminf(rec->x, span_hi);
-                    if (ghi > glo)
-                        CGContextFillRect(ctx, CGRectMake(glo, view_y, ghi - glo, rec->h));
+                    if (ghi > glo) {
+                        // Same quantization as the char-range fill below:
+                        // the gap bridge's fractional edges must agree
+                        // clipped vs unclipped (2026-10 gestures 5/12/13).
+                        float qglo = floorf(glo), qgy = floorf(view_y);
+                        CGContextFillRect(ctx, CGRectMake(qglo, qgy, ceilf(ghi) - qglo, ceilf(view_y + rec->h) - qgy));
+                    }
                 }
             }
 
@@ -1098,7 +1103,16 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
 #endif
-                CGContextFillRect(ctx, CGRectMake(x1, view_y, x2 - x1, rec->h));
+                // Quantize once here (floor/ceil outward) so the fill's
+                // fractional edges land on identical device pixels whether
+                // the pass paints clipped (incremental, damage rect) or
+                // unclipped (fresh): unclipped translucent fills blend the
+                // same fractional edge coverage differently than clipped
+                // ones, leaving 1px fringe/residue on drag-back (2026-10:
+                // gestures 5/12/13, all fractional endpoint coords). Same
+                // rule as selection_bounds_expanded's damage quantization.
+                float qx1 = floorf(x1), qy = floorf(view_y);
+                CGContextFillRect(ctx, CGRectMake(qx1, qy, ceilf(x2) - qx1, ceilf(view_y + rec->h) - qy));
             }
         }
     }
