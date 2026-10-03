@@ -124,6 +124,42 @@ fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) ca
 
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
+// Scroll fast path (#384): the live document-space layout result one scroll
+// frame produced, rented from the same static buffer as the full path (no
+// second ring). A pure scroll_y shift y-offsets it in place instead of
+// re-running layout at 120 Hz. Any content/config change invalidates via
+// invalidateScrollCache below; the reuse check itself pins the full key.
+var g_scroll_cache: layout.ScrollFrameCache = .{};
+var g_scroll_cached_cmds: [MAX_COMMANDS]layout.DrawCommand = undefined;
+// Scroll coalescing (#384): superseded precise deltas collapse per vsync.
+// The platform already queues one draw per runloop pass; folding N raw
+// deltas into one quantized target per tick keeps the displayed offset on
+// whole device pixels without touching 1:1 feel (precise still snaps from
+// the displayed offset, wheel still retargets the glide).
+var g_pending_dy: f32 = 0.0;
+var g_pending_precise: bool = false;
+var g_pending_scroll: bool = false;
+// Last invalidation key the platform saw: skip setNeedsDisplay when neither
+// scroll/overshoot nor the frame counter moved (static screen, more==0).
+var g_last_drawn_scroll: f32 = 0.0;
+var g_last_drawn_overshoot: f32 = 0.0;
+
+/// Scroll-cache content identity: pointer + length + first/last bytes.
+/// Cheap (no hash walk); any edit, reload, or swap trips at least one leg.
+fn scrollContentId() usize {
+    var id: usize = @intFromPtr(g_app.bytes.ptr);
+    id ^= g_app.bytes.len *% 0x9e3779b97f4a7c15;
+    if (g_app.bytes.len > 0) {
+        id ^= @as(usize, g_app.bytes[0]) *% 0xbf58476d1ce4e5b9;
+        id ^= @as(usize, g_app.bytes[g_app.bytes.len - 1]) *% 0x94d049bb133111eb;
+    }
+    id ^= @as(usize, g_app.line_count) *% 0xda942042e4dd58b5;
+    return id;
+}
+
+fn invalidateScrollCache() void {
+    g_scroll_cache.invalidate();
+}
 // Content-driven async plugin renders (issue #323, PR-1 Task 5). Per-doc
 // job table plus the parallel path buffers Task 4's borrow side reads
 // (slot index == job index; paths NUL-terminated in place for the outcome
@@ -875,6 +911,61 @@ fn onScrollTo(scroll_y: f32) callconv(.c) void {
     snapScroll(scroll_y);
 }
 
+/// Fold one vertical delta into the easing state (#384: shared by the
+/// input handler and the per-vsync coalesced fold). Routing (precise 1:1
+/// vs eased wheel) lives in MotionPolicy.applyVertical, pinned by strict
+/// tests. Bound residual becomes rubber-band overshoot (capped, decaying);
+/// the spring decay arms the tick even when scroll already settled.
+fn applyVerticalScroll(dy: f32, precise: bool) void {
+    const target_before = g_smooth.target;
+    const current_before = g_smooth.current;
+    g_smooth = layout.MotionPolicy.applyVertical(
+        g_smooth.target,
+        g_smooth.current,
+        dy,
+        precise,
+        g_app.max_scroll_y,
+        g_reduce_motion,
+    );
+    const desired = if (precise) current_before - dy else target_before - dy;
+    const actual = if (precise) g_smooth.current else g_smooth.target;
+    const over = desired - actual;
+    if (over != 0.0) {
+        g_edge.absorb(over);
+        bridge.platform_smooth_kick();
+    }
+    g_app.scroll_y = g_smooth.current;
+}
+
+/// Fold coalesced deltas once per vsync (#384): superseded precise samples
+/// collapse into a single quantized target before the frame runs, so the
+/// displayed offset lands on whole device pixels without touching 1:1 feel
+/// (precise still snaps from the displayed offset, wheel still retargets).
+fn foldPendingScroll(backing_scale: f32) void {
+    if (!g_pending_scroll) return;
+    g_pending_scroll = false;
+    const dy = g_pending_dy;
+    const precise = g_pending_precise;
+    g_pending_dy = 0.0;
+    g_pending_precise = false;
+    if (dy == 0.0) return;
+    if (precise) {
+        g_smooth = layout.MotionPolicy.applyVertical(
+            g_smooth.target,
+            layout.SmoothScroll.quantize(g_smooth.current, backing_scale),
+            dy,
+            true,
+            g_app.max_scroll_y,
+            g_reduce_motion,
+        );
+        g_smooth.current = layout.SmoothScroll.quantize(g_smooth.current, backing_scale);
+        g_smooth.target = g_smooth.current;
+        g_app.scroll_y = g_smooth.current;
+    } else {
+        applyVerticalScroll(dy, false);
+    }
+}
+
 fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void {
     const now_ms = getTimestampMs();
     // Gesture conditioning first: precise deltas pass bit-exact (1:1
@@ -890,30 +981,20 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
     if (locked.dy != 0.0) {
         // Routing (precise 1:1 vs eased wheel) lives in
         // MotionPolicy.applyVertical, pinned by strict tests; the full
-        // rationale is documented there. Reduce Motion snaps here, so no
-        // timer is armed. Sync the displayed offset, then arm the tick
-        // while unsettled (snaps settle synchronously, no timer).
-        const target_before = g_smooth.target;
-        const current_before = g_smooth.current;
-        g_smooth = layout.MotionPolicy.applyVertical(
-            g_smooth.target,
-            g_smooth.current,
-            locked.dy,
-            precise != 0,
-            g_app.max_scroll_y,
-            g_reduce_motion,
-        );
-        // Bound residual becomes rubber-band overshoot (capped, decaying):
-        // desired minus actual, in scroll coords. Also arm the tick so the
-        // spring decay runs even when the scroll itself already settled.
-        const desired = if (precise != 0) current_before - locked.dy else target_before - locked.dy;
-        const actual = if (precise != 0) g_smooth.current else g_smooth.target;
-        const over = desired - actual;
-        if (over != 0.0) {
-            g_edge.absorb(over);
+        // rationale is documented there. Precise deltas coalesce per vsync
+        // (#384): accumulate here, fold once per tick/draw so superseded
+        // finger samples collapse into one quantized target. Reduce Motion
+        // snaps here, so no timer is armed. Sync the displayed offset,
+        // then arm the tick while unsettled (snaps settle synchronously,
+        // no timer).
+        if (precise != 0 and !g_reduce_motion) {
+            g_pending_dy += locked.dy;
+            g_pending_precise = true;
+            g_pending_scroll = true;
             bridge.platform_smooth_kick();
+        } else {
+            applyVerticalScroll(locked.dy, precise != 0);
         }
-        g_app.scroll_y = g_smooth.current;
         if (!g_smooth.settled()) bridge.platform_smooth_kick();
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
@@ -945,13 +1026,16 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
         snapScroll(g_smooth.target);
         return if (plugin_flying or plugin_changed) 1 else 0;
     }
+    foldPendingScroll(1.0);
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
+    g_smooth.current = layout.SmoothScroll.quantize(g_smooth.current, 1.0);
     g_app.scroll_y = g_smooth.current;
     // Rubber-band decay keeps the timer alive past scroll settle (full
     // redraws: the translate moves every pixel) and parks exactly at zero.
+    // Coalesced with the scroll frame: one invalidation below covers both
+    // (the platform skips setNeedsDisplay when nothing moved).
     if (!g_edge.tick(dt_ms / 1000.0)) {
-        bridge.platform_request_redraw();
         return 1;
     }
     return if (settled and !plugin_flying and !plugin_changed) 0 else 1;
@@ -996,6 +1080,7 @@ fn updateDocumentMetrics() void {
         &g_checkpoint_count,
     );
     g_app.max_scroll_y = @max(0.0, total_height - g_app.window_height + 400.0);
+    invalidateScrollCache();
 }
 
 /// Overscroll strip (#104): the rubber-band translate uncovers window
@@ -1501,6 +1586,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
                     0.0,
                     g_app.block_max_scroll_x[id],
                 );
+                invalidateScrollCache();
             }
         },
         .block_right => {
@@ -1511,6 +1597,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
                     0.0,
                     g_app.block_max_scroll_x[id],
                 );
+                invalidateScrollCache();
             }
         },
         .page_down => {
@@ -1520,6 +1607,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
             // Manual override (#47): wins until the next system change.
             g_app.is_dark_theme = !g_app.is_dark_theme;
             g_app.theme_override = g_app.is_dark_theme;
+            invalidateScrollCache();
         },
         .toggle_help => {
             g_show_help = !g_show_help;
@@ -1611,6 +1699,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         g_app.window_height = fh;
         updateDocumentMetrics();
     }
+    foldPendingScroll(1.0);
 
     syncThemeToPlatform();
     bridge.platform_sync_scroll(g_app.scroll_y);
@@ -1619,8 +1708,9 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     // Damage tracking: AppKit reports the dirty rect for this draw.
     // Full-screen redraw happens only when the pending rect covers the view
-    // (resize, scroll, theme toggle) or is absent (headless, first draw).
-    // Partial damage culls off-region pixel commands below.
+    // (resize, theme toggle) or is absent (headless, first draw). Scroll
+    // blits on the platform (#384), so scroll damage is the exposed strip
+    // only. Partial damage culls off-region pixel commands below.
     var pdx: f32 = 0.0;
     var pdy: f32 = 0.0;
     var pdw: f32 = 0.0;
@@ -1650,12 +1740,27 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     var t_layout_ns: u64 = 0;
     if (build_options.test_hooks and g_sweep_active) t_layout_ns = nowNs();
-    const cmd_count = layout.layoutViewport(
-        g_app.bytes,
-        g_app.lines[0..g_app.line_count],
-        vp_config,
-        &g_commands_buffer,
-    );
+    // Scroll fast path (#384): pure scroll_y shifts reuse the cached frame
+    // by y-offset instead of re-running layout. Registration/state records
+    // replay verbatim, so the text model rebuilds bit-identically and the
+    // damage-parity contract holds. Any other change misses and re-lays out.
+    var cmd_count: usize = 0;
+    const content_id = scrollContentId();
+    if (g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0)) |n| {
+        cmd_count = n;
+    } else {
+        cmd_count = layout.layoutViewport(
+            g_app.bytes,
+            g_app.lines[0..g_app.line_count],
+            vp_config,
+            &g_commands_buffer,
+        );
+        const take = @min(cmd_count, g_scroll_cached_cmds.len);
+        @memcpy(g_scroll_cached_cmds[0..take], g_commands_buffer[0..take]);
+        g_scroll_cache.snapshot(g_scroll_cached_cmds[0..take], take, vp_config, content_id, 0, 1.0);
+    }
+    g_last_drawn_scroll = g_app.scroll_y;
+    g_last_drawn_overshoot = g_edge.overshoot;
     var t_paint_ns: u64 = 0;
     if (build_options.test_hooks and g_sweep_active) t_paint_ns = nowNs();
 

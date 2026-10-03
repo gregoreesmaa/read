@@ -31,6 +31,7 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
 void platform_run_loop(void);
 void platform_request_redraw(void);
 void platform_request_redraw_rect(float x, float y, float w, float h);
+void platform_request_scroll(float old_scroll_y, float new_scroll_y);
 int platform_get_pending_damage(float* x, float* y, float* w, float* h);
 void platform_sync_scroll(float scroll_y);
 void platform_sync_overshoot(float overshoot);
