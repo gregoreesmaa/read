@@ -2858,6 +2858,11 @@ static int  g_image_cache_count = 0;
 static void gif_schedule_next_frame(CachedImageRecord* rec);
 static BOOL gif_window_visible(void);
 #endif
+// Forward: on-demand frame fault lives with the loader at EOF; the GIF
+// advance tick below faults frames before invalidating, so it needs the
+// declaration before first use (fixes implicit-decl + static-follows-
+// non-static errors in animated builds).
+static void decode_frame_on_demand(CachedImageRecord* rec, int idx);
 
 #ifdef READ_ANIMATED_GIF
 // The window is a valid animation sink only while it is actually on screen.
