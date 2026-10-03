@@ -1035,6 +1035,9 @@ pub const ViewportConfig = struct {
 pub const PluginEntry = struct {
     job: plugin_cache.PluginJob,
     path: []const u8,
+    /// `fence_end == 0` means UNSTAMPED (open-time stamping never ran):
+    /// every real fence end is `> fence_line >= 0`, so 0 can never be a
+    /// valid stamped value. Unstamped rows fall back to the inline scan.
     fence_end: usize = 0,
 };
 
@@ -4956,15 +4959,21 @@ fn pluginFenceGeom(entries: ?[]const PluginEntry, i: usize) PluginFenceGeom {
 
 /// Fence-body end shared by the three code-fence passes (issue #385):
 /// the matching `code_fence_end` scan index, or lines.len when unclosed.
-/// Null-entry/foreign-index callers still scan inline (bit-identical
-/// fallback); plugin rows short-circuit through their precomputed
-/// `fence_end` (Task 5 stamps it at open), so ready/queued fences pay
-/// no per-frame body walk. Pub for the main.zig stamping test.
+/// Null-entry/foreign-index/unstamped rows still scan inline (bit-identical
+/// fallback); stamped plugin rows short-circuit through their precomputed
+/// `fence_end`, so ready/queued fences pay no per-frame body walk. Pub for
+/// the main.zig stamping test.
 pub fn codeFenceEnd(entries: ?[]const PluginEntry, lines: []const simd.Line, i: usize) usize {
     if (entries) |rows| {
         var s: usize = 0;
         while (s < rows.len) : (s += 1) {
-            if (rows[s].job.fence_line == i) return @min(rows[s].fence_end, lines.len);
+            if (rows[s].job.fence_line == i) {
+                // Stamped ends only: 0 means the row predates stamping
+                // (hand-built tables, new jobs) and any end at/below the
+                // open is a stale close — fall through to the inline scan.
+                if (rows[s].fence_end > i) return @min(rows[s].fence_end, lines.len);
+                break;
+            }
             if (rows[s].job.fence_line > i) break;
         }
     }
