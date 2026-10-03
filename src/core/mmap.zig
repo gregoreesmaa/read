@@ -242,11 +242,14 @@ fn dontNeedRange(addr: usize, len: usize) void {
 }
 
 /// Pure arithmetic: map a scroll offset to the Goldilocks keep window.
-/// Zero for empty mappings or a zero hint; otherwise the visible byte
-/// range expanded by one screen of bytes each way, clamped to
-/// [0, total_len). Pure (no syscalls): onTick calls it, then the single
-/// releaseOutsideWindow below drops pages outside the window. Zero
-/// allocations.
+/// Viewport +/-1 screen of bytes, conservation-padded at the file edges:
+/// when the above/below margin is clipped by a file edge, the cut pages
+/// are donated to the opposite side so the kept window stays a full
+/// visible + 2 screens whenever the file is big enough (the top-of-doc
+/// case keeps [0, vis+2scr) instead of shrinking to [0, vis+1scr)).
+/// Zero for empty mappings or a zero hint. Pure (no syscalls): onTick
+/// calls it, then the single releaseOutsideWindow below drops pages
+/// outside the window. Zero allocations.
 pub fn goldilocksScrollWindow(
     scroll_y: f32,
     window_height: f32,
@@ -261,7 +264,15 @@ pub fn goldilocksScrollWindow(
     const px_per_byte: f32 = @as(f32, @floatFromInt(window_hint_bytes)) / @max(window_height, 1.0);
     const vis_start: usize = @min(total_len, @as(usize, @intFromFloat(@max(scroll_y, 0.0) * px_per_byte)));
     const vis_end: usize = @min(total_len, @as(usize, @intFromFloat(@max(scroll_y + window_height, 0.0) * px_per_byte)));
-    return goldilocksWindow(vis_start, vis_end, total_len, window_hint_bytes);
+    const w = goldilocksWindow(vis_start, vis_end, total_len, window_hint_bytes);
+    // Edge conservation: clipped pages move to the free side (|-| keeps
+    // this branchless; the @min on end re-clamps the donated tail).
+    const cut_above = (window_hint_bytes * goldilocks_screens_above) -| (vis_start - w.start);
+    const cut_below = (window_hint_bytes * goldilocks_screens_below) -| (w.end - vis_end);
+    return .{
+        .start = w.start -| cut_below,
+        .end = @min(total_len, w.end +| cut_above),
+    };
 }
 
 test "mmap: scroll window keeps viewport +/-1 screen of bytes" {

@@ -390,7 +390,7 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
         if (fe->occupied && fe->font) CFRelease((__bridge CFTypeRef)fe->font);
         fe->key = fkey;
         fe->size = font_size;
-        fe->font = (__bridge_retained NSFont*)resolved;
+        fe->font = resolved;
     }
     return resolved;
 }
