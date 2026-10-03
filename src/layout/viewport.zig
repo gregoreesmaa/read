@@ -9212,7 +9212,7 @@ pub fn countRowsBefore(text: []const u8, target: usize, start_x: f32, max_w: f32
     var rows: usize = 0;
     var i: usize = 0;
     while (i < text.len) {
-        if (i >= target) break;
+        if (i > target) break;
         if (text[i] == ' ') {
             pen_x += space_w;
             i += 1;
@@ -9221,7 +9221,9 @@ pub fn countRowsBefore(text: []const u8, target: usize, start_x: f32, max_w: f32
         const w_start = i;
         while (i < text.len and text[i] != ' ') : (i += 1) {}
         const w_end = @min(i, text.len);
-        if (w_start >= target) break;
+        // The word holding `target` (w_start == target) still wraps exactly
+        // like the renderer: its wrap decides the offset's own row.
+        if (w_start > target) break;
         const w = measureTextEx(text[w_start..w_end], font_size, false, false, false, false);
         if (pen_x + w > start_x + max_w and pen_x > start_x) {
             pen_x = start_x;
