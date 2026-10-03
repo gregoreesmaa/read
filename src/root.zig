@@ -221,7 +221,7 @@ test "virtualized layout performance on 50,000 lines" {
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
     var commands: [512]layout.DrawCommand = undefined;
-    const vp_config = layout.ViewportConfig{
+    var vp_config = layout.ViewportConfig{
         .window_width = 1200.0,
         .window_height = 800.0,
         .scroll_y = 500.0, // Scrolled into the document
@@ -233,7 +233,7 @@ test "virtualized layout performance on 50,000 lines" {
     const cmd_count = layout.layoutViewport(
         mem,
         line_entries[0..line_count],
-        vp_config,
+        &vp_config,
         &commands,
     );
 

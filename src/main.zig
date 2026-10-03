@@ -220,14 +220,13 @@ var g_reduce_motion: bool = false;
 /// Retarget the animated scroll offset and arm the platform tick while the
 /// displayed offset is still settling. No-op when already settled.
 /// Under Reduce Motion every step lands synchronously instead.
-/// Reduce Motion takes the synchronous path (issue #388): snaps never arm
-/// the tick, so the onTick settled edge never fires for them — release
-/// here instead so keyboard/anchor jumps still shrink RSS. Zero extra
-/// cost on the animated path (this branch never runs there).
 fn retargetScroll(target: f32) void {
     if (g_reduce_motion) {
         snapScroll(target);
         // Synchronous landing (see snapScroll): the tick edge never fires.
+        // Reduce Motion takes the synchronous path (issue #388): release
+        // here instead so keyboard/anchor jumps still shrink RSS. Zero
+        // extra cost on the animated path (this branch never runs there).
         releaseSettledPages();
         return;
     }
