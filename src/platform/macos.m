@@ -110,7 +110,10 @@ typedef struct {
     int line_index;
 } QuadTextRecord;
 
-#define MAX_QUAD_RECORDS 16384
+#define MAX_QUAD_RECORDS 2048 // #387 safe subset: 2048 records x ~812 B
+// ~= 1.7 MB (was 16384 x ~812 B ~= 13.3 MB); MAX_COMMANDS in main.zig is
+// 2048 and realistic runs/frame are dozens. Viewport draws are bounded by
+// commands, so selection/hover records saturate long before this cap.
 static QuadTextRecord g_text_records[MAX_QUAD_RECORDS];
 static int g_text_record_count = 0;
 
@@ -426,10 +429,11 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
 // once ~500 runs were resident, evicting shaped lines mid-scroll and forcing
 // re-shape + re-raster churn on every frame (2026-09 scroll-storm hunt).
 #define SHAPE_CACHE_CAP 4096
-// 4096px = 16 MiB coverage cache, malloc-once on the cold path (BSS/file
-// size unaffected). A 2048px atlas thrashed on ordinary files at 2x
-// (flush + full re-raster storm every ~60 scroll frames, 2026-09 blackout
-// hunt); the live working set fits comfortably here.
+// 4096px = 16 MiB coverage cache, lazy-allocated on the first text draw
+// (#387: no image-only or empty doc pays the 16 MiB RSS). A 2048px atlas
+// thrashed on ordinary files at 2x (flush + full re-raster storm every ~60
+// scroll frames, 2026-09 blackout hunt); the live working set fits
+// comfortably here. KEEP 4096: a resize needs macOS verification first.
 #define ATLAS_PX 4096
 #define RASTER_SCALE 2
 
@@ -446,7 +450,7 @@ typedef struct {
 } ShapedEntry;
 
 static ShapedEntry g_shape_cache[SHAPE_CACHE_CAP]; // BSS: no binary cost
-static unsigned char* g_atlas_px = NULL;  // one 16 MiB buffer, malloc-once
+static unsigned char* g_atlas_px = NULL;  // one 16 MiB buffer, lazy on first text draw (#387)
 static CGContextRef g_atlas_ctx = NULL;
 // Single persistent atlas image: provider-backed LIVE view of g_atlas_px,
 // created once — never copied, never rebuilt (verified live via probe:
@@ -2792,6 +2796,9 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
 
 typedef struct {
     char     url[512];
+    char     resolved[1024]; // cached resolved path: size queries hit without
+                             // any NSString alloc (#387; relative-path docs
+                             // otherwise pay one alloc + file check per query)
     // Decoded frames (NULL = not yet loaded, count 0 = failed)
     CGImageRef* frames;         // malloc'd array of CGImageRef
     double*     frame_delays;   // malloc'd array of per-frame delay in seconds
@@ -2805,17 +2812,59 @@ typedef struct {
     BOOL        kick_pending;   // resolved but decode not yet dispatched (pre-first-paint)
     BOOL        parked;         // animation chain parked: no timer scheduled
     unsigned long last_draw_seq; // g_draw_seq of the pass that last painted this image
+    unsigned long last_use_seq;  // LRU clock: bumped on every cache hit (#387)
     // Last drawn rect in DOCUMENT coordinates for exact GIF-tick damage.
     float       last_doc_x;
     float       last_doc_y;
     float       last_w;
     float       last_h;
     BOOL        has_rect;
+    BOOL        occupied;        // slot live (#387: fixed ring, reuse on evict)
 } CachedImageRecord;
 
-#define MAX_IMAGE_CACHE 64
+// #387 safe subset: cap live images at 12 (was 64 unbounded, never freed).
+// Decode behavior unchanged (GIF frames still decode as before — decode-on-
+// demand belongs to #390's lane). Eviction releases retained frames and
+// reuses the slot; doc-switch drains the whole cache. MRU order is an LRU
+// clock over last_use_seq (g_image_use_seq), so no list pointers.
+#define MAX_IMAGE_CACHE 12
 static CachedImageRecord g_image_cache[MAX_IMAGE_CACHE];
-static int  g_image_cache_count = 0;
+static unsigned long g_image_use_seq = 0;
+
+// Release a record's retained decodes + heap arrays (idempotent). Called on
+// eviction and doc-switch; the slot itself is static storage.
+static void image_free_record(CachedImageRecord* rec) {
+    if (!rec) return;
+    if (rec->frames) {
+        for (int i = 0; i < rec->frame_count; i++)
+            if (rec->frames[i]) CGImageRelease(rec->frames[i]);
+        free(rec->frames);
+        rec->frames = NULL;
+    }
+    if (rec->frame_delays) {
+        free(rec->frame_delays);
+        rec->frame_delays = NULL;
+    }
+    rec->frame_count = 0;
+    rec->primed_frames = 0;
+    rec->cur_frame = 0;
+    rec->loading = NO;
+    rec->failed = NO;
+    rec->kick_pending = NO;
+    rec->parked = YES;
+    rec->has_rect = NO;
+    rec->url[0] = '\0';
+    rec->resolved[0] = '\0';
+    rec->occupied = NO;
+}
+
+// Drop every live image (doc-switch): bounded RSS across documents, no
+// cross-doc stale hits. In-flight arrivals land after the clear and find
+// occupied == NO, so they drop their pixels with no repaint.
+static void image_cache_clear(void) {
+    for (int i = 0; i < MAX_IMAGE_CACHE; i++)
+        if (g_image_cache[i].occupied) image_free_record(&g_image_cache[i]);
+}
 
 // Forward declarations (animated path only; static ship builds decode frame 0
 // and never schedule — see -Danimated-gif in build.zig to opt back in).
@@ -2845,7 +2894,7 @@ static BOOL gif_window_visible(void) {
 // next event-driven draw.
 // GIF animation timer callback: damage is the frame's exact bounding box.
 static void gif_advance_frame(CachedImageRecord* rec) {
-    if (!rec || rec->frame_count <= 1) return;
+    if (!rec || !rec->occupied || rec->frame_count <= 1) return;
     if (!gif_window_visible() || rec->last_draw_seq != g_draw_seq) {
         rec->parked = YES;
 #ifdef TEST_HOOKS
@@ -2874,7 +2923,7 @@ static void gif_advance_frame(CachedImageRecord* rec) {
 }
 
 static void gif_schedule_next_frame(CachedImageRecord* rec) {
-    if (!rec || rec->frame_count <= 1) return;
+    if (!rec || !rec->occupied || rec->frame_count <= 1) return;
     if (!gif_window_visible()) {
         rec->parked = YES;
         return;
@@ -2924,7 +2973,8 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
 // __text bytes don't shift the hot mid-file layout.
 static int prime_frame_decode(CGImageRef img);
 
-// Decode all frames from a CGImageSource into the cache record
+// Decode all frames from a CGImageSource into the cache record.
+// GIF frame decoding UNCHANGED by #387 (decode-on-demand is #390's lane).
 static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecord* rec) {
     size_t count = CGImageSourceGetCount(src);
     if (count == 0) { rec->failed = YES; return; }
@@ -2975,7 +3025,7 @@ static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecor
 #endif
 }
 
-// Synchronously populate a cache slot from a local file path. Remote URLs
+    // Synchronously populate a cache slot from a local file path. Remote URLs
 // never reach here: kick_image_load routes them to the async URL session,
 // so no synchronous network fetch exists anywhere on any path (#45).
 static void load_image_sync(CachedImageRecord* rec, NSString* pathStr) {
@@ -3046,18 +3096,33 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
 static BOOL g_images_armed = NO;
 
 static void kick_image_load(CachedImageRecord* rec, NSString* resolved);
+static NSString* image_path_for_record(CachedImageRecord* rec, const char* url, int url_len);
 
 void platform_arm_images(void) {
     if (g_images_armed) return;
     g_images_armed = YES;
-    for (int i = 0; i < g_image_cache_count; i++) {
+    for (int i = 0; i < MAX_IMAGE_CACHE; i++) {
         CachedImageRecord* rec = &g_image_cache[i];
+        if (!rec->occupied) continue;
         if (!rec->kick_pending || rec->failed) continue;
         rec->kick_pending = NO;
-        NSString* pathStr = [[NSString alloc] initWithBytes:rec->url
-                                                     length:strlen(rec->url)
-                                                   encoding:NSUTF8StringEncoding];
-        NSString* resolved = resolve_image_path(pathStr);
+        // Reuse the cached resolved path when the doc dir did not change
+        // (zero ObjC traffic); else re-resolve from the URL bytes.
+        NSString* resolved = nil;
+        if (rec->resolved[0] != '\0') {
+            resolved = [[NSString alloc] initWithUTF8String:rec->resolved];
+            if (resolved &&
+                ![[NSFileManager defaultManager] fileExistsAtPath:resolved] &&
+                ![resolved hasPrefix:@"http://"] && ![resolved hasPrefix:@"https://"]) {
+                resolved = nil;
+            }
+        }
+        if (!resolved) {
+            NSString* pathStr = [[NSString alloc] initWithBytes:rec->url
+                                                         length:strlen(rec->url)
+                                                       encoding:NSUTF8StringEncoding];
+            if (pathStr) resolved = image_path_for_record(rec, rec->url, (int)strlen(rec->url));
+        }
         if (!resolved) { rec->failed = YES; rec->loading = NO; continue; }
         kick_image_load(rec, resolved);
     }
@@ -3067,6 +3132,14 @@ void platform_arm_images(void) {
 // decodes, success or failure: metrics resync + repaint. See the notes
 // that used to live inline in kick_image_load below.
 static void image_load_completed(CachedImageRecord* rec) {
+    // Stale arrival: the record was evicted or the doc switched while the
+    // decode was in flight. Pixels belong to nobody — drop them, no repaint.
+    // The pending flag still clears so settle-waits drain (failed=YES keeps
+    // the slot reusable; the frames array stays empty so nothing leaks).
+    if (!rec || !rec->occupied) {
+        if (rec) { rec->loading = NO; rec->failed = YES; }
+        return;
+    }
     // Sizes just went live: recompute metrics and anchor scroll
     // BEFORE the repaint below, so the draw uses fresh geometry
     // and content below doesn't jump. Failures keep the fallback
@@ -3135,7 +3208,9 @@ static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
         }] resume];
         return;
     }
-    // Capture for block
+    // Capture for block. The copy pins the path across eviction/doc-switch;
+    // arrivals that find occupied == NO drop their pixels (no stale
+    // write-back — see image_load_completed).
     NSString* resolvedCopy = [resolved copy];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         load_image_sync(rec, resolvedCopy);
@@ -3145,30 +3220,77 @@ static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
     });
 }
 
-// Returns existing or allocates a record; dispatches the async decode only
-// when armed (see above) — otherwise parks it for platform_arm_images.
-static CachedImageRecord* get_or_load_image_record(const char* url, int url_len) {
+// C-string key compare (no NSString on the lookup path, #387): exact
+// byte match including the NUL terminator (prefix URLs never collide).
+static CachedImageRecord* image_cache_lookup(const char* url, int url_len) {
     if (!url || url_len <= 0 || url_len >= 512) return NULL;
-
-    // Cache hit
-    for (int i = 0; i < g_image_cache_count; i++) {
-        if (strncmp(g_image_cache[i].url, url, url_len) == 0 &&
-            g_image_cache[i].url[url_len] == '\0') {
-            return &g_image_cache[i];
+    for (int i = 0; i < MAX_IMAGE_CACHE; i++) {
+        CachedImageRecord* rec = &g_image_cache[i];
+        if (!rec->occupied) continue;
+        if (memcmp(rec->url, url, url_len) == 0 && rec->url[url_len] == '\0') {
+            rec->last_use_seq = ++g_image_use_seq;
+            return rec;
         }
     }
-    if (g_image_cache_count >= MAX_IMAGE_CACHE) return NULL;
+    return NULL;
+}
 
-    // Allocate slot
-    CachedImageRecord* rec = &g_image_cache[g_image_cache_count++];
+// Slow path: build the lookup NSString exactly once per MISS (hits never
+// reach here). Caches the resolved path bytes in the record so size queries
+// reuse them with zero ObjC traffic.
+static NSString* image_path_for_record(CachedImageRecord* rec, const char* url, int url_len) {
+    NSString* pathStr = [[NSString alloc] initWithBytes:url length:url_len
+                                               encoding:NSUTF8StringEncoding];
+    if (!pathStr) return nil;
+    NSString* resolved = resolve_image_path(pathStr);
+    if (resolved && resolved != pathStr &&
+        ![resolved hasPrefix:@"http://"] && ![resolved hasPrefix:@"https://"]) {
+        const char* rp = [resolved UTF8String];
+        if (rp) {
+            size_t n = strlen(rp);
+            if (n < sizeof(rec->resolved)) memcpy(rec->resolved, rp, n + 1);
+            else rec->resolved[0] = '\0';
+        }
+    }
+    return resolved;
+}
+
+// Returns existing or allocates a record; dispatches the async decode only
+// when armed (see above) — otherwise parks it for platform_arm_images.
+// Full cache evicts the least-recently-used finished record (loading ones
+// are pinned: evicting mid-decode would orphan the async arrival).
+// Decode behavior unchanged: GIF frames decode exactly as before (#390).
+static CachedImageRecord* get_or_load_image_record(const char* url, int url_len) {
+    CachedImageRecord* hit = image_cache_lookup(url, url_len);
+    if (hit) return hit;
+    if (!url || url_len <= 0 || url_len >= 512) return NULL;
+
+    // Allocate slot: free slot first, else LRU finished record. When every
+    // record is mid-decode (startup storm), refuse — the caller draws the
+    // placeholder and retries on the next frame.
+    CachedImageRecord* rec = NULL;
+    for (int i = 0; i < MAX_IMAGE_CACHE; i++) {
+        if (!g_image_cache[i].occupied) { rec = &g_image_cache[i]; break; }
+    }
+    if (!rec) {
+        unsigned long oldest = (unsigned long)-1;
+        for (int i = 0; i < MAX_IMAGE_CACHE; i++) {
+            CachedImageRecord* c = &g_image_cache[i];
+            if (c->loading || c->kick_pending) continue;
+            if (c->last_use_seq < oldest) { oldest = c->last_use_seq; rec = c; }
+        }
+        if (!rec) return NULL;
+        image_free_record(rec);
+    }
     memset(rec, 0, sizeof(*rec));
     memcpy(rec->url, url, url_len);
     rec->url[url_len] = '\0';
     rec->loading = YES;
+    rec->occupied = YES;
+    rec->parked = YES;
+    rec->last_use_seq = ++g_image_use_seq;
 
-    NSString* pathStr = [[NSString alloc] initWithBytes:url length:url_len
-                                               encoding:NSUTF8StringEncoding];
-    NSString* resolved = resolve_image_path(pathStr);
+    NSString* resolved = image_path_for_record(rec, url, url_len);
     if (!resolved) { rec->failed = YES; rec->loading = NO; return rec; }
 
     if (!g_images_armed) {
@@ -3206,8 +3328,8 @@ void platform_probe_px_add(int x, int y) {
 // decode-priming regression test: every loaded frame must be primed.
 void platform_test_image_primed(unsigned long* total_frames, unsigned long* primed_frames) {
     unsigned long t = 0, p = 0;
-    for (int i = 0; i < g_image_cache_count; i++) {
-        if (g_image_cache[i].failed) continue;
+    for (int i = 0; i < MAX_IMAGE_CACHE; i++) {
+        if (!g_image_cache[i].occupied || g_image_cache[i].failed) continue;
         t += (unsigned long)g_image_cache[i].frame_count;
         p += (unsigned long)g_image_cache[i].primed_frames;
     }
@@ -3220,8 +3342,8 @@ void platform_test_image_primed(unsigned long* total_frames, unsigned long* prim
 // Number of image records still decoding (for headless settle waits).
 int platform_images_pending(void) {
     int n = 0;
-    for (int i = 0; i < g_image_cache_count; i++)
-        if (g_image_cache[i].loading) n++;
+    for (int i = 0; i < MAX_IMAGE_CACHE; i++)
+        if (g_image_cache[i].occupied && g_image_cache[i].loading) n++;
     return n;
 }
 #endif
@@ -3248,6 +3370,10 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 
     // Record the frame rect in document coordinates so GIF ticks can
     // invalidate exactly this box (scroll-compensated at tick time).
+    // Stamp this pass: proves the image is inside the painted viewport, and
+    // re-arms a parked animation chain from this genuine event-driven draw.
+    // get_or_load_image_record above already marked the record MRU for the
+    // LRU clock; a NULL return (all 12 slots mid-decode) draws placeholder.
     if (rec) {
         rec->last_doc_x = x;
         rec->last_doc_y = y + g_scroll_y;
@@ -3284,6 +3410,8 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
     // to content width with proper aspect ratio), so we just draw at (x,y,w,h).
     // Stamp this pass: proves the image is inside the painted viewport, and
     // re-arms a parked animation chain from this genuine event-driven draw.
+    // Eviction is synchronous within this function (get_or_load_image_record
+    // above), so rec stays pinned through the blit below.
     rec->last_draw_seq = g_draw_seq;
 #ifdef READ_ANIMATED_GIF
     if (rec->parked && rec->frame_count > 1) {
@@ -3681,7 +3809,7 @@ static int image_url_is_remote(NSString* s) {
 }
 
 // Shared remote-fetch session: ephemeral (no disk persistence), NO shared
-// URLCache (the 64-slot image cache above is the bound — an unbounded
+// URLCache (the 12-slot image cache above is the bound — an unbounded
 // NSURLCache would violate it), bounded timeouts so blocked hosts fail
 // into the placeholder instead of dangling.
 static NSURLSession* image_session(void) {
@@ -3701,6 +3829,9 @@ static NSURLSession* image_session(void) {
 // stored verbatim (the process never chdirs, so relative stays valid).
 // Empty/absent path clears it (built-in default doc).
 void platform_set_document_dir(const char* path, int path_len) {
+    // New document: drain image decodes so RSS stays bounded across docs
+    // and no stale cross-doc hit can serve (#387). Cheap (<=12 slots).
+    image_cache_clear();
     g_doc_dir[0] = '\0';
     if (!path || path_len <= 0) return;
     int end = path_len;
