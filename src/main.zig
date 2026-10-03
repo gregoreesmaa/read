@@ -6,6 +6,7 @@ const simd = @import("hot");
 const parser = @import("core/parser.zig");
 const layout = @import("layout/viewport.zig");
 const damage = @import("layout/damage.zig");
+const idle = @import("platform/idle.zig");
 const help_overlay = @import("layout/help_overlay.zig");
 const math_detect = @import("core/math_detect.zig");
 const remote_policy = @import("core/remote_policy.zig");
@@ -203,19 +204,38 @@ fn snapScroll(v: f32) void {
     g_app.scroll_y = g_smooth.current;
 }
 
-/// Async image natural sizes landed (platform completion): recompute metrics
-/// with live sizes (stale checkpoints would misplace content), then absorb
-/// the above-viewport height delta so content below stays put instead of
-/// jumping. The platform computes the delta from its last drawn rect
-/// (same laidOutImageHeight/above-viewport math, pinned by contract tests
-/// in controls_test.zig — see the scrollbar mirror precedent). Cold path:
-/// one metrics walk; zero allocations. No animation — snapScroll lands it
-/// synchronously and clamps to the fresh max.
-fn onImagesChanged(delta_above: f32) callconv(.c) void {
+/// Coalesced re-measure batch (issue #386): every async arrival (image
+/// decode, plugin completion) notes here instead of walking metrics
+/// inline. The drain below runs exactly one `updateDocumentMetrics` walk
+/// per frame no matter how many arrivals landed, then absorbs the summed
+/// above-viewport delta in a single snap. Static BSS; zero allocations.
+var g_metrics_batch: layout.MetricsCoalescer = .{};
+
+/// Drain one frame's arrival batch: a single metrics walk plus the summed
+/// above-viewport shift (same anchor math as the old per-arrival path, so
+/// final scroll offset and laid-out images are identical). Returns true
+/// when a walk ran (caller repaints once: AppKit coalesces repeats).
+fn drainMetricsBatch() bool {
+    if (!g_metrics_batch.drain()) return false;
     updateDocumentMetrics();
-    if (delta_above != 0.0) {
-        snapScroll(g_app.scroll_y + delta_above);
-    }
+    const d = g_metrics_batch.takeDelta();
+    if (d != 0.0) snapScroll(g_app.scroll_y + d);
+    return true;
+}
+
+/// Async image natural sizes landed (platform completion): batch into the
+/// frame's re-measure instead of walking metrics inline (issue #386: 16
+/// staggered arrivals cost 16 walks; now one). The metrics resync still
+/// happens before the repaint — the drain runs synchronously here when
+/// called outside a tick — so the draw uses fresh geometry and content
+/// below doesn't jump. The platform computes the delta from its last drawn
+/// rect (same laidOutImageHeight/above-viewport math, pinned by contract
+/// tests in controls_test.zig — see the scrollbar mirror precedent).
+/// Cold path: at most one metrics walk; zero allocations. No animation —
+/// snapScroll lands it synchronously and clamps to the fresh max.
+fn onImagesChanged(delta_above: f32) callconv(.c) void {
+    g_metrics_batch.noteArrival(delta_above);
+    if (drainMetricsBatch()) bridge.platform_request_redraw();
 }
 
 // ---------------------------------------------------------------------------
@@ -685,10 +705,12 @@ fn pluginPollAndAdvance() bool {
     g_plugin_orphans = @intCast(@max(orphans_open, 0));
     pluginProbeAndLaunch();
     if (resolved > 0) {
-        // Same arrival path as async images (no above-viewport shift is
-        // known here: content below settles on the next frame's layout).
-        onImagesChanged(0.0);
-        bridge.platform_request_redraw();
+        // Batch the whole drain's flips into one re-measure (issue #386:
+        // N completions in one poll cost one walk, not N). Same arrival
+        // path as async images (no above-viewport shift is known here:
+        // content below settles on the next frame's layout).
+        g_metrics_batch.noteArrival(0.0);
+        if (drainMetricsBatch()) bridge.platform_request_redraw();
         return true;
     }
     return false;
@@ -1214,6 +1236,9 @@ fn openDocumentInPlace(link_path: []const u8, frag: []const u8) bool {
 // Empty for the built-in doc and stdin spools (unlinked): unwatched.
 var g_doc_path_buf: [2048]u8 = undefined;
 var g_doc_path: []const u8 = "";
+// Last accepted reload timestamp (monotonic ms) for the #386 save-pair
+// debounce above. Null until the first reload; static BSS.
+var g_last_reload_ms: ?i64 = null;
 
 fn setDocPath(path: []const u8) void {
     const take = @min(path.len, g_doc_path_buf.len);
@@ -1236,10 +1261,17 @@ fn watchCurrentDocument() void {
 /// (editors replace files, killing the watched fd), then reload with
 /// scroll preserved and clamped. A vanished or momentarily unreadable
 /// file keeps the old document; the next event converges.
+/// Debounced (issue #386): editors save in rapid pairs (temp write +
+/// rename), so repeats inside the 250 ms quiet window are swallowed — one
+/// save pair costs exactly one mmap + metrics walk. The re-arm still runs
+/// first so the watcher never goes deaf on a swallowed repeat.
 fn onFileChanged() callconv(.c) void {
     watchCurrentDocument();
     if (g_doc_path.len == 0) return;
+    const now = getTimestampMs();
+    if (!idle.reloadDebounced(now, g_last_reload_ms)) return;
     const mapped = mmap.MappedFile.open(g_doc_path) catch return;
+    g_last_reload_ms = now;
     activateMappedFile(mapped, false);
 }
 
@@ -1278,12 +1310,11 @@ var g_find_folded: [FIND_QUERY_MAX]u8 = undefined;
 var g_find_count: usize = 0;
 var g_find_current: usize = 0;
 var g_find_query_len: usize = 0;
-// Chase state (issue #42): findOffsetY lands block-exact; when wrapping
-// pushes the match below the viewport, up to 4 viewport-steps follow the
-// painted wash. painted is set by the highlight pass when the current
-// match draws any rect this frame.
+// Landing state (issues #42/#386): scrollFindTo snaps row-exact in one
+// step, so no chase steps follow. `armed` is disarmed by the draw pass if
+// ever set (legacy headless paths); `painted` is draw-pass telemetry set
+// by the highlight pass when the current match draws any rect this frame.
 var g_find_chase_armed: bool = false;
-var g_find_chase_left: u8 = 0;
 var g_find_painted: bool = false;
 
 fn pushFindCount() void {
@@ -1326,16 +1357,25 @@ fn findMatchY(offset: usize) ?f32 {
         .join_buf = &g_joinbuf,
     };
     pluginAttachConfig(&vp_config);
-    return layout.findOffsetY(g_app.bytes, g_app.lines, vp_config, offset);
+    const top = layout.findOffsetY(g_app.bytes, g_app.lines, vp_config, offset) orelse return null;
+    // Row-exact landing (issue #386): resolve the containing unit and step
+    // to the match's wrapped visual row in the same snap — the old chase
+    // loop's follow-up steps converge here by construction, so the final
+    // offset is identical with zero extra fullscreen redraws.
+    var unit: usize = 0;
+    while (unit < g_app.line_count and
+        g_app.lines[unit].offset + g_app.lines[unit].len <= offset) : (unit += 1)
+    {}
+    if (unit >= g_app.line_count) return top;
+    unit = layout.snapWindowStart(g_app.bytes, g_app.lines[0..g_app.line_count], unit);
+    return layout.findRowOffsetY(g_app.bytes, g_app.lines[0..g_app.line_count], vp_config, unit, top, offset);
 }
 
 fn scrollFindTo(idx: usize) void {
     if (idx >= g_find_count) return;
     if (findMatchY(g_find_matches[idx].start)) |y| {
-        // Coarse landing on the match's block top; the draw pass refines
-        // (see the chase below) when wrapping puts the match lower.
-        g_find_chase_armed = true;
-        g_find_chase_left = 4;
+        // Single exact snap on the match row: no chase steps, no extra
+        // redraws. The painted flag stays as draw-pass telemetry only.
         g_find_painted = false;
         snapScroll(@max(0.0, y - g_app.window_height / 3.0));
     }
@@ -1367,7 +1407,6 @@ fn clearFind() void {
     g_find_current = 0;
     g_find_query_len = 0;
     g_find_chase_armed = false;
-    g_find_chase_left = 0;
     g_find_painted = false;
     bridge.platform_find_hide();
     bridge.platform_request_redraw();
@@ -1951,17 +1990,12 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         bridge.platform_end_clip();
     }
 
-    // Find chase (issue #42): the cycle scrolled to the match's block
-    // top; if wrapping kept the current wash off-viewport (nothing
-    // painted this frame), step down and redraw — bounded, then rest.
+    // Find landing (issues #42/#386): scrollFindTo already snaps exactly
+    // on the match's wrapped row, so no chase steps follow. The armed flag
+    // is disarmed here if ever set (legacy headless paths); the draw never
+    // issues follow-up scrolls or extra fullscreen redraws.
     if (g_find_chase_armed) {
-        if (g_find_painted or g_find_chase_left == 0) {
-            g_find_chase_armed = false;
-        } else {
-            g_find_chase_left -= 1;
-            snapScroll(g_app.scroll_y + g_app.window_height * 0.8);
-            bridge.platform_request_redraw();
-        }
+        g_find_chase_armed = false;
     }
 
     // Modal cheat sheet paints above everything, unclipped (see
@@ -3747,6 +3781,9 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
         watchCurrentDocument();
         try t.expectEqual(@as(c_int, 1), bridge.platform_test_watch_active());
         // External modify: content swaps, scroll offset is preserved.
+        // Reset the debounce latch first: the test fires events back to
+        // back, and the second (vanish) event must not be swallowed.
+        g_last_reload_ms = null;
         const afd = try std.posix.openat(
             std.posix.AT.FDCWD,
             tmp_name,
@@ -3760,7 +3797,13 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
         try t.expectEqualStrings(v2, g_app.bytes);
         try t.expectEqual(@as(usize, 200), g_app.line_count);
         try t.expectEqual(@as(f32, 40.0), g_app.scroll_y);
-        // Vanished file: the last good document stays, no crash.
+        // Rapid save-pair repeat: same content, one walk — the debounce
+        // swallows it, so bytes stay converged without a second swap.
+        onFileChanged();
+        try t.expectEqualStrings(v2, g_app.bytes);
+        // Vanished file: the last good document stays, no crash. Reset
+        // the latch so the age check cannot swallow this distinct event.
+        g_last_reload_ms = null;
         _ = std.c.unlink(tmp_name);
         onFileChanged();
         try t.expectEqualStrings(v2, g_app.bytes);
@@ -3773,8 +3816,9 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
 
 test "find: query, cycle, close state machine (#42)" {
     // Drives the real callbacks against a static doc (save/restore keeps
-    // other tests hermetic). Scroll assertions stay coarse: exact landing
-    // is pinned headless by the --find probes and by findOffsetY below.
+    // other tests hermetic). Exact landing is pinned by findRowOffsetY and
+    // the row tests in viewport.zig; settle behavior (#386: one snap, no
+    // chase redraws) is pinned here.
     if (build_options.test_hooks) {
         const t = std.testing;
         const doc = "foo bar foo\nbaz foo\n";
@@ -3802,16 +3846,28 @@ test "find: query, cycle, close state machine (#42)" {
         try t.expectEqual(@as(usize, 3), g_find_count);
         try t.expectEqual(@as(usize, 0), g_find_current);
         try t.expectEqualStrings("foo", g_find_query[0..g_find_query_len]);
+        // #386: a cycle lands in one snap — no chase armed, no follow-up
+        // steps queued — and wrap-around returns to the first offset.
+        // ("foo bar foo\nbaz foo\n": matches 0/1 share line 0's block, so
+        // all three land on the same block top; the wrap assertion below
+        // checks the return, not distinct rows — row-exactness for
+        // wrapped rows is pinned by the viewport row tests.)
+        const y0 = g_app.scroll_y;
+        try t.expect(!g_find_chase_armed);
         onFindNext(0);
         try t.expectEqual(@as(usize, 1), g_find_current);
+        try t.expect(!g_find_chase_armed);
         onFindNext(0);
         try t.expectEqual(@as(usize, 2), g_find_current);
+        try t.expect(!g_find_chase_armed);
         onFindNext(0); // wraps to first
         try t.expectEqual(@as(usize, 0), g_find_current);
+        try t.expectEqual(y0, g_app.scroll_y);
         onFindNext(1); // previous wraps to last
         try t.expectEqual(@as(usize, 2), g_find_current);
         onFindNext(0);
         try t.expectEqual(@as(usize, 0), g_find_current);
+        try t.expectEqual(y0, g_app.scroll_y);
         // Empty query and misses clear the match list, never crash.
         onFindQuery("", 0);
         try t.expectEqual(@as(usize, 0), g_find_count);
