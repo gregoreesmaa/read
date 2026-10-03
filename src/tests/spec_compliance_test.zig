@@ -18,7 +18,7 @@ fn renderFull(doc: []const u8, lines: []simd.Line, n: usize, cmds: []layout.Draw
     std.debug.assert(cmds.len > 32);
     st.def_count = simd.scanRefDefs(doc, lines[0..n], &st.defs);
     st.entities.reset();
-    const config = layout.ViewportConfig{
+    var config = layout.ViewportConfig{
         .window_width = 1200.0,
         .window_height = 900.0,
         .scroll_y = 0.0,
@@ -26,7 +26,7 @@ fn renderFull(doc: []const u8, lines: []simd.Line, n: usize, cmds: []layout.Draw
         .entities = &st.entities,
         .join_buf = &st.join,
     };
-    return layout.layoutViewport(doc, lines[0..n], config, cmds);
+    return layout.layoutViewport(doc, lines[0..n], &config, cmds);
 }
 
 fn hasRun(cmds: []layout.DrawCommand, text: []const u8) bool {
@@ -82,12 +82,12 @@ test "spec compliance: Setext headings h1 (===) and h2 (---)" {
     try std.testing.expectEqual(@as(usize, 5), n);
 
     var cmds: [64]layout.DrawCommand = undefined;
-    const config = layout.ViewportConfig{
+    var config = layout.ViewportConfig{
         .window_width = 800.0,
         .window_height = 800.0,
         .scroll_y = 0.0,
     };
-    const cmd_count = layout.layoutViewport(doc, lines[0..n], config, &cmds);
+    const cmd_count = layout.layoutViewport(doc, lines[0..n], &config, &cmds);
 
     var found_h1 = false;
     var found_h2 = false;
@@ -164,13 +164,13 @@ test "spec compliance: blockquotes and nested quotes" {
     try std.testing.expectEqual(simd.BlockType.quote, lines[2].block_type);
 
     var cmds: [64]layout.DrawCommand = undefined;
-    const vp_cfg = layout.ViewportConfig{
+    var vp_cfg = layout.ViewportConfig{
         .window_width = 800,
         .window_height = 600,
         .scroll_y = 0,
         .content_max_width = 600,
     };
-    const cmd_count = layout.layoutViewport(doc, lines[0..n], vp_cfg, &cmds);
+    const cmd_count = layout.layoutViewport(doc, lines[0..n], &vp_cfg, &cmds);
     try std.testing.expect(cmd_count > 0);
 
     // Count fill_rect commands (the quote bars)
@@ -199,13 +199,13 @@ test "design #24: blank-separated quote bars connect with no seam" {
     try std.testing.expectEqual(@as(usize, 3), n);
 
     var cmds: [64]layout.DrawCommand = undefined;
-    const vp_cfg = layout.ViewportConfig{
+    var vp_cfg2 = layout.ViewportConfig{
         .window_width = 800,
         .window_height = 600,
         .scroll_y = 0,
         .content_max_width = 600,
     };
-    const cmd_count = layout.layoutViewport(doc, lines[0..n], vp_cfg, &cmds);
+    const cmd_count = layout.layoutViewport(doc, lines[0..n], &vp_cfg2, &cmds);
 
     // content_x = (800 - 600) / 2 = 100; depth-1 bar at 100 + 16 - 12 - 3.
     var bars: [4]layout.Rect = undefined;
@@ -422,14 +422,14 @@ test "spec compliance: standalone image block parsing and viewport command gener
     try std.testing.expectEqual(simd.BlockType.image, lines[8].block_type);
     try std.testing.expectEqual(simd.BlockType.image, lines[9].block_type);
 
-    const vp_config = layout.ViewportConfig{
+    var vp_config = layout.ViewportConfig{
         .window_width = 1000.0,
         .window_height = 800.0,
         .scroll_y = 0.0,
     };
 
     var commands: [64]layout.DrawCommand = undefined;
-    const cmd_count = layout.layoutViewport(md, lines[0..line_count], vp_config, &commands);
+    const cmd_count = layout.layoutViewport(md, lines[0..line_count], &vp_config, &commands);
     try std.testing.expect(cmd_count > 0);
 
     var img_cmd_count: usize = 0;
@@ -482,12 +482,12 @@ test "situation: extreme and pathological line lengths" {
     try std.testing.expectEqual(@as(u20, @intCast(long_line.items.len - 1)), lines[0].len);
 
     var cmds: [256]layout.DrawCommand = undefined;
-    const cfg = layout.ViewportConfig{
+    var cfg = layout.ViewportConfig{
         .window_width = 600.0,
         .window_height = 800.0,
         .scroll_y = 0.0,
     };
-    const cmd_count = layout.layoutViewport(long_line.items, lines[0..n], cfg, &cmds);
+    const cmd_count = layout.layoutViewport(long_line.items, lines[0..n], &cfg, &cmds);
     try std.testing.expect(cmd_count > 0);
 }
 
@@ -513,12 +513,12 @@ test "situation: deeply nested blockquotes (up to 8 levels)" {
     }
 
     var cmds: [128]layout.DrawCommand = undefined;
-    const cfg = layout.ViewportConfig{
+    var cfg = layout.ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    const count = layout.layoutViewport(doc, lines[0..n], &cfg, &cmds);
     try std.testing.expect(count > 0);
 
     // Verify quote bars: 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 = 36 bars total
@@ -550,12 +550,12 @@ test "situation: unclosed code fence and malformed block elements" {
     try std.testing.expect(in_fence.open);
 
     var cmds: [64]layout.DrawCommand = undefined;
-    const cfg = layout.ViewportConfig{
+    var cfg2 = layout.ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = 0.0,
     };
-    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    const count = layout.layoutViewport(doc, lines[0..n], &cfg2, &cmds);
     try std.testing.expect(count > 0);
 }
 
@@ -582,12 +582,12 @@ test "situation: Unicode UTF-8 multi-byte robustness across headings and inlines
     try std.testing.expectEqual(simd.BlockType.bullet_list, lines[5].block_type);
 
     var cmds: [128]layout.DrawCommand = undefined;
-    const cfg = layout.ViewportConfig{
+    var cfg3 = layout.ViewportConfig{
         .window_width = 800.0,
         .window_height = 800.0,
         .scroll_y = 0.0,
     };
-    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    const count = layout.layoutViewport(doc, lines[0..n], &cfg3, &cmds);
     try std.testing.expect(count > 0);
 }
 
@@ -606,39 +606,39 @@ test "situation: extreme viewport dimensions and overscroll boundaries" {
     var cmds: [64]layout.DrawCommand = undefined;
 
     // 1. Tiny viewport (50x50)
-    const cfg_tiny = layout.ViewportConfig{
+    var cfg_tiny = layout.ViewportConfig{
         .window_width = 50.0,
         .window_height = 50.0,
         .scroll_y = 0.0,
     };
-    const count_tiny = layout.layoutViewport(doc, lines[0..n], cfg_tiny, &cmds);
+    const count_tiny = layout.layoutViewport(doc, lines[0..n], &cfg_tiny, &cmds);
     try std.testing.expect(count_tiny > 0);
 
     // 2. 4K Ultra-wide viewport (3840x2160)
-    const cfg_4k = layout.ViewportConfig{
+    var cfg_4k = layout.ViewportConfig{
         .window_width = 3840.0,
         .window_height = 2160.0,
         .scroll_y = 0.0,
     };
-    const count_4k = layout.layoutViewport(doc, lines[0..n], cfg_4k, &cmds);
+    const count_4k = layout.layoutViewport(doc, lines[0..n], &cfg_4k, &cmds);
     try std.testing.expect(count_4k > 0);
 
     // 3. Negative scroll (overscroll bounce)
-    const cfg_neg = layout.ViewportConfig{
+    var cfg_neg = layout.ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = -300.0,
     };
-    const count_neg = layout.layoutViewport(doc, lines[0..n], cfg_neg, &cmds);
+    const count_neg = layout.layoutViewport(doc, lines[0..n], &cfg_neg, &cmds);
     try std.testing.expect(count_neg > 0);
 
     // 4. Past EOF scroll
-    const cfg_eof = layout.ViewportConfig{
+    var cfg_eof = layout.ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = 100_000.0,
     };
-    const count_eof = layout.layoutViewport(doc, lines[0..n], cfg_eof, &cmds);
+    const count_eof = layout.layoutViewport(doc, lines[0..n], &cfg_eof, &cmds);
     // Background fill command only
     try std.testing.expectEqual(@as(usize, 1), count_eof);
 }
@@ -677,7 +677,7 @@ test "situation: arbitrary scroll position checkpoint invariance across rich doc
     var checkpoints: [128]layout.Checkpoint = undefined;
     var cp_count: usize = 0;
 
-    const base_cfg = layout.ViewportConfig{
+    var base_cfg = layout.ViewportConfig{
         .window_width = 900.0,
         .window_height = 700.0,
         .scroll_y = 0.0,
@@ -686,7 +686,7 @@ test "situation: arbitrary scroll position checkpoint invariance across rich doc
     const doc_h = layout.computeDocumentHeightEx(
         mem,
         lines[0..line_count],
-        base_cfg,
+        &base_cfg,
         &checkpoints,
         &cp_count,
     );
@@ -697,12 +697,12 @@ test "situation: arbitrary scroll position checkpoint invariance across rich doc
     const scroll_positions = [_]f32{ 0.0, 500.0, 1500.0, 3200.0, 6400.0, doc_h * 0.5, doc_h * 0.85 };
 
     for (scroll_positions) |s_y| {
-        const cfg_no_cp = layout.ViewportConfig{
+        var cfg_no_cp = layout.ViewportConfig{
             .window_width = 900.0,
             .window_height = 700.0,
             .scroll_y = s_y,
         };
-        const cfg_cp = layout.ViewportConfig{
+        var cfg_cp = layout.ViewportConfig{
             .window_width = 900.0,
             .window_height = 700.0,
             .scroll_y = s_y,
@@ -712,8 +712,8 @@ test "situation: arbitrary scroll position checkpoint invariance across rich doc
         var cmds_a: [512]layout.DrawCommand = undefined;
         var cmds_b: [512]layout.DrawCommand = undefined;
 
-        const count_a = layout.layoutViewport(mem, lines[0..line_count], cfg_no_cp, &cmds_a);
-        const count_b = layout.layoutViewport(mem, lines[0..line_count], cfg_cp, &cmds_b);
+        const count_a = layout.layoutViewport(mem, lines[0..line_count], &cfg_no_cp, &cmds_a);
+        const count_b = layout.layoutViewport(mem, lines[0..line_count], &cfg_cp, &cmds_b);
 
         try std.testing.expectEqual(count_a, count_b);
         for (cmds_a[0..count_a], 0..) |ca, idx| {
@@ -727,13 +727,16 @@ test "situation: arbitrary scroll position checkpoint invariance across rich doc
     }
 }
 
-fn testCfg() layout.ViewportConfig {
-    return layout.ViewportConfig{
-        .window_width = 800,
-        .window_height = 600,
-        .scroll_y = 0,
-        .content_max_width = 600,
+fn testCfg() *const layout.ViewportConfig {
+    const S = struct {
+        var cfg = layout.ViewportConfig{
+            .window_width = 800,
+            .window_height = 600,
+            .scroll_y = 0,
+            .content_max_width = 600,
+        };
     };
+    return &S.cfg;
 }
 
 fn scanDoc(doc: []const u8, lines: []simd.Line) usize {
@@ -1098,10 +1101,10 @@ test "regression: headers, lists, tasks, and code render inside blockquotes" {
     const n = scanDoc(doc, &lines);
 
     var store = layout.OrderedMarkerStore{};
-    var cfg = testCfg();
+    var cfg = testCfg().*;
     cfg.ordered_markers = &store;
     var cmds: [256]layout.DrawCommand = undefined;
-    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    const count = layout.layoutViewport(doc, lines[0..n], &cfg, &cmds);
 
     var saw_heading = false;
     var saw_bullet = false;
@@ -1156,10 +1159,10 @@ test "regression: ordered list markers renumber per CommonMark" {
     const n2 = scanDoc(doc2, &l2);
 
     var store = layout.OrderedMarkerStore{};
-    var cfg = testCfg();
+    var cfg = testCfg().*;
     cfg.ordered_markers = &store;
     var cmds: [64]layout.DrawCommand = undefined;
-    const c1 = layout.layoutViewport(doc, l1[0..n1], cfg, &cmds);
+    const c1 = layout.layoutViewport(doc, l1[0..n1], &cfg, &cmds);
     var got1: [3][]const u8 = undefined;
     var k: usize = 0;
     for (cmds[0..c1]) |c| {
@@ -1176,7 +1179,7 @@ test "regression: ordered list markers renumber per CommonMark" {
     var store2 = layout.OrderedMarkerStore{};
     cfg.ordered_markers = &store2;
     var cmds2: [64]layout.DrawCommand = undefined;
-    const c2 = layout.layoutViewport(doc2, l2[0..n2], cfg, &cmds2);
+    const c2 = layout.layoutViewport(doc2, l2[0..n2], &cfg, &cmds2);
     var got2: [3][]const u8 = undefined;
     k = 0;
     for (cmds2[0..c2]) |c| {
@@ -1249,9 +1252,9 @@ test "regression: list multi-paragraph items keep indent; bare lines end them" {
     const n = scanDoc(doc, &lines);
     var cmds: [128]layout.DrawCommand = undefined;
     var store = layout.OrderedMarkerStore{};
-    var cfg = testCfg();
+    var cfg = testCfg().*;
     cfg.ordered_markers = &store;
-    const count = layout.layoutViewport(doc, lines[0..n], cfg, &cmds);
+    const count = layout.layoutViewport(doc, lines[0..n], &cfg, &cmds);
     var second_x: f32 = -1;
     var saw_2 = false;
     for (cmds[0..count]) |c| {
@@ -1315,6 +1318,10 @@ test "regression: quotes and code indent inside list items" {
     }
     try std.testing.expectApproxEqAbs(@as(f32, 100.0 + 30.0), bg_x, 0.5);
     try std.testing.expect(code_mono);
+}
+
+fn testCfgPtr() *const layout.ViewportConfig {
+    return testCfg();
 }
 
 test "regression: indented code blocks render as code cards" {
@@ -1603,18 +1610,18 @@ test "regression: checkpoints agree on continuation-heavy documents" {
 
     var checkpoints: [64]layout.Checkpoint = undefined;
     var cp_count: usize = 0;
-    const cfg = layout.ViewportConfig{ .window_width = 900.0, .window_height = 700.0, .scroll_y = 0.0 };
-    _ = layout.computeDocumentHeightEx(mem, lines[0..line_count], cfg, &checkpoints, &cp_count);
+    var cfg = layout.ViewportConfig{ .window_width = 900.0, .window_height = 700.0, .scroll_y = 0.0 };
+    _ = layout.computeDocumentHeightEx(mem, lines[0..line_count], &cfg, &checkpoints, &cp_count);
     try std.testing.expect(cp_count > 0);
 
     const scrolls = [_]f32{ 0.0, 900.0, 2500.0, 9000.0 };
     for (scrolls) |s_y| {
-        const cfg_plain = layout.ViewportConfig{ .window_width = 900.0, .window_height = 700.0, .scroll_y = s_y };
-        const cfg_cp = layout.ViewportConfig{ .window_width = 900.0, .window_height = 700.0, .scroll_y = s_y, .checkpoints = checkpoints[0..cp_count] };
+        var cfg_plain = layout.ViewportConfig{ .window_width = 900.0, .window_height = 700.0, .scroll_y = s_y };
+        var cfg_cp = layout.ViewportConfig{ .window_width = 900.0, .window_height = 700.0, .scroll_y = s_y, .checkpoints = checkpoints[0..cp_count] };
         var ca: [512]layout.DrawCommand = undefined;
         var cb: [512]layout.DrawCommand = undefined;
-        const na = layout.layoutViewport(mem, lines[0..line_count], cfg_plain, &ca);
-        const nb = layout.layoutViewport(mem, lines[0..line_count], cfg_cp, &cb);
+        const na = layout.layoutViewport(mem, lines[0..line_count], &cfg_plain, &ca);
+        const nb = layout.layoutViewport(mem, lines[0..line_count], &cfg_cp, &cb);
         try std.testing.expectEqual(na, nb);
         for (ca[0..na], 0..) |c, k| {
             try std.testing.expectEqual(c.kind, cb[k].kind);

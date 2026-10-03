@@ -96,7 +96,10 @@ pub const MappedFile = struct {
                 null,
                 size,
                 .{ .READ = true },
-                .{ .TYPE = .SHARED },
+                // PRIVATE: a read-only view never writes back, and private
+                // pages the scan faults are reclaimable without swap pressure.
+                // Correctness is unchanged: the mapping is never written.
+                .{ .TYPE = .PRIVATE },
                 fd,
                 0,
             );
@@ -200,6 +203,9 @@ pub fn adviseSequentialRange(bytes: []const u8) void {
     }
 }
 
+/// Keep window shared by both Goldilocks helpers: byte range kept resident.
+pub const GoldilocksWindow = struct { start: usize, end: usize };
+
 /// Pure arithmetic: expand a visible byte range by one screen of bytes in
 /// each direction, clamped to [0, total_len). No syscalls, no allocations.
 pub fn goldilocksWindow(
@@ -207,7 +213,7 @@ pub fn goldilocksWindow(
     visible_end: usize,
     total_len: usize,
     window_hint_bytes: usize,
-) struct { start: usize, end: usize } {
+) GoldilocksWindow {
     const above = window_hint_bytes * goldilocks_screens_above;
     const below = window_hint_bytes * goldilocks_screens_below;
     return .{
@@ -235,6 +241,60 @@ fn dontNeedRange(addr: usize, len: usize) void {
     );
 }
 
+/// Pure arithmetic: map a scroll offset to the Goldilocks keep window.
+/// Viewport +/-1 screen of bytes, conservation-padded at the file edges:
+/// when the above/below margin is clipped by a file edge, the cut pages
+/// are donated to the opposite side so the kept window stays a full
+/// visible + 2 screens whenever the file is big enough (the top-of-doc
+/// case keeps [0, vis+2scr) instead of shrinking to [0, vis+1scr)).
+/// Zero for empty mappings or a zero hint. Pure (no syscalls): onTick
+/// calls it, then the single releaseOutsideWindow below drops pages
+/// outside the window. Zero allocations.
+pub fn goldilocksScrollWindow(
+    scroll_y: f32,
+    window_height: f32,
+    total_len: usize,
+    window_hint_bytes: usize,
+) GoldilocksWindow {
+    if (total_len == 0 or window_hint_bytes == 0) return .{ .start = 0, .end = 0 };
+    // Same byte-density model as the viewport estimator: one screen of
+    // pixels shows roughly `window_hint_bytes` of source (the open-path
+    // caller passes bytes-per-screen measured from the real scan, so the
+    // window tracks the actual document, not a guess).
+    const px_per_byte: f32 = @as(f32, @floatFromInt(window_hint_bytes)) / @max(window_height, 1.0);
+    const vis_start: usize = @min(total_len, @as(usize, @intFromFloat(@max(scroll_y, 0.0) * px_per_byte)));
+    const vis_end: usize = @min(total_len, @as(usize, @intFromFloat(@max(scroll_y + window_height, 0.0) * px_per_byte)));
+    const w = goldilocksWindow(vis_start, vis_end, total_len, window_hint_bytes);
+    // Edge conservation: clipped pages move to the free side (|-| keeps
+    // this branchless; the @min on end re-clamps the donated tail).
+    const cut_above = (window_hint_bytes * goldilocks_screens_above) -| (vis_start - w.start);
+    const cut_below = (window_hint_bytes * goldilocks_screens_below) -| (w.end - vis_end);
+    return .{
+        .start = w.start -| cut_below,
+        .end = @min(total_len, w.end +| cut_above),
+    };
+}
+
+test "mmap: scroll window keeps viewport +/-1 screen of bytes" {
+    // Empty/zero-hint: no window, no syscall noise.
+    try std.testing.expectEqual(@as(usize, 0), goldilocksScrollWindow(0.0, 900.0, 0, 65536).start);
+    try std.testing.expectEqual(@as(usize, 0), goldilocksScrollWindow(0.0, 900.0, 0, 65536).end);
+    try std.testing.expectEqual(@as(usize, 0), goldilocksScrollWindow(0.0, 900.0, 1 << 20, 0).start);
+    try std.testing.expectEqual(@as(usize, 0), goldilocksScrollWindow(0.0, 900.0, 1 << 20, 0).end);
+    // Top of a 1 MiB doc, 64 KiB/screen: visible [0,64K), keep +/-1 screen.
+    const top = goldilocksScrollWindow(0.0, 900.0, 1 << 20, 65536);
+    try std.testing.expectEqual(@as(usize, 0), top.start);
+    try std.testing.expectEqual(@as(usize, 3 * 65536), top.end);
+    // Mid-doc: one screen each way around the visible range.
+    const mid = goldilocksScrollWindow(900.0, 900.0, 1 << 20, 65536);
+    try std.testing.expectEqual(@as(usize, 0), mid.start);
+    try std.testing.expectEqual(@as(usize, 3 * 65536), mid.end);
+    // End clamps: never past total_len.
+    const end = goldilocksScrollWindow(1e9, 900.0, 1 << 20, 65536);
+    try std.testing.expectEqual(@as(usize, 1 << 20), end.end);
+    try std.testing.expect(end.start < end.end);
+}
+
 test "mmap: willneed window is capped, zero for empty" {
     try std.testing.expectEqual(@as(usize, 0), willneedLen(0));
     try std.testing.expectEqual(@as(usize, 1), willneedLen(1));
@@ -242,6 +302,16 @@ test "mmap: willneed window is capped, zero for empty" {
     try std.testing.expectEqual(willneed_window_bytes, willneedLen(willneed_window_bytes));
     try std.testing.expectEqual(willneed_window_bytes, willneedLen(willneed_window_bytes + 1));
     try std.testing.expectEqual(willneed_window_bytes, willneedLen(1 << 40));
+}
+
+test "mmap: scroll window never exceeds total, mid-doc math" {
+    // Mid-doc on a big file: exactly [vis-1scr, vis+2scr).
+    const w = goldilocksScrollWindow(10.0 * 900.0, 900.0, 50 << 20, 65536);
+    try std.testing.expectEqual(@as(usize, 9 * 65536), w.start);
+    try std.testing.expectEqual(@as(usize, 12 * 65536), w.end);
+    // Window always stays inside the mapping.
+    try std.testing.expect(w.start <= w.end);
+    try std.testing.expect(w.end <= 50 << 20);
 }
 
 test "mmap: cold-start advise leaves bytes intact, safe on empty" {
@@ -303,6 +373,16 @@ test "mmap: startup path advises sequential (issue #11 wiring audit)" {
     var main_src = try MappedFile.open("src/main.zig");
     defer main_src.close();
     try std.testing.expect(std.mem.indexOf(u8, main_src.bytes, "adviseSequential") != null);
+}
+
+test "mmap: release wiring keeps viewport resident (issue #388 audit)" {
+    // The Goldilocks gate depends on main.zig releasing pages outside the
+    // keep window after scan/metrics (cold open) and on scroll settle
+    // (steady state) — pin the wiring, not just the helpers.
+    var main_src = try MappedFile.open("src/main.zig");
+    defer main_src.close();
+    try std.testing.expect(std.mem.indexOf(u8, main_src.bytes, "releaseOutsideWindow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_src.bytes, "goldilocksScrollWindow") != null);
 }
 
 /// Release pages of `bytes` outside [keep_start, keep_end).

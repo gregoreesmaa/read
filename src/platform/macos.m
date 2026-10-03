@@ -35,6 +35,9 @@ static float scrollbar_thumb_y(void);
 static BOOL scrollbar_hit(NSPoint view_pt, float view_w);
 static void scrollbar_drag_to(float y);
 static void mark_link_visited(const char* url);
+// Uncached font resolver (issue #388): defined below get_font_for_style;
+// declared here so the font cache's miss path sees a static prototype.
+static NSFont* font_resolve_uncached(float font_size, int is_bold, int is_italic, int is_mono, int is_heading);
 
 // Idle policy (mirrors src/platform/idle.zig): mouse motion alone never
 // redraws. Only a hover-state transition re-arms a draw. The last hover
@@ -117,7 +120,11 @@ static int g_text_record_count = 0;
 #define MAX_CODE_BLOCKS 64
 typedef struct {
     float x, y, w, h;
-    char text[8192];
+    // Borrowed source slice (issue #388): the mmap/doc bytes are stable for
+    // the document's lifetime, so the Copy button reads ptr[0..len] with no
+    // 8 KiB copy per block per frame. Cleared with the per-frame record
+    // reset; readers must use it within the frame (same rule as QuadText).
+    const char* text;
     int len;
 } CodeBlockRecord;
 
@@ -361,8 +368,35 @@ static void register_app_fonts(void) {
 }
 
 static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
+    // Resolved-font cache (issue #388): NSFont lookups allocate + hit the
+    // font registry per shape miss; ~8 live (family x size) entries cover
+    // the steady state, keyed by style bits + quantized size. Direct-mapped
+    // (collision = evict); ARC retains the NSFont* on insert, releases the
+    // evicted entry. Zero per-hit allocation.
     register_app_fonts();
+    #define FONT_CACHE_CAP 8
+    typedef struct { uint32_t key; float size; NSFont* font; uint8_t occupied; } FontEntry;
+    static FontEntry s_font_cache[FONT_CACHE_CAP]; // BSS: no binary cost
+    uint32_t fstyle = ((uint32_t)(is_bold ? 1 : 0)) | ((uint32_t)(is_italic ? 2 : 0)) |
+                      ((uint32_t)(is_mono ? 4 : 0)) | ((uint32_t)(is_heading ? 8 : 0));
+    // Quantize to 0.25pt: body/heading/code sizes are exact multiples, and
+    // sub-quarter sizes never occur (effectiveBase steps are integral).
+    uint32_t qsize = (uint32_t)(font_size * 4.0f + 0.5f);
+    uint32_t fkey = (fstyle << 20) ^ (qsize & 0xFFFFF);
+    FontEntry* fe = &s_font_cache[fkey % FONT_CACHE_CAP];
+    if (fe->occupied && fe->key == fkey && fe->size == font_size && fe->font) return fe->font;
+    NSFont* resolved = font_resolve_uncached(font_size, is_bold, is_italic, is_mono, is_heading);
+    if (resolved) {
+        if (fe->occupied && fe->font) CFRelease((__bridge CFTypeRef)fe->font);
+        fe->key = fkey;
+        fe->size = font_size;
+        fe->font = resolved;
+    }
+    return resolved;
+}
 
+// Uncached resolver: the registry walk above, one call per font-cache miss.
+static NSFont* font_resolve_uncached(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
     if (is_mono) {
         NSFont* f = [NSFont fontWithName:@"JetBrainsMono-Regular" size:font_size];
         if (!f) f = [NSFont fontWithName:@"JetBrains Mono" size:font_size];
@@ -584,14 +618,62 @@ static inline float heading_kern_pts(float font_size, int is_heading) {
     return is_heading ? -0.015f * font_size : 0.0f;
 }
 
-// Shape (or hit) a run. On hit returns the entry with zero shaping work.
-// On miss shapes exactly once, retains the CTLine, and rasterizes into the
-// atlas when `rasterize` is set (measure-only callers pass 0 and the rect
-// is produced lazily on first draw). NULL only when text is not cacheable.
-static ShapedEntry* shape_run(const char* text, int len, float font_size,
+// Chunked entry for long runs (issue #388): shapes the head piece (which
+// carries the cached CTLine + metrics) then a chain of cached 448 B tail
+// pieces linked through slice/aw (repurposed: slice==NULL + aw>0 marks a
+// chunk link, never rasterized). Sizing sums advances; drawing walks the
+// chain. Bounded: 8 links cover ~4 KiB; longer runs take the legacy path.
+#define SHAPE_CHUNK_LEN 448
+#define SHAPE_CHUNK_LINKS 8
+typedef struct ShapeChunk { ShapedEntry* pieces[SHAPE_CHUNK_LINKS + 1]; int n; } ShapeChunk;
+
+// Forward: the single-piece shaper below.
+static ShapedEntry* shape_run_piece(const char* text, int len, float font_size,
+                              int is_bold, int is_italic, int is_mono, int is_heading,
+                              int rasterize);
+
+// Chunk a long run into cacheable pieces; fills c, returns head or NULL.
+// Every piece shapes through the normal cache (hits stay hits), so a long
+// line costs one NSString per NEW piece and zero per frame thereafter.
+static ShapedEntry* shape_run_chunked(const char* text, int len, float font_size,
                               int is_bold, int is_italic, int is_mono, int is_heading,
                               int rasterize) {
-    if (!text || len <= 0 || len >= 511) return NULL;
+    static ShapeChunk s_chunk; // main thread only, like all shaping state
+    ShapedEntry* head = shape_run_piece(text, SHAPE_CHUNK_LEN, font_size,
+                                        is_bold, is_italic, is_mono, is_heading, rasterize);
+    if (!head || !head->line) return NULL;
+    s_chunk.pieces[0] = head;
+    s_chunk.n = 1;
+    int off = SHAPE_CHUNK_LEN;
+    while (off < len && s_chunk.n <= SHAPE_CHUNK_LINKS) {
+        int take = len - off > SHAPE_CHUNK_LEN ? SHAPE_CHUNK_LEN : len - off;
+        ShapedEntry* p = shape_run_piece(text + off, take, font_size,
+                                         is_bold, is_italic, is_mono, is_heading, rasterize);
+        if (!p || !p->line) return NULL;
+        s_chunk.pieces[s_chunk.n++] = p;
+        off += take;
+    }
+    if (off < len) return NULL; // past the link budget: caller goes legacy
+    // Sum advances into the head (draw walks s_chunk, sizing reads head).
+    float w = 0, h = 0, asc = 0, desc = 0;
+    for (int k = 0; k < s_chunk.n; k++) {
+        w += s_chunk.pieces[k]->w;
+        if (s_chunk.pieces[k]->h > h) h = s_chunk.pieces[k]->h;
+        if (s_chunk.pieces[k]->ascent > asc) asc = s_chunk.pieces[k]->ascent;
+        if (s_chunk.pieces[k]->descent > desc) desc = s_chunk.pieces[k]->descent;
+    }
+    head->w = w;
+    head->h = h;
+    head->ascent = asc;
+    head->descent = desc;
+    return head;
+}
+
+// Shape (or hit) one cacheable piece. Single-piece body shared by short
+// runs (direct) and long runs (via the chunker above, one call per piece).
+static ShapedEntry* shape_run_piece(const char* text, int len, float font_size,
+                              int is_bold, int is_italic, int is_mono, int is_heading,
+                              int rasterize) {
     uint64_t key = shape_key(text, len, font_size, is_bold, is_italic, is_mono, is_heading);
     ShapedEntry* e = &g_shape_cache[key % SHAPE_CACHE_CAP];
     if (e->occupied && e->key == key && e->len == len &&
@@ -637,6 +719,18 @@ static ShapedEntry* shape_run(const char* text, int len, float font_size,
 
     if (rasterize) shape_rasterize_entry(e, nsFont, str, heading_kern_pts(font_size, is_heading));
     return e;
+}
+
+// Shape (or hit) a run. Short runs shape one piece directly; long runs
+// (>= 511 B) fan out through the chunker above so every byte stays cached
+// instead of re-shaping every frame. NULL only for empty input or an
+// over-budget long run (caller draws those via the legacy path).
+static ShapedEntry* shape_run(const char* text, int len, float font_size,
+                              int is_bold, int is_italic, int is_mono, int is_heading,
+                              int rasterize) {
+    if (!text || len <= 0) return NULL;
+    if (len >= 511) return shape_run_chunked(text, len, font_size, is_bold, is_italic, is_mono, is_heading, rasterize);
+    return shape_run_piece(text, len, font_size, is_bold, is_italic, is_mono, is_heading, rasterize);
 }
 
 // Rasterize an already-shaped entry into the atlas (idempotent).
@@ -2378,8 +2472,8 @@ void platform_set_test_hover(float x, float y) {
 void platform_test_button_damage(float bx, float by, float bw, float bh,
                                  float* ox, float* oy, float* ow, float* oh) {
     CodeBlockRecord tmp;
-    memset(&tmp, 0, sizeof(tmp));
     tmp.x = bx; tmp.y = by; tmp.w = bw; tmp.h = bh;
+    tmp.text = ""; tmp.len = 0;
     NSRect d = copy_button_damage_rect(&tmp);
     if (ox) *ox = d.origin.x;
     if (oy) *oy = d.origin.y;
@@ -2495,15 +2589,10 @@ void platform_register_code_block(float x, float y, float w, float h, const char
     b->y = y;
     b->w = w;
     b->h = h;
-    int copy_len = (code_text && code_len > 0) ? (code_len < 8191 ? code_len : 8191) : 0;
-    if (copy_len > 0) {
-        memcpy(b->text, code_text, copy_len);
-        b->text[copy_len] = '\0';
-        b->len = copy_len;
-    } else {
-        b->text[0] = '\0';
-        b->len = 0;
-    }
+    // Borrow, never copy (issue #388): caller bytes (DrawCommand.text over
+    // the mmap/doc) outlive the frame's records, which reset every draw.
+    b->text = (code_text && code_len > 0) ? code_text : "";
+    b->len = (code_text && code_len > 0) ? code_len : 0;
 }
 
 void platform_register_scrollable_block(int block_id, float x, float y, float w, float h, float max_scroll_x, float scroll_x) {
