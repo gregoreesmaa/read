@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supported Markdown — Read docs</title>
+<meta name="description" content="Every Markdown construct Read renders.">
+<style>
+:root { color-scheme: dark light; --bg: #121212; --fg: #E0E0E0; --muted: #9a9a9a; --card: #1b1b1b; --accent: #7cc4ff; }
+@media (prefers-color-scheme: light) { :root { --bg: #FAFAFA; --fg: #1E2022; --muted: #666; --card: #fff; --accent: #0b5fff; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.75 Georgia, "IBM Plex Serif", serif; }
+.wrap { max-width: 680px; margin: 0 auto; padding: 48px 24px 96px; }
+h1, h2 { font-family: "Space Grotesk", system-ui, sans-serif; }
+a { color: var(--accent); }
+nav { font-family: system-ui, sans-serif; font-size: 15px; margin-bottom: 32px; }
+ul { padding-left: 22px; }
+code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .88em; background: var(--card); padding: 1px 6px; border-radius: 5px; }
+.ex { background: var(--card); border-radius: 10px; padding: 14px 18px; margin: 16px 0; font-size: 15px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav><a href="index.html">&larr; Read docs</a> · <a href="examples.html">Live examples</a></nav>
+<h1>Supported Markdown</h1>
+<p>Strictly CommonMark plus GFM tables and task lists. Full HTML rendering is intentionally unsupported — only a blessed inline subset (<code>br</code>, <code>kbd</code>, <code>sub</code>, <code>sup</code>, <code>mark</code>, <code>del</code>) renders; everything else stays visible as muted mono.</p>
+<h2>Blocks</h2>
+<ul>
+<li>ATX headings <code>#</code>–<code>######</code> (optional closing <code>#</code>), Setext <code>===</code> / <code>---</code></li>
+<li>Fenced code (<code>```</code>, <code>~~~</code>) + indented code, with syntax highlighting</li>
+<li>Blockquotes incl. nested <code>&gt;&gt;</code>; GitHub alerts (<code>&gt; [!NOTE]</code>) tint the bar</li>
+<li>Unordered (<code>*</code> <code>-</code> <code>+</code>), ordered (<code>1.</code> <code>1)</code>), task (<code>- [ ]</code>) lists</li>
+<li>GFM tables with alignment and dividers</li>
+<li>Diagrams: mermaid, d2, Graphviz, PlantUML (cached render, code fallback)</li>
+<li>Math via ZaTeX: <code>```math</code> fences, whole-line <code>$$…$$</code>, inline <code>$…$</code></li>
+<li>YAML frontmatter renders nothing</li>
+</ul>
+<h2>Inlines</h2>
+<ul>
+<li><code>**bold**</code>, <code>*italic*</code>, <code>***both***</code>, <code>~~strike~~</code>, <code>`code`</code></li>
+<li>Links <code>[text](url)</code>, autolinks, bare <code>https://</code> URLs, images</li>
+<li>Backslash escapes (<code>\*</code>, <code>\_</code>, …)</li>
+</ul>
+<div class="ex"><strong>Try it:</strong> open <code>showcase.md</code> in Read — every construct above renders on one page. Math setup: <a href="engine.html">engine guide</a>.</div>
+</div>
+</body>
+</html>

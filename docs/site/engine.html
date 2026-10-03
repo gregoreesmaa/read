@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Math engine setup — Read docs</title>
+<meta name="description" content="Setting up the ZaTeX math engine for Read.">
+<style>
+:root { color-scheme: dark light; --bg: #121212; --fg: #E0E0E0; --muted: #9a9a9a; --card: #1b1b1b; --accent: #7cc4ff; }
+@media (prefers-color-scheme: light) { :root { --bg: #FAFAFA; --fg: #1E2022; --muted: #666; --card: #fff; --accent: #0b5fff; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.75 Georgia, "IBM Plex Serif", serif; }
+.wrap { max-width: 680px; margin: 0 auto; padding: 48px 24px 96px; }
+h1, h2 { font-family: "Space Grotesk", system-ui, sans-serif; }
+a { color: var(--accent); }
+nav { font-family: system-ui, sans-serif; font-size: 15px; margin-bottom: 32px; }
+pre { background: var(--card); padding: 14px 16px; border-radius: 10px; overflow-x: auto; font: 14px/1.6 "JetBrains Mono", ui-monospace, monospace; }
+code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .88em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav><a href="index.html">&larr; Read docs</a> · <a href="examples.html">Math examples</a></nav>
+<h1>Math engine setup</h1>
+<p>Formulae render through the ZaTeX engine, loaded at runtime via <code>dlopen</code> — never linked, so the ship binary keeps its size budget with the engine absent. Math is render-only, never authoring.</p>
+<h2>Load path</h2>
+<p>1. <code>Read.app/Contents/Resources/libzatex.dylib</code> (vendored — the version a release ships)<br>2. <code>/usr/local/lib/libzatex.dylib</code> (manual install)</p>
+<p>Without either, formulae fall back to source text — fences as code cards, islands as literal text.</p>
+<h2>Install</h2>
+<pre>git clone https://github.com/gregoreesmaa/zatex
+# build packages/zatex per its README, then:
+cp &lt;build-output&gt;/libzatex.dylib /usr/local/lib/libzatex.dylib</pre>
+<h2>Supported spellings</h2>
+<p>Only exact <code>```math</code> fences, whole-line <code>$$…$$</code> display, and guarded <code>$…$</code> inline islands route to the engine. <code>tex</code>/<code>latex</code>/<code>katex</code> fences stay syntax-highlighted code; currency (<code>$100</code>) stays literal.</p>
+<p>Layout is fully on-device and synchronous — a document's formulae never leave the machine.</p>
+</div>
+</body>
+</html>

@@ -4,56 +4,45 @@
 [![License: MIT](https://img.shields.io/github/license/gregoreesmaa/read)](LICENSE)
 [![Zig 0.16](https://img.shields.io/badge/zig-0.16-orange)](https://ziglang.org)
 
-> **Read** — an ultra-minimalist, zero-dependency, microsecond-grade Markdown reader in pure Zig with a native macOS Cocoa/CoreText layer.
-
-A **zig markdown reader** that opens files with zero-copy **mmap**, scans lines with branchless
-**SIMD**, lays out only the visible viewport in **microseconds**, and renders native **Core Text**
-typography on **macOS**. No Electron, no WebKit, no UI toolkit, no package dependencies.
+**The Markdown reader that opens before you blink.** Pure Zig, zero dependencies, native macOS — mmap + SIMD, microsecond rendering, CoreText typography.
 
 ![Reading view](screenshots/text_wrapping.png)
-
-## Try it (30 seconds)
-
-macOS + Zig 0.16:
 
 ```bash
 zig build -Doptimize=ReleaseFast && ./zig-out/bin/read showcase.md
 ```
 
-`j`/`k` scroll · `Space` page down · `t` toggle theme · `q` quit.
-Full controls: [docs/keys.md](docs/keys.md). Why this exists: [VISION.md](VISION.md).
+`j`/`k` scroll · `Space` page · `t` theme · `q` quit · [all keys](docs/keys.md)
 
-## Benchmarks
+## Why
 
-The numbers below are enforced in CI on every commit, not marketing: each is pinned by
-[src/core/strict_benchmarks.zig](src/core/strict_benchmarks.zig) (immutable — a miss means the
-implementation gets faster, never the target lower) and the
-[ship binary gate](scripts/size_gate.sh). This table is the single claims surface:
-no number here is repeated anywhere else in the repo.
-
-| Metric | Typical Electron app | Standard native reader | **Read** |
+| | Electron app | Native reader | **Read** |
 | :--- | :--- | :--- | :--- |
-| **Binary size** | ~180 MB | ~15–35 MB | **< 200 KiB** |
-| **Document open** | 350–1,200 ms | 20–60 ms | **≤ 18 µs** (zero-copy `mmap`) |
-| **Line scan, 50,000 lines** | ~100 ms | 15–25 ms | **≤ 400 µs (≥ 5.5 GB/s)** |
-| **Viewport layout** | 8–16 ms | 1–3 ms | **≤ 8 µs** |
-| **Substring search, 50k lines** | ~50 ms | 5–10 ms | **≤ 50 µs** |
-| **Deep scroll (line 45k+)** | 8–16 ms | 1–3 ms | **≤ 11 µs** |
-| **Line index entry** | — | — | **8 bytes, packed** |
-| **Hot-path heap allocations** | Millions | Thousands | **0** |
-| **Active memory (MaxRSS)** | 150–400 MB | 30–80 MB | **< 6 MB** |
-| **Third-party dependencies** | Hundreds | Multiple toolkits | **0** |
+| Binary | ~180 MB | ~15–35 MB | **< 200 KiB** |
+| Open | 350–1,200 ms | 20–60 ms | **≤ 18 µs** |
+| 50k-line scan | ~100 ms | 15–25 ms | **≤ 400 µs** |
+| Viewport layout | 8–16 ms | 1–3 ms | **≤ 8 µs** |
+| Deep scroll | 8–16 ms | 1–3 ms | **≤ 11 µs** |
+| Hot-path allocs | millions | thousands | **0** |
+| Memory | 150–400 MB | 30–80 MB | **< 6 MB** |
+| Dependencies | hundreds | toolkits | **0** |
 
-## Learn more
+Every number is enforced in CI by [`strict_benchmarks.zig`](src/core/strict_benchmarks.zig) — a miss means the code gets faster, never the target lower.
 
-- [showcase.md](showcase.md) — the live demo document (the command above opens it)
-- [docs/architecture.md](docs/architecture.md) — how it stays fast
-- [docs/spec.md](docs/spec.md) — supported Markdown inventory
-- [docs/keys.md](docs/keys.md) — selection, scrolling, keybindings
-- [docs/privacy.md](docs/privacy.md) — remote-image policy (indicator, `i` toggle, HTTPS-only)
-- [docs/engine.md](docs/engine.md) — math engine setup (`libzatex`: load path, install, supported spellings)
-- [CONTRIBUTING.md](CONTRIBUTING.md) — pre-commit protocol (tests, screenshots, gates)
-- [AGENTS.md](AGENTS.md) — contributor contract and immutable targets
+## What's inside
+
+- Zero-copy `mmap` open, branchless SIMD line scan, virtualized viewport — only visible tokens are parsed ([how it works](docs/architecture.md))
+- CommonMark + GFM tables, task lists, math, diagrams, images ([supported Markdown](docs/spec.md))
+- Buttery 120 Hz scrolling, native selection & clipboard, dark/light themes ([keys & gestures](docs/keys.md))
+- Remote-image privacy guard, on-device math engine ([privacy](docs/privacy.md) · [engine setup](docs/engine.md))
+
+## Docs
+
+**[gregoreesmaa.github.io/read](https://gregoreesmaa.github.io/read/)** — guides, keybindings, Markdown support, examples.
+
+Try: [`showcase.md`](showcase.md) (the one-page tour) · [`examples/`](examples) (classic reference docs) · [`test_cases/`](test_cases) (fixtures behind every screenshot)
+
+Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md) · [releases](docs/release.md)
 
 ## License
 

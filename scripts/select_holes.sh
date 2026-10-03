@@ -2,7 +2,7 @@
 # select_holes.sh — selection-highlight hole/residue regression suite.
 # Pure pixel ground truth via --probe-px (no log parsing: deterministic
 # under concurrent live sessions). Headless geometry for
-# markdown-testfile.md is stable: 1200x900 at --force-scale 1.
+# examples/markdown-testfile.md is stable: 1200x900 at --force-scale 1.
 #
 # Case 1: full single-line select over the "tags" paragraph line paints
 # every word (xrow/xfirst/xlast/bridge + trailing-edge clamp).
@@ -21,7 +21,7 @@
 # gaps right of it, nothing left of it).
 set -u
 BIN="${HOOKS_BIN:-zig-out/bin/read-test}"
-DOC="${1:-markdown-testfile.md}"
+DOC="${1:-examples/markdown-testfile.md}"
 OUT="${TMPDIR:-/tmp}/select_holes.png"
 
 shot() {

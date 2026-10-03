@@ -2,7 +2,7 @@ const std = @import("std");
 const mmap = @import("../core/mmap.zig");
 
 // ============================================================================
-// Event-Driven Idling Policy (todo/ideas.txt line 5: "Event-Driven Idling").
+// Event-Driven Idling Policy (docs/design-notes/ideas.txt line 5: "Event-Driven Idling").
 //
 // The platform run loop ([NSApp run] in src/platform/macos.m) blocks inside
 // the OS kernel event wait. It never spins, polls, or runs a persistent
