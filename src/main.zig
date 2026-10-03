@@ -17,10 +17,6 @@ const DEFAULT_DOC =
     \\
     \\An ultra-minimalist, zero-dependency, microsecond-grade Markdown reader.
     \\
-    \\## The Philosophy of Speed
-    \\
-    \\Computers are exceptionally fast, but modern document readers often hide layers of virtual DOMs, heavy JavaScript bundles, garbage collectors, and complex AST allocations.
-    \\
     \\**Read** takes the opposite approach:
     \\
     \\- **Zero-copy memory mapping**: Files are mapped directly into virtual address space via `mmap`.
@@ -2041,8 +2037,6 @@ const CLI_USAGE =
     \\  -          Read Markdown from stdin (max 32 MiB)
     \\  --help     Print this help and exit
     \\  --version  Print version and exit
-    \\
-    \\With no file and piped stdin (`curl … | read`), stdin is read instead.
     \\
 ;
 const CLI_VERSION_LINE = "read " ++ READ_VERSION ++ "\n";

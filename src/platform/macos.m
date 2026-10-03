@@ -331,6 +331,12 @@ static NSRect copy_button_damage_rect(CodeBlockRecord* b) {
 
 static void paint_copy_button(CGContextRef ctx);
 
+// Font-name diet (#391 __TEXT): helpers defined at end-of-file per the SIZE
+// NOTE; forward declarations so get_font_for_style can call them.
+static NSFont* diet_body_font(float size, int is_bold, int is_italic);
+static NSFont* diet_heading_font(float size, int is_bold);
+static NSFont* diet_mono_font(float size, int unused);
+
 static void register_app_fonts(void) {
     static BOOL registered = NO;
     if (registered) return;
@@ -363,9 +369,20 @@ static void register_app_fonts(void) {
 static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
     register_app_fonts();
 
+    // Diet (issue #391 __TEXT): PostScript-name literals are the long
+    // pole (~15 sites: "IBMPlexSerif-BoldItalic" etc. plus the Georgia
+    // rung). The bundled faces' FAMILY names ("IBM Plex Serif",
+    // "Space Grotesk", "JetBrains Mono") are short prefixes of those
+    // literals, and NSFontManager:fontWithFamily:traits:weight:size:
+    // resolves the style from traits — so one family literal covers all
+    // four body styles, one the headings, one the mono face. Lookup
+    // order and fallbacks are unchanged: bundled PostScript name first
+    // (exact face, byte-identical pixels), then the family+traits
+    // resolution, then the legacy system fallbacks. The three helpers
+    // live at end-of-file per the SIZE NOTE (see prime_frame_decode).
     if (is_mono) {
         NSFont* f = [NSFont fontWithName:@"JetBrainsMono-Regular" size:font_size];
-        if (!f) f = [NSFont fontWithName:@"JetBrains Mono" size:font_size];
+        if (!f) f = diet_mono_font(font_size, 0);
         if (!f) f = [NSFont fontWithName:@"Menlo" size:font_size];
         if (!f) f = [NSFont userFixedPitchFontOfSize:font_size];
         return f;
@@ -376,9 +393,7 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
             f = [NSFont fontWithName:@"SpaceGrotesk-Light_Bold" size:font_size];
             if (!f) f = [NSFont fontWithName:@"SpaceGrotesk-Bold" size:font_size];
         }
-        if (!f) f = [NSFont fontWithName:@"SpaceGrotesk-Light_Regular" size:font_size];
-        if (!f) f = [NSFont fontWithName:@"SpaceGrotesk-Regular" size:font_size];
-        if (!f) f = [NSFont fontWithName:@"Space Grotesk" size:font_size];
+        if (!f) f = diet_heading_font(font_size, is_bold);
         if (!f) f = [NSFont boldSystemFontOfSize:font_size];
         return f;
     }
@@ -394,14 +409,7 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
     } else {
         f = [NSFont fontWithName:@"IBMPlexSerif-Regular" size:font_size];
     }
-    if (!f) f = [NSFont fontWithName:@"IBM Plex Serif" size:font_size];
-    if (!f) {
-        // Fallback to Georgia or system serif
-        if (is_bold && is_italic) f = [NSFont fontWithName:@"Georgia-BoldItalic" size:font_size];
-        else if (is_bold) f = [NSFont fontWithName:@"Georgia-Bold" size:font_size];
-        else if (is_italic) f = [NSFont fontWithName:@"Georgia-Italic" size:font_size];
-        else f = [NSFont fontWithName:@"Georgia" size:font_size];
-    }
+    if (!f) f = diet_body_font(font_size, is_bold, is_italic);
     if (!f) {
         f = is_bold ? [NSFont boldSystemFontOfSize:font_size] : [NSFont systemFontOfSize:font_size];
     }
@@ -4130,3 +4138,48 @@ static void read_find_show(void) {
 #else
 #include "macos_zatex.m"
 #endif
+
+// Font-name diet (issue #391 __TEXT): PostScript-name literals are the
+// long pole (~15 sites: "IBMPlexSerif-BoldItalic", "SpaceGrotesk-Bold",
+// the Georgia rung). The bundled faces' FAMILY names are short prefixes
+// of those literals, and NSFontManager:fontWithFamily:traits:weight:size:
+// resolves the style from traits — one family literal per face. Lookup
+// order is unchanged: bundled PostScript name first (exact face,
+// byte-identical pixels), then family+traits here, then system
+// fallbacks in get_font_for_style. EOF per the SIZE NOTE.
+static NSFont* diet_traits_font(NSString* family, NSFontTraitMask traits, float size, int weight) {
+    NSFont* f = [[NSFontManager sharedFontManager] fontWithFamily:family
+        traits:traits weight:weight size:size];
+    if (f) return f;
+    // Unbold/unitalic mask variants: the manager answers 0 traits for a
+    // plain request on some families; retry bare.
+    if (traits != 0) {
+        f = [[NSFontManager sharedFontManager] fontWithFamily:family
+            traits:0 weight:5 size:size];
+    }
+    return f;
+}
+
+static NSFont* diet_body_font(float size, int is_bold, int is_italic) {
+    NSFontTraitMask traits = 0;
+    if (is_bold) traits |= NSBoldFontMask;
+    if (is_italic) traits |= NSItalicFontMask;
+    NSFont* f = diet_traits_font(@"IBM Plex Serif", traits, size, is_bold ? 9 : 5);
+    if (f) return f;
+    // Legacy serif rung (was four Georgia PostScript literals): the
+    // family+traits form resolves Bold/Italic/BoldItalic the same way.
+    return diet_traits_font(@"Georgia", traits, size, is_bold ? 9 : 5);
+}
+
+static NSFont* diet_heading_font(float size, int is_bold) {
+    NSFont* f = diet_traits_font(@"Space Grotesk", is_bold ? NSBoldFontMask : 0, size, is_bold ? 9 : 5);
+    if (f) return f;
+    return nil;
+}
+
+static NSFont* diet_mono_font(float size, int unused) {
+    (void)unused;
+    NSFont* f = diet_traits_font(@"JetBrains Mono", 0, size, 5);
+    if (f) return f;
+    return nil;
+}
