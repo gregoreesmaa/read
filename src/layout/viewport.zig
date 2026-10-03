@@ -9256,7 +9256,7 @@ test "find row landing matches wrapped flow rows (#386)" {
     const w1 = measureTextEx("aaa", 17.0, false, false, false, false);
     const w2 = measureTextEx("bbb", 17.0, false, false, false, false);
     const sp = measureCharEx(' ', 17.0, false, false, false, false);
-    const narrow = w1 + sp + 1.0;
+    const narrow = w1 + sp + w2 - 1.0;
     try t.expect(w1 + sp + w2 > narrow);
     try t.expectEqual(@as(usize, 0), countRowsBefore("aaa bbb", 0, 0.0, narrow, 17.0));
     try t.expectEqual(@as(usize, 1), countRowsBefore("aaa bbb", 4, 0.0, narrow, 17.0));
