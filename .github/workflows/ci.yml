@@ -31,9 +31,19 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      # Math engine (third_party/zatex, pinned submodule): built per OS so
+      # math shots render live everywhere. Runtime-loaded (dlopen), never
+      # linked — outside the ship size budget.
+      - name: Build ZaTeX engine (pinned submodule)
+        run: |
+          git submodule update --init third_party/zatex
+          cd third_party/zatex/packages/zatex && zig build
+          echo "READ_ZATEX_LIB=$PWD/zig-out/lib/libzatex.dylib" >> "$GITHUB_ENV"
       # Wall-clock microsecond gates enforce on stable hardware only (see
       # simd.timingBudgetsEnforced): shared CI VMs measure neighbor
       # contention as much as code, so CI runs the same tests with prints
@@ -81,11 +91,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
       - name: Install X11/FreeType/fontconfig/libpng dev packages
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libfontconfig1-dev libfreetype6-dev libpng-dev xvfb
+      # Math engine (third_party/zatex, pinned submodule): built per OS so
+      # math shots render live everywhere. Runtime-loaded (dlopen), never
+      # linked — outside the ship size budget.
+      - name: Build ZaTeX engine (pinned submodule)
+        run: |
+          git submodule update --init third_party/zatex
+          cd third_party/zatex/packages/zatex && zig build
+          echo "READ_ZATEX_LIB=$PWD/zig-out/lib/libzatex.so" >> "$GITHUB_ENV"
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
       - name: Parser short fuzz (malformed + huge inputs, issue #34)
@@ -110,9 +130,19 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      # Math engine (third_party/zatex, pinned submodule): built per OS so
+      # math shots render live everywhere. Runtime-loaded (LoadLibrary),
+      # never linked — outside the ship size budget.
+      - name: Build ZaTeX engine (pinned submodule)
+        run: |
+          git submodule update --init third_party/zatex
+          cd third_party/zatex/packages/zatex && zig build
+          echo "READ_ZATEX_LIB=$PWD/zig-out/lib/zatex.dll" >> "$GITHUB_ENV"
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
       - name: Parser short fuzz (malformed + huge inputs, issue #34)
