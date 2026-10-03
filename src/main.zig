@@ -119,11 +119,62 @@ fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) ca
     const slice = url[0..@as(usize, @intCast(url_len))];
     if (remote_policy.isRemoteUrl(slice)) g_remote_seen = true;
     if (remote_policy.blockedByPolicy(slice, g_app.remote_images)) return;
+    // Per-document image-size memo (issue #385): metrics + draw used to
+    // re-query every image every pass through the platform FFI. Hits
+    // return the latched dims with no FFI round-trip; misses call
+    // through once and latch — including the 0x0 (still loading/blocked
+    // platform-side) outcome, so a loading image pays one query per
+    // table cycle, not per pass. Keyed by URL bytes: the table is
+    // reset on every document open (stale URLs must never pin), and a
+    // byte compare guards wrap-around eviction.
+    const key = @intFromPtr(url);
+    var h: usize = key ^ (@as(usize, @intCast(url_len)) *% 0x9E3779B97F4A7C15);
+    for (slice) |c| h = (h ^ c) *% 0x100000001B3;
+    const idx = h % IMAGE_SIZE_CACHE_LEN;
+    const slot = &g_image_size_cache[idx];
+    if (slot.hit and slot.url_ptr == key and slot.url_len == slice.len and std.mem.eql(u8, slot.url_buf[0..slot.url_len], slice)) {
+        out_w.* = slot.w;
+        out_h.* = slot.h;
+        return;
+    }
     bridge.platform_get_image_size(url, url_len, out_w, out_h);
+    slot.url_ptr = key;
+    const take = @min(slice.len, slot.url_buf.len);
+    @memcpy(slot.url_buf[0..take], slice[0..take]);
+    slot.url_len = take;
+    slot.w = out_w.*;
+    slot.h = out_h.*;
+    slot.hit = true;
+}
+
+/// Per-document image-size memo entry (issue #385): URL bytes plus the
+/// last platform answer. 16 entries x ~272B in BSS; zero hot-path
+/// allocations, zero ship-file cost (BSS).
+const IMAGE_SIZE_CACHE_LEN: usize = 16;
+const ImageSizeCacheEntry = struct {
+    url_ptr: usize = 0,
+    url_len: usize = 0,
+    url_buf: [256]u8 = [_]u8{0} ** 256,
+    w: f32 = 0,
+    h: f32 = 0,
+    hit: bool = false,
+};
+var g_image_size_cache: [IMAGE_SIZE_CACHE_LEN]ImageSizeCacheEntry = undefined;
+
+/// Zero the image-size memo (document open): stale URLs must never pin.
+fn imageSizeCacheReset() void {
+    for (&g_image_size_cache) |*e| e.* = .{};
 }
 
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
+// Per-frame layout memo tables (issue #385): math boxes keyed by tex
+// slice, code-line segments keyed by (lang, line slice). Threaded into
+// the render config in onDraw; metrics passes leave the config nulls so
+// heights track rendering exactly through the shared query path. BSS,
+// zero hot-path allocations, zero ship-file cost.
+var g_math_box_cache: layout.MathBoxCache = undefined;
+var g_token_cache: layout.TokenCache = undefined;
 // Content-driven async plugin renders (issue #323, PR-1 Task 5). Per-doc
 // job table plus the parallel path buffers Task 4's borrow side reads
 // (slot index == job index; paths NUL-terminated in place for the outcome
@@ -138,6 +189,10 @@ var g_plugin_count: usize = 0;
 var g_plugin_entries: [plugin_cache.MAX_PLUGIN_JOBS]layout.PluginEntry = undefined;
 var g_plugin_path_bufs: [plugin_cache.MAX_PLUGIN_JOBS][256]u8 = undefined;
 var g_plugin_path_lens: [plugin_cache.MAX_PLUGIN_JOBS]u8 = [_]u8{0} ** plugin_cache.MAX_PLUGIN_JOBS;
+// Precomputed fence ends, stamped by pluginStampFenceEnds at open/seeding
+// (issue #385): threaded into the entry bundle on every attach so layout
+// skips the per-frame fence-body walk. BSS, zero ship-file cost.
+var g_plugin_fence_ends: [plugin_cache.MAX_PLUGIN_JOBS]usize = [_]usize{0} ** plugin_cache.MAX_PLUGIN_JOBS;
 var g_plugin_launched: [plugin_cache.MAX_PLUGIN_JOBS]bool = [_]bool{false} ** plugin_cache.MAX_PLUGIN_JOBS;
 var g_plugin_inflight: u8 = 0;
 // Previously tracked children orphaned by a document swap: still reaped by
@@ -324,6 +379,26 @@ fn pluginResolvePaths(
         }
     }
     return take;
+}
+
+/// Stamp the precomputed fence ends onto the layout-facing entry bundle
+/// (issue #385): one inline walk per row from its `fence_line` to the
+/// matching `code_fence_end` (first wins, mirroring the old per-frame
+/// scan), so render/height/refine skip the per-frame body walk. Cold
+/// path (open/seeding); rows keep document order.
+fn pluginStampFenceEnds(
+    lines: []const simd.Line,
+    jobs: []const plugin_cache.PluginJob,
+    entries: []layout.PluginEntry,
+    count: usize,
+) void {
+    const take = @min(count, @min(jobs.len, entries.len));
+    var i: usize = 0;
+    while (i < take) : (i += 1) {
+        var j: usize = jobs[i].fence_line + 1;
+        while (j < lines.len and lines[j].block_type != .code_fence_end) : (j += 1) {}
+        entries[i].fence_end = j;
+    }
 }
 
 /// Cache root for rendered PNGs (`<root>/read/plugins/<name>/<hex>.png`):
@@ -721,6 +796,12 @@ fn pluginKickForDocument() void {
     // Explicit truncation at 16 rows (Task 4 review F2): collection caps
     // there too, so this minimum documents the bound at the build.
     g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    pluginStampFenceEnds(
+        g_app.lines[0..g_app.line_count],
+        g_plugin_jobs[0..],
+        g_plugin_entries[0..],
+        g_plugin_count,
+    );
     if (g_plugin_count == 0) return;
     var saw_ready = false;
     var i: usize = 0;
@@ -768,6 +849,12 @@ fn pluginSeedReadyForScreenshot() void {
         g_plugin_path_lens[0..],
     );
     g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    pluginStampFenceEnds(
+        g_app.lines[0..g_app.line_count],
+        g_plugin_jobs[0..],
+        g_plugin_entries[0..],
+        g_plugin_count,
+    );
     if (g_plugin_count == 0) return;
     var saw_ready = false;
     var i: usize = 0;
@@ -801,6 +888,7 @@ noinline fn pluginAttachConfig(cfg: *layout.ViewportConfig) void {
         g_plugin_entries[i] = .{
             .job = g_plugin_jobs[i],
             .path = g_plugin_path_bufs[i][0..g_plugin_path_lens[i]],
+            .fence_end = g_plugin_fence_ends[i],
         };
     }
     cfg.plugins = g_plugin_entries[0..g_plugin_count];
@@ -875,8 +963,14 @@ fn onScrollTo(scroll_y: f32) callconv(.c) void {
     snapScroll(scroll_y);
 }
 
-fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void {
-    const now_ms = getTimestampMs();
+fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int, event_ms: f64) callconv(.c) void {
+    // NSEvent timestamp (issue #385): the platform stamps each scroll
+    // event with its own monotonic time, so the gesture/scroll-lock
+    // engine reads event time with no clock_gettime per callback. The
+    // timestamp rides the existing FFI as a trailing double — appended
+    // last so all prior field offsets never shift. A non-positive stamp
+    // (synthetic/test callers) falls back to one clock read.
+    const now_ms: i64 = if (event_ms > 0.0) @intFromFloat(event_ms) else getTimestampMs();
     // Gesture conditioning first: precise deltas pass bit-exact (1:1
     // sync preserved); absorbed wheel jitter feeds the lock a zero so a
     // lifted gesture still resets cleanly, then returns (nothing moved).
@@ -1182,6 +1276,12 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     // A new document ends any find session (issue #42): matches belong
     // to the old bytes. (External reloads keep the query; see #44.)
     clearFind();
+    // Per-document memo tables (issue #385): image sizes, fence ends, and
+    // (in onDraw) math/token caches are keyed by document slices — reset
+    // here so a swapped-in document never reads the old one's entries.
+    imageSizeCacheReset();
+    layout.mathBoxCacheReset(&g_math_box_cache);
+    layout.tokenCacheReset(&g_token_cache);
     updateDocumentMetrics();
     // Plugin renders (issue #323): per-doc table, cache-hit stat-marking,
     // probe and FIFO launch. No-op in read-test/headless binaries.
@@ -1285,6 +1385,15 @@ var g_find_query_len: usize = 0;
 var g_find_chase_armed: bool = false;
 var g_find_chase_left: u8 = 0;
 var g_find_painted: bool = false;
+// Per-run first-overlap memo (issue #385): paintFindHighlights binary
+// searches the match list per text run per frame; runs arrive in offset
+// order within a frame, so the previous run's lower bound is a warm
+// start for the next search (monotone: never moves backward). Keyed by
+// frame: reset in onDraw before the command loop, so a new frame (new
+// scroll, new commands) restarts from zero exactly like the old cold
+// search. Bit-identical washes: the memo only narrows the search floor,
+// the binary search above the floor is unchanged.
+var g_find_search_floor: usize = 0;
 
 fn pushFindCount() void {
     const shown: c_int = if (g_find_count == 0) 0 else @intCast(g_find_current + 1);
@@ -1369,8 +1478,30 @@ fn clearFind() void {
     g_find_chase_armed = false;
     g_find_chase_left = 0;
     g_find_painted = false;
+    g_find_search_floor = 0;
     bridge.platform_find_hide();
     bridge.platform_request_redraw();
+}
+
+// Per-frame visited-URL memo (issue #385): the FFI probe is pure per
+// URL per frame (the set only changes on click, which redraws anyway).
+// One latched slot: wrapped links repeat one URL across consecutive
+// runs (the common repeat); a different URL simply re-probes and
+// re-latches (still at most one FFI per run, never more). Reset in
+// onDraw before the command loop and on document open.
+var g_visited_memo_ptr: usize = 0;
+var g_visited_memo_len: usize = 0;
+var g_visited_memo_hit: bool = false;
+
+fn visitedCached(t: []const u8) bool {
+    if (g_visited_memo_len == t.len and g_visited_memo_ptr == @intFromPtr(t.ptr)) {
+        return g_visited_memo_hit;
+    }
+    const hit = bridge.platform_link_visited(t.ptr, @intCast(t.len)) != 0;
+    g_visited_memo_ptr = @intFromPtr(t.ptr);
+    g_visited_memo_len = t.len;
+    g_visited_memo_hit = hit;
+    return hit;
 }
 
 /// Find highlight wash (issue #42): intersects one text run's source
@@ -1388,13 +1519,16 @@ fn paintFindHighlights(cmd: *const layout.DrawCommand, find_bg: *const layout.Co
     const rs = rp - base;
     const re = rs + cmd.text.len;
     // Matches are offset-ordered and disjoint: binary search the first
-    // one ending past the run start, then walk while overlapping.
-    var lo: usize = 0;
+    // one ending past the run start, then walk while overlapping. The
+    // floor is the previous run's lower bound (runs arrive offset-ordered
+    // per frame; clamped to the count so a shorter list stays safe).
+    var lo: usize = @min(g_find_search_floor, g_find_count);
     var hi: usize = g_find_count;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         if (g_find_matches[mid].start + g_find_matches[mid].len > rs) hi = mid else lo = mid + 1;
     }
+    g_find_search_floor = lo;
     var mi = lo;
     while (mi < g_find_count and g_find_matches[mi].start < re) : (mi += 1) {
         const m = g_find_matches[mi];
@@ -1630,6 +1764,12 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     g_markers.reset();
     g_entities.reset();
+    // Per-frame memo resets (issue #385): the find floor and the visited
+    // latch are keyed by this frame's command stream — a new draw starts
+    // both cold, exactly like the old per-run searches/probes.
+    g_find_search_floor = 0;
+    g_visited_memo_ptr = 0;
+    g_visited_memo_len = 0;
     var vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
@@ -1641,6 +1781,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .image_size_fn = gatedImageSize,
         .math_size_fn = liveMathSizeFn(),
         .math_error_fn = liveMathErrorFn(),
+        .math_box_cache = &g_math_box_cache,
+        .token_cache = &g_token_cache,
         .ordered_markers = &g_markers,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
@@ -1815,12 +1957,13 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 // Visited-link state (issue #25): the platform owns the
                 // clicked-URL set; linked runs query it and take the theme
                 // visited color. Link runs are rare, so the FFI round-trip
-                // never touches the hot path.
+                // never touches the hot path. Per-frame memo (issue #385):
+                // one URL repeats across the runs of a wrapped link — the
+                // first run's verdict is latched by slice identity, so the
+                // rest skip the FFI with the identical color.
                 var run_color = cmd.color;
                 if (cmd.link_target) |t| {
-                    if (t.len > 0 and
-                        bridge.platform_link_visited(t.ptr, @intCast(t.len)) != 0)
-                    {
+                    if (t.len > 0 and visitedCached(t)) {
                         run_color = if (g_app.is_dark_theme)
                             layout.Theme.dark.link_visited
                         else
@@ -2445,6 +2588,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Fresh document: privacy indicator latch re-arms (relatched by the
     // metrics pass below when the doc actually contains remote images).
     g_remote_seen = false;
+    // Per-document memo tables (issue #385): same reset as the
+    // activateMappedFile path above (stale slices must never pin).
+    imageSizeCacheReset();
+    layout.mathBoxCacheReset(&g_math_box_cache);
+    layout.tokenCacheReset(&g_token_cache);
 
     // Index lines with SIMD scanner
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
@@ -4146,8 +4294,28 @@ test "plugin task5: sidecar path + shim bodies are exact, hostile helpers refuse
     try t.expect(pluginProbeShim("/h/a\"b.sh", "mermaid", &jb) == null);
 }
 
-test "plugin task5: table build truncates at 16, read-test never kicks (#323)" {
-    // Build truncation is explicit at table build (Task 4 review F2): a
+test "energy #385: fence-end stamping mirrors the inline scan" {
+    if (comptime build_options.plugin_stub) return;
+    const doc = "```mermaid\nA-->B\n```\ntext\n```mermaid\nC-->D\n```\n";
+    var lines: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var jobs: [plugin_cache.MAX_PLUGIN_JOBS]plugin_cache.PluginJob = undefined;
+    var bufs: [plugin_cache.MAX_PLUGIN_JOBS][256]u8 = undefined;
+    var lens: [plugin_cache.MAX_PLUGIN_JOBS]u8 = [_]u8{0} ** plugin_cache.MAX_PLUGIN_JOBS;
+    const take = pluginResolvePaths(doc, lines[0..n], "/tmp/C", jobs[0..], bufs[0..], lens[0..]);
+    try std.testing.expectEqual(@as(usize, 2), take);
+    var entries: [plugin_cache.MAX_PLUGIN_JOBS]layout.PluginEntry = undefined;
+    pluginStampFenceEnds(lines[0..n], jobs[0..], entries[0..], take);
+    // Fence ends match the first-close-wins inline rule: fence 0 closes
+    // at scan index 2, fence 4 at index 6.
+    try std.testing.expectEqual(jobs[0].fence_line + 2, entries[0].fence_end);
+    try std.testing.expectEqual(jobs[1].fence_line + 2, entries[1].fence_end);
+    // The layout helper honors the stamped ends.
+    try std.testing.expectEqual(entries[0].fence_end, layout.codeFenceEnd(entries[0..take], lines[0..n], jobs[0].fence_line));
+}
+
+test "plugin task5: table build truncates at 16, read-test never kicks (#323)" {    // Build truncation is explicit at table build (Task 4 review F2): a
     // 17-fence doc keeps 16 rows with NUL-terminated paths for the query.
     // Twin builds collect zero jobs, so skip there.
     if (comptime build_options.plugin_stub) return;
