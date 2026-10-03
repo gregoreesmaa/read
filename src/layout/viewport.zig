@@ -970,14 +970,27 @@ pub const ViewportConfig = struct {
     /// Null keeps fallbacks byte-identical; set beside math_size_fn on the
     /// live ship path.
     math_error_fn: ?MathErrorFn = null,
+    /// Caller-owned memo tables (issue #385): math boxes keyed by tex
+    /// slice and code-line segments keyed by (lang, line slice). Null
+    /// keeps the old direct calls bit-for-bit; main.zig threads live
+    /// tables on the render path. Measurement contexts leave them null
+    /// (their math matches rendering exactly via the shared query path).
+    math_box_cache: ?*MathBoxCache = null,
+    token_cache: ?*TokenCache = null,
 };
 
 /// One layout-facing plugin row: the fence anchor plus what the fence
 /// decision and the ready-image link need. Built by main.zig at open from
 /// the job table and the per-slot path buffers; layout never writes it.
+/// `fence_end` closes the region (matching `code_fence_end` scan index,
+/// lines.len when unclosed): callers skip re-scanning the fence body.
 pub const PluginEntry = struct {
     job: plugin_cache.PluginJob,
     path: []const u8,
+    /// `fence_end == 0` means UNSTAMPED (open-time stamping never ran):
+    /// every real fence end is `> fence_line >= 0`, so 0 can never be a
+    /// valid stamped value. Unstamped rows fall back to the inline scan.
+    fence_end: usize = 0,
 };
 
 /// Cross-line reference joint scratch length: two source lines plus a space.
@@ -1342,6 +1355,13 @@ pub const FlowCtx = struct {
     /// keeps fallbacks byte-identical). Names the failure byte for the
     /// accent mark; geometry never depends on it.
     math_error_fn: ?MathErrorFn = null,
+    /// Caller-owned memo tables (issue #385): math boxes keyed by tex
+    /// slice and code-line segments keyed by (lang, line slice). Null
+    /// keeps the old direct calls bit-for-bit; main.zig threads live
+    /// tables on the render path. Measurement contexts leave them null
+    /// (their math matches rendering exactly via the shared query path).
+    math_box_cache: ?*MathBoxCache = null,
+    token_cache: ?*TokenCache = null,
     /// RTL paragraph flow (issue #50): the pen tracks the RIGHT edge and
     /// words lay right-to-left. Defaults false: the LTR path below is
     /// byte-identical to the historical layout.
@@ -1734,7 +1754,7 @@ test "design #23: inline code pill geometry + atomic wrap" {
 /// unavailable (null size fn, twin builds) or refuses the formula: the
 /// caller falls back to literal source rendering, byte-identical to the
 /// pre-math reader. `font_px` is the ambient size; dims scale linearly.
-const MathBox = struct {
+pub const MathBox = struct {
     w: f32,
     above: f32,
     below: f32,
@@ -1742,10 +1762,81 @@ const MathBox = struct {
     display: bool,
 };
 
+/// Per-frame math-box memo (issue #385): scroll frames re-derive the same
+/// boxes through the FFI size query, which is pure in its inputs (tex
+/// bytes, display flag, font px). Key is the tex slice identity (ptr +
+/// len) plus display/px; the boxed args cross the FFI by value, so hits
+/// skip the query with a bitwise-identical box. Small direct-mapped
+/// table (8 entries, caller-agnostic BSS-free: callers thread their own
+/// table so measurement passes stay independent): ptr/len/px/flag hits
+/// are exact for stable document slices (the same fence re-renders from
+/// the same mmap bytes every frame); a same-slot eviction simply
+/// re-queries (never aliases: the loser re-fills the slot). Miss path is
+/// byte-identical to the old direct call — the table only skips repeated
+/// queries.
+pub const MATH_BOX_CACHE_LEN: usize = 8;
+pub const MathBoxCacheEntry = struct {
+    tex_ptr: usize = 0,
+    tex_len: usize = 0,
+    font_px: f32 = 0,
+    display: bool = false,
+    box: MathBox = .{ .w = 0, .above = 0, .below = 0, .font_px = 0, .display = false },
+    hit: bool = false,
+    fail: bool = false,
+};
+pub const MathBoxCache = [MATH_BOX_CACHE_LEN]MathBoxCacheEntry;
+
+/// Zero the table (document open / font change): stale entries would pin
+/// a previous document's slices.
+pub fn mathBoxCacheReset(cache: *MathBoxCache) void {
+    for (cache) |*e| e.* = .{};
+}
+
 fn mathBox(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSizeFn) ?MathBox {
+    return mathBoxCached(tex, display, font_px, size_fn, null);
+}
+
+/// Cache-threaded math-box query (issue #385): same pure query as
+/// mathBox, but consults a small caller-owned memo first. Null cache
+/// keeps the old direct call bit-for-bit (measurement contexts and
+/// existing callers pass null during the rollout); a live cache skips
+/// repeated FFI queries with bitwise-identical boxes. The memo key is
+/// the tex slice identity (ptr + len) plus display/px: stable document
+/// slices hit exactly, and a same-slot eviction re-queries rather than
+/// aliasing (the loser re-fills the slot).
+/// Misses (and refused formulas) call through exactly once and fill the
+/// direct-mapped slot — including `fail` latching, so a repeatedly
+/// refused formula pays one FFI refusal per table cycle, not per frame.
+fn mathBoxCached(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSizeFn, cache: ?*MathBoxCache) ?MathBox {
     const q = size_fn orelse return null;
     if (comptime math_stub) return null;
     if (tex.len == 0 or tex.len > 65536 or font_px <= 0) return null;
+    const tab = cache orelse return mathBoxQuery(tex, display, font_px, q);
+    const key = @intFromPtr(tex.ptr);
+    // Direct-mapped by slice identity: cheap hash over ptr/len/px/flag.
+    var h: usize = key ^ (tex.len *% 0x9E3779B97F4A7C15) ^ @as(usize, @as(u32, @bitCast(font_px)));
+    if (display) h ^= 0xA24BAED4963EE407;
+    const slot = tab[@as(usize, h) % MATH_BOX_CACHE_LEN];
+    if (slot.hit and slot.tex_ptr == key and slot.tex_len == tex.len and slot.font_px == font_px and slot.display == display) {
+        if (slot.fail) return null;
+        return slot.box;
+    }
+    const got = mathBoxQuery(tex, display, font_px, q);
+    tab[@as(usize, h) % MATH_BOX_CACHE_LEN] = .{
+        .tex_ptr = key,
+        .tex_len = tex.len,
+        .font_px = font_px,
+        .display = display,
+        .box = got orelse .{ .w = 0, .above = 0, .below = 0, .font_px = 0, .display = false },
+        .hit = true,
+        .fail = got == null,
+    };
+    return got;
+}
+
+/// One raw FFI math-box query: the old mathBox body, uncached. Shared by
+/// the null-cache path (bit-for-bit the old call) and cache misses.
+fn mathBoxQuery(tex: []const u8, display: bool, font_px: f32, q: MathSizeFn) ?MathBox {
     var w: f32 = 0;
     var above: f32 = 0;
     var below: f32 = 0;
@@ -1785,7 +1876,7 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
         flowSpans(island, .{}, null, pen, ctx, false);
         return;
     };
-    const box = mathBox(tex, display, ctx.font_size, ctx.math_size_fn) orelse {
+    const box = mathBoxCached(tex, display, ctx.font_size, ctx.math_size_fn, ctx.math_box_cache) orelse {
         // Typed-error mark (issue #377): the accent byte names the failure
         // position; untyped failures flow plainly as before.
         if (comptime !math_stub) {
@@ -1895,7 +1986,7 @@ fn mathBlockGeom(ux: *UnitCx, i: usize, base_x: f32, bw: f32) ?MathBlockGeom {
     if (ux.config.math_size_fn == null) return null;
     if (i >= ux.lines.len or ux.lines[i].block_type != .paragraph) return null;
     const blk = math_detect.displayBlock(ux.bytes, ux.lines, i) orelse return null;
-    const box = mathBox(blk.tex, true, ux.config.base_font_size, ux.config.math_size_fn) orelse return null;
+    const box = mathBoxCached(blk.tex, true, ux.config.base_font_size, ux.config.math_size_fn, ux.config.math_box_cache) orelse return null;
     const fit = fitMathBox(box, bw);
     // Centered: the RTL mirror is identical (symmetric about the middle).
     return .{ .tex = blk.tex, .box = fit, .x = base_x + (bw - fit.w) / 2.0, .consumed = blk.close_idx - i + 1 };
@@ -1907,7 +1998,7 @@ fn mathBlockGeom(ux: *UnitCx, i: usize, base_x: f32, bw: f32) ?MathBlockGeom {
 /// break, so mid-paragraph display lines just work. Mid-line islands never
 /// reach this path: they stay in the text flow via flowMathSpan.
 fn flowMathDisplay(tex: []const u8, pen: *FlowPen, ctx: FlowCtx) bool {
-    const box = mathBox(tex, true, ctx.font_size, ctx.math_size_fn) orelse return false;
+    const box = mathBoxCached(tex, true, ctx.font_size, ctx.math_size_fn, ctx.math_box_cache) orelse return false;
     if (pen.x > ctx.start_x or (ctx.rtl and pen.x < ctx.start_x + ctx.max_w)) {
         advanceRow(pen, ctx.line_h);
         pen.x = if (ctx.rtl) ctx.start_x + ctx.max_w else ctx.start_x;
@@ -2794,6 +2885,8 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .entities = ux.config.entities,
         .math_size_fn = ux.config.math_size_fn,
         .math_error_fn = ux.config.math_error_fn,
+        .math_box_cache = ux.config.math_box_cache,
+        .token_cache = ux.config.token_cache,
     };
 }
 
@@ -4654,9 +4747,38 @@ fn pluginFenceGeom(entries: ?[]const PluginEntry, i: usize) PluginFenceGeom {
                 const path: ?[]const u8 = if (rows[s].path.len > 0) rows[s].path else null;
                 return .{ .state = rows[s].job.state, .path = path };
             }
+            // Rows arrive in fence_line order (Task 5 builds from the
+            // fence-ordered scan; tests pin it): stop at the first row
+            // past the query instead of scanning the tail.
+            if (rows[s].job.fence_line > i) break;
         }
     }
     return .{};
+}
+
+/// Fence-body end shared by the three code-fence passes (issue #385):
+/// the matching `code_fence_end` scan index, or lines.len when unclosed.
+/// Null-entry/foreign-index/unstamped rows still scan inline (bit-identical
+/// fallback); stamped plugin rows short-circuit through their precomputed
+/// `fence_end`, so ready/queued fences pay no per-frame body walk. Pub for
+/// the main.zig stamping test.
+pub fn codeFenceEnd(entries: ?[]const PluginEntry, lines: []const simd.Line, i: usize) usize {
+    if (entries) |rows| {
+        var s: usize = 0;
+        while (s < rows.len) : (s += 1) {
+            if (rows[s].job.fence_line == i) {
+                // Stamped ends only: 0 means the row predates stamping
+                // (hand-built tables, new jobs) and any end at/below the
+                // open is a stale close — fall through to the inline scan.
+                if (rows[s].fence_end > i) return @min(rows[s].fence_end, lines.len);
+                break;
+            }
+            if (rows[s].job.fence_line > i) break;
+        }
+    }
+    var j: usize = i + 1;
+    while (j < lines.len and lines[j].block_type != .code_fence_end) : (j += 1) {}
+    return j;
 }
 
 /// ZaTeX math-fence geometry (```math|tex|latex|katex): the synchronous
@@ -4686,9 +4808,72 @@ fn mathFenceGeom(
     if (!math_detect.isMathFenceToken(tok)) return null;
     // No empty-source guard: mathBox nulls it below.
     const tex = plugin_cache.fenceSource(bytes, lines, i);
-    const box = mathBox(tex, true, config.base_font_size, config.math_size_fn) orelse return null;
+    const box = mathBoxCached(tex, true, config.base_font_size, config.math_size_fn, config.math_box_cache) orelse return null;
     const fit = fitMathBox(box, content_width);
     return .{ .tex = tex, .box = fit, .x = content_x + (content_width - fit.w) / 2.0 };
+}
+
+/// Per-frame code-line tokenization memo (issue #385): tokenize is pure
+/// in `(lang, line bytes)` but costs a full scan per visible line per
+/// tick. Small direct-mapped table over caller-owned segment storage:
+/// the hit path copies the latched segments into the caller's buffer
+/// (same bytes the direct call would have written) and returns the
+/// prefix; the miss path tokenizes once and latches the outcome —
+/// including the null (plain-run) outcome, so untokenizable lines pay
+/// one scan per table cycle, not per frame. Key is the line slice
+/// identity (ptr + len) plus lang; segments are small values, and the
+/// caller-visible `out` buffer always carries the returned runs, so a
+/// same-slot eviction re-tokenizes (never aliases). Callers pass their
+/// per-iteration stack buffer through; the memo owns no memory.
+pub const TOKEN_CACHE_LEN: usize = 16;
+pub const TokenCacheEntry = struct {
+    line_ptr: usize = 0,
+    line_len: usize = 0,
+    lang: highlight.Lang = .none,
+    seg_count: u8 = 0,
+    is_null: bool = false,
+    hit: bool = false,
+    segs: [highlight.MAX_SEGMENTS]highlight.Segment = undefined,
+};
+pub const TokenCache = [TOKEN_CACHE_LEN]TokenCacheEntry;
+
+/// Zero the table (document open): stale entries would pin a previous
+/// document's slices.
+pub fn tokenCacheReset(cache: *TokenCache) void {
+    for (cache) |*e| e.* = .{};
+}
+
+/// Memoized tokenize: bitwise-identical segments to the direct call.
+/// `out` is the caller's segment buffer (same contract as tokenize);
+/// `cache` may be null (direct call, bit-for-bit the old path).
+pub fn tokenizeCached(lang: highlight.Lang, line: []const u8, out: []highlight.Segment, cache: ?*TokenCache) ?[]highlight.Segment {
+    const tab = cache orelse return highlight.tokenize(lang, line, out);
+    if (line.len == 0) return highlight.tokenize(lang, line, out);
+    if (out.len < highlight.MAX_SEGMENTS) return highlight.tokenize(lang, line, out);
+    const key = @intFromPtr(line.ptr);
+    const h: usize = key ^ (line.len *% 0x9E3779B97F4A7C15) ^ @as(usize, @intFromEnum(lang));
+    const idx = h % TOKEN_CACHE_LEN;
+    const slot = &tab[idx];
+    if (slot.hit and slot.line_ptr == key and slot.line_len == line.len and slot.lang == lang) {
+        if (slot.is_null) return null;
+        const n = @min(@as(usize, slot.seg_count), out.len);
+        @memcpy(out[0..n], slot.segs[0..n]);
+        return out[0..n];
+    }
+    const got = highlight.tokenize(lang, line, out);
+    slot.line_ptr = key;
+    slot.line_len = line.len;
+    slot.lang = lang;
+    slot.hit = true;
+    if (got) |runs| {
+        slot.is_null = false;
+        slot.seg_count = @intCast(@min(runs.len, slot.segs.len));
+        @memcpy(slot.segs[0..slot.seg_count], runs[0..slot.seg_count]);
+    } else {
+        slot.is_null = true;
+        slot.seg_count = 0;
+    }
+    return got;
 }
 
 /// One monospace slice of a fenced-code row: the fence card's typed-error
@@ -4818,11 +5003,11 @@ pub fn renderViewportCore(
         // Handle Code Blocks: ```start ... lines ... ```end
         // ----------------------------------------------------
         if (line_info.block_type == .code_fence_start) {
-            var code_line_count: usize = 0;
-            var scan_i = i + 1;
-            while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
-                code_line_count += 1;
-            }
+            // Precomputed fence end (issue #385): plugin rows stamp the
+            // matching close at open; other fences scan inline exactly as
+            // before (same first-`code_fence_end`-wins rule).
+            const scan_i = codeFenceEnd(unit_cx.plugins, lines, i);
+            const code_line_count: usize = if (scan_i > i + 1) scan_i - i - 1 else 0;
 
             // ZaTeX math fence (```math|tex|latex|katex): synchronous
             // native block, centered with image margins. Engine off or
@@ -5070,7 +5255,11 @@ pub fn renderViewportCore(
                         var seg_buf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
                         // Null (untokenizable) and empty runs share the one
                         // plain run below — identical pixels, one literal.
-                        const runs: []highlight.Segment = if (highlight.tokenize(fence_lang, c_bytes, &seg_buf)) |r| r else &.{};
+                        // Memoized per (lang, line) per frame-set (issue
+                        // #385): repeat scroll frames hit the caller-owned
+                        // table instead of re-scanning; null cache (tests,
+                        // metrics) takes the old direct call bit-for-bit.
+                        const runs: []highlight.Segment = if (tokenizeCached(fence_lang, c_bytes, &seg_buf, config.token_cache)) |r| r else &.{};
                         // Failed ```math row with a typed error (issue
                         // #377): plain/accent/plain at the error column
                         // instead of the tinted runs (error case only).
@@ -5756,11 +5945,8 @@ pub fn computeDocumentHeightEx(
 
         // 1. Code blocks
         if (line_info.block_type == .code_fence_start) {
-            var code_line_count: usize = 0;
-            var scan_i = i + 1;
-            while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
-                code_line_count += 1;
-            }
+            const scan_i = codeFenceEnd(unit_cx.plugins, lines, i);
+            const code_line_count: usize = if (scan_i > i + 1) scan_i - i - 1 else 0;
             // ZaTeX math fence mirror: the same mathFenceGeom decision
             // the render branch draws, so the document height tracks
             // native math blocks exactly. Falls through to the card.
@@ -7370,12 +7556,8 @@ pub fn refineLineHeight(
         .code_line => return .{ .height = lh * 0.88, .consumed = 1 },
         .code_fence_end => return .{ .height = 0.0, .consumed = 1 },
         .code_fence_start => {
-            var n: usize = 0;
-            var j = idx + 1;
-            while (j < lines.len and lines[j].block_type != .code_fence_end) : ({
-                j += 1;
-                n += 1;
-            }) {}
+            const j = codeFenceEnd(config.plugins, lines, idx);
+            const n: usize = if (j > idx + 1) j - idx - 1 else 0;
             // Plugin fence mirror (issue #323, PR-1 Task 5 F1): same
             // pluginFenceGeom decision as render/height so JIT refine
             // converges to the drawn box, never the stale card.
@@ -9832,4 +10014,162 @@ test "math: tex/latex/katex fences stay highlighted code, never math" {
     // Even with a live engine: highlighted code card, zero math commands.
     try std.testing.expect(count > 0);
     for (cmds[0..count]) |c| try std.testing.expect(c.kind != .math);
+}
+
+test "energy #385: math-box memo matches direct query, skips repeat FFI" {
+    if (comptime core_options.plugin_stub) return;
+    const Calls = struct {
+        var n: u32 = 0;
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            n += 1;
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    const tex = "x+y";
+    var cache: MathBoxCache = undefined;
+    mathBoxCacheReset(&cache);
+    Calls.n = 0;
+    const a = mathBoxCached(tex, true, 17.0, Calls.size, &cache) orelse return error.MissExpected;
+    try std.testing.expectEqual(@as(u32, 1), Calls.n);
+    const b = mathBoxCached(tex, true, 17.0, Calls.size, &cache) orelse return error.MissExpected;
+    // Hit: no second FFI call, bitwise-identical box.
+    try std.testing.expectEqual(@as(u32, 1), Calls.n);
+    try std.testing.expectEqual(a.w, b.w);
+    try std.testing.expectEqual(a.above, b.above);
+    try std.testing.expectEqual(a.below, b.below);
+    // Direct call agrees with the memoized box.
+    const d = mathBox(tex, true, 17.0, Calls.size) orelse return error.MissExpected;
+    try std.testing.expectEqual(a.w, d.w);
+    try std.testing.expectEqual(a.above, d.above);
+    try std.testing.expectEqual(a.below, d.below);
+    // Different px re-queries (key includes font size).
+    _ = mathBoxCached(tex, true, 20.0, Calls.size, &cache);
+    try std.testing.expectEqual(@as(u32, 3), Calls.n);
+    // Null cache is the old direct path.
+    Calls.n = 0;
+    _ = mathBoxCached(tex, true, 17.0, Calls.size, null);
+    _ = mathBoxCached(tex, true, 17.0, Calls.size, null);
+    try std.testing.expectEqual(@as(u32, 2), Calls.n);
+}
+
+test "energy #385: math-box memo latches refusals" {
+    if (comptime core_options.plugin_stub) return;
+    const Calls = struct {
+        var n: u32 = 0;
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            _ = px;
+            _ = w;
+            _ = ab;
+            _ = bl;
+            n += 1;
+            return 2;
+        }
+    };
+    var cache: MathBoxCache = undefined;
+    mathBoxCacheReset(&cache);
+    Calls.n = 0;
+    try std.testing.expect(mathBoxCached("bad", true, 17.0, Calls.size, &cache) == null);
+    try std.testing.expect(mathBoxCached("bad", true, 17.0, Calls.size, &cache) == null);
+    try std.testing.expectEqual(@as(u32, 1), Calls.n);
+}
+
+test "energy #385: tokenize memo matches direct call incl. null" {
+    var cache: TokenCache = undefined;
+    tokenCacheReset(&cache);
+    const line = "const x = 42; // hi";
+    var buf1: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    var buf2: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    const want = highlight.tokenize(.zig, line, &buf1);
+    const got = tokenizeCached(.zig, line, &buf2, &cache);
+    if (want == null) {
+        try std.testing.expect(got == null);
+    } else {
+        try std.testing.expect(got != null);
+        try std.testing.expectEqual(want.?.len, got.?.len);
+        for (want.?, 0..) |s, k| try std.testing.expectEqual(s, got.?[k]);
+    }
+    // Second call hits the memo with a fresh buffer: same runs.
+    var buf3: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    const got2 = tokenizeCached(.zig, line, &buf3, &cache);
+    if (want == null) {
+        try std.testing.expect(got2 == null);
+    } else {
+        try std.testing.expect(got2 != null);
+        try std.testing.expectEqual(want.?.len, got2.?.len);
+        for (want.?, 0..) |s, k| try std.testing.expectEqual(s, got2.?[k]);
+    }
+    // Untokenizable lines latch null (tab content).
+    const bad = "a\tb";
+    var bbuf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    try std.testing.expect(tokenizeCached(.zig, bad, &bbuf, &cache) == null);
+    var bbuf2: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    try std.testing.expect(tokenizeCached(.zig, bad, &bbuf2, &cache) == null);
+    // Null cache is the old direct path.
+    var nbuf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    const direct = highlight.tokenize(.zig, line, &nbuf);
+    if (want == null) {
+        try std.testing.expect(direct == null);
+    } else {
+        try std.testing.expect(direct != null);
+        try std.testing.expectEqual(want.?.len, direct.?.len);
+    }
+}
+
+test "energy #385: codeFenceEnd matches inline scan, honors precomputed ends" {
+    const doc =
+        "```zig\n" ++
+        "const x = 1;\n" ++
+        "```\n" ++
+        "text\n" ++
+        "```mermaid\n" ++
+        "A-->B\n" ++
+        "```\n";
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    // Null table: same first-close-wins scan as the old inline loops.
+    try std.testing.expectEqual(@as(usize, 2), codeFenceEnd(null, lines, 0));
+    try std.testing.expectEqual(@as(usize, 6), codeFenceEnd(null, lines, 4));
+    // Precomputed row short-circuits (ready plugin fence at 4).
+    const rows = [_]PluginEntry{.{
+        .job = .{ .fence_line = 4, .hash = 0, .renderer = .mermaid, .state = .ready },
+        .path = "p",
+        .fence_end = 6,
+    }};
+    try std.testing.expectEqual(@as(usize, 6), codeFenceEnd(rows[0..], lines, 4));
+    // Foreign index still scans inline.
+    try std.testing.expectEqual(@as(usize, 2), codeFenceEnd(rows[0..], lines, 0));
+    // Unclosed fence runs to lines.len.
+    const doc2 = "```zig\nconst x = 1;\n";
+    var lb2: [8]simd.Line = undefined;
+    var f2: simd.FenceState = .{};
+    const n2 = simd.scanLines(doc2, &lb2, &f2);
+    try std.testing.expectEqual(n2, codeFenceEnd(null, lb2[0..n2], 0));
+}
+
+test "energy #385: plugin lookup stops at first row past the query" {
+    const rows = [_]PluginEntry{
+        .{ .job = .{ .fence_line = 0, .hash = 1, .renderer = .mermaid, .state = .ready }, .path = "a", .fence_end = 2 },
+        .{ .job = .{ .fence_line = 5, .hash = 2, .renderer = .d2, .state = .queued }, .path = "", .fence_end = 7 },
+    };
+    const g0 = pluginFenceGeom(rows[0..], 0);
+    try std.testing.expect(g0.state.? == .ready);
+    try std.testing.expectEqualStrings("a", g0.path.?);
+    const g5 = pluginFenceGeom(rows[0..], 5);
+    try std.testing.expect(g5.state.? == .queued);
+    try std.testing.expect(g5.path == null);
+    // Miss between/after rows: null state, same as before.
+    try std.testing.expect(pluginFenceGeom(rows[0..], 3).state == null);
+    try std.testing.expect(pluginFenceGeom(rows[0..], 9).state == null);
+    try std.testing.expect(pluginFenceGeom(null, 0).state == null);
 }

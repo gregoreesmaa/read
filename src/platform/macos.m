@@ -107,6 +107,7 @@ typedef struct {
     char text[512];
     int len;
     char link_url[256];
+    int link_url_len; // cached byte length (issue #385: hash without strlen)
     int line_index;
 } QuadTextRecord;
 
@@ -1196,18 +1197,24 @@ static void paint_copy_button(CGContextRef ctx) {
 - (void)mouseMoved:(NSEvent *)event {
     g_mouse_pos = [self convertPoint:[event locationInWindow] fromView:nil];
 
+    // Single-pass hover scan (issue #385): one walk finds both the link
+    // hover (hash + cursor) and the code-button hover (button rect),
+    // instead of one pass per concern. URL lengths ride along in the
+    // text record (link_url_len) so the hash never re-scans for '\0'.
     BOOL over_link = NO;
     uint64_t hover_hash = 0;
+    int new_hover_btn = -1;
     for (int i = 0; i < g_text_record_count; i++) {
         QuadTextRecord* rec = &g_text_records[i];
         float view_y = rec->doc_y - g_scroll_y;
-        if (rec->link_url[0] != '\0' &&
-            g_mouse_pos.x >= rec->x && g_mouse_pos.x <= rec->x + rec->w &&
+        if (g_mouse_pos.x >= rec->x && g_mouse_pos.x <= rec->x + rec->w &&
             g_mouse_pos.y >= view_y && g_mouse_pos.y <= view_y + rec->h) {
-            over_link = YES;
-            // Unified link hover (#101): the whole URL highlights, not
-            // just the word under the cursor.
-            hover_hash = link_url_hash(rec->link_url, (int)strlen(rec->link_url));
+            if (rec->link_url_len > 0) {
+                over_link = YES;
+                // Unified link hover (#101): the whole URL highlights, not
+                // just the word under the cursor.
+                hover_hash = link_url_hash(rec->link_url, rec->link_url_len);
+            }
             break;
         }
     }
@@ -1223,8 +1230,18 @@ static void paint_copy_button(CGContextRef ctx) {
         if (g_mouse_pos.x >= btn_x && g_mouse_pos.x <= btn_x + btn_w &&
             g_mouse_pos.y >= btn_y && g_mouse_pos.y <= btn_y + btn_h) {
             over_code_btn = YES;
-            break;
         }
+        // The copy-button visibility scan below walks the same blocks for
+        // the container hit: fold it in here so one block pass serves both
+        // (identical outcome: first container hit wins either way; the
+        // button hit never breaks the container scan, mirroring the old
+        // two loops where the second always ran to its own break).
+        if (new_hover_btn < 0 &&
+            g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
+            g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
+            new_hover_btn = b_idx;
+        }
+        if (over_code_btn && new_hover_btn >= 0) break;
     }
 
     if (scrollbar_hit(g_mouse_pos, self.bounds.size.width) || g_scrollbar_dragging) {
@@ -1237,15 +1254,7 @@ static void paint_copy_button(CGContextRef ctx) {
 
     // Damage: cursor changes need no repaint. Only the hover Copy button
     // changing visibility dirties pixels: invalidate old + new button rects.
-    int new_hover_btn = -1;
-    for (int b_idx = 0; b_idx < g_code_block_count; b_idx++) {
-        CodeBlockRecord* b = &g_code_blocks[b_idx];
-        if (g_mouse_pos.x >= b->x && g_mouse_pos.x <= b->x + b->w &&
-            g_mouse_pos.y >= b->y && g_mouse_pos.y <= b->y + b->h) {
-            new_hover_btn = b_idx;
-            break;
-        }
-    }
+    // (new_hover_btn was resolved in the single block pass above.)
     // Idle-gated link highlight (mirrors idle.zig shouldRedrawOnHover): pure
     // mouse motion never redraws. A link-highlight flip re-arms one gated
     // full redraw (no exact record handy); copy-button-only flips stay
@@ -1890,7 +1899,7 @@ static NSString* selected_text_string(void) {
         NSEventPhase momentum = [event momentumPhase];
         if (phase == NSEventPhaseEnded || phase == NSEventPhaseCancelled ||
             momentum == NSEventPhaseEnded || momentum == NSEventPhaseCancelled) {
-            g_callbacks.on_scroll(0.0f, 0.0f, -1, 1);
+            g_callbacks.on_scroll(0.0f, 0.0f, -1, 1, [event timestamp] * 1000.0);
             // Damage: scroll-lock reset changes no pixels, so no repaint.
 #ifdef TEST_HOOKS
             DBGLOG("EV scroll_end");
@@ -1915,7 +1924,7 @@ static NSString* selected_text_string(void) {
                 break;
             }
         }
-        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id, (int)[event hasPreciseScrollingDeltas]);
+        g_callbacks.on_scroll((float)dx, (float)dy, hovered_block_id, (int)[event hasPreciseScrollingDeltas], [event timestamp] * 1000.0);
 #ifdef TEST_HOOKS
         DBGLOG("EV scroll t=%llu dx=%.1f dy=%.1f hover=%d phase=%lu mom=%lu", dbg_t_ms(), dx, dy, hovered_block_id,
             (unsigned long)phase, (unsigned long)momentum);
@@ -2559,6 +2568,7 @@ static __attribute__((noinline)) void record_text_quad(const char* text, int len
     } else {
         rec->link_url[0] = '\0';
     }
+    rec->link_url_len = copy_url;
 }
 
 // Record-only registration for culled text runs: the selection/hover/link
