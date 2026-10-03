@@ -5,6 +5,7 @@ artifacts/
 *.o
 *.png
 !screenshots/*.png
+!screenshots/*/*.png
 !assets/images/*.png
 !test_cases/assets/*.png
 .zig-cache-global/

@@ -1715,47 +1715,14 @@ void platform_clear_selection(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Math stubs: size -> 1 (engine unavailable), last_error -> 0, draw no-op,
-// stats/info zeros. TEST_HOOKS-only readers stay under the same gate so
-// ship never links them.
+// ZaTeX runtime math backend (LaTeX math plugin) lives in linux_zatex.c
+// (FreeType metrics + direct draw); READ_PLUGIN_STUB=1 includes the empty
+// stub instead — same TU, same flags (AGENTS.md §7, macos.m precedent).
 // ---------------------------------------------------------------------------
-int platform_math_size(const char* tex, int tex_len, int display, float font_px,
-                       float* out_w, float* out_above, float* out_below) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    if (out_w) *out_w = 0;
-    if (out_above) *out_above = 0;
-    if (out_below) *out_below = 0;
-    return 1;
-}
-
-int platform_math_last_error(const char* tex, int tex_len, int display,
-                             unsigned int* out_offset, int* out_code) {
-    (void)tex; (void)tex_len; (void)display;
-    (void)out_offset; (void)out_code;
-    return 0;
-}
-
-void platform_draw_math(const char* tex, int tex_len, int display, float font_px,
-                        float x, float y_top,
-                        unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    (void)x; (void)y_top; (void)r; (void)g; (void)b; (void)a;
-}
-
-#ifdef TEST_HOOKS
-void platform_math_atlas_stats(uint64_t* hits, uint64_t* misses) {
-    if (hits) *hits = 0;
-    if (misses) *misses = 0;
-}
-
-void platform_math_engine_info(unsigned int* version, unsigned int* use_ex, unsigned int* conform_ran,
-                               int* conform_n, unsigned int* caps) {
-    if (version) *version = 0;
-    if (use_ex) *use_ex = 0;
-    if (conform_ran) *conform_ran = 0;
-    if (conform_n) *conform_n = 0;
-    if (caps) *caps = 0;
-}
+#if READ_PLUGIN_STUB
+#include "linux_zatex_stub.c"
+#else
+#include "linux_zatex.c"
 #endif
 
 // ---------------------------------------------------------------------------

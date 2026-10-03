@@ -102,7 +102,12 @@ var g_remote_seen: bool = false;
 /// no dylib seeded (mirrors the launcher-callback-null pattern for async
 /// plugins). Twin builds compile the math paths out regardless.
 fn liveMathSizeFn() ?layout.MathSizeFn {
-    if (build_options.test_hooks) return null;
+    // Headless determinism default: test builds fall back unless the
+    // caller opts into live rendering via READ_LIVE_MATH (screenshot
+    // suite math captures; same TEST_HOOKS-only env pattern as
+    // ZATEX_TEST_DYLIB). Ship (test_hooks=false) folds this to live and
+    // never consults the environment.
+    if (build_options.test_hooks and std.c.getenv("READ_LIVE_MATH") == null) return null;
     return bridge.platform_math_size;
 }
 
@@ -110,7 +115,9 @@ fn liveMathSizeFn() ?layout.MathSizeFn {
 /// same gating as the size query above — null in headless tests and
 /// compiled out in twin builds, so fallbacks stay deterministic there.
 fn liveMathErrorFn() ?layout.MathErrorFn {
-    if (build_options.test_hooks) return null;
+    // Same READ_LIVE_MATH opt-in as liveMathSizeFn above (paired fns must
+    // agree: size-live with error-null would mis-mark fallback positions).
+    if (build_options.test_hooks and std.c.getenv("READ_LIVE_MATH") == null) return null;
     return bridge.platform_math_last_error;
 }
 
