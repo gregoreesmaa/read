@@ -189,7 +189,7 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         const bytes = mapped.bytes;
         var in_fence: simd.FenceState = .{};
         const line_count = simd.scanLines(bytes, &lines_buf, &in_fence);
-        const vp_config = layout.ViewportConfig{
+        var vp_config = layout.ViewportConfig{
             .window_width = 1000.0,
             .window_height = 750.0,
             .scroll_y = 0.0,
@@ -198,11 +198,11 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         _ = layout.computeDocumentHeightEx(
             bytes,
             lines_buf[0..line_count],
-            vp_config,
+            &vp_config,
             &checkpoints,
             &cp_count,
         );
-        const deep_config = layout.ViewportConfig{
+        var deep_config = layout.ViewportConfig{
             .window_width = 1000.0,
             .window_height = 750.0,
             .scroll_y = 0.0,
@@ -211,7 +211,7 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         const cmd_count = layout.layoutViewport(
             bytes,
             lines_buf[0..line_count],
-            deep_config,
+            &deep_config,
             &commands,
         );
         mapped.close();

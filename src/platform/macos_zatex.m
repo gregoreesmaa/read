@@ -585,10 +585,7 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
             CGContextScaleCTM(g_atlas_ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), 1.0);
             base = 0.0;
         }
-        uint32_t n = rn->glyph_count;
-        // Scratch bound (issue #388: zatex_gbuf/zatex_pos are 1024 now);
-        // over-cap runs skip exactly like zero-count runs above.
-        if (n > 1024) continue;
+        // n already bounded to 1024 by the loop guard above.
         int64_t acc = 0;
         for (uint32_t k = 0; k < n; k++) {
             uint16_t gl = zatex_glyphs[rn->glyph_start + k];

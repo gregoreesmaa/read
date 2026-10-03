@@ -666,7 +666,7 @@ test "controls: accurate document height computation ensures tables and end of d
     const accurate_height = layout.computeDocumentHeightEx(
         showcase_doc,
         lines_buf[0..line_count],
-        vp_config,
+        &vp_config,
         null,
         null,
     );
@@ -686,7 +686,7 @@ test "controls: accurate document height computation ensures tables and end of d
     const cmd_count = layout.layoutViewport(
         showcase_doc,
         lines_buf[0..line_count],
-        table_scroll_config,
+        &table_scroll_config,
         &commands_buf,
     );
 

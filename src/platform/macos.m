@@ -35,6 +35,9 @@ static float scrollbar_thumb_y(void);
 static BOOL scrollbar_hit(NSPoint view_pt, float view_w);
 static void scrollbar_drag_to(float y);
 static void mark_link_visited(const char* url);
+// Uncached font resolver (issue #388): defined below get_font_for_style;
+// declared here so the font cache's miss path sees a static prototype.
+static NSFont* font_resolve_uncached(float font_size, int is_bold, int is_italic, int is_mono, int is_heading);
 
 // Idle policy (mirrors src/platform/idle.zig): mouse motion alone never
 // redraws. Only a hover-state transition re-arms a draw. The last hover
