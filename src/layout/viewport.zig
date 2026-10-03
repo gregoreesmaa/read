@@ -700,6 +700,54 @@ test "findOffsetY lands on the match block (#42)" {
     try t.expect(findOffsetY(doc, lines[0..0], cfg, 0) == null);
 }
 
+test "findRowOffsetY lands row-exact inside wrapped paras (#386)" {
+    const t = std.testing;
+    const doc = "# Title\n\nFirst para here.\n\nSecond para here.\n";
+    var line_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &line_buf, &fence);
+    const lines = line_buf[0..n];
+    const cfg = ViewportConfig{
+        .window_width = 1200,
+        .window_height = 900,
+        .scroll_y = 0,
+        .base_font_size = 17,
+        .line_height = 29.75,
+        .is_dark_theme = true,
+    };
+    // Single-row paragraph: row-exact == block top.
+    const off = std.mem.indexOf(u8, doc, "First").?;
+    const top = findOffsetY(doc, lines, cfg, off).?;
+    var unit: usize = 0;
+    while (unit < lines.len and lines[unit].offset + lines[unit].len <= off) : (unit += 1) {}
+    unit = snapWindowStart(doc, lines, unit);
+    try t.expectEqual(top, findRowOffsetY(doc, lines, cfg, unit, top, off));
+    // Narrow column wraps the run: an offset on the second visual row
+    // lands exactly one line height below the block top.
+    const doc2 = "aaa bbb ccc ddd eee fff ggg hhh\n";
+    var lb2: [8]simd.Line = undefined;
+    var f2: simd.FenceState = .{};
+    const n2 = simd.scanLines(doc2, &lb2, &f2);
+    const w1 = measureTextEx("aaa", 17.0, false, false, false, false);
+    const sp = measureCharEx(' ', 17.0, false, false, false, false);
+    // Force wrap after the first word by sizing the column just past it.
+    const cfg2 = ViewportConfig{
+        .window_width = 64.0 + w1 + sp + 2.0,
+        .window_height = 900,
+        .scroll_y = 0,
+        .base_font_size = 17,
+        .line_height = 29.75,
+        .is_dark_theme = true,
+    };
+    const top2 = findOffsetY(doc2, lb2[0..n2], cfg2, 0).?;
+    const late = std.mem.indexOf(u8, doc2, "hhh").?;
+    const y_late = findRowOffsetY(doc2, lb2[0..n2], cfg2, 0, top2, late);
+    try t.expect(y_late > top2);
+    // Row-exact never lands above the block top nor past its refined bottom.
+    const u = refineLineHeight(doc2, lb2[0..n2], 0, cfg2, contentWidthOf(cfg2), contentXOf(cfg2));
+    try t.expect(y_late <= top2 + u.height + 0.001);
+}
+
 pub const DrawCommandKind = enum {
     fill_rect,
     text_run,
@@ -4330,22 +4378,26 @@ fn flowParaLineJoint(ux: *UnitCx, pen: *FlowPen, ctx: FlowCtx, k: usize, strip: 
 /// Scans the same continuation lines the unit consumes below, so the
 /// decision — and therefore every wrap — is identical across the render,
 /// measure, and refine passes. False (LTR) preserves history exactly.
-noinline fn paragraphDirection(ux: *UnitCx, i: usize) bool {
-    const lb0 = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
+fn unitRtl(bytes: []const u8, lines: []const simd.Line, i: usize) bool {
+    const lb0 = bytes[lines[i].offset..][0..lines[i].len];
     if (bidi.firstStrong(lb0)) |s| return s == .r;
     // Setext pairs decide on the text line alone: the underline is neutral
     // but must not leak the scan into the following paragraph.
-    if (setextLevel(ux.bytes, ux.lines, i) != null) return false;
+    if (setextLevel(bytes, lines, i) != null) return false;
     var j = i + 1;
-    while (j < ux.lines.len and
-        ((ux.lines[j].block_type == .paragraph and
-            setextLevel(ux.bytes, ux.lines, j) == null) or
-            ((listContinuationStart(ux.bytes, ux.lines, j) orelse (j + 1)) == i))) : (j += 1)
+    while (j < lines.len and
+        ((lines[j].block_type == .paragraph and
+            setextLevel(bytes, lines, j) == null) or
+            ((listContinuationStart(bytes, lines, j) orelse (j + 1)) == i))) : (j += 1)
     {
-        const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
+        const lb = bytes[lines[j].offset..][0..lines[j].len];
         if (bidi.firstStrong(lb)) |s| return s == .r;
     }
     return false;
+}
+
+noinline fn paragraphDirection(ux: *UnitCx, i: usize) bool {
+    return unitRtl(ux.bytes, ux.lines, i);
 }
 
 /// Lays out a paragraph unit: setext pair (consumes 2) or a flowed run of
@@ -8471,6 +8523,68 @@ pub fn findOffsetY(
     return y;
 }
 
+/// Exact document y of a byte offset inside the unit starting at
+/// `unit_start` with document top `unit_top_y` (issue #386: one-snap find
+/// landing, no chase steps). Paragraph units refine to the wrapped visual
+/// row holding the offset via `countRowsBefore` over the unit's joined
+/// source text; every other unit type lands on the unit top exactly like
+/// `findOffsetY` (its intra-block geometry is not row-addressable). Cold
+/// path (per find cycle only); zero heap.
+pub fn findRowOffsetY(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    config: ViewportConfig,
+    unit_start: usize,
+    unit_top_y: f32,
+    target: usize,
+) f32 {
+    if (unit_start >= lines.len) return unit_top_y;
+    if (lines[unit_start].block_type != .paragraph) return unit_top_y;
+    // Plain-LTR body runs only (see countRowsBefore): inline markup
+    // (code, emphasis, links, math, tags, entities, escapes, bare URLs —
+    // every opener the parser honors, per hasInlineMarkup's doc comment),
+    // RTL paragraphs, and multi-line or owned units (quotes, lists,
+    // setext pairs, continuations, indented code rows) fall back to the
+    // unit top — the same offset the chase's first step landed on — so
+    // the final scroll is never worse than before, only sometimes
+    // row-exact.
+    {
+        const lb0 = bytes[lines[unit_start].offset..][0..lines[unit_start].len];
+        var t0 = lb0;
+        while (t0.len > 0 and (t0[0] == ' ' or t0[0] == '\t')) : (t0 = t0[1..]) {}
+        if (hasInlineMarkup(t0)) return unit_top_y;
+        if (unitRtl(bytes, lines, unit_start)) return unit_top_y;
+        if (setextLevel(bytes, lines, unit_start) != null) return unit_top_y;
+        if (enclosingListMarker(bytes, lines, unit_start) != null) return unit_top_y;
+        if (quoteLeader(bytes, lines, unit_start) != null) return unit_top_y;
+        if (indentedCodeLeader(bytes, lines, unit_start) != null) return unit_top_y;
+        if (inItemCodeRow(bytes, lines, unit_start)) return unit_top_y;
+        if (unit_start + 1 < lines.len) {
+            const nl = lines[unit_start + 1];
+            if (nl.block_type == .paragraph and quoteLeader(bytes, lines, unit_start + 1) == null) return unit_top_y;
+        }
+    }
+    // The unit's first flowed row mirrors the render join's head line:
+    // followers append with one soft space (see layoutParagraphUnit via
+    // flowParaLineJoint). Single-line units only (multi-line gated above),
+    // stripped of edge indent exactly like flowSourceLine. Tail offsets
+    // past the joined text clamp to its last row, never past the block.
+    var joined: [512]u8 = undefined;
+    var jlen: usize = 0;
+    {
+        const lb = bytes[lines[unit_start].offset..][0..lines[unit_start].len];
+        var s = lb;
+        while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) : (s = s[1..]) {}
+        while (s.len > 0 and (s[s.len - 1] == ' ' or s[s.len - 1] == '\t')) : (s = s[0 .. s.len - 1]) {}
+        jlen = @min(s.len, joined.len);
+        @memcpy(joined[0..jlen], s[0..jlen]);
+    }
+    const start_off = lines[unit_start].offset;
+    const rel = if (target > start_off) @min(target - start_off, jlen) else 0;
+    const rows = countRowsBefore(joined[0..jlen], rel, contentXOf(config), contentWidthOf(config), config.base_font_size);
+    return findRowY(unit_top_y, rows, config.line_height);
+}
+
 pub fn anchorScrollY(
     bytes: []const u8,
     lines: []const simd.Line,
@@ -9036,6 +9150,119 @@ test "virtualized: warm JIT viewport layout under 12us" {
 // on the layoutViewport hot path: estimate/map build run once at open,
 // per-frame cost is one index multiply plus checkpoint binary search.
 // ============================================================================
+
+/// Coalesced document re-measure state (issue #386): arrivals (async image
+/// sizes, plugin render completions) batch into one metrics walk per frame
+/// instead of one walk per arrival. Zig accumulates the above-viewport
+/// height delta; the platform's per-arrival repaint requests coalesce
+/// through AppKit's `setNeedsDisplay:` (already idempotent). Pure, zero
+/// heap, test-pinned below.
+pub const MetricsCoalescer = struct {
+    pending: bool = false,
+    delta_above: f32 = 0.0,
+
+    pub fn noteArrival(self: *MetricsCoalescer, delta_above: f32) void {
+        self.pending = true;
+        self.delta_above += delta_above;
+    }
+
+    /// Drain one frame's batch: exactly one metrics walk, then the summed
+    /// above-viewport shift as a single scroll snap. True when a walk ran
+    /// (caller repaints once); false when nothing arrived (zero walks).
+    pub fn drain(self: *MetricsCoalescer) bool {
+        if (!self.pending) return false;
+        self.pending = false;
+        return true;
+    }
+
+    /// Consume the accumulated delta after the walk (same absorbHeightDelta
+    /// anchor math the platform path uses: top-visible pixel stays put).
+    pub fn takeDelta(self: *MetricsCoalescer) f32 {
+        const d = self.delta_above;
+        self.delta_above = 0.0;
+        return d;
+    }
+};
+
+/// Exact find landing (issue #386): intra-block row for a byte offset
+/// inside a wrapped paragraph run. `block_top_y` is the unit top from
+/// findOffsetY's walk (document coords); `line_h` the block's visual row
+/// height; `rows_before` the count of wrapped visual rows strictly above
+/// the offset's row. Landing = block_top + rows_before * line_h, so find
+/// cycles land on the match row in one snap — no chase steps, no extra
+/// fullscreen redraws. Pure geometry, zero allocations.
+pub fn findRowY(block_top_y: f32, rows_before: usize, line_h: f32) f32 {
+    return block_top_y + @as(f32, @floatFromInt(rows_before)) * line_h;
+}
+
+/// Count wrapped visual rows strictly above `target` within the flowed
+/// source line `text` at `(start_x, max_w, font_size)`. Rows break at the
+/// same word boundaries the renderer uses: a word that overflows the row
+/// moves down exactly when the renderer wraps it (`flowWord`: overflow and
+/// not already at the row start). Per-word widths use whole-run
+/// `measureTextEx` (kern pairs apply within the run, as drawn) — callers
+/// must therefore pass whole flowed runs, never re-sliced words. Inline
+/// code pills, bold/italic/marks, and RTL runs use different widths or
+/// directions, so callers restrict this to plain LTR body runs; anything
+/// else lands on the block top via `findRowOffsetY`'s paragraph gate.
+/// Zero heap.
+pub fn countRowsBefore(text: []const u8, target: usize, start_x: f32, max_w: f32, font_size: f32) usize {
+    const space_w = measureCharEx(' ', font_size, false, false, false, false);
+    var pen_x: f32 = start_x;
+    var rows: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i >= target) break;
+        if (text[i] == ' ') {
+            pen_x += space_w;
+            i += 1;
+            continue;
+        }
+        const w_start = i;
+        while (i < text.len and text[i] != ' ') : (i += 1) {}
+        const w_end = @min(i, text.len);
+        if (w_start >= target) break;
+        const w = measureTextEx(text[w_start..w_end], font_size, false, false, false, false);
+        if (pen_x + w > start_x + max_w and pen_x > start_x) {
+            pen_x = start_x;
+            if (w_start >= target) break;
+            rows += 1;
+        }
+        pen_x += w;
+        if (i >= target) break;
+    }
+    return rows;
+}
+
+test "metrics coalescer batches arrivals into one walk (#386)" {
+    var m = MetricsCoalescer{};
+    try std.testing.expect(!m.drain());
+    m.noteArrival(10.0);
+    m.noteArrival(-4.0);
+    m.noteArrival(0.0);
+    try std.testing.expect(m.drain());
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), m.takeDelta(), 0.001);
+    try std.testing.expect(!m.drain());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), m.takeDelta(), 0.001);
+}
+
+test "find row landing matches wrapped flow rows (#386)" {
+    const t = std.testing;
+    const lh: f32 = 29.75;
+    // Single short line: no wrap, row 0.
+    try t.expectEqual(@as(usize, 0), countRowsBefore("foo bar", 4, 0.0, 600.0, 17.0));
+    try t.expectEqual(@as(f32, 50.0), findRowY(50.0, 0, lh));
+    // Narrow row forces a wrap: the second word sits one row down and the
+    // landing tracks it exactly.
+    const w1 = measureTextEx("aaa", 17.0, false, false, false, false);
+    const w2 = measureTextEx("bbb", 17.0, false, false, false, false);
+    const sp = measureCharEx(' ', 17.0, false, false, false, false);
+    const narrow = w1 + sp + 1.0;
+    try t.expect(w1 + sp + w2 > narrow);
+    try t.expectEqual(@as(usize, 0), countRowsBefore("aaa bbb", 0, 0.0, narrow, 17.0));
+    try t.expectEqual(@as(usize, 1), countRowsBefore("aaa bbb", 4, 0.0, narrow, 17.0));
+    try t.expectEqual(50.0 + lh, findRowY(50.0, 1, lh));
+}
 
 pub const SCROLL_CHROME_PAD: f32 = 100.0; // 50 top + 50 bottom, mirrors layoutViewport/computeDocumentHeightEx
 

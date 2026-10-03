@@ -73,6 +73,19 @@ pub fn isGestureEnd(phase_ended_or_cancelled: bool, momentum_ended_or_cancelled:
     return phase_ended_or_cancelled or momentum_ended_or_cancelled;
 }
 
+/// External-change reload debounce (issue #386): editors save in rapid
+/// pairs (temp write + rename); the second vnode event lands within
+/// milliseconds. Reload on the first, swallow repeats inside the window so
+/// a save pair costs exactly one mmap + metrics walk. Pure, zero heap.
+/// Window: 250 ms — an order above save-pair spacing, an order below a
+/// human re-save.
+pub const RELOAD_QUIET_MS: i64 = 250;
+
+pub fn reloadDebounced(now_ms: i64, last_ms: ?i64) bool {
+    const prev = last_ms orelse return true;
+    return now_ms - prev >= RELOAD_QUIET_MS;
+}
+
 // ---------------------------------------------------------------------------
 // Tests: hover gating
 // ---------------------------------------------------------------------------
@@ -133,6 +146,15 @@ test "idle: scroll gesture end returns loop to idle" {
     try std.testing.expect(isGestureEnd(false, true));
     try std.testing.expect(isGestureEnd(true, true));
     try std.testing.expect(!isGestureEnd(false, false));
+}
+
+test "idle: reload debounce swallows save pairs (#386)" {
+    try std.testing.expect(reloadDebounced(1000, null));
+    try std.testing.expect(reloadDebounced(1000, 0));
+    try std.testing.expect(!reloadDebounced(1000, 999));
+    try std.testing.expect(!reloadDebounced(1000, 751));
+    try std.testing.expect(reloadDebounced(1000, 750));
+    try std.testing.expect(reloadDebounced(1250, 1000));
 }
 
 // ---------------------------------------------------------------------------
