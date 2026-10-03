@@ -14,11 +14,16 @@ typography on **macOS**. No Electron, no WebKit, no UI toolkit, no package depen
 
 ## Try it (30 seconds)
 
-macOS + Zig 0.16:
+macOS, Linux, or Windows + Zig 0.16:
 
 ```bash
 zig build -Doptimize=ReleaseFast && ./zig-out/bin/read showcase.md
 ```
+
+Linux needs the X11/FreeType stack (`sudo apt-get install libx11-dev
+libxext-dev libfontconfig1-dev libfreetype6-dev libpng-dev`); Windows and
+macOS need nothing beyond Zig. Versioned tags ship installable artifacts
+for all three OSes — see [docs/release.md](docs/release.md).
 
 `j`/`k` scroll · `Space` page down · `t` toggle theme · `q` quit.
 Full controls: [docs/keys.md](docs/keys.md). Why this exists: [VISION.md](VISION.md).

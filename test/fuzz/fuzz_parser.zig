@@ -21,9 +21,7 @@ const MAX_LINES: usize = 220_000;
 const TOKENS_PER_LINE: usize = 256;
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    return read.port_clock.nowNs();
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

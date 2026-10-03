@@ -1,5 +1,6 @@
 const std = @import("std");
 const simd = @import("hot");
+const port_clock = @import("../core/port_clock.zig");
 const parser = @import("../core/parser.zig");
 const highlight = @import("../core/highlight.zig");
 const bidi = @import("../core/bidi.zig");
@@ -8072,8 +8073,7 @@ pub const LayoutJob = struct {
         const n = @min(lines.len, heights.len);
         const cw = contentWidthOf(config);
         const cx = contentXOf(config);
-        var ts0: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts0);
+        const ts0: u64 = port_clock.nowNs();
 
         if (self.phase == .estimate) {
             while (self.next_line < n) {
@@ -8114,12 +8114,9 @@ pub const LayoutJob = struct {
     }
 };
 
-fn budgetExceeded(ts0: std.posix.timespec, budget_ns: u64) bool {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
-    const elapsed: i128 = (@as(i128, ts.sec) - @as(i128, ts0.sec)) * 1_000_000_000 +
-        (@as(i128, ts.nsec) - @as(i128, ts0.nsec));
-    return elapsed >= @as(i128, budget_ns);
+fn budgetExceeded(ts0: u64, budget_ns: u64) bool {
+    const elapsed: u64 = port_clock.nowNs() -% ts0;
+    return elapsed >= budget_ns;
 }
 
 /// JIT viewport layout: seeks with the Goldilocks `cache` (estimates outside,
@@ -9002,13 +8999,9 @@ test "virtualized: warm JIT viewport layout under 12us" {
     var attempts: usize = 0;
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = port_clock.nowNsI128();
         last_cmd_count = layoutViewportJIT(mem, lines, deep_cfg, &cache, &commands);
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
+        const end_ns: i128 = port_clock.nowNsI128();
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
@@ -9228,13 +9221,11 @@ test "scroll illusion: O(1) fraction jump resolves inside deep-scroll budget" {
     var iter: usize = 0;
     var sink: usize = 0;
     while (iter < 200) : (iter += 1) {
-        var ts: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+        const s_ns: u64 = port_clock.nowNs();
         const s = jumpLineForFraction(lines, map_buf[0..map_n], 0.75);
-        var te: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &te);
+        const e_ns: u64 = port_clock.nowNs();
         sink ^= s;
-        const us = @divTrunc((@as(i128, te.sec) * 1_000_000_000 + te.nsec) - (@as(i128, ts.sec) * 1_000_000_000 + ts.nsec), 1000);
+        const us = @divTrunc(@as(i128, e_ns) - @as(i128, s_ns), 1000);
         if (us < min_us) min_us = us;
     }
     std.testing.expect(sink < lines.len * 2) catch {};

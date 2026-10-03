@@ -1,5 +1,6 @@
 const std = @import("std");
 const simd = @import("hot");
+const portfs = @import("port_fs.zig");
 
 /// Flat SoA block-index store (see todo/ideas2.txt:3-7).
 ///
@@ -184,18 +185,19 @@ test "mmap: MADV_DONTNEED release keeps mapping readable (volatile, not free)" {
     const row = "# Heading row for release test with padding text 0123456789\nBody text row for the memory pressure discipline check.\n";
     const rows = 4096; // ~440KB, well above the 64KB advise threshold
 
-    const fd = try std.posix.openat(
-        std.posix.AT.FDCWD,
-        fname,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    var w: usize = 0;
-    while (w < rows) : (w += 1) {
-        _ = std.c.write(fd, row.ptr, row.len);
+    var fio = portfs.TestIo.init();
+    defer fio.deinit();
+    const fio_io = fio.io();
+    const fio_cwd = std.Io.Dir.cwd();
+    {
+        var f = try fio_cwd.createFile(fio_io, fname, .{});
+        var w: usize = 0;
+        while (w < rows) : (w += 1) {
+            try f.writeStreamingAll(fio_io, row);
+        }
+        f.close(fio_io);
     }
-    _ = std.c.close(fd);
-    defer _ = std.c.unlink(fname);
+    defer portfs.deleteFile(fio_io, fio_cwd, fname);
 
     var mapped = try mmap.MappedFile.open(fname);
     defer mapped.close();

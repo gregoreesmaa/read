@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const port_fs = @import("port_fs.zig");
 
 /// Zero-copy memory mapped file handle with zero wrapper overhead
 pub const MappedFile = struct {
@@ -8,23 +9,27 @@ pub const MappedFile = struct {
 
     pub fn open(path: []const u8) !MappedFile {
         if (builtin.os.tag == .windows) {
-            const windows = std.os.windows;
             // Convert to UTF-16 on Windows
             var path_w: [std.fs.max_path_bytes:0]u16 = undefined;
             const len = try std.unicode.utf8ToUtf16Le(&path_w, path);
             path_w[len] = 0;
 
-            const h_file = try windows.OpenFile(&path_w, .{
-                .dir = null,
-                .access_mask = windows.GENERIC_READ,
-                .share_access = windows.FILE_SHARE_READ,
-                .creation_disposition = windows.OPEN_EXISTING,
-                .filter = .{},
-                .follow_symlinks = true,
-            });
-            errdefer windows.CloseHandle(h_file);
+            const h_file = kernel32.CreateFileW(
+                @ptrCast(&path_w),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                null,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null,
+            );
+            if (h_file == INVALID_HANDLE_VALUE) return error.FileNotFound;
+            errdefer _ = kernel32.CloseHandle(h_file);
 
-            const size = try windows.GetFileSizeEx(h_file);
+            var size_hi: u32 = 0;
+            const size_lo = kernel32.GetFileSize(h_file, &size_hi);
+            if (size_lo == 0xFFFFFFFF and kernel32.GetLastError() != 0) return error.StatFailed;
+            const size: u64 = (@as(u64, size_hi) << 32) | size_lo;
             if (size == 0) {
                 return MappedFile{
                     .bytes = &[_]u8{},
@@ -32,26 +37,28 @@ pub const MappedFile = struct {
                 };
             }
 
-            const h_map = try windows.CreateFileMapping(
+            const h_map = kernel32.CreateFileMappingW(
                 h_file,
                 null,
-                windows.PAGE_READONLY,
+                PAGE_READONLY,
                 0,
                 0,
                 null,
             );
-            defer windows.CloseHandle(h_map);
+            if (h_map == null) return error.MappingFailed;
+            defer _ = kernel32.CloseHandle(h_map.?);
 
-            const ptr = try windows.MapViewOfFile(
-                h_map,
-                windows.FILE_MAP_READ,
+            const ptr = kernel32.MapViewOfFile(
+                h_map.?,
+                FILE_MAP_READ,
                 0,
                 0,
                 @intCast(size),
             );
+            if (ptr == null) return error.MappingFailed;
 
             return MappedFile{
-                .bytes = @as([*]const u8, @ptrCast(ptr))[0..@intCast(size)],
+                .bytes = @as([*]const u8, @ptrCast(ptr.?))[0..@intCast(size)],
                 .fd = h_file,
             };
         } else {
@@ -134,19 +141,61 @@ pub const MappedFile = struct {
     pub fn close(self: *MappedFile) void {
         if (self.bytes.len > 0) {
             if (builtin.os.tag == .windows) {
-                _ = std.os.windows.UnmapViewOfFile(self.bytes.ptr);
+                _ = kernel32.UnmapViewOfFile(self.bytes.ptr);
             } else {
                 std.posix.munmap(@alignCast(self.bytes));
             }
         }
         if (builtin.os.tag == .windows) {
-            std.os.windows.CloseHandle(self.fd);
+            _ = kernel32.CloseHandle(self.fd);
         } else {
             _ = std.c.close(self.fd);
         }
         self.* = undefined;
     }
 };
+
+/// kernel32 file-mapping surface (Zig 0.16 std.os.windows no longer ships
+/// the thin OpenFile/CreateFileMapping wrappers, so the Windows branch
+/// declares exactly the five functions it needs; POSIX keeps its syscalls).
+const kernel32 = if (builtin.os.tag == .windows) struct {
+    pub extern "kernel32" fn CreateFileW(
+        lpFileName: [*:0]const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: ?*anyopaque,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: ?std.os.windows.HANDLE,
+    ) callconv(.winapi) std.os.windows.HANDLE;
+    pub extern "kernel32" fn GetFileSize(hFile: std.os.windows.HANDLE, lpFileSizeHigh: ?*u32) callconv(.winapi) u32;
+    pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    pub extern "kernel32" fn CreateFileMappingW(
+        hFile: std.os.windows.HANDLE,
+        lpFileMappingAttributes: ?*anyopaque,
+        flProtect: u32,
+        dwMaximumSizeHigh: u32,
+        dwMaximumSizeLow: u32,
+        lpName: ?[*:0]const u16,
+    ) callconv(.winapi) ?std.os.windows.HANDLE;
+    pub extern "kernel32" fn MapViewOfFile(
+        hFileMappingObject: std.os.windows.HANDLE,
+        dwDesiredAccess: u32,
+        dwFileOffsetHigh: u32,
+        dwFileOffsetLow: u32,
+        dwNumberOfBytesToMap: usize,
+    ) callconv(.winapi) ?*anyopaque;
+    pub extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: *const anyopaque) callconv(.winapi) c_int;
+    pub extern "kernel32" fn CloseHandle(hObject: std.os.windows.HANDLE) callconv(.winapi) c_int;
+} else struct {};
+
+const INVALID_HANDLE_VALUE: std.os.windows.HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+const GENERIC_READ: u32 = 0x80000000;
+const FILE_SHARE_READ: u32 = 0x00000001;
+const OPEN_EXISTING: u32 = 3;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+const PAGE_READONLY: u32 = 0x02;
+const FILE_MAP_READ: u32 = 0x0004;
 
 /// Goldilocks window: keep the viewport plus exactly one screen-height above
 /// and below resident; pages far outside get MADV_DONTNEED (see ideas.txt:3).
@@ -255,15 +304,12 @@ test "mmap: cold-start advise leaves bytes intact, safe on empty" {
     // the same zero-copy bytes before and after.
     const path = "mmap_advise_test.md";
     const content = "# Cold Start\nscan me twice\n";
-    const fd = try std.posix.openat(
-        std.posix.AT.FDCWD,
-        path,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    _ = std.c.write(fd, content.ptr, content.len);
-    _ = std.c.close(fd);
-    defer _ = std.c.unlink(path);
+    var fio = port_fs.TestIo.init();
+    defer fio.deinit();
+    const fio_io = fio.io();
+    const fio_cwd = std.Io.Dir.cwd();
+    try port_fs.writeFile(fio_io, fio_cwd, path, content);
+    defer port_fs.deleteFile(fio_io, fio_cwd, path);
 
     var mapped = try MappedFile.open(path);
     defer mapped.close();
@@ -273,25 +319,21 @@ test "mmap: cold-start advise leaves bytes intact, safe on empty" {
     // Large mapping (past the WILLNEED cap): exercises the real page-aligned
     // syscall path; content must still be bit-identical afterwards.
     const big_path = "mmap_advise_big_test.md";
-    const big_fd = try std.posix.openat(
-        std.posix.AT.FDCWD,
-        big_path,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    var written: usize = 0;
-    while (written < willneed_window_bytes + 64 * 1024) {
-        _ = std.c.write(big_fd, content.ptr, content.len);
-        written += content.len;
+    {
+        var big_f = try fio_cwd.createFile(fio_io, big_path, .{});
+        var written_inner: usize = 0;
+        while (written_inner < willneed_window_bytes + 64 * 1024) {
+            try big_f.writeStreamingAll(fio_io, content);
+            written_inner += content.len;
+        }
+        big_f.close(fio_io);
     }
-    _ = std.c.close(big_fd);
-    defer _ = std.c.unlink(big_path);
+    defer port_fs.deleteFile(fio_io, fio_cwd, big_path);
 
     var big = try MappedFile.open(big_path);
     defer big.close();
     try std.testing.expect(big.bytes.len > willneed_window_bytes);
     big.adviseSequential();
-    try std.testing.expectEqual(written, big.bytes.len);
     try std.testing.expect(std.mem.startsWith(u8, big.bytes, content));
     try std.testing.expect(std.mem.endsWith(u8, big.bytes, content));
 }

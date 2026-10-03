@@ -1,4 +1,6 @@
 const std = @import("std");
+const clock = @import("core/port_clock.zig");
+const portfs = @import("core/port_fs.zig");
 
 pub const mmap = @import("core/mmap.zig");
 pub const simd = @import("hot");
@@ -14,12 +16,16 @@ pub const bidi = @import("core/bidi.zig");
 pub const glyph_cache = @import("platform/glyph_cache.zig");
 pub const strict_benchmarks = @import("core/strict_benchmarks.zig");
 pub const plugin_cache = @import("core/plugin_cache.zig");
+pub const port_clock = @import("core/port_clock.zig");
+pub const port_fs = @import("core/port_fs.zig");
 pub const controls_test = @import("tests/controls_test.zig");
 pub const spec_compliance_test = @import("tests/spec_compliance_test.zig");
 pub const commonmark_harness = @import("tests/commonmark_harness.zig");
 
 test {
     _ = strict_benchmarks;
+    _ = port_clock;
+    _ = port_fs;
     _ = help_overlay;
     _ = remote_policy;
     _ = bidi;
@@ -129,14 +135,10 @@ test "microsecond benchmark on 50,000 lines" {
 
     var in_fence: simd.FenceState = .{};
 
-    var ts_start: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+    const start_ns: i128 = clock.nowNsI128();
     const count = simd.scanLines(mem, line_entries, &in_fence);
-    var ts_end: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+    const end_ns: i128 = clock.nowNsI128();
 
-    const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-    const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
     const elapsed_ns = end_ns - start_ns;
     const elapsed_us = @divTrunc(elapsed_ns, 1_000);
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
@@ -164,16 +166,14 @@ test "mmap mapped file read and parse" {
         \\Zero allocations on the hot path.
     ;
 
-    // Write a temporary file using direct posix syscalls
-    const fd = try std.posix.openat(
-        std.posix.AT.FDCWD,
-        test_filename,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    _ = std.c.write(fd, test_content.ptr, test_content.len);
-    _ = std.c.close(fd);
-    defer _ = std.c.unlink(test_filename);
+    // Write a temporary file (cross-platform: std.posix.openat has no
+    // Windows spelling in Zig 0.16).
+    var fio = portfs.TestIo.init();
+    defer fio.deinit();
+    const fio_io = fio.io();
+    const fio_cwd = std.Io.Dir.cwd();
+    try portfs.writeFile(fio_io, fio_cwd, test_filename, test_content);
+    defer portfs.deleteFile(fio_io, fio_cwd, test_filename);
 
     // Map the file
     var mapped = try mmap.MappedFile.open(test_filename);
@@ -227,8 +227,7 @@ test "virtualized layout performance on 50,000 lines" {
         .scroll_y = 500.0, // Scrolled into the document
     };
 
-    var ts_start: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+    const start_ns: i128 = clock.nowNsI128();
 
     const cmd_count = layout.layoutViewport(
         mem,
@@ -237,11 +236,7 @@ test "virtualized layout performance on 50,000 lines" {
         &commands,
     );
 
-    var ts_end: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
-
-    const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-    const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
+    const end_ns: i128 = clock.nowNsI128();
     const elapsed_ns = end_ns - start_ns;
     const elapsed_us = @divTrunc(elapsed_ns, 1_000);
 

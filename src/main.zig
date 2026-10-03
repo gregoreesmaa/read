@@ -11,6 +11,8 @@ const math_detect = @import("core/math_detect.zig");
 const remote_policy = @import("core/remote_policy.zig");
 const bridge = @import("platform/bridge.zig");
 const plugin_cache = @import("core/plugin_cache.zig");
+const port_clock = @import("core/port_clock.zig");
+const port_fs = @import("core/port_fs.zig");
 
 const DEFAULT_DOC =
     \\# Read
@@ -381,13 +383,47 @@ fn pluginStoreNul(dst: []u8, len_out: *u8, s: []const u8) bool {
     return true;
 }
 
-/// mkdir, tolerating EEXIST (verified by open: a pre-existing dir passes).
-fn pluginEnsureDir(path_z: [*:0]const u8) bool {
-    if (std.c.mkdir(path_z, 0o755) == 0) return true;
-    const fd = std.posix.openat(std.posix.AT.FDCWD, std.mem.span(path_z), .{ .ACCMODE = .RDONLY }, 0) catch return false;
-    _ = std.c.close(fd);
-    return true;
+/// Unlink a NUL-terminated path (best effort). Windows: DeleteFileW
+/// (std.c.unlink may not link there); POSIX: libc unlink.
+fn deletePathZ(path_z: [*:0]const u8) void {
+    if (comptime builtin.os.tag == .windows) {
+        var path_w: [1024:0]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&path_w, std.mem.span(path_z)) catch return;
+        path_w[wlen] = 0;
+        _ = DeleteFileW(@ptrCast(&path_w));
+    } else {
+        _ = std.c.unlink(path_z);
+    }
 }
+
+/// mkdir, tolerating EEXIST (verified by open: a pre-existing dir passes).
+/// Windows: CreateDirectoryW + existence probe (forward slashes accepted).
+fn pluginEnsureDir(path_z: [*:0]const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        var path_w: [1024:0]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&path_w, std.mem.span(path_z)) catch return false;
+        path_w[wlen] = 0;
+        if (CreateDirectoryW(@ptrCast(&path_w), null) != 0) return true;
+        var ad: WIN32_FILE_ATTRIBUTE_DATA = undefined;
+        return GetFileAttributesExW(@ptrCast(&path_w), 0, &ad) != 0;
+    } else {
+        if (std.c.mkdir(path_z, 0o755) == 0) return true;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, std.mem.span(path_z), .{ .ACCMODE = .RDONLY }, 0) catch return false;
+        _ = std.c.close(fd);
+        return true;
+    }
+}
+
+extern "kernel32" fn CreateDirectoryW(lpPathName: [*:0]const u16, lpSecurityAttributes: ?*anyopaque) callconv(.winapi) c_int;
+const WIN32_FILE_ATTRIBUTE_DATA = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: u64,
+    ftLastAccessTime: u64,
+    ftLastWriteTime: u64,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+};
+extern "kernel32" fn GetFileAttributesExW(lpFileName: [*:0]const u16, fInfoLevelId: u32, lpFileInformation: *WIN32_FILE_ATTRIBUTE_DATA) callconv(.winapi) c_int;
 
 /// mkdir -p for the three plugin levels under root. Cold path only.
 fn pluginMkdirAll(root: []const u8, dir: []const u8) bool {
@@ -409,25 +445,64 @@ fn pluginMkdirAll(root: []const u8, dir: []const u8) bool {
 
 /// Cache-hit probe: the PNG exists and is nonzero (fresh renders carry the
 /// exit-status dimension too, validated at reap and reported by outcome).
+/// Portable: direct statx(AT_EMPTY_PATH) on Linux (std.c.fstat is void
+/// there in Zig 0.16), GetFileAttributesExW on Windows (no openat there),
+/// libc fstat elsewhere.
 fn pluginCacheFileReady(path: []const u8) bool {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
-    defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return false;
-    return st.size > 0;
+    if (comptime builtin.os.tag == .windows) {
+        var path_w: [1024:0]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&path_w, path) catch return false;
+        path_w[wlen] = 0;
+        var ad: WIN32_FILE_ATTRIBUTE_DATA = undefined;
+        if (GetFileAttributesExW(@ptrCast(&path_w), 0, &ad) == 0) return false;
+        return (@as(u64, ad.nFileSizeHigh) << 32 | ad.nFileSizeLow) > 0;
+    } else {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+        defer _ = std.c.close(fd);
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            var sx = std.mem.zeroes(linux.Statx);
+            const err = linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &sx));
+            if (err != .SUCCESS or !sx.mask.SIZE) return false;
+            return sx.size > 0;
+        } else {
+            var st: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &st) != 0) return false;
+            return st.size > 0;
+        }
+    }
 }
 
 /// Stage bytes to an absolute path (src sidecars, shims). Cold path only.
+/// Windows: CreateFileW + WriteFile (no openat there).
 fn pluginWriteFile(path_z: [*:0]const u8, data: []const u8) bool {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, std.mem.span(path_z), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return false;
-    defer _ = std.c.close(fd);
-    var off: usize = 0;
-    while (off < data.len) {
-        const w = std.c.write(fd, data[off..].ptr, data.len - off);
-        if (w <= 0) return false;
-        off += @intCast(w);
+    if (comptime builtin.os.tag == .windows) {
+        var path_w: [1024:0]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&path_w, std.mem.span(path_z)) catch return false;
+        path_w[wlen] = 0;
+        const fh = CreateFileW(@ptrCast(&path_w), 0x40000000, 0, null, 2, 0x80, null); // CREATE_ALWAYS
+        if (fh == null or fh == INVALID_HANDLE_VALUE) return false;
+        defer _ = CloseHandle(fh.?);
+        var off: usize = 0;
+        while (off < data.len) {
+            var wrote: u32 = 0;
+            const rest: u32 = @intCast(@min(data.len - off, std.math.maxInt(u32)));
+            if (WriteFile(fh.?, data[off..].ptr, rest, &wrote, null) == 0) return false;
+            if (wrote == 0) return false;
+            off += wrote;
+        }
+        return true;
+    } else {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, std.mem.span(path_z), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return false;
+        defer _ = std.c.close(fd);
+        var off: usize = 0;
+        while (off < data.len) {
+            const w = std.c.write(fd, data[off..].ptr, data.len - off);
+            if (w <= 0) return false;
+            off += @intCast(w);
+        }
+        return true;
     }
-    return true;
 }
 
 /// Resolve the renderer driver script: `$READ_PLUGIN_RENDERER`, then the
@@ -504,6 +579,9 @@ fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe:
     const text = if (probe) pluginProbeShim(helper, name, &body) else pluginRenderShim(helper, name, &body);
     const t = text orelse return false;
     if (!pluginWriteFile(path_z, t)) return false;
+    // Windows: no chmod (CreateFile ACLs already permit execution; the
+    // shims never execute there — probes demote before launching).
+    if (comptime builtin.os.tag == .windows) return true;
     if (std.c.chmod(path_z, 0o755) != 0) return false;
     return true;
 }
@@ -531,7 +609,7 @@ fn pluginLaunchProbe(r: usize) void {
         // reuse a path within the session. Drop the superseded outfile, if any.
         if (g_plugin_probe_out_len[r] > 0) {
             const prev_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_out[r][0]);
-            _ = std.c.unlink(prev_z);
+            deletePathZ(prev_z);
             g_plugin_probe_out_len[r] = 0;
         }
         const seq = g_plugin_probe_seq[r];
@@ -554,11 +632,11 @@ fn pluginLaunchProbe(r: usize) void {
         leaf[10] = 'u';
         leaf[11] = 't';
         const out = pluginChildPath(dir, leaf[0..], tmp[512..]) orelse {
-            _ = std.c.unlink(src_z);
+            deletePathZ(src_z);
             break :fail;
         };
         if (!pluginStoreNul(g_plugin_probe_out[r][0..], &g_plugin_probe_out_len[r], out)) {
-            _ = std.c.unlink(src_z);
+            deletePathZ(src_z);
             break :fail;
         }
         const shim_z: [*:0]const u8 = @ptrCast(&g_plugin_probe_shim[r][0]);
@@ -569,8 +647,8 @@ fn pluginLaunchProbe(r: usize) void {
             g_plugin_inflight += 1;
             return;
         }
-        _ = std.c.unlink(src_z);
-        _ = std.c.unlink(out_z);
+        deletePathZ(src_z);
+        deletePathZ(out_z);
         // 0: table momentarily full; jobs stay queued and the next drain
         // retries the probe structurally. -1: shim unlaunchable, demote.
         if (rc == 0) return;
@@ -615,7 +693,7 @@ fn pluginLaunchQueued() void {
             // Nothing transferred on these paths: the staged sidecar is
             // still ours, so remove it here (the launcher unlinks only
             // what a 1 return took over).
-            _ = std.c.unlink(src_z);
+            deletePathZ(src_z);
             if (rc == 0) break;
             g_plugin_jobs[i].state = .failed;
         }
@@ -665,7 +743,7 @@ fn pluginPollAndAdvance() bool {
         g_plugin_probe[r] = (oc == 1);
         g_plugin_inflight -= 1;
         resolved += 1;
-        _ = std.c.unlink(probe_z);
+        deletePathZ(probe_z);
         if (oc != 1) pluginMarkNaive(r);
     }
     var i: usize = 0;
@@ -838,15 +916,11 @@ fn parseF32(s: []const u8) f32 {
 }
 
 fn getTimestampMs() i64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+    return port_clock.nowMs();
 }
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    return port_clock.nowNs();
 }
 
 // Headless scroll-sweep profiler state (read-test binary only): renders a
@@ -2034,7 +2108,9 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 // buffering (mmap needs a real file). Anything outside this interface is
 // rejected with a usage hint, never silently absorbed. Raw std.c.write
 // only: no std.fmt linkage may leak into ship builds (__TEXT budget).
-const READ_VERSION = "0.1.0";
+// The stamp comes from -Dversion= (release.yml passes the tag); local
+// builds carry the dev default.
+const READ_VERSION = build_options.app_version;
 const CLI_USAGE =
     \\Usage: read [--help] [--version] [file]
     \\  file       Markdown document to open (default: built-in welcome doc)
@@ -2064,12 +2140,37 @@ fn cliIsStdinDash(arg: []const u8) bool {
 }
 
 fn cliWriteStderr(msg: []const u8) void {
-    _ = std.c.write(std.posix.STDERR_FILENO, msg.ptr, msg.len);
+    // Windows: std.c.write takes a HANDLE there, so go through
+    // GetStdHandle + WriteFile (same raw-write discipline, no std.fmt).
+    if (comptime builtin.os.tag == .windows) {
+        const h = GetStdHandle(-12);
+        if (h != null and h != INVALID_HANDLE_VALUE) {
+            var done: u32 = 0;
+            _ = WriteFile(h.?, msg.ptr, @intCast(msg.len), &done, null);
+        }
+    } else {
+        _ = std.c.write(std.posix.STDERR_FILENO, msg.ptr, msg.len);
+    }
 }
 
 fn cliWriteStdout(msg: []const u8) void {
-    _ = std.c.write(std.posix.STDOUT_FILENO, msg.ptr, msg.len);
+    if (comptime builtin.os.tag == .windows) {
+        const h = GetStdHandle(-11);
+        if (h != null and h != INVALID_HANDLE_VALUE) {
+            var done: u32 = 0;
+            _ = WriteFile(h.?, msg.ptr, @intCast(msg.len), &done, null);
+        }
+    } else {
+        _ = std.c.write(std.posix.STDOUT_FILENO, msg.ptr, msg.len);
+    }
 }
+
+// Minimal Windows console/file shims (production CLI paths only): raw
+// kernel32 declarations in the same style as src/core/mmap.zig, so no new
+// module or heap dependency. POSIX builds never reference them.
+const INVALID_HANDLE_VALUE: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+extern "kernel32" fn GetStdHandle(nStdHandle: i32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn WriteFile(hFile: *anyopaque, lpBuffer: [*]const u8, nBytes: u32, lpWritten: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 
 fn cliUsageError(detail: ?[]const u8) noreturn {
     if (detail) |msg| {
@@ -2083,11 +2184,16 @@ fn cliUsageError(detail: ?[]const u8) noreturn {
 
 /// fstat mode carries a piped/redirected document (FIFO, regular file,
 /// socket) as opposed to an interactive terminal, /dev/null, or TTY.
+/// Windows has no mode bits (std.posix.S is void there): never piped.
 fn stdinCarriesDocument(mode: std.posix.mode_t) bool {
-    return switch (mode & std.posix.S.IFMT) {
-        std.posix.S.IFIFO, std.posix.S.IFREG, std.posix.S.IFSOCK => true,
-        else => false,
-    };
+    if (comptime builtin.os.tag == .windows) {
+        return false;
+    } else {
+        return switch (mode & std.posix.S.IFMT) {
+            std.posix.S.IFIFO, std.posix.S.IFREG, std.posix.S.IFSOCK => true,
+            else => false,
+        };
+    }
 }
 
 /// fstat mode of stdin, or null when it cannot be queried (closed stdin,
@@ -2095,8 +2201,12 @@ fn stdinCarriesDocument(mode: std.posix.mode_t) bool {
 /// same split as MappedFile.open (see mmap.zig), because Zig 0.16 leaves
 /// libc fstat void on Linux.
 fn stdinMode() ?std.posix.mode_t {
-    if (builtin.os.tag == .windows) return null;
-    if (builtin.os.tag == .linux) {
+    // comptime-first: the Linux branch references std.os.linux and the
+    // fallback references std.posix.STDIN_FILENO, neither of which resolves
+    // on Windows (analyzed even when unreachable at runtime).
+    if (comptime builtin.os.tag == .windows) {
+        return null;
+    } else if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var sx = std.mem.zeroes(linux.Statx);
         const err = linux.errno(linux.statx(
@@ -2137,7 +2247,12 @@ fn spoolStdinToTemp(buf: *[std.fs.max_path_bytes:0]u8) ![:0]const u8 {
     len += dir.len;
     @memcpy(buf[len..][0..stem.len], stem);
     len += stem.len;
-    var pid: u32 = @bitCast(std.c.getpid());
+    var pid: u32 = if (comptime builtin.os.tag == .windows)
+        // std.c.getpid is a HANDLE there; the spool name only needs the
+        // low bits (uniqueness comes from the pid, not its width).
+        @truncate(@intFromPtr(std.c.getpid()))
+    else
+        @bitCast(std.c.getpid());
     var digits: [20]u8 = undefined;
     var ndigits: usize = 0;
     if (pid == 0) {
@@ -2157,33 +2272,88 @@ fn spoolStdinToTemp(buf: *[std.fs.max_path_bytes:0]u8) ![:0]const u8 {
     buf[len] = 0;
     const path = buf[0..len :0];
 
-    _ = std.c.unlink(path);
-    const fd = try std.posix.openat(
-        std.posix.AT.FDCWD,
-        path,
-        .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true },
-        0o600,
+    // Windows spool (explicit `-` only: piped-stdin detection is off
+    // there): kernel32 CreateFileW/ReadFile/WriteFile, same bounded
+    // exclusive-create discipline as the POSIX path below.
+    if (comptime builtin.os.tag == .windows) {
+        return spoolStdinToTempWindows(path);
+    } else {
+        deletePathZ(path);
+        const fd = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            path,
+            .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true },
+            0o600,
+        );
+        defer _ = std.c.close(fd);
+        var chunk: [64 * 1024]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+            if (n == 0) break;
+            total += n;
+            if (total > STDIN_MAX_BYTES) {
+                deletePathZ(path);
+                return error.StdinTooLarge;
+            }
+            var off: usize = 0;
+            while (off < n) {
+                const w: isize = std.c.write(fd, chunk[off..n].ptr, n - off);
+                if (w <= 0 or w > @as(isize, @intCast(n - off))) return error.StdinSpoolFailed;
+                off += @intCast(w);
+            }
+        }
+        return path;
+    }
+}
+
+// Windows stdin spool (see above): forward slashes are accepted by the
+// Win32 file APIs, so no path rewrite is needed. Cold path only.
+fn spoolStdinToTempWindows(path: [:0]const u8) ![:0]const u8 {
+    var path_w: [std.fs.max_path_bytes:0]u16 = undefined;
+    const wlen = try std.unicode.utf8ToUtf16Le(&path_w, path);
+    path_w[wlen] = 0;
+    _ = DeleteFileW(@ptrCast(&path_w));
+    const fh = CreateFileW(
+        @ptrCast(&path_w),
+        0x40000000, // GENERIC_WRITE
+        0,
+        null,
+        1, // CREATE_NEW (exclusive, like O_EXCL above)
+        0x80, // FILE_ATTRIBUTE_NORMAL
+        null,
     );
-    defer _ = std.c.close(fd);
+    if (fh == null or fh == INVALID_HANDLE_VALUE) return error.StdinSpoolFailed;
+    defer _ = CloseHandle(fh.?);
+    const stdin_h = GetStdHandle(-10);
+    if (stdin_h == null or stdin_h == INVALID_HANDLE_VALUE) return error.StdinSpoolFailed;
     var chunk: [64 * 1024]u8 = undefined;
     var total: usize = 0;
     while (true) {
-        const n = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
-        if (n == 0) break;
-        total += n;
+        var got: u32 = 0;
+        if (ReadFile(stdin_h.?, &chunk, chunk.len, &got, null) == 0) return error.StdinSpoolFailed;
+        if (got == 0) break;
+        total += got;
         if (total > STDIN_MAX_BYTES) {
-            _ = std.c.unlink(path);
+            _ = DeleteFileW(@ptrCast(&path_w));
             return error.StdinTooLarge;
         }
         var off: usize = 0;
-        while (off < n) {
-            const w: isize = std.c.write(fd, chunk[off..n].ptr, n - off);
-            if (w <= 0 or w > @as(isize, @intCast(n - off))) return error.StdinSpoolFailed;
-            off += @intCast(w);
+        while (off < got) {
+            var wrote: u32 = 0;
+            if (WriteFile(fh.?, chunk[off..got].ptr, @intCast(got - off), &wrote, null) == 0)
+                return error.StdinSpoolFailed;
+            if (wrote == 0) return error.StdinSpoolFailed;
+            off += wrote;
         }
     }
     return path;
 }
+
+extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn ReadFile(hFile: *anyopaque, lpBuffer: [*]u8, nBytes: u32, lpRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
+extern "kernel32" fn CloseHandle(hObject: *anyopaque) callconv(.winapi) c_int;
+extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) c_int;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var in_fence: simd.FenceState = .{};
@@ -2197,7 +2367,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // --force-scale, --settle-images) lives behind ONE comptime gate so the
     // ship binary contains none of it; it runs only in the read-test
     // binary. Trust the compiler.
-    var args_it = std.process.Args.Iterator.init(init.args);
+    // initAllocator on every platform (== init elsewhere): Windows has no
+    // init (WTF-16 argv needs the heap), cold path only.
+    var args_it = try std.process.Args.Iterator.initAllocator(init.args, std.heap.page_allocator);
+    defer args_it.deinit();
     // Capture argv[0] for bundle-Resources helper resolution (plugin probe:
     // `<exe-dir>/../Resources/read-plugin-render.sh`). Best effort only.
     if (args_it.next()) |exe_arg| {
@@ -2410,12 +2583,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const mapped = mmap.MappedFile.open(path) catch {
             // Ship-safe error path: raw writes only, so no std.fmt
             // error-formatting machinery is linked into ship builds.
-            if (stdin_tmp_c) |cpath| _ = std.c.unlink(cpath);
-            const pre = "Failed to open file: ";
-            _ = std.c.write(std.posix.STDERR_FILENO, pre, pre.len);
-            _ = std.c.write(std.posix.STDERR_FILENO, path.ptr, path.len);
-            const nl = "\n";
-            _ = std.c.write(std.posix.STDERR_FILENO, nl, nl.len);
+            if (stdin_tmp_c) |cpath| deletePathZ(cpath);
+            cliWriteStderr("Failed to open file: ");
+            cliWriteStderr(path);
+            cliWriteStderr("\n");
             return;
         };
         g_app.mapped_file = mapped;
@@ -2427,7 +2598,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         mapped.adviseSequential();
         // The spool has served its purpose: the mapping and open fd survive
         // the unlink, and no temp file lingers after startup.
-        if (stdin_tmp_c) |cpath| _ = std.c.unlink(cpath);
+        if (stdin_tmp_c) |cpath| deletePathZ(cpath);
         // Anchor relative `.md` links (and image paths) to this file's dir.
         setDocDir(path);
         // Anchor external-change reloads (#44), unless this is an
@@ -2480,11 +2651,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // wait for them to drain as before.
             bridge.platform_arm_images();
             const t0 = getTimestampMs();
-            const req = std.posix.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
             while (bridge.platform_images_pending() > 0 and
                 getTimestampMs() - t0 < settle_images_ms)
             {
-                _ = std.c.nanosleep(&req, null);
+                port_clock.sleepNs(20 * 1_000_000);
             }
             if (build_options.test_hooks) {
                 std.debug.print("SETTLE pending={d} elapsed_ms={d}\n", .{
@@ -3495,16 +3665,22 @@ test "cli surface: help/version/dash classification (issue #55)" {
 test "cli surface: piped-stdin mode decision (issue #55)" {
     // Pipes, redirected files, and sockets carry a document; terminals,
     // /dev/null (char device), directories, and mode 0 keep the welcome doc.
+    // Windows has no mode bits (stdin is never piped there): the mode table
+    // is POSIX-only, the spool bound is pinned everywhere.
     const t = std.testing;
-    const S = std.posix.S;
-    try t.expect(stdinCarriesDocument(S.IFIFO));
-    try t.expect(stdinCarriesDocument(S.IFREG));
-    try t.expect(stdinCarriesDocument(S.IFSOCK));
-    try t.expect(!stdinCarriesDocument(S.IFCHR));
-    try t.expect(!stdinCarriesDocument(S.IFDIR));
-    try t.expect(!stdinCarriesDocument(S.IFBLK));
-    try t.expect(!stdinCarriesDocument(S.IFLNK));
-    try t.expect(!stdinCarriesDocument(0));
+    if (comptime builtin.os.tag != .windows) {
+        const S = std.posix.S;
+        try t.expect(stdinCarriesDocument(S.IFIFO));
+        try t.expect(stdinCarriesDocument(S.IFREG));
+        try t.expect(stdinCarriesDocument(S.IFSOCK));
+        try t.expect(!stdinCarriesDocument(S.IFCHR));
+        try t.expect(!stdinCarriesDocument(S.IFDIR));
+        try t.expect(!stdinCarriesDocument(S.IFBLK));
+        try t.expect(!stdinCarriesDocument(S.IFLNK));
+        try t.expect(!stdinCarriesDocument(0));
+    } else {
+        try t.expect(!stdinCarriesDocument(0));
+    }
     // Spool bound is a real cap, not zero and not unbounded.
     try t.expect(STDIN_MAX_BYTES == 32 * 1024 * 1024);
 }
@@ -3643,14 +3819,11 @@ test "open file swaps document and resets viewport, restores cleanly (#43)" {
         const t = std.testing;
         const doc = "# Hi\n\nhello\n";
         const tmp_name = "read_open_test.md";
-        const wfd = try std.posix.openat(
-            std.posix.AT.FDCWD,
-            tmp_name,
-            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-            0o644,
-        );
-        _ = std.c.write(wfd, doc.ptr, doc.len);
-        _ = std.c.close(wfd);
+        var otio = port_fs.TestIo.init();
+        const oio = otio.io();
+        const ocwd = std.Io.Dir.cwd();
+        defer otio.deinit();
+        try port_fs.writeFile(oio, ocwd, tmp_name, doc);
         const s_bytes = g_app.bytes;
         const s_mapped = g_app.mapped_file;
         var s_dir: [2048]u8 = undefined;
@@ -3682,7 +3855,7 @@ test "open file swaps document and resets viewport, restores cleanly (#43)" {
             @memcpy(&g_app.block_scroll_x, &s_blocks);
             @memcpy(&g_app.block_max_scroll_x, &s_maxblocks);
             updateDocumentMetrics();
-            _ = std.c.unlink(tmp_name);
+            port_fs.deleteFile(oio, ocwd, tmp_name);
         }
         onOpenFile(tmp_name, @intCast(tmp_name.len));
         try t.expectEqualStrings(doc, g_app.bytes);
@@ -3701,6 +3874,10 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
         const t = std.testing;
         const tmp_name = "read_reload_test.md";
         const v1 = "# One\n";
+        var rtio = port_fs.TestIo.init();
+        const rio = rtio.io();
+        const rcwd = std.Io.Dir.cwd();
+        defer rtio.deinit();
         var v2_buf: [2048]u8 = undefined;
         var v2_len: usize = 0;
         var li: usize = 0;
@@ -3710,14 +3887,7 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
             v2_len += line.len;
         }
         const v2 = v2_buf[0..v2_len];
-        const wfd = try std.posix.openat(
-            std.posix.AT.FDCWD,
-            tmp_name,
-            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-            0o644,
-        );
-        _ = std.c.write(wfd, v1.ptr, v1.len);
-        _ = std.c.close(wfd);
+        try port_fs.writeFile(rio, rcwd, tmp_name, v1);
         const s_bytes = g_app.bytes;
         const s_mapped = g_app.mapped_file;
         var s_path: [2048]u8 = undefined;
@@ -3741,27 +3911,20 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
             g_smooth.target = s_target;
             g_smooth.current = s_current;
             updateDocumentMetrics();
-            _ = std.c.unlink(tmp_name);
+            port_fs.deleteFile(rio, rcwd, tmp_name);
         }
         setDocPath(tmp_name);
         watchCurrentDocument();
         try t.expectEqual(@as(c_int, 1), bridge.platform_test_watch_active());
         // External modify: content swaps, scroll offset is preserved.
-        const afd = try std.posix.openat(
-            std.posix.AT.FDCWD,
-            tmp_name,
-            .{ .ACCMODE = .WRONLY, .TRUNC = true },
-            0o644,
-        );
-        _ = std.c.write(afd, v2.ptr, v2.len);
-        _ = std.c.close(afd);
+        try port_fs.writeFile(rio, rcwd, tmp_name, v2);
         g_app.scroll_y = 40.0;
         onFileChanged();
         try t.expectEqualStrings(v2, g_app.bytes);
         try t.expectEqual(@as(usize, 200), g_app.line_count);
         try t.expectEqual(@as(f32, 40.0), g_app.scroll_y);
         // Vanished file: the last good document stays, no crash.
-        _ = std.c.unlink(tmp_name);
+        port_fs.deleteFile(rio, rcwd, tmp_name);
         onFileChanged();
         try t.expectEqualStrings(v2, g_app.bytes);
         // Empty path disarms.
@@ -3952,16 +4115,12 @@ test "image completeness contracts: doc-dir resolve + URL session (#45)" {
 // its own completion line so the next failure names the phase that hung.
 // Returns completions drained. No sleeping.
 fn drainPluginUntilIdle(timeout_ns: i128) c_int {
-    var start_ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &start_ts);
-    const start_ns: i128 = @as(i128, start_ts.sec) * 1_000_000_000 + start_ts.nsec;
+    const start_ns: i128 = port_clock.nowNsI128();
     var total: c_int = 0;
     while (true) {
         total += bridge.pollPluginCompletions();
         if (bridge.platform_test_plugin_active() == 0) break;
-        var now_ts: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &now_ts);
-        const now_ns: i128 = @as(i128, now_ts.sec) * 1_000_000_000 + now_ts.nsec;
+        const now_ns: i128 = port_clock.nowNsI128();
         if (now_ns - start_ns >= timeout_ns) break;
     }
     return total;
@@ -3981,7 +4140,10 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
     // absolute path (done path) and the bare-name `true` tool (resolves via
     // PATH, exits with no outfile: terminal-failure path). Twin builds stub
     // the launcher C side (nothing ever launches), so there is nothing to
-    // pin there either.
+    // pin there either. Windows: shell-script doubles cannot exec through
+    // CreateProcess (no shebang), so the .sh copy/cap phases are POSIX-only;
+    // the probe + `true` phases run everywhere `true` resolves (Git usr/bin
+    // on dev machines) and still pin launch/drain/outcome/unlink.
     if (build_options.test_hooks and !build_options.plugin_stub) {
         const t = std.testing;
         var threaded = std.Io.Threaded.init(t.allocator, .{});
@@ -4041,79 +4203,83 @@ test "plugin launcher: missing fails fast, true drains, table caps at 8 (#323)" 
             try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
         }
 
-        // Copy stub by absolute path: done path — outfile arrives carrying
-        // the src bytes, staged src unlinked at reap, slot freed.
-        {
-            const src = "/tmp/read-plugint3-ok-src.txt";
-            const out = "/tmp/read-plugint3-ok-out.png";
-            try writeTmpFile(io, src, "graph TD\n    A-->B\n");
-            defer std.Io.Dir.deleteFileAbsolute(io, src) catch {};
-            defer std.Io.Dir.deleteFileAbsolute(io, out) catch {};
-            try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
-            std.debug.print("t3 phase=copy: launched, draining (10s deadline)\n", .{});
-            const ok_drained = drainPluginUntilIdle(10_000_000_000);
-            std.debug.print("t3 phase=copy: drained={d} active={d} outcome={d}\n", .{
-                ok_drained,
-                bridge.platform_test_plugin_active(),
-                bridge.pluginOutcomeFor(out),
-            });
-            try t.expectEqual(@as(c_int, 1), ok_drained);
-            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
-            try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out));
-            var buf: [64]u8 = undefined;
-            const bytes = try cwd.readFile(io, out, &buf);
-            try t.expectEqualStrings("graph TD\n    A-->B\n", bytes);
-            try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
-        }
-
-        // Table cap: 8 in flight, the 9th stays queued (0, silent), then
-        // all 8 drain; every staged src is gone except the rejected one.
-        {
-            var i: usize = 0;
-            while (i < 8) : (i += 1) {
-                var sbuf: [64]u8 = undefined;
-                var obuf: [64]u8 = undefined;
-                const src = try std.fmt.bufPrintZ(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
-                const out = try std.fmt.bufPrintZ(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
-                try writeTmpFile(io, src, "A-->B\n");
+        // Shell-double phases (POSIX-only: CreateProcess cannot exec the
+        // .sh stub on Windows — see the test header).
+        if (comptime builtin.os.tag != .windows) {
+            // Copy stub by absolute path: done path — outfile arrives carrying
+            // the src bytes, staged src unlinked at reap, slot freed.
+            {
+                const src = "/tmp/read-plugint3-ok-src.txt";
+                const out = "/tmp/read-plugint3-ok-out.png";
+                try writeTmpFile(io, src, "graph TD\n    A-->B\n");
+                defer std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+                defer std.Io.Dir.deleteFileAbsolute(io, out) catch {};
                 try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
-            }
-            const rsrc = "/tmp/read-plugint3-rej-src.txt";
-            const rout = "/tmp/read-plugint3-rej-out.png";
-            try writeTmpFile(io, rsrc, "A-->B\n");
-            defer std.Io.Dir.deleteFileAbsolute(io, rsrc) catch {};
-            defer std.Io.Dir.deleteFileAbsolute(io, rout) catch {};
-            try t.expectEqual(@as(c_int, 0), bridge.launchPluginRender(stub_path, rsrc, rout));
-            try t.expectEqual(@as(c_int, 8), bridge.platform_test_plugin_active());
-            std.debug.print("t3 phase=cap8: 8 in flight, draining (30s deadline)\n", .{});
-            const cap_drained = drainPluginUntilIdle(30_000_000_000);
-            std.debug.print("t3 phase=cap8: drained={d} active={d}\n", .{
-                cap_drained,
-                bridge.platform_test_plugin_active(),
-            });
-            try t.expectEqual(@as(c_int, 8), cap_drained);
-            try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
-            // One cap-phase job landed clean per the outcome table.
-            var obuf0: [64]u8 = undefined;
-            const out0 = try std.fmt.bufPrintZ(&obuf0, "/tmp/read-plugint3-o{d}.png", .{@as(usize, 0)});
-            try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out0));
-            // Rejected src was never owned: still present, no outfile made.
-            _ = try cwd.statFile(io, rsrc, .{});
-            try t.expectError(error.FileNotFound, cwd.statFile(io, rout, .{}));
-            // Every slot landed done (outfile carries src bytes, staged src
-            // reaped away); then remove them explicitly (no per-iteration
-            // defers: staged srcs must survive to reap).
-            i = 0;
-            while (i < 8) : (i += 1) {
-                var sbuf: [64]u8 = undefined;
-                var obuf: [64]u8 = undefined;
-                var rbuf: [16]u8 = undefined;
-                const src = try std.fmt.bufPrint(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
-                const out = try std.fmt.bufPrint(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
-                try t.expectEqualStrings("A-->B\n", try cwd.readFile(io, out, &rbuf));
+                std.debug.print("t3 phase=copy: launched, draining (10s deadline)\n", .{});
+                const ok_drained = drainPluginUntilIdle(10_000_000_000);
+                std.debug.print("t3 phase=copy: drained={d} active={d} outcome={d}\n", .{
+                    ok_drained,
+                    bridge.platform_test_plugin_active(),
+                    bridge.pluginOutcomeFor(out),
+                });
+                try t.expectEqual(@as(c_int, 1), ok_drained);
+                try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+                try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out));
+                var buf: [64]u8 = undefined;
+                const bytes = try cwd.readFile(io, out, &buf);
+                try t.expectEqualStrings("graph TD\n    A-->B\n", bytes);
                 try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
-                std.Io.Dir.deleteFileAbsolute(io, src) catch {};
-                std.Io.Dir.deleteFileAbsolute(io, out) catch {};
+            }
+
+            // Table cap: 8 in flight, the 9th stays queued (0, silent), then
+            // all 8 drain; every staged src is gone except the rejected one.
+            {
+                var i: usize = 0;
+                while (i < 8) : (i += 1) {
+                    var sbuf: [64]u8 = undefined;
+                    var obuf: [64]u8 = undefined;
+                    const src = try std.fmt.bufPrintZ(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
+                    const out = try std.fmt.bufPrintZ(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
+                    try writeTmpFile(io, src, "A-->B\n");
+                    try t.expectEqual(@as(c_int, 1), bridge.launchPluginRender(stub_path, src, out));
+                }
+                const rsrc = "/tmp/read-plugint3-rej-src.txt";
+                const rout = "/tmp/read-plugint3-rej-out.png";
+                try writeTmpFile(io, rsrc, "A-->B\n");
+                defer std.Io.Dir.deleteFileAbsolute(io, rsrc) catch {};
+                defer std.Io.Dir.deleteFileAbsolute(io, rout) catch {};
+                try t.expectEqual(@as(c_int, 0), bridge.launchPluginRender(stub_path, rsrc, rout));
+                try t.expectEqual(@as(c_int, 8), bridge.platform_test_plugin_active());
+                std.debug.print("t3 phase=cap8: 8 in flight, draining (30s deadline)\n", .{});
+                const cap_drained = drainPluginUntilIdle(30_000_000_000);
+                std.debug.print("t3 phase=cap8: drained={d} active={d}\n", .{
+                    cap_drained,
+                    bridge.platform_test_plugin_active(),
+                });
+                try t.expectEqual(@as(c_int, 8), cap_drained);
+                try t.expectEqual(@as(c_int, 0), bridge.platform_test_plugin_active());
+                // One cap-phase job landed clean per the outcome table.
+                var obuf0: [64]u8 = undefined;
+                const out0 = try std.fmt.bufPrintZ(&obuf0, "/tmp/read-plugint3-o{d}.png", .{@as(usize, 0)});
+                try t.expectEqual(@as(c_int, 1), bridge.pluginOutcomeFor(out0));
+                // Rejected src was never owned: still present, no outfile made.
+                _ = try cwd.statFile(io, rsrc, .{});
+                try t.expectError(error.FileNotFound, cwd.statFile(io, rout, .{}));
+                // Every slot landed done (outfile carries src bytes, staged src
+                // reaped away); then remove them explicitly (no per-iteration
+                // defers: staged srcs must survive to reap).
+                i = 0;
+                while (i < 8) : (i += 1) {
+                    var sbuf: [64]u8 = undefined;
+                    var obuf: [64]u8 = undefined;
+                    var rbuf: [16]u8 = undefined;
+                    const src = try std.fmt.bufPrint(&sbuf, "/tmp/read-plugint3-s{d}.txt", .{i});
+                    const out = try std.fmt.bufPrint(&obuf, "/tmp/read-plugint3-o{d}.png", .{i});
+                    try t.expectEqualStrings("A-->B\n", try cwd.readFile(io, out, &rbuf));
+                    try t.expectError(error.FileNotFound, cwd.statFile(io, src, .{}));
+                    std.Io.Dir.deleteFileAbsolute(io, src) catch {};
+                    std.Io.Dir.deleteFileAbsolute(io, out) catch {};
+                }
             }
         }
         std.debug.print("t3: all phases complete (probe/true/copy/cap8)\n", .{});
@@ -4225,3 +4391,5 @@ test "outline picker contracts: filter + panel build (#48)" {
         try t.expectEqual(@as(c_int, 1), bridge.platform_test_outline_build());
     }
 }
+
+

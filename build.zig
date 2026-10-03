@@ -26,10 +26,10 @@ pub fn build(b: *std.Build) void {
     // C-side twin select, always passed (0/1) so every TU agrees: macos.m
     // #includes the real launcher source at 0, the empty stub at 1.
     const stub_define: []const u8 = if (plugin_stub) "-DREAD_PLUGIN_STUB=1" else "-DREAD_PLUGIN_STUB=0";
-    // It's also possible to define more custom flags to toggle optional features
-    // of this build script using `b.option()`. All defined flags (including
-    // target and optimize options) will be listed when running `zig build --help`
-    // in this directory.
+    // Release version stamp: -Dversion=X.Y.Z bakes the tag into
+    // --version output (release.yml passes ${TAG#v}); defaults to the
+    // dev version so local builds keep working with no flags.
+    const app_version = b.option([]const u8, "version", "Release version stamp (default: dev)") orelse "0.0.0-dev";
     // Two binaries from one source tree:
     //   read      = production ship binary. test_hooks is hardcoded OFF, so
     //               no headless test CLI (--screenshot, --scroll, --damage,
@@ -44,8 +44,10 @@ pub fn build(b: *std.Build) void {
     // every build (ship included). No build option disables it.
     const ship_options = b.addOptions();
     ship_options.addOption(bool, "test_hooks", false);
+    ship_options.addOption([]const u8, "app_version", app_version);
     const hooks_options = b.addOptions();
     hooks_options.addOption(bool, "test_hooks", true);
+    hooks_options.addOption([]const u8, "app_version", app_version);
     // The twin select rides the app options too so main.zig test guards can
     // see it (same value everywhere; ship shape stays the default).
     ship_options.addOption(bool, "plugin_stub", plugin_stub);
@@ -290,16 +292,97 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    // The ship binary is a native Cocoa app: it only links on Darwin, where
-    // macos.m and the system frameworks provide the platform_* symbols.
-    // Elsewhere (Linux CI portability job) there is no windowed product, so
-    // `zig build` installs nothing and succeeds; portability is covered by
-    // `zig build test` (see README: the native window needs macOS).
+    // Linux X11 backend (src/platform/linux.c): mirrors the Darwin block
+    // above. -Oz for the ship platform-glue TU, -Os + TEST_HOOKS for the
+    // test TU. System libs only (stock Ubuntu 22.04): X11, Xext,
+    // fontconfig, FreeType, libpng (pkg-config in CI installs them).
+    // libjpeg is deliberately NOT linked (no headers on stock images):
+    // JPEG/WebP/BMP/GIF stills degrade to the muted placeholder, PNG
+    // decodes locally via libpng, remote URLs stay placeholders.
+    if (target.result.os.tag == .linux) {
+        for ([_]*std.Build.Step.Compile{ exe, exe_test }) |e| {
+            e.link_gc_sections = true;
+            e.root_module.linkSystemLibrary("X11", .{});
+            e.root_module.linkSystemLibrary("Xext", .{});
+            e.root_module.linkSystemLibrary("fontconfig", .{});
+            e.root_module.linkSystemLibrary("freetype", .{});
+            e.root_module.linkSystemLibrary("png", .{});
+        }
+        exe_mod.linkSystemLibrary("X11", .{});
+        exe_mod.linkSystemLibrary("Xext", .{});
+        exe_mod.linkSystemLibrary("fontconfig", .{});
+        exe_mod.linkSystemLibrary("freetype", .{});
+        exe_mod.linkSystemLibrary("png", .{});
+        const linux_stub_define: []const u8 = if (plugin_stub) "-DREAD_PLUGIN_STUB=1" else "-DREAD_PLUGIN_STUB=0";
+        ship_mod.addCSourceFile(.{
+            .file = b.path("src/platform/linux.c"),
+            .flags = &.{ "-Oz", "-fno-unwind-tables", "-fno-exceptions", "-fvisibility=hidden", "-DREAD_ANIMATED_GIF=1", "-I/usr/include/freetype2", linux_stub_define },
+        });
+        exe_mod.addCSourceFile(.{
+            .file = b.path("src/platform/linux.c"),
+            .flags = &.{ "-Oz", "-DREAD_ANIMATED_GIF=1", "-I/usr/include/freetype2", linux_stub_define },
+        });
+        exe_test.root_module.addCSourceFile(.{
+            .file = b.path("src/platform/linux.c"),
+            .flags = &.{ "-Os", "-DTEST_HOOKS=1", "-DREAD_ANIMATED_GIF=1", "-I/usr/include/freetype2", linux_stub_define },
+        });
+    }
+
+    // Windows Win32 backend (src/platform/win32.c): mirrors the Darwin
+    // block above. -Oz for the ship platform-glue TU, -Os + TEST_HOOKS
+    // for the test TU. System libs only (all stock Windows, verified
+    // present as Zig MinGW import libs): gdi32, user32, gdiplus (image
+    // decode via the flat API, lazy GdiplusStartup in win32.c),
+    // comdlg32 (open panel), shell32 (URL open), shcore (DPI), msimg32
+    // (AlphaBlend for straight-alpha image blits).
+    if (target.result.os.tag == .windows) {
+        for ([_]*std.Build.Step.Compile{ exe, exe_test }) |e| {
+            e.link_gc_sections = true;
+            e.root_module.linkSystemLibrary("gdi32", .{});
+            e.root_module.linkSystemLibrary("user32", .{});
+            e.root_module.linkSystemLibrary("gdiplus", .{});
+            e.root_module.linkSystemLibrary("comdlg32", .{});
+            e.root_module.linkSystemLibrary("shell32", .{});
+            e.root_module.linkSystemLibrary("shcore", .{});
+            e.root_module.linkSystemLibrary("msimg32", .{});
+        }
+        exe_mod.linkSystemLibrary("gdi32", .{});
+        exe_mod.linkSystemLibrary("user32", .{});
+        exe_mod.linkSystemLibrary("gdiplus", .{});
+        exe_mod.linkSystemLibrary("comdlg32", .{});
+        exe_mod.linkSystemLibrary("shell32", .{});
+        exe_mod.linkSystemLibrary("shcore", .{});
+        exe_mod.linkSystemLibrary("msimg32", .{});
+        if (optimize != .Debug) exe.root_module.strip = true;
+        ship_mod.addCSourceFile(.{
+            .file = b.path("src/platform/win32.c"),
+            // Same diet discipline as the Darwin ship TU: drop unwind
+            // metadata (measured -2.8 KiB .pdata/.xdata on MinGW, zero
+            // instruction change) and demote entry points from dynamic
+            // exports (Zig resolves them at static link time).
+            .flags = &.{ "-Oz", "-fno-unwind-tables", "-fno-exceptions", "-fvisibility=hidden", "-DREAD_GDIP=1", stub_define },
+        });
+        exe_mod.addCSourceFile(.{
+            .file = b.path("src/platform/win32.c"),
+            .flags = &.{ "-Oz", "-DREAD_GDIP=1", stub_define },
+        });
+        exe_test.root_module.addCSourceFile(.{
+            .file = b.path("src/platform/win32.c"),
+            .flags = &.{ "-Os", "-DTEST_HOOKS=1", "-DREAD_GDIP=1", stub_define },
+        });
+    }
+
+    // The ship binary is a native app: it links on Darwin (Cocoa, macos.m)
+    // and on Linux (X11, linux.c), where the platform TU provides the
+    // platform_* symbols. Elsewhere `zig build` installs nothing and
+    // succeeds; portability is covered by `zig build test`.
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
-    // by passing `--prefix` or `-p`.
-    if (target.result.os.tag.isDarwin()) {
+    // by passing `--prefix` or `-p`. Linux installs the same ship + hooks
+    // pair (X11 backend); Windows installs the same pair (Win32 backend,
+    // read.exe); the `run` step and strip -x stay Darwin-only.
+    if (target.result.os.tag.isDarwin() or target.result.os.tag == .linux or target.result.os.tag == .windows) {
         // Twin (plugin_stub): observability tooling — installed under twin/
         // as read-noplugins, never the ship path, never bundled (bundle and
         // release scripts take an explicit binary path; nothing globs twin/).
@@ -386,10 +469,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
-    // App-shell tests drive the Cocoa platform layer (draw/render/glyph
-    // calls with no non-Darwin implementation) so they link Darwin-only.
-    // The Linux portability job covers core through mod_tests above.
-    if (target.result.os.tag.isDarwin()) {
+    // App-shell tests drive the platform layer (draw/render/glyph calls
+    // with Darwin + Linux + Windows implementations) so they link there. Other
+    // targets cover core through mod_tests above.
+    if (target.result.os.tag.isDarwin() or target.result.os.tag == .linux or target.result.os.tag == .windows) {
         // Creates an executable that will run `test` blocks from the executable's
         // root module. Note that test executables only test one module at a time,
         // hence why we have to create two separate ones.

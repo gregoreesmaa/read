@@ -1,5 +1,7 @@
 const std = @import("std");
+const clock = @import("../core/port_clock.zig");
 const mmap = @import("../core/mmap.zig");
+const portfs = @import("../core/port_fs.zig");
 const simd = @import("hot");
 const parser = @import("../core/parser.zig");
 const layout = @import("../layout/viewport.zig");
@@ -73,16 +75,12 @@ test "STRICT: SIMD Line Scanner Throughput and Latency" {
         if (attempts > 0) simd.timingGateBackoff();
         var in_fence: simd.FenceState = .{};
 
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = clock.nowNsI128();
 
         const count = simd.scanLines(mem, line_entries, &in_fence);
 
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+        const end_ns: i128 = clock.nowNsI128();
 
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_ns = end_ns - start_ns;
         const elapsed_us = @divTrunc(elapsed_ns, 1_000);
 
@@ -125,15 +123,12 @@ test "STRICT: Zero-Copy mmap Open Latency" {
     const test_filename = "strict_mmap_test.md";
     const test_content = "# Test Document for Latency Verification\nContent row.\n";
 
-    const fd = try std.posix.openat(
-        std.posix.AT.FDCWD,
-        test_filename,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    _ = std.c.write(fd, test_content.ptr, test_content.len);
-    _ = std.c.close(fd);
-    defer _ = std.c.unlink(test_filename);
+    var fio = portfs.TestIo.init();
+    defer fio.deinit();
+    const fio_io = fio.io();
+    const fio_cwd = std.Io.Dir.cwd();
+    try portfs.writeFile(fio_io, fio_cwd, test_filename, test_content);
+    defer portfs.deleteFile(fio_io, fio_cwd, test_filename);
 
     // Adaptive sampling (simd.timing_gate_*): repeat until one sample
     // clears the threshold — a true regression clears no sample — or
@@ -142,17 +137,13 @@ test "STRICT: Zero-Copy mmap Open Latency" {
     var attempts: usize = 0;
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = clock.nowNsI128();
 
         var mapped = try mmap.MappedFile.open(test_filename);
         defer mapped.close();
 
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+        const end_ns: i128 = clock.nowNsI128();
 
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
@@ -182,8 +173,7 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
     var attempts: usize = 0;
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = clock.nowNsI128();
 
         var mapped = try mmap.MappedFile.open("showcase.md");
         const bytes = mapped.bytes;
@@ -216,14 +206,11 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         );
         mapped.close();
 
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+        const end_ns: i128 = clock.nowNsI128();
 
         last_line_count = line_count;
         try std.testing.expect(cmd_count > 0);
 
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
@@ -289,8 +276,7 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
     var attempts: usize = 0;
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = clock.nowNsI128();
 
         const cmd_count = layout.layoutViewport(
             mem,
@@ -300,11 +286,8 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
         );
         last_cmd_count = cmd_count;
 
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+        const end_ns: i128 = clock.nowNsI128();
 
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
@@ -348,18 +331,14 @@ test "STRICT: SIMD Substring Search Under 500 µs on 50,000 Lines" {
     var attempts: usize = 0;
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = clock.nowNsI128();
 
         const match_pos = simd.simdSearch(mem, needle);
 
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+        const end_ns: i128 = clock.nowNsI128();
 
         try std.testing.expect(match_pos != null);
 
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
@@ -450,8 +429,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
     var attempts: usize = 0;
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = clock.nowNsI128();
 
         const cmd_count = layout.layoutViewport(
             mem,
@@ -460,13 +438,10 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
             &commands,
         );
 
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+        const end_ns: i128 = clock.nowNsI128();
 
         try std.testing.expect(cmd_count > 0);
 
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
@@ -515,18 +490,14 @@ test "STRICT: SIMD Search Edge Situations (Needle at Start, End, and Not Found)"
     var attempts: usize = 0;
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
-        var ts_start: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_start);
+        const start_ns: i128 = clock.nowNsI128();
 
         const pos_none = simd.simdSearch(mem, "NONEXISTENT_TOKEN_12345");
 
-        var ts_end: std.posix.timespec = undefined;
-        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts_end);
+        const end_ns: i128 = clock.nowNsI128();
 
         try std.testing.expect(pos_none == null);
 
-        const start_ns = @as(i128, ts_start.sec) * 1_000_000_000 + ts_start.nsec;
-        const end_ns = @as(i128, ts_end.sec) * 1_000_000_000 + ts_end.nsec;
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
         if (elapsed_us < min_elapsed_us) min_elapsed_us = elapsed_us;
