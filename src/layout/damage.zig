@@ -372,12 +372,12 @@ test "damage: redraw-region verification against real layout output" {
     try std.testing.expect(n > 0);
 
     var cmds: [256]viewport.DrawCommand = undefined;
-    const cfg = viewport.ViewportConfig{
+    var cfg = viewport.ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = 0.0,
     };
-    const count = viewport.layoutViewport(doc, lines_buf[0..n], cfg, &cmds);
+    const count = viewport.layoutViewport(doc, lines_buf[0..n], &cfg, &cmds);
     try std.testing.expect(count > 0);
 
     // Simulate a keystroke on the first text run: damage is its exact box.
