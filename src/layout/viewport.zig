@@ -1115,6 +1115,15 @@ pub const SmoothScroll = struct {
         }
         return self.current == self.target;
     }
+
+    /// Quantize a scroll offset to whole device pixels at the given backing
+    /// scale (#384: coalesced vsync deltas + sub-pixel jitter converge to
+    /// the same physical pixel, so the compositor moves rows in whole-pixel
+    /// steps and scroll-blits stay pixel-exact). Scale <= 0 is a no-op.
+    pub fn quantize(v: f32, backing_scale: f32) f32 {
+        if (!(backing_scale > 0.0)) return v;
+        return @round(v * backing_scale) / backing_scale;
+    }
 };
 
 /// Display text scaling from the system size class (issue #315 removed
@@ -1242,6 +1251,146 @@ pub const EdgeSpring = struct {
         return self.overshoot == 0.0;
     }
 };
+
+/// Cached scroll frame (#384): the live document-space layout result one
+/// scroll frame produced, so a pure `scroll_y` shift reuses it instead of
+/// re-running the full pipeline at 120 Hz. Layout y-offsets it (zero
+/// re-measure); anything else (content identity, geometry, theme, h-scroll,
+/// plugin/image/math state) invalidates. Fixed-size, zero heap, caller-owned
+/// ring rental like `g_commands_buffer`: hit = in-place caller-buffer shift,
+/// miss = full `layoutViewport` + snapshot.
+///
+/// Scope guard: covers only the pure-scroll fast path. Registration-only
+/// records (`register_scrollable_block`, clips, anchors) replay verbatim —
+/// state rebuild stays bit-identical — while pixel rects translate by the
+/// scroll delta. Callers must route any content/config change through
+/// `invalidate` first; stale reuse reads as frozen or torn rows.
+pub const ScrollFrameCache = struct {
+    valid: bool = false,
+    count: usize = 0,
+    scroll_y: f32 = 0.0,
+    window_width: f32 = 0.0,
+    window_height: f32 = 0.0,
+    base_font_size: f32 = 0.0,
+    line_height: f32 = 0.0,
+    content_max_width: f32 = 0.0,
+    is_dark_theme: bool = false,
+    backing_scale: f32 = 0.0,
+    content_id: usize = 0,
+    hover_epoch: usize = 0,
+
+    pub fn invalidate(self: *ScrollFrameCache) void {
+        self.valid = false;
+        self.count = 0;
+    }
+
+    pub fn snapshot(
+        self: *ScrollFrameCache,
+        cmds: []const DrawCommand,
+        count: usize,
+        cfg: ViewportConfig,
+        content_id: usize,
+        hover_epoch: usize,
+        backing_scale: f32,
+    ) void {
+        self.valid = true;
+        self.count = count;
+        self.scroll_y = cfg.scroll_y;
+        self.window_width = cfg.window_width;
+        self.window_height = cfg.window_height;
+        self.base_font_size = cfg.base_font_size;
+        self.line_height = cfg.line_height;
+        self.content_max_width = cfg.content_max_width;
+        self.is_dark_theme = cfg.is_dark_theme;
+        self.backing_scale = backing_scale;
+        self.content_id = content_id;
+        self.hover_epoch = hover_epoch;
+        _ = cmds;
+    }
+
+    fn configMatches(self: *const ScrollFrameCache, cfg: ViewportConfig, content_id: usize, hover_epoch: usize) bool {
+        return self.window_width == cfg.window_width and
+            self.window_height == cfg.window_height and
+            self.base_font_size == cfg.base_font_size and
+            self.line_height == cfg.line_height and
+            self.content_max_width == cfg.content_max_width and
+            self.is_dark_theme == cfg.is_dark_theme and
+            self.content_id == content_id and
+            self.hover_epoch == hover_epoch;
+    }
+
+    /// Pure-scroll reuse: translate cached rect y by the scroll delta into
+    /// the caller buffer (same buffer the full path rents). Registration
+    /// and clip records replay unchanged; `fill_rect` backgrounds always
+    /// span the view, so they replay unchanged too. Returns the count on a
+    /// hit, null on any mismatch (caller runs full layout instead).
+    pub fn reuse(
+        self: *const ScrollFrameCache,
+        cached: []const DrawCommand,
+        out: []DrawCommand,
+        cfg: ViewportConfig,
+        content_id: usize,
+        hover_epoch: usize,
+    ) ?usize {
+        if (!self.valid) return null;
+        if (!self.configMatches(cfg, content_id, hover_epoch)) return null;
+        if (self.count > out.len) return null;
+        if (cached.len < self.count) return null;
+        const dy = self.scroll_y - cfg.scroll_y;
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            var c = cached[i];
+            switch (c.kind) {
+                .register_scrollable_block, .begin_clip, .end_clip, .fill_rect => {},
+                else => {
+                    c.rect.y += dy;
+                },
+            }
+            out[i] = c;
+        }
+        return self.count;
+    }
+};
+
+test "scroll cache: pure scroll reuses by y-shift, anything else misses" {
+    const cmds = [_]DrawCommand{
+        .{ .kind = .fill_rect, .rect = .{ .x = 0, .y = 0, .w = 800, .h = 600 } },
+        .{ .kind = .text_run, .rect = .{ .x = 100, .y = 120, .w = 200, .h = 24 }, .text = "row" },
+        .{ .kind = .register_scrollable_block, .rect = .{ .x = 100, .y = 200, .w = 400, .h = 80 } },
+    };
+    const base = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
+    var cache = ScrollFrameCache{};
+    try std.testing.expect(cache.reuse(&cmds, emptyCmds(), base, 7, 0) == null);
+    cache.snapshot(&cmds, cmds.len, base, 7, 0, 2.0);
+    var out: [8]DrawCommand = undefined;
+    const moved_cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 40.0 };
+    const n = cache.reuse(&cmds, &out, moved_cfg, 7, 0).?;
+    try std.testing.expectEqual(cmds.len, n);
+    try std.testing.expectEqual(@as(f32, 0.0), out[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 80.0), out[1].rect.y);
+    try std.testing.expectEqual(@as(f32, 200.0), out[2].rect.y);
+    try std.testing.expect(cache.reuse(&cmds, &out, moved_cfg, 8, 0) == null);
+    var theme_cfg = moved_cfg;
+    theme_cfg.is_dark_theme = !base.is_dark_theme;
+    try std.testing.expect(cache.reuse(&cmds, &out, theme_cfg, 7, 0) == null);
+    var wide_cfg = moved_cfg;
+    wide_cfg.window_width = 801.0;
+    try std.testing.expect(cache.reuse(&cmds, &out, wide_cfg, 7, 0) == null);
+    try std.testing.expect(cache.reuse(&cmds, &out, moved_cfg, 7, 1) == null);
+}
+
+fn emptyCmds() []DrawCommand {
+    var buf: [1]DrawCommand = undefined;
+    return buf[0..0];
+}
+
+test "scroll quantize: whole device pixels, passthrough on bad scale" {
+    try std.testing.expectEqual(@as(f32, 40.0), SmoothScroll.quantize(40.0, 2.0));
+    try std.testing.expectEqual(@as(f32, 40.0), SmoothScroll.quantize(40.24, 2.0));
+    try std.testing.expectEqual(@as(f32, 40.5), SmoothScroll.quantize(40.26, 2.0));
+    try std.testing.expectEqual(@as(f32, 41.0), SmoothScroll.quantize(40.9, 1.0));
+    try std.testing.expectEqual(@as(f32, 12.125), SmoothScroll.quantize(12.125, 0.0));
+}
 
 /// Renders a series of inline spans with automatic word wrapping and exact typography.
 /// `rtl` right-anchors the pen (issue #50): false preserves history exactly.
