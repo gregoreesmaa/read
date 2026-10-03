@@ -3096,6 +3096,7 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
 static BOOL g_images_armed = NO;
 
 static void kick_image_load(CachedImageRecord* rec, NSString* resolved);
+static NSString* image_path_for_record(CachedImageRecord* rec, const char* url, int url_len);
 
 void platform_arm_images(void) {
     if (g_images_armed) return;
