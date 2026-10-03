@@ -484,6 +484,8 @@ fn pluginMarkNaive(r: usize) void {
 
 /// Write one shim script (render or probe entry point) under dir and mark
 /// it executable. The stable path persists for later launches.
+/// Hash-skip (#390): when a shim with identical bytes already exists, keep
+/// it — no rewrite, no chmod, no mtime churn for watchers or Time Machine.
 fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe: bool, stable: []u8, stable_len: *u8) bool {
     const infix = if (probe) "/probe-" else "/run-";
     const ext = ".sh";
@@ -503,8 +505,30 @@ fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe:
     var body: [2048]u8 = undefined;
     const text = if (probe) pluginProbeShim(helper, name, &body) else pluginRenderShim(helper, name, &body);
     const t = text orelse return false;
+    if (pluginFileContentMatches(stable[0..s], t)) return true;
     if (!pluginWriteFile(path_z, t)) return false;
     if (std.c.chmod(path_z, 0o755) != 0) return false;
+    return true;
+}
+
+/// True when the file at `path` holds exactly `want` bytes. Pure read
+/// probe for the shim hash-skip: a missing/unreadable file reads as
+/// different (rewrite path), never as equal.
+fn pluginFileContentMatches(path: []const u8, want: []const u8) bool {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return false;
+    if (st.size != want.len) return false;
+    var off: usize = 0;
+    var buf: [512]u8 = undefined;
+    while (off < want.len) {
+        const n = std.c.read(fd, &buf, @min(buf.len, want.len - off));
+        if (n <= 0) return false;
+        const got: usize = @intCast(n);
+        if (!std.mem.eql(u8, buf[0..got], want[off..][0..got])) return false;
+        off += got;
+    }
     return true;
 }
 
@@ -694,10 +718,162 @@ fn pluginPollAndAdvance() bool {
     return false;
 }
 
-/// Per-open plugin kick (cold): reset per-doc state, resolve the table,
-/// stat cache hits to ready, then probe and launch. Read-test/headless
-/// binaries skip the entire kick (same determinism rule as the parked image
-/// decodes: fences stay code cards there).
+/// Cold-path cache tidy (#390): sweeps every renderer's cache dir under
+/// `root` — removes stale `probe-*` sentinels (leaked when a previous run
+/// crashed between probe launch and reap) and prunes the per-renderer PNG
+/// cache past PLUGIN_CACHE_MAX_FILES, oldest mtime first (LRU-ish; mtime
+/// on a cache hit is NOT bumped — hits are stat-only on the hot path).
+/// Bounded: scans at most PLUGIN_TIDY_SCAN entries per renderer dir,
+/// deletes at most PLUGIN_TIDY_DEL_MAX files. One pass per open, before
+/// the fence fast path so plain documents clean too; best-effort (any
+/// failure silently keeps old bytes, including a missing dir). Zero heap:
+/// libc dir iteration into stack buffers; no std.Io.Dir (needs an Io
+/// context the cold path does not thread) and no std.fs (links plumbing
+/// into ship __TEXT).
+///
+/// Portability: Zig 0.16's `std.c` exposes `readdir`/`stat` only for
+/// Darwin targets, so the two entry points are declared locally with an
+/// explicit symbol name — plain `readdir`/`stat` exist in both libSystem
+/// (arm64) and glibc. The dirent name field differs per OS ([1024]u8
+/// Darwin, [256]u8 Linux), handled by the per-OS struct below; only the
+/// name is read.
+const pluginDirent = switch (builtin.os.tag) {
+    .linux => extern struct {
+        ino: std.c.ino_t,
+        off: std.c.off_t,
+        reclen: c_ushort,
+        kind: u8,
+        name: [256]u8,
+    },
+    else => extern struct {
+        ino: u64,
+        seekoff: u64,
+        reclen: u16,
+        namlen: u16,
+        kind: u8,
+        name: [1024]u8,
+    },
+};
+const pluginReaddir = @extern(*const fn (*std.c.DIR) callconv(.c) ?*pluginDirent, .{ .name = "readdir" });
+const pluginStat = @extern(*const fn ([*:0]const u8, *std.c.Stat) callconv(.c) c_int, .{ .name = "stat" });
+const PLUGIN_CACHE_MAX_FILES: usize = 64;
+const PLUGIN_TIDY_SCAN: usize = 256;
+const PLUGIN_TIDY_DEL_MAX: usize = 32;
+/// Sweep one renderer's cache dir: drop stale probe sentinels, prune PNG
+/// overflow. `root` is the cache root (resolved once by the caller).
+fn pluginTidyCache(root: []const u8) void {
+    var r: usize = 0;
+    while (r < PLUGIN_RENDERER_COUNT) : (r += 1) {
+        const renderer: plugin_cache.Renderer = @enumFromInt(r);
+        var dbuf: [512]u8 = undefined;
+        const dir = pluginRendererDir(root, @tagName(renderer), &dbuf) orelse continue;
+        pluginTidyRendererDir(dir);
+    }
+}
+
+fn pluginTidyRendererDir(dir: []const u8) void {
+    var zdir: [1024:0]u8 = [_:0]u8{0} ** 1024;
+    if (dir.len + 1 > zdir.len) return;
+    @memcpy(zdir[0..dir.len], dir);
+    zdir[dir.len] = 0;
+    const dz: [*:0]const u8 = @ptrCast(&zdir[0]);
+    const dp = std.c.opendir(dz) orelse return;
+    defer _ = std.c.closedir(dp);
+    var oldest: [PLUGIN_TIDY_DEL_MAX]i64 = [_]i64{0} ** PLUGIN_TIDY_DEL_MAX;
+    var onames: [PLUGIN_TIDY_DEL_MAX][64]u8 = [_][64]u8{[_]u8{0} ** 64} ** PLUGIN_TIDY_DEL_MAX;
+    var n_old: usize = 0;
+    var png_count: usize = 0;
+    var scanned: usize = 0;
+    while (scanned < PLUGIN_TIDY_SCAN) {
+        const ent = pluginReaddir(dp) orelse break;
+        scanned += 1;
+        // d_name is a fixed array ([256]u8 Linux, [1024]u8 Darwin):
+        // slice to the first NUL (never a raw sentinel pointer).
+        const n = std.mem.sliceTo(ent.*.name[0..], 0);
+        if (n.len == 0) continue;
+        if (n[0] == '.') continue;
+        // Stale probe sentinels first: only the `probe-<hh>.src/.out`
+        // shape (live shims `probe-<name>.sh` never match — longer tail,
+        // `.sh` extension; see pluginIsStaleProbeName). Note the seq
+        // counter is u8, so leaves are always two hex digits, never wider
+        // (see pluginLaunchProbe).
+        if (pluginIsStaleProbeName(n)) {
+            var full: [1024:0]u8 = [_:0]u8{0} ** 1024;
+            if (pluginJoinPath(dir, n, full[0..1023]) != null) {
+                const fz: [*:0]const u8 = @ptrCast(&full[0]);
+                _ = std.c.unlink(fz);
+            }
+            continue;
+        }
+        if (!std.mem.endsWith(u8, n, ".png")) continue;
+        png_count += 1;
+        var full: [1024:0]u8 = [_:0]u8{0} ** 1024;
+        if (pluginJoinPath(dir, n, full[0..1023]) == null) continue;
+        const fz: [*:0]const u8 = @ptrCast(&full[0]);
+        var st: std.c.Stat = undefined;
+        if (pluginStat(fz, &st) != 0) continue;
+        // mtime() (method, not field) is portable across Darwin/Linux
+        // Stat shapes; compare seconds only — prune order needs no nsec.
+        const mt = st.mtime().sec;
+        // Track the oldest few for pruning; insertion into a tiny sorted
+        // window keeps this O(scan * 32) with no allocation.
+        if (n_old < PLUGIN_TIDY_DEL_MAX or mt < oldest[n_old - 1]) {
+            var pos: usize = 0;
+            while (pos < n_old and oldest[pos] <= mt) : (pos += 1) {}
+            if (n_old < PLUGIN_TIDY_DEL_MAX) n_old += 1;
+            var q: usize = n_old - 1;
+            while (q > pos) : (q -= 1) {
+                oldest[q] = oldest[q - 1];
+                onames[q] = onames[q - 1];
+            }
+            oldest[pos] = mt;
+            const take = @min(n.len, 63);
+            @memcpy(onames[pos][0..take], n[0..take]);
+            onames[pos][take] = 0;
+        }
+    }
+    if (png_count <= PLUGIN_CACHE_MAX_FILES) return;
+    var drop = png_count - PLUGIN_CACHE_MAX_FILES;
+    if (drop > n_old) drop = n_old;
+    var i: usize = 0;
+    while (i < drop) : (i += 1) {
+        const tail = std.mem.span(@as([*:0]const u8, @ptrCast(&onames[i][0])));
+        var full: [1024:0]u8 = [_:0]u8{0} ** 1024;
+        if (pluginJoinPath(dir, tail, full[0..1023]) != null) {
+            const fz: [*:0]const u8 = @ptrCast(&full[0]);
+            _ = std.c.unlink(fz);
+        }
+    }
+}
+
+/// Stale probe sentinel shape: `probe-<hh>.src` / `probe-<hh>.out` where
+/// <hh> are exactly two lowercase hex digits. Live shims (`probe-<name>.sh`)
+/// never match: their post-prefix tail is longer and ends in `.sh`.
+fn pluginIsStaleProbeName(n: []const u8) bool {
+    const pre = "probe-";
+    if (!std.mem.startsWith(u8, n, pre)) return false;
+    const tail = n[pre.len..];
+    if (tail.len != 6) return false; // "<hh>.src" / "<hh>.out"
+    for (tail[0..2]) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    }
+    return std.mem.eql(u8, tail[2..], ".src") or std.mem.eql(u8, tail[2..], ".out");
+}
+
+/// `<dir>/<leaf>` into `out` with NUL termination. Returns the path slice,
+/// or null when it does not fit (caller keeps old bytes). Thin wrapper
+/// over pluginChildPath (one join codegen site, not two).
+fn pluginJoinPath(dir: []const u8, leaf: []const u8, out: []u8) ?[]u8 {
+    if (out.len == 0) return null;
+    const p = pluginChildPath(dir, leaf, out[0 .. out.len - 1]) orelse return null;
+    out[p.len] = 0;
+    return out[0..p.len];
+}
+
+/// Per-open plugin kick (cold): reset per-doc state, tidy the cache,
+/// resolve the table, stat cache hits to ready, then probe and launch.
+/// Read-test/headless binaries skip the entire kick (same determinism rule
+/// as the parked image decodes: fences stay code cards there).
 fn pluginKickForDocument() void {
     g_plugin_orphans +|= g_plugin_inflight;
     g_plugin_count = 0;
@@ -705,11 +881,18 @@ fn pluginKickForDocument() void {
     for (&g_plugin_launched) |*l| l.* = false;
     for (&g_plugin_probe_pending) |*p| p.* = false;
     if (build_options.test_hooks) return;
-    // No hasPluginFences pre-check: collectPluginJobs already scans the
-    // lines once and returns 0 when none match, so a separate pre-scan
-    // would walk every plain document twice (one inline copy + one pass).
     const root = pluginCacheRoot(g_plugin_root_buf[0..]) orelse return;
     g_plugin_root_len = root.len;
+    // Cold-path tidy (#390): one bounded sweep per open — stale probe
+    // sentinels from a crashed earlier run and cache overflow never linger
+    // or grow without bound, even across sessions (renderer dirs derive
+    // from the root, not session state). Runs before the fence fast path
+    // so plain documents clean too; best-effort, failures keep old bytes.
+    pluginTidyCache(root);
+    // Fast path (#390): documents without plugin fences skip the job scan
+    // and every per-job stat. hasPluginFences is one scan over
+    // already-resident line structs (no bytes walk).
+    if (!plugin_cache.hasPluginFences(g_app.bytes, g_app.lines[0..g_app.line_count])) return;
     const n = pluginResolvePaths(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
@@ -1168,6 +1351,10 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     if (g_app.mapped_file) |*m| m.close();
     g_app.mapped_file = mapped;
     g_app.bytes = mapped.bytes;
+    // Cold-open prefetch (#390): same SEQUENTIAL + WILLNEED hint as the
+    // startup path — in-place opens and external reloads walk the mapping
+    // front to back exactly once too. One syscall, cold only.
+    mapped.adviseSequential();
     var in_fence: simd.FenceState = .{};
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
     g_app.lines = g_lines_buffer[0..g_app.line_count];
@@ -4144,6 +4331,32 @@ test "plugin task5: sidecar path + shim bodies are exact, hostile helpers refuse
     try t.expect(pluginRenderShim("/h/$(x).sh", "mermaid", &jb) == null);
     try t.expect(pluginRenderShim("/h/a`b`.sh", "mermaid", &jb) == null);
     try t.expect(pluginProbeShim("/h/a\"b.sh", "mermaid", &jb) == null);
+}
+
+test "plugin tidy: stale probe names match, live shims never do (#390)" {
+    const t = std.testing;
+    // Stale sentinel shapes (two lowercase hex + .src/.out).
+    try t.expect(pluginIsStaleProbeName("probe-00.src"));
+    try t.expect(pluginIsStaleProbeName("probe-af.out"));
+    try t.expect(pluginIsStaleProbeName("probe-9c.src"));
+    // Live shims in the same dir are never tidy targets.
+    try t.expect(!pluginIsStaleProbeName("probe-mermaid.sh"));
+    try t.expect(!pluginIsStaleProbeName("run-mermaid.sh"));
+    // Near-misses: wrong length, uppercase hex, wrong extension.
+    try t.expect(!pluginIsStaleProbeName("probe-0.src"));
+    try t.expect(!pluginIsStaleProbeName("probe-000.src"));
+    try t.expect(!pluginIsStaleProbeName("probe-AF.out"));
+    try t.expect(!pluginIsStaleProbeName("probe-af.png"));
+    try t.expect(!pluginIsStaleProbeName("src-0123456789abcdef.txt"));
+    try t.expect(!pluginIsStaleProbeName("probe-"));
+    try t.expect(!pluginIsStaleProbeName(""));
+    // Join helper: exact bytes + NUL, null when it does not fit.
+    var out: [32]u8 = undefined;
+    const j = pluginJoinPath("/d", "f.png", &out).?;
+    try t.expectEqualStrings("/d/f.png", j);
+    try t.expectEqual(@as(u8, 0), out[j.len]);
+    var tiny: [4]u8 = undefined;
+    try t.expect(pluginJoinPath("/dir", "leaf.png", &tiny) == null);
 }
 
 test "plugin task5: table build truncates at 16, read-test never kicks (#323)" {

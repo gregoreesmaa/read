@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
-#include <Carbon/Carbon.h> // IsSecureEventInputEnabled for Copy validation
+// Carbon edge (#390): IsSecureEventInputEnabled arrives via dlopen, never a
+// link edge — see secure_input_active() below. build.zig links no Carbon.
 #import <dispatch/dispatch.h> // vnode watcher (libSystem, no new framework)
 #include <fcntl.h> // O_EVTONLY for the watcher (libSystem)
 #include <spawn.h> // posix_spawnp: no NSTask/threads/timers (audit-safe)
@@ -8,6 +9,7 @@
 #include <sys/stat.h> // outfile validation (exists + nonzero + mtime)
 #include <time.h> // start stamp for the mtime check
 #include <unistd.h> // access/unlink
+#include <dlfcn.h> // dlopen/dlsym for the Carbon-free secure-input gate
 #include <crt_externs.h> // _NSGetEnviron: children inherit our environment
 #include "platform.h"
 
@@ -343,15 +345,34 @@ static void register_app_fonts(void) {
     // loop below exactly as before.
     if ([NSFont fontWithName:@"IBMPlexSerif-Regular" size:12.0]) return;
 
-    NSArray* paths = @[
-        @"assets/fonts/IBMPlexSerif-Regular.ttf",
-        @"assets/fonts/IBMPlexSerif-Bold.ttf",
-        @"assets/fonts/IBMPlexSerif-Italic.ttf",
-        @"assets/fonts/SpaceGrotesk.ttf",
-        @"assets/fonts/JetBrainsMono.ttf",
+    // Launch economy (#390): the loop below stats + parses file URLs. The
+    // bundle carries them under Contents/Resources/Fonts (see
+    // scripts/make_app_bundle.sh), so resolve bundle-relative FIRST and
+    // register only paths that exist — one lookup, no source-relative
+    // misses. A bare `read` binary beside the source tree keeps the old
+    // source-relative names as fallback (dev). The bundle never ships the
+    // top-level assets/ tree, so ship pays zero failed stats here.
+    NSBundle* bundle = [NSBundle mainBundle];
+    NSURL* fontsDir = bundle ? [bundle URLForResource:@"Fonts" withExtension:nil] : nil;
+    NSArray* names = @[
+        @"IBMPlexSerif-Regular.ttf",
+        @"IBMPlexSerif-Bold.ttf",
+        @"IBMPlexSerif-Italic.ttf",
+        @"SpaceGrotesk.ttf",
+        @"JetBrainsMono.ttf",
     ];
 
-    for (NSString* relPath in paths) {
+    for (NSString* name in names) {
+        if (fontsDir) {
+            NSURL* url = [fontsDir URLByAppendingPathComponent:name];
+            if (url && [[NSFileManager defaultManager] fileExistsAtPath:[url path]]) {
+                CFErrorRef err = NULL;
+                CTFontManagerRegisterFontsForURL((__bridge CFURLRef)url, kCTFontManagerScopeProcess, &err);
+                continue;
+            }
+        }
+        // Dev fallback: source-relative (never present in the bundle).
+        NSString* relPath = [@"assets/fonts/" stringByAppendingString:name];
         NSURL* url = [NSURL fileURLWithPath:relPath];
         if ([[NSFileManager defaultManager] fileExistsAtPath:[url path]]) {
             CFErrorRef err = NULL;
@@ -1618,7 +1639,7 @@ static void paint_copy_button(CGContextRef ctx) {
     }
 
     NSMenuItem *copyItem = [[NSMenuItem alloc] initWithTitle:@"Copy" action:@selector(copySelectionToClipboard) keyEquivalent:@"c"];
-    if ((!g_has_selection && !g_select_all) || IsSecureEventInputEnabled()) {
+    if ((!g_has_selection && !g_select_all) || secure_input_active()) {
         [copyItem setEnabled:NO];
     }
     [menu addItem:copyItem];
@@ -1628,7 +1649,7 @@ static void paint_copy_button(CGContextRef ctx) {
 
     // Look Up / Search need a selection and refuse under Secure Input,
     // same as Copy (see validateMenuItem: for the main-menu path).
-    if ((g_has_selection || g_select_all) && !IsSecureEventInputEnabled()) {
+    if ((g_has_selection || g_select_all) && !secure_input_active()) {
         [menu addItem:[NSMenuItem separatorItem]];
         NSMenuItem *lookUp = [[NSMenuItem alloc] initWithTitle:@"Look Up" action:@selector(lookUpSelection:) keyEquivalent:@""];
         [menu addItem:lookUp];
@@ -1708,9 +1729,15 @@ static BOOL edit_action_available(SEL action, BOOL has_selection, BOOL secure_in
     return YES;
 }
 
+// Secure-input gate, Carbon-free (#390): IsSecureEventInputEnabled arrives
+// via dlopen of /System/Library/Frameworks/Carbon.framework — no link edge
+// (see build.zig), loaded once and cached. A missing framework or symbol
+// reads as inactive (fail-open: Copy is validation UX, never a secret).
+static BOOL secure_input_active(void); // defined at end-of-file
+
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     return edit_action_available([item action], g_has_selection || g_select_all,
-                                 IsSecureEventInputEnabled() ? YES : NO);
+                                 secure_input_active() ? YES : NO);
 }
 
 // Services: vend the selection as plain text; read-only, so no
@@ -2792,7 +2819,15 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
 
 typedef struct {
     char     url[512];
-    // Decoded frames (NULL = not yet loaded, count 0 = failed)
+    // Retained source for on-demand frame faults (#390: frames past 0
+    // decode at display time, not at load). NULL for vector rasters and
+    // single-frame stills; released when the record is freed.
+    CGImageSourceRef src;
+    // Resolved load path (file URL string or remote URL, NUL-terminated):
+    // stored at record creation so arrivals and re-kicks never re-resolve
+    // (#390: one resolve per record lifetime, not per draw/size/arm call).
+    char     resolved[1024];
+    // Decoded frames (NULL entry = not yet displayed; count 0 = failed)
     CGImageRef* frames;         // malloc'd array of CGImageRef
     double*     frame_delays;   // malloc'd array of per-frame delay in seconds
     int         frame_count;
@@ -2823,6 +2858,11 @@ static int  g_image_cache_count = 0;
 static void gif_schedule_next_frame(CachedImageRecord* rec);
 static BOOL gif_window_visible(void);
 #endif
+// Forward: on-demand frame fault lives with the loader at EOF; the GIF
+// advance tick below faults frames before invalidating, so it needs the
+// declaration before first use (fixes implicit-decl + static-follows-
+// non-static errors in animated builds).
+static void decode_frame_on_demand(CachedImageRecord* rec, int idx);
 
 #ifdef READ_ANIMATED_GIF
 // The window is a valid animation sink only while it is actually on screen.
@@ -2860,6 +2900,9 @@ static void gif_advance_frame(CachedImageRecord* rec) {
         rec->cur_frame, rec->frame_count, rec->last_doc_x, rec->last_doc_y - g_scroll_y,
         rec->last_w, rec->last_h);
 #endif
+    // On-demand fault (#390): the newly current frame (plus its successor)
+    // may never have decoded — fault it before invalidating.
+    decode_frame_on_demand(rec, rec->cur_frame);
     if (rec->has_rect) {
         // Document -> view coordinates at current scroll offset.
         invalidate_rect(NSMakeRect(
@@ -2898,18 +2941,27 @@ static void gif_schedule_next_frame(CachedImageRecord* rec) {
 // via platform_set_document_dir (absolute, or empty = unset). Cold path only.
 static char g_doc_dir[1024] = {0};
 
-// Resolve relative path to absolute (#45: document-dir first).
+// Resolve relative path to absolute (#45: the raw path first for
+// absolute/CWD hits (back-compat), then the document directory set by
+// platform_set_document_dir, then CWD join).
 // Remote URLs pass through untouched (fetched via NSURLSession, never
-// resolved as files). Absolute/CWD hits win (back-compat), then the
-// document directory set by platform_set_document_dir, then CWD join.
+// resolved as files).
+// Stat order (#390): the common hits return before any miss path stats —
+// a missing file costs at most one existence probe per directory level.
 static NSString* resolve_image_path(NSString* pathStr) {
     if (image_url_is_remote(pathStr)) return pathStr;
     NSFileManager* fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:pathStr]) return pathStr;
+    // Document-relative names are the common case for real documents: try
+    // the doc-dir join FIRST so a hit pays exactly one stat total.
     if (g_doc_dir[0] != '\0') {
         NSString* docDir = [[NSString alloc] initWithUTF8String:g_doc_dir];
         NSString* full = [docDir stringByAppendingPathComponent:pathStr];
         if ([fm fileExistsAtPath:full]) return full;
+        // A doc-relative miss is authoritative for plain filenames (no
+        // slash): CWD cannot hold a different intended file, so fail here
+        // instead of paying a third stat that only finds stale CWD shadows.
+        if ([pathStr rangeOfString:@"/"].location == NSNotFound) return nil;
     }
     NSString* cwd = [fm currentDirectoryPath];
     NSString* full = [cwd stringByAppendingPathComponent:pathStr];
@@ -2923,8 +2975,15 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
 // Forward: decode primer lives at end-of-file (see note there) so its
 // __text bytes don't shift the hot mid-file layout.
 static int prime_frame_decode(CGImageRef img);
+// Forward: on-demand frame fault, defined with the loader below.
+static void decode_frame_on_demand(CachedImageRecord* rec, int idx);
 
-// Decode all frames from a CGImageSource into the cache record
+// Decode frames from a CGImageSource into the cache record, on demand
+// (#390): frame 0 decodes now (natural size + first paint); remaining
+// frames decode lazily at display time via decode_frame_on_demand below.
+// Previously every frame decoded + primed up front, so a 44-frame GIF paid
+// 44 decodes + 44 primes at load; now load pays 1 + 1. Frame properties
+// (delays) still parse for every frame — cheap metadata, no pixel decode.
 static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecord* rec) {
     size_t count = CGImageSourceGetCount(src);
     if (count == 0) { rec->failed = YES; return; }
@@ -2938,15 +2997,21 @@ static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecor
 #ifdef READ_ANIMATED_GIF
     rec->frames       = (CGImageRef*)malloc(sizeof(CGImageRef) * count);
     rec->frame_delays = (double*)malloc(sizeof(double) * count);
+    if (!rec->frames || !rec->frame_delays) {
+        free(rec->frames); free(rec->frame_delays);
+        rec->frames = NULL; rec->frame_delays = NULL;
+        CGImageRelease(first); rec->failed = YES; return;
+    }
     rec->frame_count  = (int)count;
     rec->primed_frames = 0;
     rec->frames[0]    = first; // already retained by Create
     rec->primed_frames += prime_frame_decode(first);
-
-    for (size_t i = 1; i < count; i++) {
-        rec->frames[i] = CGImageSourceCreateImageAtIndex(src, i, NULL);
-        rec->primed_frames += prime_frame_decode(rec->frames[i]);
-    }
+    // Frames past 0 stay NULL until displayed (decode_frame_on_demand).
+    // Keep the source alive for on-demand decodes; NULL when the record
+    // dies or the source cannot be retained (then later frames fail to
+    // the still frame 0, exactly the old static behavior).
+    for (size_t i = 1; i < count; i++) rec->frames[i] = NULL;
+    rec->src = (CGImageSourceRef)CFRetain(src);
 
     // Extract per-frame delays (GIF {GIFDelayTime} property)
     for (size_t i = 0; i < count; i++) {
@@ -2975,10 +3040,42 @@ static void load_image_source_into_record(CGImageSourceRef src, CachedImageRecor
 #endif
 }
 
+// Display-time frame fault (#390): decode frame `idx` on first display,
+// plus prefetch idx+1 (the next tick's frame) so animation never decodes
+// on the paint path twice in a row. Retained CGImageSource decodes are
+// thread-confined here to the main thread (all callers are main-thread
+// draws/ticks). Idempotent: decoded frames return immediately.
+static void decode_frame_on_demand(CachedImageRecord* rec, int idx) {
+#ifdef READ_ANIMATED_GIF
+    if (!rec || !rec->src) return;
+    if (idx < 0 || idx >= rec->frame_count) return;
+    for (int k = idx; k <= idx + 1 && k < rec->frame_count; k++) {
+        if (rec->frames[k]) continue;
+        CGImageRef img = CGImageSourceCreateImageAtIndex(rec->src, (size_t)k, NULL);
+        if (!img) continue;
+        rec->frames[k] = img; // already retained by Create
+        rec->primed_frames += prime_frame_decode(img);
+    }
+#else
+    (void)rec; (void)idx;
+#endif
+}
+
 // Synchronously populate a cache slot from a local file path. Remote URLs
 // never reach here: kick_image_load routes them to the async URL session,
 // so no synchronous network fetch exists anywhere on any path (#45).
 static void load_image_sync(CachedImageRecord* rec, NSString* pathStr) {
+    // Vector-first (#390): SVG/PDF hit the AppKit rasterizer without paying
+    // for a doomed ImageIO source creation + frame-0 probe first. The
+    // extension check is advisory only — rasterize_vector_into_record still
+    // fails closed to a placeholder for mislabeled files.
+    NSString* ext = [[pathStr pathExtension] lowercaseString];
+    if ([ext isEqualToString:@"svg"] || [ext isEqualToString:@"pdf"]) {
+        rasterize_vector_into_record(pathStr, rec);
+        if (rec->frame_count == 0) rec->failed = YES;
+        rec->loading = NO;
+        return;
+    }
     CGImageSourceRef src = nil;
     NSURL* fu = [NSURL fileURLWithPath:pathStr];
     if (fu) src = CGImageSourceCreateWithURL((__bridge CFURLRef)fu, NULL);
@@ -3054,11 +3151,10 @@ void platform_arm_images(void) {
         CachedImageRecord* rec = &g_image_cache[i];
         if (!rec->kick_pending || rec->failed) continue;
         rec->kick_pending = NO;
-        NSString* pathStr = [[NSString alloc] initWithBytes:rec->url
-                                                     length:strlen(rec->url)
-                                                   encoding:NSUTF8StringEncoding];
-        NSString* resolved = resolve_image_path(pathStr);
-        if (!resolved) { rec->failed = YES; rec->loading = NO; continue; }
+        // The resolved path was stored at record creation: re-kick through
+        // it directly, no second resolve (#390).
+        NSString* resolved = [[NSString alloc] initWithUTF8String:rec->resolved];
+        if (!resolved || [resolved length] == 0) { rec->failed = YES; rec->loading = NO; continue; }
         kick_image_load(rec, resolved);
     }
 }
@@ -3094,7 +3190,22 @@ static void image_load_completed(CachedImageRecord* rec) {
     if (g_callbacks.on_images_changed) {
         g_callbacks.on_images_changed(delta_above);
     }
-    [g_main_view setNeedsDisplay:YES];
+    // Rect-scoped arrival (#390): the record's last drawn rect bounds the
+    // repaint. Off-viewport arrivals (never drawn, or scrolled away) skip
+    // the invalidate entirely — the next genuine draw paints them — while
+    // on-screen arrivals repaint exactly their box instead of the window.
+    if (rec->has_rect) {
+        NSView* iv = damage_target_view();
+        float vh = iv ? (float)[iv bounds].size.height : 0.0f;
+        float vy = rec->last_doc_y - g_scroll_y;
+        // View-space rect vs the visible band: overlap test with the drawn
+        // size (last_h already advanced above; last_w is current).
+        if (vy + rec->last_h >= 0.0f && vy <= vh) {
+            invalidate_rect(NSMakeRect(rec->last_doc_x, vy, rec->last_w, rec->last_h));
+        }
+    } else {
+        [g_main_view setNeedsDisplay:YES];
+    }
 #ifdef TEST_HOOKS
     DBGLOG("EV img_done url=%s frames=%d failed=%d primed=%d %.0fx%.0f", dbg_base(rec->url),
         rec->frame_count, rec->failed ? 1 : 0, rec->primed_frames,
@@ -3113,6 +3224,9 @@ static void kick_image_load(CachedImageRecord* rec, NSString* resolved) {
     // paint, scroll, or layout. The completion decodes off-main and lands
     // through the same image_load_completed arrival as local files, so a
     // broken/blocked load degrades to the identical muted placeholder.
+    // Caps (#390, mirror of remote_policy.zig): MAX_IMAGE_BYTES via the
+    // delegate's didReceiveResponse cancel + byte counter, 8 s timeouts,
+    // max 3 redirects — enforced in image_session/delegate below.
     if (image_url_is_remote(resolved)) {
         NSURL* u = [NSURL URLWithString:resolved];
         if (!u) { rec->failed = YES; rec->loading = NO; image_load_completed(rec); return; }
@@ -3167,9 +3281,18 @@ static CachedImageRecord* get_or_load_image_record(const char* url, int url_len)
     rec->loading = YES;
 
     NSString* pathStr = [[NSString alloc] initWithBytes:url length:url_len
-                                               encoding:NSUTF8StringEncoding];
+                                                   encoding:NSUTF8StringEncoding];
     NSString* resolved = resolve_image_path(pathStr);
     if (!resolved) { rec->failed = YES; rec->loading = NO; return rec; }
+    // One resolve per record lifetime (#390): arrivals and arm re-kicks
+    // reuse this; later draws/sizes never re-stat.
+    const char* ru = [resolved UTF8String];
+    if (ru) {
+        size_t rn = strlen(ru);
+        if (rn >= sizeof(rec->resolved)) rn = sizeof(rec->resolved) - 1;
+        memcpy(rec->resolved, ru, rn);
+        rec->resolved[rn] = '\0';
+    }
 
     if (!g_images_armed) {
         rec->kick_pending = YES;
@@ -3204,11 +3327,18 @@ void platform_probe_px_add(int x, int y) {
 #ifdef TEST_HOOKS
 // Total frames vs force-decoded frames across the image cache, for the
 // decode-priming regression test: every loaded frame must be primed.
+// NOTE (#390): with on-demand frame faults, "total" counts only decoded
+// frames (frame 0 + faulted), not the full GIF frame count — an undisplayed
+// frame is undecoded by design, not a priming miss. scroll_profile.sh
+// asserts primed == total after a settle, which still holds.
 void platform_test_image_primed(unsigned long* total_frames, unsigned long* primed_frames) {
     unsigned long t = 0, p = 0;
     for (int i = 0; i < g_image_cache_count; i++) {
         if (g_image_cache[i].failed) continue;
-        t += (unsigned long)g_image_cache[i].frame_count;
+        for (int f = 0; f < g_image_cache[i].frame_count; f++) {
+            if (!g_image_cache[i].frames || !g_image_cache[i].frames[f]) continue;
+            t += 1;
+        }
         p += (unsigned long)g_image_cache[i].primed_frames;
     }
     if (total_frames) *total_frames = t;
@@ -3290,7 +3420,10 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
         gif_schedule_next_frame(rec);
     }
 #endif
-    CGImageRef frame = rec->frames[rec->cur_frame];
+    // On-demand fault (#390): first display of a multi-frame GIF decodes
+    // the displayed frame (+1 prefetch) here — never at load.
+    decode_frame_on_demand(rec, rec->cur_frame);
+    CGImageRef frame = rec->frames ? rec->frames[rec->cur_frame] : NULL;
     if (!frame) return;
 
     CGContextSaveGState(ctx);
@@ -3683,19 +3816,102 @@ static int image_url_is_remote(NSString* s) {
 // Shared remote-fetch session: ephemeral (no disk persistence), NO shared
 // URLCache (the 64-slot image cache above is the bound — an unbounded
 // NSURLCache would violate it), bounded timeouts so blocked hosts fail
-// into the placeholder instead of dangling.
+// into the placeholder instead of dangling. Timeouts mirror the Zig
+// transport contract (remote_policy.zig FETCH_TIMEOUT_MS = 8 s); MAX_REDIRECTS
+// (3) and MAX_IMAGE_BYTES (8 MiB) are enforced by the delegate below.
+#define READ_REMOTE_MAX_BYTES (8 * 1024 * 1024)
+#define READ_REMOTE_MAX_REDIRECTS 3
+// Fetch delegate (#390): enforces what dataTaskWithURL:completionHandler:
+// cannot — (1) cancel over-budget bodies in didReceiveResponse via
+// expectedContentLength, (2) accumulate a byte counter in didReceiveData
+// and cancel past MAX_IMAGE_BYTES (unbounded NSData otherwise), (3) cap
+// redirects at 3. Completion blocks still receive (nil-data, cancelled)
+// for over-budget loads and fail into the placeholder.
+@interface ImageFetchDelegate : NSObject <NSURLSessionDataDelegate>
+@end
+// Per-task counters without NSDictionary (no heap churn per byte batch):
+// tasks are few (bounded by the 64-slot image cache), so a small static
+// ring suffices. Past 16 CONCURRENT fetches two live tasks may share a
+// slot: byte counts merge and the sharers may cancel early — fail-safe
+// (a placeholder, never an unbounded buffer). Stale slots age out on reuse.
+#define FETCH_TRACK_MAX 16
+static NSURLSessionTask* fetch_task[FETCH_TRACK_MAX] = { nil };
+static long long fetch_bytes[FETCH_TRACK_MAX] = { 0 };
+static int fetch_redirects[FETCH_TRACK_MAX] = { 0 };
+static int fetch_track_pos = 0;
+static int fetch_track_slot(NSURLSessionTask* task) {
+    for (int i = 0; i < FETCH_TRACK_MAX; i++)
+        if (fetch_task[i] == task) return i;
+    int slot = fetch_track_pos;
+    fetch_track_pos = (fetch_track_pos + 1) % FETCH_TRACK_MAX;
+    fetch_task[slot] = task;
+    fetch_bytes[slot] = 0;
+    fetch_redirects[slot] = 0;
+    return slot;
+}
+static void fetch_track_drop(NSURLSessionTask* task) {
+    for (int i = 0; i < FETCH_TRACK_MAX; i++)
+        if (fetch_task[i] == task) { fetch_task[i] = nil; fetch_bytes[i] = 0; fetch_redirects[i] = 0; }
+}
 static NSURLSession* image_session(void) {
     static NSURLSession* s = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         NSURLSessionConfiguration* cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         cfg.URLCache = nil;
-        cfg.timeoutIntervalForRequest = 20.0;
-        cfg.timeoutIntervalForResource = 30.0;
-        s = [NSURLSession sessionWithConfiguration:cfg];
+        // No credential/cookie persistence: each fetch is standalone.
+        cfg.URLCredentialStorage = nil;
+        cfg.HTTPCookieStorage = nil;
+        cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyNever;
+        cfg.timeoutIntervalForRequest = 8.0;
+        cfg.timeoutIntervalForResource = 8.0;
+        ImageFetchDelegate* delegate = [[ImageFetchDelegate alloc] init];
+        // Delegate queue semantics: NSOperationQueue is Foundation (no new
+        // framework); a serial max-1 queue bounds delegate work.
+        NSOperationQueue* q = [[NSOperationQueue alloc] init];
+        [q setMaxConcurrentOperationCount:1];
+        s = [NSURLSession sessionWithConfiguration:cfg delegate:delegate delegateQueue:q];
     });
     return s;
 }
+@implementation ImageFetchDelegate
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)task
+        didReceiveResponse:(NSURLResponse *)response
+        completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    (void)session;
+    long long expected = [response expectedContentLength];
+    if (expected > READ_REMOTE_MAX_BYTES) {
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+    completionHandler(NSURLSessionResponseAllow);
+}
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)task
+        didReceiveData:(NSData *)data {
+    (void)session;
+    int slot = fetch_track_slot(task);
+    fetch_bytes[slot] += (long long)[data length];
+    if (fetch_bytes[slot] > READ_REMOTE_MAX_BYTES) [task cancel];
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+        willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+        newRequest:(NSURLRequest *)request
+        completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    (void)session; (void)response;
+    int slot = fetch_track_slot(task);
+    if (fetch_redirects[slot] >= READ_REMOTE_MAX_REDIRECTS) {
+        completionHandler(nil);
+        return;
+    }
+    fetch_redirects[slot]++;
+    completionHandler(request);
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+        didCompleteWithError:(NSError *)error {
+    (void)session; (void)error;
+    fetch_track_drop(task);
+}
+@end
 
 // Document directory for relative image paths: dirname of the open file,
 // stored verbatim (the process never chdirs, so relative stays valid).
@@ -3757,17 +3973,47 @@ int platform_test_image_resolve(const char* dir, int dirlen, const char* rel, in
 }
 
 // URL session contract: session exists, no shared cache, bounded timeouts.
+// Bounds mirror remote_policy.zig (FETCH_TIMEOUT_MS = 8 s): request and
+// resource timeouts are exactly 8 s, so a policy change here must update
+// the Zig contract pin too.
 int platform_test_image_session(void) {
     NSURLSession* s = image_session();
     if (!s) return 0;
     NSURLSessionConfiguration* c = s.configuration;
     if (!c) return 0;
     if (c.URLCache != nil) return 0;
-    if (c.timeoutIntervalForRequest <= 0.0 || c.timeoutIntervalForRequest > 30.0) return 0;
-    if (c.timeoutIntervalForResource <= 0.0 || c.timeoutIntervalForResource > 60.0) return 0;
+    if (c.URLCredentialStorage != nil) return 0;
+    if (c.HTTPCookieAcceptPolicy == NSHTTPCookieAcceptPolicyAlways) return 0;
+    if (c.timeoutIntervalForRequest != 8.0) return 0;
+    if (c.timeoutIntervalForResource != 8.0) return 0;
+    if (s.delegate == nil) return 0;
     return 1;
 }
 #endif
+// Secure-input gate, Carbon-free (#390): IsSecureEventInputEnabled arrives
+// via dlopen of /System/Library/Frameworks/Carbon.framework — no link edge
+// (see build.zig), loaded once and cached. A missing framework or symbol
+// reads as inactive (fail-open: Copy is validation UX, never a secret).
+// End-of-file per the SIZE NOTE (see prime_frame_decode above): mid-file
+// bytes here would cascade ~3x via page-boundary shifts.
+// dlfcn is libSystem (no new framework); the Carbon path is a literal.
+static BOOL secure_input_active(void) {
+    typedef Boolean (*SecureInputFn)(void);
+    static int tried = 0;
+    static SecureInputFn fn = NULL;
+    if (!tried) {
+        tried = 1;
+        void* h = dlopen("/System/Library/Frameworks/Carbon.framework/Carbon", RTLD_LAZY | RTLD_LOCAL);
+        if (h) {
+            fn = (SecureInputFn)dlsym(h, "IsSecureEventInputEnabled");
+            // Keep the handle open for the process lifetime (no dlclose):
+            // the cached pointer must stay valid, and Carbon is a system
+            // framework — no unload cost worth a use-after-close risk.
+        }
+    }
+    return (fn && fn()) ? YES : NO;
+}
+
 // Heading outline picker (#48): native NSPanel + NSSearchField + NSTableView
 // with zero custom drawing. Standard controls carry free AppKit-provided
 // roles (AXWindow/AXSearchField/AXTable/AXRow) and follow the
