@@ -2963,14 +2963,20 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
 // masks, which tint to ANY run color via ClipToMask + FillRect — the same
 // GPU-textured path the 2x blit always used (the dim-glyph incident that
 // banned fill-color CTLines never applied to masks: the color enters via
-// FillRect, not via the line's own attributes). A 1x dest downsamples the
-// 2x mask 2:1; softness is bounded by one dest px and headless screenshots
-// pin the pixels, so any drift fails loudly. Under the caller's primed
-// fill color (no Save/Restore, no state sets — the whole group composites
-// as one GPU batch). Falls back to 0 when there is no raster.
+// FillRect, not via the line's own attributes). Blits only when the dest
+// scale matches the 2x raster: on 1x a downsampled blit under a damage
+// clip resamples differently than the same blit unclipped (CoreGraphics
+// rounds masked blits under a clip up to 1 LSB differently), so
+// incremental drag repaints never matched fresh renders pixel-exactly
+// (2026-10 drag-back residue across every gesture, extend phase included).
+// 1x falls back to the legacy direct draw below (pixel-identical to the
+// pre-atlas renderer). Under the caller's primed fill color (no
+// Save/Restore, no state sets — the whole group composites as one GPU
+// batch). Falls back to 0 when there is no raster.
 static inline int blit_tinted_mask_batched(CGContextRef ctx, ShapedEntry* e,
         float x, float y, float font_size) {
     if (!e || e->aw == 0 || !e->slice) return 0;
+    if (g_output_scale < 1.5f) return 0; // 1x: legacy direct (clip-parity)
     float dest_x = roundf(x * g_output_scale) / g_output_scale;
     float dest_y = roundf((y + font_size * 0.85f - e->ascent) * g_output_scale) / g_output_scale;
     CGRect dest = CGRectMake(dest_x, dest_y,
@@ -3033,21 +3039,23 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     // this a link resuming after an intervening word would bridge over it.
     if (!link_url || link_url_len <= 0) g_last_ul.valid = NO;
 
-    // Shaping economy: shape AND rasterize on every scale. Rasterizing on
-    // 1x costs atlas space, but the tinted white-mask path below blits it
-    // directly (no CTLineCreate, no CGColorSpace/Color per run per frame),
-    // so the 1x steady path is textured quads too — the shaping cache
-    // already absorbed the only per-miss cost.
-    ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading, 1);
+    // Shaping economy: shape on every scale; rasterize only where the
+    // blit is pixel-exact (2x dest). On 1x the tinted-mask blit is
+    // gated off (clip-parity, see blit_tinted_mask_batched), so pass 0
+    // and skip the atlas churn the pre-#389 renderer avoided.
+    ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading,
+                               (g_output_scale > 1.5f) ? 1 : 0);
     if (e && e->line) {
         // Record EXACTLY ONCE per call with shaped dims; every branch below
         // is pixels-only (regression: an earlier fall-through recorded twice).
         record_text_quad(text, len, x, y, e->w, e->h, font_size,
                          is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
         // Per-frame render is ONE retained slice blit: no shaping, no copy,
-        // no allocation, no CPU compositing. The white-mask raster tints to
-        // any run color via FillRect, so 1x blits it too (downsampled 2:1,
-        // pinned by headless screenshots) instead of re-shaping per frame.
+        // no allocation, no CPU compositing. On 2x dests the white-mask
+        // raster tints to any run color via FillRect (textured quads);
+        // on 1x the blit above declines (clip-parity) and the run falls
+        // through to the legacy direct draw below (pixel-identical to
+        // the pre-atlas renderer) instead of re-shaping per frame.
         // Batched: consecutive same-color runs share one primed fill color
         // (no per-run SaveGState/SetFillColor/Restore — the state churn the
         // issue calls out). Link underlines ride the primed color.
@@ -3059,9 +3067,15 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             }
             return; // textured quad done: no shaping, no CPU compositing
         }
-        // Missing slice (larger than the atlas, or rasterize failed):
-        // legacy pixels, no re-record. Close any open batch first: the
-        // legacy path manages its own gstate and must not inherit ours.
+        // 1x destination (or missing slice): legacy pixels, no re-record.
+        // NOTE: drawing the cached font-only line via the context fill color
+        // was measured rendering every glyph dim (0 bright pixels over a full
+        // document vs ~27k on the explicit-color path), so that shortcut
+        // stays removed until the cause is understood. The shaping cache
+        // still serves measure/hit-test paths with zero re-shape cost.
+        // (2026-10: the 1x tinted-mask blit lived here briefly and was
+        // reverted — downsampled blits under a damage clip never matched
+        // fresh renders pixel-exactly. See blit_tinted_mask_batched.)
         platform_batch_end();
         draw_text_legacy(ctx, text, len, x, y, font_size, is_bold, is_italic, is_mono, is_heading,
                          r, g, b, a, 0, link_url, link_url_len);

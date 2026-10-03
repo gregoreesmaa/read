@@ -314,6 +314,16 @@ pub const ColorGroup = struct {
     }
 };
 
+/// Masked blits are clip-parity safe only at the raster's native scale:
+/// the 2x raster blits pixel-exact on 2x dests (snapped 1:1); on 1x the
+/// downsample under a damage clip resamples up to 1 LSB differently than
+/// the same blit unclipped, so incremental drag repaints never match
+/// fresh renders (2026-10 drag-back residue, every gesture incl. extend).
+/// 1x runs take the legacy direct draw (shaping still cached).
+pub fn blitScaleParityOk(output_scale: f32) bool {
+    return output_scale > 1.5;
+}
+
 /// Count the fill-color groups (batches) in one pass's run-color sequence:
 /// the number of SetFillColor primes the platform loop issues (first run
 /// primes, each group change re-primes). Zero runs => zero primes.
@@ -355,6 +365,15 @@ test "gpu batching: opaque grouping is RGB-identity (issue #389)" {
     try std.testing.expect(a.eql(b));
     const c = ColorGroup.init(18, 18, 19, 255);
     try std.testing.expect(!a.eql(c));
+}
+
+test "gpu batching: masked blit is clip-parity safe only at native scale (issue #389)" {
+    // Mirrors the g_output_scale > 1.5f gate in blit_tinted_mask_batched
+    // (macos.m): 1x downsamples of the 2x raster differ under a damage
+    // clip by up to 1 LSB vs unclipped, breaking incremental-vs-fresh
+    // pixel parity, so 1x takes the legacy direct draw.
+    try std.testing.expect(!blitScaleParityOk(1.0));
+    try std.testing.expect(blitScaleParityOk(2.0));
 }
 
 test "shaped-run cache: repeat run is a hit, zero re-shape" {
