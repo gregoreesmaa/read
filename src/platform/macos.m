@@ -2970,6 +2970,11 @@ static void image_cache_clear(void) {
 static void gif_schedule_next_frame(CachedImageRecord* rec);
 static BOOL gif_window_visible(void);
 #endif
+// Forward: on-demand frame fault lives with the loader at EOF; the GIF
+// advance tick below faults frames before invalidating, so it needs the
+// declaration before first use (fixes implicit-decl + static-follows-
+// non-static errors in animated builds).
+static void decode_frame_on_demand(CachedImageRecord* rec, int idx);
 
 #ifdef READ_ANIMATED_GIF
 // The window is a valid animation sink only while it is actually on screen.
@@ -3082,8 +3087,8 @@ static void rasterize_vector_into_record(NSString* resolvedPath, CachedImageReco
 // Forward: decode primer lives at end-of-file (see note there) so its
 // __text bytes don't shift the hot mid-file layout.
 static int prime_frame_decode(CGImageRef img);
-// Forward: on-demand frame fault, defined with the loader below.
-static void decode_frame_on_demand(CachedImageRecord* rec, int idx);
+// (decode_frame_on_demand is forward-declared once above, before first use
+// in the GIF tick.)
 
 // Decode frames from a CGImageSource into the cache record, on demand
 // (#390): frame 0 decodes now (natural size + first paint); remaining
