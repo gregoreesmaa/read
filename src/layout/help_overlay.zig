@@ -88,12 +88,21 @@ pub fn emitOverlay(
     theme: layout.Theme,
 ) usize {
     const n_rows = BINDINGS.len;
+    // Single measure pass (issue #391 __TEXT diet): each row's label/desc
+    // widths are measured once into stack slots; the emit loop below
+    // reuses them instead of re-measuring (was 2 measures per row per
+    // pass = 4 total). Values are bit-exact, so card geometry and every
+    // text-run rect are unchanged.
+    var label_ws: [BINDINGS.len]f32 = undefined;
+    var desc_ws: [BINDINGS.len]f32 = undefined;
     var label_w: f32 = 0.0;
     var row_w: f32 = 0.0;
-    for (BINDINGS) |b| {
+    for (BINDINGS, 0..) |b, i| {
         const lw = layout.measureTextEx(b.label, OVERLAY_FONT_SIZE, true, false, false, false);
-        if (lw > label_w) label_w = lw;
         const dw = layout.measureTextEx(b.desc, OVERLAY_FONT_SIZE, false, false, false, false);
+        label_ws[i] = lw;
+        desc_ws[i] = dw;
+        if (lw > label_w) label_w = lw;
         const w = lw + OVERLAY_LABEL_GAP + dw;
         if (w > row_w) row_w = w;
     }
@@ -137,10 +146,10 @@ pub fn emitOverlay(
         count += 1;
     }
     var row_y = card_y + OVERLAY_PAD_Y + OVERLAY_TITLE_SIZE * 1.75 + OVERLAY_TITLE_GAP;
-    for (BINDINGS) |b| {
+    for (BINDINGS, 0..) |b, i| {
         if (count + 2 > commands.len) break;
-        const lw = layout.measureTextEx(b.label, OVERLAY_FONT_SIZE, true, false, false, false);
-        const dw = layout.measureTextEx(b.desc, OVERLAY_FONT_SIZE, false, false, false, false);
+        const lw = label_ws[i];
+        const dw = desc_ws[i];
         commands[count] = .{
             .kind = .text_run,
             .rect = .{ .x = card_x + OVERLAY_PAD_X, .y = row_y, .w = lw, .h = OVERLAY_LINE_H },

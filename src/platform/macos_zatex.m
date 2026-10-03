@@ -59,7 +59,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <unistd.h> // write(2) diagnostics (no fprintf/stdio, issue #391)
 #include <CoreText/CoreText.h>
 #include <CoreGraphics/CoreGraphics.h>
 
@@ -662,6 +662,16 @@ static const char *zatex_nfc(const char *tex, int tex_len, int *n) {
 static uint32_t zatex_colors[ZATEX_RUNS_CAP];
 static int zatex_has_color = 0;
 
+// write(2) diagnostics, never fprintf (issue #391 __TEXT diet): the two
+// one-shot notices below are the only prints in this TU, and the format
+// call pulls stdio machinery into the binary. stderr is unbuffered, so
+// bytes hit the fd in order either way. Literal + one dynamic part.
+static void zatex_diag2(const char *a, const char *b) {
+    if (a) (void)write(2, a, strlen(a));
+    if (b) (void)write(2, b, strlen(b));
+    (void)write(2, "\n", 1);
+}
+
 static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLayout *out) {
     if (!tex || tex_len <= 0 || tex_len > ZATEX_INPUT_CAP) return ZATEX_FALLBACK;
     zatex_try_load();
@@ -729,8 +739,29 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
         // formula; the reader still falls back literally.
         if (zatex_last_diag_key != zatex_err_key) {
             zatex_last_diag_key = zatex_err_key;
-            fprintf(stderr, "read: math over engine ceilings (status %d, need %u runs/%u rules) — literal fallback\n",
-                    rc, out->nruns, out->nrules);
+            // Status + needs are numeric: three short decimal parts, no
+            // format call. Message text unchanged.
+            char nbuf[72];
+            int n = 0;
+            unsigned vals[3];
+            vals[0] = (unsigned)rc;
+            vals[1] = out->nruns;
+            vals[2] = out->nrules;
+            const char *seps[3] = { "read: math over engine ceilings (status ", ", need ", " runs/" };
+            for (int k = 0; k < 3; k++) {
+                const char *s = seps[k];
+                while (*s && n < (int)sizeof(nbuf) - 24) nbuf[n++] = *s++;
+                unsigned v = vals[k];
+                char rev[12];
+                int rn = 0;
+                if (v == 0) rev[rn++] = '0';
+                while (v > 0 && rn < (int)sizeof(rev)) { rev[rn++] = (char)('0' + v % 10); v /= 10; }
+                while (rn > 0 && n < (int)sizeof(nbuf) - 24) nbuf[n++] = rev[--rn];
+            }
+            const char *tail = " rules) — literal fallback";
+            while (*tail && n < (int)sizeof(nbuf) - 2) nbuf[n++] = *tail++;
+            nbuf[n] = '\0';
+            zatex_diag2(nbuf, NULL);
         }
         return ZATEX_OVERFLOW;
     }
@@ -784,7 +815,7 @@ int platform_math_size(const char *tex, int tex_len, int display, float font_px,
         st = zatex_layout_once(tex, tex_len, display, &lo);
         if (st == ZATEX_UNAVAILABLE && !zatex_missing_noticed) {
             zatex_missing_noticed = 1;
-            fprintf(stderr, "read: libzatex.dylib unavailable — math renders as source text; install to /usr/local/lib (see docs/engine.md)\n");
+            zatex_diag2("read: libzatex.dylib unavailable — math renders as source text; install to /usr/local/lib (see docs/engine.md)", NULL);
         }
         if (st == ZATEX_OK) {
             double s = (double)font_px / 1000.0;
