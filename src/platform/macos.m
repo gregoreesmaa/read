@@ -3704,9 +3704,13 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // Phase 0: caret baseline at A-start, FULL (the settled frame before the
     // drag begins). No highlight: collapsed selection paints nothing.
 #ifdef DRAG_DIAG
+    // Per-gesture log: remove-then-append guarantees one gesture per file
+    // even if fopen("a") elsewhere would concatenate. The remove ALSO
+    // proves this probe runs (its absence later means the TU is stale).
     remove("/tmp/drag_diag.log");
     DRAGLOG("DIAG gesture scroll=%.1f A=(%.1f,%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f,%.1f)",
         g_scroll_y, ax1, ay1, ax2, ay2, bx1, by1, bx2, by2);
+    DRAGLOG("DIAG probe-alive TU=%s %s", __DATE__, __TIME__);
 #endif
     g_select_start = NSMakePoint(ax1, ay1);
     g_select_end = NSMakePoint(ax1, ay1);
