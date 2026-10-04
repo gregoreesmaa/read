@@ -3566,6 +3566,22 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     // Headless selection captures paint the same highlight as live draws.
 #ifdef DRAG_DIAG
     DRAGLOG("DIAG fresh sel=%d records=%d start=(%.1f,%.1f) end=(%.1f,%.1f)", (int)(g_has_selection || g_select_all), g_text_record_count, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
+    {
+        unsigned char* pxf = CGBitmapContextGetData(ctx);
+        size_t bprf = CGBitmapContextGetBytesPerRow(ctx);
+        int wpxf = (int)CGBitmapContextGetWidth(ctx), hpxf = (int)CGBitmapContextGetHeight(ctx);
+        uint64_t sumf = 0; int cntf = 0;
+        for (int yy = 0; yy < hpxf; yy++) {
+            int row = hpxf - 1 - yy;
+            if (!pxf) break;
+            for (int xx = 0; xx < wpxf; xx++) {
+                size_t o = (size_t)row * bprf + (size_t)xx * 4;
+                sumf += pxf[o] + pxf[o+1]*3 + pxf[o+2]*5 + pxf[o+3]*7;
+                cntf++;
+            }
+        }
+        DRAGLOG("DIAG fresh fullsum=%llu cnt=%d", sumf, cntf);
+    }
 #endif
     if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
     // Same for the hover copy button (--hover): headless screenshots
@@ -3729,6 +3745,28 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     render_fn(width, height);
     platform_batch_end();
 #ifdef DRAG_DIAG
+    {
+        // Pre-wash pixels: proves whether the glyph layer already diverges
+        // before any wash fill lands (then the wash trace is a red herring).
+        unsigned char* px1 = CGBitmapContextGetData(ctx);
+        size_t bpr1 = CGBitmapContextGetBytesPerRow(ctx);
+        int wpx1 = (int)CGBitmapContextGetWidth(ctx), hpx1 = (int)CGBitmapContextGetHeight(ctx);
+        int dx0 = (int)g_pending_dirty.origin.x, dy0 = (int)g_pending_dirty.origin.y;
+        int dx1 = dx0 + (int)g_pending_dirty.size.width, dy1 = dy0 + (int)g_pending_dirty.size.height;
+        if (dx0 < 0) dx0 = 0; if (dy0 < 0) dy0 = 0;
+        if (dx1 > wpx1) dx1 = wpx1; if (dy1 > hpx1) dy1 = hpx1;
+        uint64_t sum1 = 0; int cnt1 = 0;
+        for (int yy = dy0; yy < dy1; yy++) {
+            int row = hpx1 - 1 - yy;
+            if (row < 0 || row >= hpx1 || !px1) break;
+            for (int xx = dx0; xx < dx1; xx++) {
+                size_t o = (size_t)row * bpr1 + (size_t)xx * 4;
+                sum1 += px1[o] + px1[o+1]*3 + px1[o+2]*5 + px1[o+3]*7;
+                cnt1++;
+            }
+        }
+        DRAGLOG("DIAG ph1 prewash dmg=%d,%d,%d,%d sum=%llu cnt=%d", dx0, dy0, dx1-dx0, dy1-dy0, sum1, cnt1);
+    }
     DRAGLOG("DIAG ph1 records=%d", g_text_record_count);
     for (int di = 0; di < g_text_record_count; di++) {
         QuadTextRecord* dr = &g_text_records[di];
@@ -3737,6 +3775,28 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     }
 #endif
     paint_selection_highlight(ctx);
+#ifdef DRAG_DIAG
+    {
+        unsigned char* px2 = CGBitmapContextGetData(ctx);
+        size_t bpr2 = CGBitmapContextGetBytesPerRow(ctx);
+        int wpx2 = (int)CGBitmapContextGetWidth(ctx), hpx2 = (int)CGBitmapContextGetHeight(ctx);
+        int ex0 = (int)g_pending_dirty.origin.x, ey0 = (int)g_pending_dirty.origin.y;
+        int ex1 = ex0 + (int)g_pending_dirty.size.width, ey1 = ey0 + (int)g_pending_dirty.size.height;
+        if (ex0 < 0) ex0 = 0; if (ey0 < 0) ey0 = 0;
+        if (ex1 > wpx2) ex1 = wpx2; if (ey1 > hpx2) ey1 = hpx2;
+        uint64_t sum2 = 0; int cnt2 = 0;
+        for (int yy = ey0; yy < ey1; yy++) {
+            int row = hpx2 - 1 - yy;
+            if (row < 0 || row >= hpx2 || !px2) break;
+            for (int xx = ex0; xx < ex1; xx++) {
+                size_t o = (size_t)row * bpr2 + (size_t)xx * 4;
+                sum2 += px2[o] + px2[o+1]*3 + px2[o+2]*5 + px2[o+3]*7;
+                cnt2++;
+            }
+        }
+        DRAGLOG("DIAG ph1 postwash sum=%llu cnt=%d", sum2, cnt2);
+    }
+#endif
     CGContextRestoreGState(ctx);
     rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
     if (rc != 0) { CGContextRelease(ctx); return rc; }
@@ -3773,6 +3833,31 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     render_fn(width, height);
     platform_batch_end();
 #ifdef DRAG_DIAG
+    {
+        // Pixel-space truth: dump the damage-region checksum per phase so
+        // the log (attached as artifact) shows WHERE bytes diverge even
+        // when the decision trace looks identical.
+        unsigned char* px = CGBitmapContextGetData(ctx);
+        size_t bpr = CGBitmapContextGetBytesPerRow(ctx);
+        int wpx = (int)CGBitmapContextGetWidth(ctx), hpx = (int)CGBitmapContextGetHeight(ctx);
+        int dx0 = (int)g_pending_dirty.origin.x, dy0 = (int)g_pending_dirty.origin.y;
+        int dx1 = dx0 + (int)g_pending_dirty.size.width, dy1 = dy0 + (int)g_pending_dirty.size.height;
+        // View-space damage y is measured from the BOTTOM (flipped view);
+        // bitmap rows are top-down: row = height - 1 - y.
+        if (dx0 < 0) dx0 = 0; if (dy0 < 0) dy0 = 0;
+        if (dx1 > wpx) dx1 = wpx; if (dy1 > hpx) dy1 = hpx;
+        uint64_t sum = 0; int cnt = 0;
+        for (int yy = dy0; yy < dy1; yy++) {
+            int row = hpx - 1 - yy;
+            if (row < 0 || row >= hpx || !px) break;
+            for (int xx = dx0; xx < dx1; xx++) {
+                size_t o = (size_t)row * bpr + (size_t)xx * 4;
+                sum += px[o] + px[o+1]*3 + px[o+2]*5 + px[o+3]*7;
+                cnt++;
+            }
+        }
+        DRAGLOG("DIAG ph2 pix dmg=%d,%d,%d,%d sum=%llu cnt=%d", dx0, dy0, dx1-dx0, dy1-dy0, sum, cnt);
+    }
     DRAGLOG("DIAG ph2 records=%d", g_text_record_count);
     for (int di = 0; di < g_text_record_count; di++) {
         QuadTextRecord* dr = &g_text_records[di];
