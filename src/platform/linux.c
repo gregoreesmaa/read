@@ -354,14 +354,33 @@ static void register_app_fonts(void) {
     p = font_asset_path("SpaceGrotesk.ttf");
     if (p && FT_New_Face(g_ft, p, 0, &g_face_head) == 0) {
         // SpaceGrotesk.ttf is variable (wght 300-700, default 300); headings
-        // force bold so pin wght to 700. Cold path; failures keep default.
+        // force bold so pin wght to 700. Cold path; a failed pin keeps the
+        // default but stays visible (issue #401 fixC: assert the return —
+        // previously only the axis count was guarded and the Set call's
+        // result was ignored, so a silent no-pin read as "thin headings").
         FT_MM_Var* mm = NULL;
         if (FT_Get_MM_Var(g_face_head, &mm) == 0 && mm != NULL) {
             FT_Fixed c[4];
             FT_UInt n = mm->num_axis < 4 ? mm->num_axis : 4;
             for (FT_UInt i = 0; i < n; i++)
                 c[i] = (mm->axis[i].tag == 0x77676874UL) ? (700 << 16) : mm->axis[i].def;
-            if (n) FT_Set_Var_Design_Coordinates(g_face_head, n, c);
+            if (n && FT_Set_Var_Design_Coordinates(g_face_head, n, c) != 0) {
+                // Pin rejected: drop back to the default instance rather
+                // than render a half-pinned face (embolden below still
+                // applies, so headings stay bold, just Light-metrics).
+                FT_Set_Var_Design_Coordinates(g_face_head, 0, NULL);
+            }
+#ifdef TEST_HOOKS
+            // Pin readback (issue #401 fixC): log the live wght coordinate
+            // the Set call above left behind (expect 700). TEST_HOOKS only:
+            // cold path, one stderr line per process, ship never links it.
+            {
+                FT_Fixed rc[4] = { 0, 0, 0, 0 };
+                FT_UInt rn = 0;
+                if (FT_Get_Var_Design_Coordinates(g_face_head, 4, rc, &rn) == 0 && rn > 0)
+                    fprintf(stderr, "[fixC] heading wght pin: %ld\n", (long)(rc[0] >> 16));
+            }
+#endif
             FT_Done_MM_Var(g_ft, mm);
         }
     }
@@ -553,7 +572,23 @@ static GlyphEntry* glyph_ensure(uint32_t cp, int style, int px, int is_mono_face
     if (FT_Set_Pixel_Sizes(face, 0, (FT_UInt)px) != 0) return NULL;
     // Bold synthesis for the Plex Bold face is native; faux-bold the
     // fallback/mono faces lightly like the mac double-strike path.
-    if (FT_Load_Glyph(face, gi, FT_LOAD_RENDER) != 0) return NULL;
+    // Headings (issue #401 fixC): the variable Space Grotesk pin above can
+    // still read thin at 1x grayscale even when wght=700 holds (grayscale
+    // stem coverage, not a missed pin), so embolden heading outlines at
+    // raster time — FT_Outline_Embolden at ~1/64 em, atlas-time only,
+    // zero-alloc, keyed by the heading style bit already in the cache key.
+    // Implements the linux.c:554-555 comment for real.
+    int do_embolden = (style & 8) && face == g_face_head;
+    if (do_embolden) {
+        if (FT_Load_Glyph(face, gi, FT_LOAD_DEFAULT) != 0) return NULL;
+        // 1/64 em in 26.6 outline units: 1em = px*64 units, so 1/64 em =
+        // px units (≈0.27px at 17px). Ink grows, advance untouched, so the
+        // Zig-side Light-metrics tables stay the source of truth.
+        FT_Pos strength = (FT_Pos)px;
+        if (strength < 1) strength = 1;
+        FT_Outline_Embolden(&face->glyph->outline, strength);
+        if (FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL) != 0) return NULL;
+    } else if (FT_Load_Glyph(face, gi, FT_LOAD_RENDER) != 0) return NULL;
     FT_Bitmap* bm = &face->glyph->bitmap;
     int pw = (int)bm->width, ph = (int)bm->rows;
     atlas_ensure();
