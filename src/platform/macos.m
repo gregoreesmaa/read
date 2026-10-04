@@ -46,6 +46,14 @@ static NSFont* font_resolve_uncached(float font_size, int is_bold, int is_italic
 // state is cached here so mouseMoved can compare instead of redrawing.
 static BOOL g_last_link_hover = NO;
 static BOOL g_last_code_btn_hover = NO;
+// Last installed cursor shape (#389 GPU): cursor setters are skipped unless
+// the shape actually flips, so steady-hover motion does zero cursor work.
+static NSCursor* g_last_cursor = nil;
+// Invalidate the view-space boxes of every text record whose URL hashes to
+// old_hash or new_hash (one side is zero when the pointer entered/left all
+// links). Called on a link-highlight flip so the redraw is record-precise
+// instead of full-view. Forward-declared: text records live below.
+static void hover_invalidate_link_runs(uint64_t old_hash, uint64_t new_hash);
 // Monotonic draw pass counter. GIF records stamp it when actually painted;
 // a frame tick whose stamp is stale means the image left the viewport, so
 // the animation chain parks instead of waking the loop.
@@ -150,6 +158,11 @@ typedef struct {
 #define MAX_SCROLLABLE_BLOCKS 128
 static ScrollableBlockRecord g_scrollable_blocks[MAX_SCROLLABLE_BLOCKS];
 static int g_scrollable_block_count = 0;
+
+// Invalidate the view-space boxes of every text record whose URL hashes to
+// old_hash or new_hash (#389 GPU: record-precise link-hover damage instead
+// of a full redraw). Records are defined below; the body lives with them.
+static void hover_invalidate_link_runs(uint64_t old_hash, uint64_t new_hash);
 
 static BOOL g_has_selection = NO;
 static int g_selection_mode = 0; // 0 = none, 1 = range, 2 = word, 3 = line, 4 = all
@@ -340,6 +353,32 @@ static NSRect copy_button_rect_for_block(CodeBlockRecord* b) {
 // rect above.
 static NSRect copy_button_damage_rect(CodeBlockRecord* b) {
     return NSInsetRect(copy_button_rect_for_block(b), -2.0f, -2.0f);
+}
+
+// Record-precise link-hover damage (#389 GPU): the underline/highlight
+// flip repaints only the runs of the old + new hovered URLs (view-space
+// boxes from the live text records), never the full view. A zero hash
+// matches nothing (no URL hashes to zero in practice — same rationale as
+// the visited-link ring). Boxes are padded 2px to cover the underline
+// rule + antialiasing fringe.
+static void hover_invalidate_link_runs(uint64_t old_hash, uint64_t new_hash) {
+    if (old_hash == 0 && new_hash == 0) return;
+    BOOL any = NO;
+    for (int i = 0; i < g_text_record_count; i++) {
+        QuadTextRecord* rec = &g_text_records[i];
+        if (rec->link_url[0] == '\0') continue;
+        uint64_t h = link_url_hash(rec->link_url, (int)strlen(rec->link_url));
+        if (h != old_hash && h != new_hash) continue;
+        float view_y = rec->doc_y - g_scroll_y;
+        invalidate_rect(NSMakeRect(rec->x - 2.0f, view_y - 2.0f, rec->w + 4.0f, rec->h + 4.0f));
+        any = YES;
+    }
+    // Defensive: a hovered URL with no live records (vertically culled
+    // mid-frame) still needs its old pixels cleared — one full redraw.
+    if (!any) {
+        NSView* v = damage_target_view();
+        if (v) [v setNeedsDisplay:YES];
+    }
 }
 
 static void paint_copy_button(CGContextRef ctx);
@@ -996,6 +1035,13 @@ static void display_push(int force) {
     return YES;
 }
 
+// #389 (GPU): opaque compositing. The view paints a full opaque theme bg
+// every pass, so report opaque and let the compositor skip the
+// translucency blend + backing-store composite for the whole window.
+- (BOOL)isOpaque {
+    return YES;
+}
+
 - (BOOL)acceptsFirstResponder {
     return YES;
 }
@@ -1103,6 +1149,16 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #endif
                 continue;
             }
+            // No per-record damage cull here: the wash rect is the
+            // char-range sub-rect [x1,x2], not the record box. A record
+            // outside the damage can still own fringe pixels inside it
+            // (2026-10 gestures 5/12/13: extend-phase fringe differs when
+            // the endpoint lands mid-run — the fringe rect intersects the
+            // damage while the record box does not). The damage clip
+            // (CGContextClipToRect / platform_begin_clip) already confines
+            // pixels on partial passes; the gate at the drawRect call site
+            // (sel_box vs damage) keeps the wholesale skip. Same rule as
+            // the copy path below (selected_text_string culls nothing).
 
             // Strict edge resolution: an endpoint in the +-4px inclusion
             // slop but strictly outside the record band belongs to the gap,
@@ -1160,8 +1216,13 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (fabsf(prev->doc_y - rec->doc_y) < 6.0f) {
                     float glo = fmaxf(prev->x + prev->w, span_lo);
                     float ghi = fminf(rec->x, span_hi);
-                    if (ghi > glo)
-                        CGContextFillRect(ctx, CGRectMake(glo, view_y, ghi - glo, rec->h));
+                    if (ghi > glo) {
+                        // Same quantization as the char-range fill below:
+                        // the gap bridge's fractional edges must agree
+                        // clipped vs unclipped (2026-10 gestures 5/12/13).
+                        float qglo = floorf(glo), qgy = floorf(view_y);
+                        CGContextFillRect(ctx, CGRectMake(qglo, qgy, ceilf(ghi) - qglo, ceilf(view_y + rec->h) - qgy));
+                    }
                 }
             }
 
@@ -1217,7 +1278,16 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
 #endif
-                CGContextFillRect(ctx, CGRectMake(x1, view_y, x2 - x1, rec->h));
+                // Quantize once here (floor/ceil outward) so the fill's
+                // fractional edges land on identical device pixels whether
+                // the pass paints clipped (incremental, damage rect) or
+                // unclipped (fresh): unclipped translucent fills blend the
+                // same fractional edge coverage differently than clipped
+                // ones, leaving 1px fringe/residue on drag-back (2026-10:
+                // gestures 5/12/13, all fractional endpoint coords). Same
+                // rule as selection_bounds_expanded's damage quantization.
+                float qx1 = floorf(x1), qy = floorf(view_y);
+                CGContextFillRect(ctx, CGRectMake(qx1, qy, ceilf(x2) - qx1, ceilf(view_y + rec->h) - qy));
             }
         }
     }
@@ -1261,7 +1331,21 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
         g_callbacks.on_draw((int)self.bounds.size.width, (int)self.bounds.size.height);
     }
 
-    paint_selection_highlight(ctx);
+    // #389 (GPU): wash-before-glyph + damage-gated selection wash. The
+    // wash paints once per pass from the live records the Zig pass just
+    // rebuilt (the record model only exists post-pass, so same-pass
+    // wash-before-glyph would need stale geometry — rejected: it leaves
+    // drag-fringe residue). The GPU win is gating: when the selection box
+    // misses the damage rect entirely, this pass paints no wash pixels at
+    // all (before: every pass re-blended the full selection wash even when
+    // the damage was an unrelated GIF tick on another line).
+    {
+        NSRect sel_box = selection_bounds_expanded(0.0f);
+        BOOL sel_visible = (g_has_selection || g_select_all) && g_text_record_count > 0 &&
+            !NSIsEmptyRect(sel_box) &&
+            (!g_pending_dirty_valid || NSIntersectsRect(sel_box, g_pending_dirty));
+        if (sel_visible) paint_selection_highlight(ctx);
+    }
 #ifdef TEST_HOOKS
     DBGLOG("DRAW seq=%lu t=%llu dirty=%.0f,%.0f,%.0fx%.0f scroll=%.1f scale=%.1f us=%llu txt=%d code=%d sblk=%d imgdraw=%lu dhit=+%llu dmiss=+%llu dflush=+%lu sel=%d,%d,%.0f,%.0f,%.0f,%.0f",
         g_draw_seq, dbg_t_ms(), dirtyRect.origin.x, dirtyRect.origin.y, dirtyRect.size.width, dirtyRect.size.height,
@@ -1275,6 +1359,11 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 
     paint_copy_button(ctx);
 
+    // #389 (GPU): close any fill-color batch the text-run loop left open
+    // (platform_batch_end is idempotent; the legacy fallbacks inside the
+    // run loop already closed it mid-pass when they ran).
+    platform_batch_end();
+
     g_current_cg_context = NULL;
     g_pending_dirty_valid = NO;
 }
@@ -1282,6 +1371,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 // Visible-on-hover Copy Button for Code Blocks. Shared by live draws and
 // the headless screenshot engine so --hover screenshots exercise the same
 // paint (and the damage-rect contract the test pins actually covers it).
+// #389 (GPU): dirty-rect cull before any paint work — buttons whose padded
+// damage rect misses the compositor's dirty rect contribute no pixels this
+// pass (before: every pass re-ran the NSBezierPath + NSString paint for
+// every visible button).
 static void paint_copy_button(CGContextRef ctx) {
     (void)ctx;
     double now = [NSDate timeIntervalSinceReferenceDate];
@@ -1292,7 +1385,17 @@ static void paint_copy_button(CGContextRef ctx) {
 
         BOOL is_copied = (g_copied_block_idx == b_idx && (now - g_copied_timestamp < 1.5));
 
-        if (is_hovered || is_copied) {
+        if (!(is_hovered || is_copied)) continue;
+        // Cull before the NSBezierPath/NSString work below.
+        if (g_pending_dirty_valid) {
+            NSRect btn_dmg = copy_button_damage_rect(b);
+            CGRect br = CGRectMake(btn_dmg.origin.x, btn_dmg.origin.y,
+                                   btn_dmg.size.width, btn_dmg.size.height);
+            CGRect dr = CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
+                                   g_pending_dirty.size.width, g_pending_dirty.size.height);
+            if (!CGRectIntersectsRect(br, dr)) continue;
+        }
+        {
             float btn_w = 64.0f;
             float btn_h = 24.0f;
             float btn_x = b->x + b->w - btn_w - 8.0f;
@@ -1309,18 +1412,44 @@ static void paint_copy_button(CGContextRef ctx) {
             // Text
             NSString* label = is_copied ? @"Copied!" : @"Copy";
             NSColor* textColor = is_copied ? [NSColor colorWithCalibratedRed:0.3 green:0.85 blue:0.4 alpha:1.0] :
-                                             [NSColor colorWithCalibratedRed:0.85 green:0.88 blue:0.92 alpha:1.0];
-            NSDictionary* attrs = @{
+                                              [NSColor colorWithCalibratedRed:0.85 green:0.88 blue:0.92 alpha:1.0];
+            int li = is_copied ? 1 : 0;
+            NSFont* label_font = nil;
+            NSSize textSize;
+            if (g_copy_label_measured) {
+                textSize = g_copy_label_size[li];
+            } else {
+                label_font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightMedium];
+                NSDictionary* mattrs = @{
+                    NSFontAttributeName: label_font,
+                };
+                g_copy_label_size[0] = [@"Copy" sizeWithAttributes:mattrs];
+                g_copy_label_size[1] = [@"Copied!" sizeWithAttributes:mattrs];
+                g_copy_label_measured = YES;
+                textSize = g_copy_label_size[li];
+            }
+            NSDictionary* attrs = label_font ? @{
+                NSFontAttributeName: label_font,
+                NSForegroundColorAttributeName: textColor,
+            } : @{
                 NSFontAttributeName: [NSFont systemFontOfSize:11.0 weight:NSFontWeightMedium],
                 NSForegroundColorAttributeName: textColor,
             };
-            NSSize textSize = [label sizeWithAttributes:attrs];
             float text_x = btn_x + (btn_w - textSize.width) * 0.5f;
             float text_y = btn_y + (btn_h - textSize.height) * 0.5f;
             [label drawAtPoint:NSMakePoint(text_x, text_y) withAttributes:attrs];
         }
     }
 }
+
+// Copy-button label metrics (#389 GPU): the per-frame systemFontOfSize: +
+// sizeWithAttributes: pair above is the last per-frame AppKit lookup on the
+// button path. The label font is constant (11pt medium) and the strings are
+// constant ("Copy"/"Copied!"), so cache the two measured sizes once (BSS:
+// NSSize is 16 bytes). The paint above keeps drawAtPoint: for pixel
+// identity and only skips the redundant lookup + measure on hits.
+static NSSize g_copy_label_size[2]; // [0] Copy, [1] Copied!
+static BOOL g_copy_label_measured = NO;
 
 - (void)mouseMoved:(NSEvent *)event {
     g_mouse_pos = [self convertPoint:[event locationInWindow] fromView:nil];
@@ -1372,31 +1501,40 @@ static void paint_copy_button(CGContextRef ctx) {
         if (over_code_btn && new_hover_btn >= 0) break;
     }
 
-    if (scrollbar_hit(g_mouse_pos, self.bounds.size.width) || g_scrollbar_dragging) {
-        [[NSCursor arrowCursor] set];
-    } else if (over_link || over_code_btn) {
-        [[NSCursor pointingHandCursor] set];
-    } else {
-        [[NSCursor IBeamCursor] set];
-    }
-
     // Damage: cursor changes need no repaint. Only the hover Copy button
     // changing visibility dirties pixels: invalidate old + new button rects.
     // (new_hover_btn was resolved in the single block pass above.)
     // Idle-gated link highlight (mirrors idle.zig shouldRedrawOnHover): pure
-    // mouse motion never redraws. A link-highlight flip re-arms one gated
-    // full redraw (no exact record handy); copy-button-only flips stay
-    // rect-precise below.
+    // mouse motion never redraws. A link-highlight flip re-arms one
+    // record-precise redraw: invalidate the old + new link run boxes
+    // (resolved here from the live text records) instead of the full view.
     static uint64_t prev_hover_hash = 0;
-    if (g_text_record_count > 0 &&
+    uint64_t old_hash = prev_hover_hash;
+    BOOL link_flip = g_text_record_count > 0 &&
         (over_link != g_last_link_hover ||
-         (over_link && hover_hash != prev_hover_hash))) {
+          (over_link && hover_hash != prev_hover_hash));
+    if (link_flip) {
         g_last_link_hover = over_link;
         prev_hover_hash = hover_hash;
 #ifdef TEST_HOOKS
         DBGLOG("EV hover_flip link=%d", over_link ? 1 : 0);
 #endif
-        [self setNeedsDisplay:YES];
+        hover_invalidate_link_runs(old_hash, prev_hover_hash);
+    }
+    // Cursor changes need no repaint: only set when the pointer shape
+    // actually flipped (the setters are no-ops otherwise, but skip the
+    // call entirely so Instruments shows zero cursor work on steady hover).
+    NSCursor* want_cursor;
+    if (scrollbar_hit(g_mouse_pos, self.bounds.size.width) || g_scrollbar_dragging) {
+        want_cursor = [NSCursor arrowCursor];
+    } else if (over_link || over_code_btn) {
+        want_cursor = [NSCursor pointingHandCursor];
+    } else {
+        want_cursor = [NSCursor IBeamCursor];
+    }
+    if (want_cursor != g_last_cursor) {
+        g_last_cursor = want_cursor;
+        [want_cursor set];
     }
     g_last_code_btn_hover = over_code_btn;
     if (new_hover_btn != g_hovered_code_btn) {
@@ -2362,6 +2500,11 @@ int platform_init(const char* title, int width, int height, PlatformCallbacks ca
 
     ReadView* view = [[ReadView alloc] initWithFrame:frame];
     g_main_view = view;  // for async image load → setNeedsDisplay callbacks
+    // #389 (GPU): opaque compositing. The view is opaque (isOpaque YES)
+    // and paints one full theme bg per pass, so the window is opaque too:
+    // no layer-backed translucency, no whole-window composite.
+    [g_window setOpaque:YES];
+    [view setWantsLayer:NO];
     [g_window setContentView:view];
     // Window drag-and-drop target (issue #43): file URLs only.
     [view registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
@@ -2545,6 +2688,18 @@ unsigned long platform_test_image_draws(void) { return g_test_image_draws; }
 // + coverage-mask blits) so per-frame pixel behavior can be diffed.
 static float g_test_scale = 0.0f;
 void platform_set_test_scale(float s) { g_test_scale = s; }
+// Headless scroll for --scroll in the drag/fresh harnesses (fix-round 4):
+// onDraw syncs g_scroll_y from g_app.scroll_y, but the drag harness sets
+// each phase's damage from selection boxes computed BEFORE render_fn runs
+// — with a stale zero scroll those boxes (doc_y - 0) miss the damage
+// union, and fresh --select renders at scroll 0 while sweep gestures are
+// doc-space at --scroll N. Syncing here puts damage, records, and wash in
+// the swept coordinate space on every phase. Live path unaffected (the
+// hook only runs headless; drawRect syncs from the real scroller).
+void platform_set_test_scroll(float scroll_y) {
+    g_scroll_y = scroll_y;
+    g_hover_link_hash = 0;
+}
 void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
     // Doc-space endpoints (issue #55 pin: --select takes document coords);
     // #314 readers resolve the owning block live per read, so the hook
@@ -2651,35 +2806,6 @@ void platform_draw_rect(float x, float y, float w, float h, unsigned char r, uns
 
     CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
     CGContextFillRect(ctx, CGRectMake(x, y, w, h));
-}
-
-// Inline-code pill (issue #23): rounded-rect fill + 1px border. Pure
-// CoreGraphics (no NSBezierPath) so headless bitmap captures take the
-// identical path as windows. Same coordinate convention as
-// platform_draw_rect; the caller's damage clip confines pixels.
-void platform_draw_pill(float x, float y, float w, float h, float radius,
-                        unsigned char fr, unsigned char fg, unsigned char fb, unsigned char fa,
-                        unsigned char br, unsigned char bg, unsigned char bb, unsigned char ba) {
-    if (!g_current_cg_context) return;
-    if (w <= 0.0f || h <= 0.0f) return;
-    CGContextRef ctx = g_current_cg_context;
-
-    float r = fminf(radius, fminf(w, h) * 0.5f);
-    float x0 = x, y0 = y, x1 = x + w, y1 = y + h;
-    CGContextMoveToPoint(ctx, x0 + r, y0);
-    CGContextAddLineToPoint(ctx, x1 - r, y0);
-    CGContextAddArcToPoint(ctx, x1, y0, x1, y0 + r, r);
-    CGContextAddLineToPoint(ctx, x1, y1 - r);
-    CGContextAddArcToPoint(ctx, x1, y1, x1 - r, y1, r);
-    CGContextAddLineToPoint(ctx, x0 + r, y1);
-    CGContextAddArcToPoint(ctx, x0, y1, x0, y1 - r, r);
-    CGContextAddLineToPoint(ctx, x0, y0 + r);
-    CGContextAddArcToPoint(ctx, x0, y0, x0 + r, y0, r);
-    CGContextClosePath(ctx);
-    CGContextSetRGBFillColor(ctx, fr / 255.0f, fg / 255.0f, fb / 255.0f, fa / 255.0f);
-    CGContextSetRGBStrokeColor(ctx, br / 255.0f, bg / 255.0f, bb / 255.0f, ba / 255.0f);
-    CGContextSetLineWidth(ctx, 1.0);
-    CGContextDrawPath(ctx, kCGPathFillStroke);
 }
 
 void platform_register_code_block(float x, float y, float w, float h, const char* code_text, int code_len) {
@@ -2908,6 +3034,79 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
     CGColorSpaceRelease(colorSpace);
 }
 
+// 1x tinted white-mask path (#389 GPU): the atlas holds white coverage
+// masks, which tint to ANY run color via ClipToMask + FillRect — the same
+// GPU-textured path the 2x blit always used (the dim-glyph incident that
+// banned fill-color CTLines never applied to masks: the color enters via
+// FillRect, not via the line's own attributes). Blits only when the dest
+// scale matches the 2x raster: on 1x a downsampled blit under a damage
+// clip resamples differently than the same blit unclipped (CoreGraphics
+// rounds masked blits under a clip up to 1 LSB differently), so
+// incremental drag repaints never matched fresh renders pixel-exactly
+// (2026-10 drag-back residue across every gesture, extend phase included).
+// 1x falls back to the legacy direct draw below (pixel-identical to the
+// pre-atlas renderer). Under the caller's primed fill color (no
+// Save/Restore, no state sets — the whole group composites as one GPU
+// batch). Falls back to 0 when there is no raster.
+static inline int blit_tinted_mask_batched(CGContextRef ctx, ShapedEntry* e,
+        float x, float y, float font_size) {
+    if (!e || e->aw == 0 || !e->slice) return 0;
+    if (g_output_scale < 1.5f) return 0; // 1x: legacy direct (clip-parity)
+    float dest_x = roundf(x * g_output_scale) / g_output_scale;
+    float dest_y = roundf((y + font_size * 0.85f - e->ascent) * g_output_scale) / g_output_scale;
+    CGRect dest = CGRectMake(dest_x, dest_y,
+        (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
+    CGContextClipToMask(ctx, dest, e->slice);
+    CGContextFillRect(ctx, dest);
+    return 1;
+}
+
+// Group id for the per-frame fill-color batcher below: runs sharing one
+// group paint under a single hoisted SetFillColor (no state churn between
+// runs), which is what lets the GPU batch the textured quads. Opaque text
+// (a==255) collapses to RGB-only identity; translucent runs keep their
+// alpha in the key.
+static inline uint32_t run_color_group(unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+    if (a == 255) return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+    return 0xFF000000u | ((uint32_t)(r ^ g ^ b ^ a) << 16) | ((uint32_t)a << 8) | 0x01u;
+}
+
+// Batched text-run draw (#389 GPU): consecutive same-color runs share one
+// primed fill color + interpolation (hoisted here — the per-run
+// SaveGState/SetFillColor/Restore churn the issue calls out is gone); a
+// group change re-primes once. Link underlines ride the primed color (they
+// use the run's own color), so they set no state either. Behavior-neutral:
+// priming sets the same values the unbatched blit set, and the group
+// closes (Restore) at pass end via platform_batch_end.
+static int g_batch_open = 0;
+static uint32_t g_batch_group = 0xFFFFFFFFu;
+
+void platform_batch_end(void) {
+    if (!g_batch_open) return;
+    g_batch_open = 0;
+    g_batch_group = 0xFFFFFFFFu;
+    if (!g_current_cg_context) return;
+    CGContextRestoreGState(g_current_cg_context);
+}
+
+// Pixels-only shaped-run draw under the current batch group. Records
+// nothing (the caller records exactly once before calling); returns 1 on
+// the textured-quad path, 0 when the caller must draw direct (legacy).
+static int draw_run_batched(CGContextRef ctx, ShapedEntry* e,
+        float x, float y, float font_size,
+        unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+    uint32_t grp = run_color_group(r, g, b, a);
+    if (!g_batch_open || grp != g_batch_group) {
+        if (g_batch_open) CGContextRestoreGState(ctx);
+        CGContextSaveGState(ctx);
+        CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
+        CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+        g_batch_open = 1;
+        g_batch_group = grp;
+    }
+    return blit_tinted_mask_batched(ctx, e, x, y, font_size);
+}
+
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
     if (!g_current_cg_context || len <= 0 || !text) return;
     CGContextRef ctx = g_current_cg_context;
@@ -2915,10 +3114,10 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     // this a link resuming after an intervening word would bridge over it.
     if (!link_url || link_url_len <= 0) g_last_ul.valid = NO;
 
-    // Shaping economy: shape once per unique run (cached thereafter). Only
-    // rasterize when this destination will actually blit (2x); on 1x the
-    // legacy path draws directly, so rasterizing would just churn the atlas
-    // toward a pointless flush every frame (observed live: ~96% of draws).
+    // Shaping economy: shape on every scale; rasterize only where the
+    // blit is pixel-exact (2x dest). On 1x the tinted-mask blit is
+    // gated off (clip-parity, see blit_tinted_mask_batched), so pass 0
+    // and skip the atlas churn the pre-#389 renderer avoided.
     ShapedEntry* e = shape_run(text, len, font_size, is_bold, is_italic, is_mono, is_heading,
                                (g_output_scale > 1.5f) ? 1 : 0);
     if (e && e->line) {
@@ -2927,30 +3126,18 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         record_text_quad(text, len, x, y, e->w, e->h, font_size,
                          is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
         // Per-frame render is ONE retained slice blit: no shaping, no copy,
-        // no allocation, no CPU compositing. Only when the destination scale
-        // matches the 2x raster, otherwise the downsample softens edges.
-        if (e->aw != 0 && e->slice && g_output_scale > 1.5f) {
-            // Destination: same baseline as the old CTLineDraw geometry
-            // (y + size*0.85, ascent above), snapped to the output device
-            // grid. A fractional origin resamples the 2x mask on every blit
-            // (soft edges); a snapped origin blits mask pixels 1:1 (crisp).
-            // Dest size is the mask size exactly, not the shaped advance, so
-            // there is no sub-pixel stretch either (differs by < 1 device px
-            // of trailing whitespace; runs never drift, origins are absolute).
-            float dest_x = roundf(x * g_output_scale) / g_output_scale;
-            float dest_y = roundf((y + font_size * 0.85f - e->ascent) * g_output_scale) / g_output_scale;
-            CGRect dest = CGRectMake(dest_x, dest_y,
-                (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
-            CGContextSaveGState(ctx);
-            CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
-            CGContextClipToMask(ctx, dest, e->slice);
-            CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
-            CGContextFillRect(ctx, dest);
-            CGContextRestoreGState(ctx);
+        // no allocation, no CPU compositing. On 2x dests the white-mask
+        // raster tints to any run color via FillRect (textured quads);
+        // on 1x the blit above declines (clip-parity) and the run falls
+        // through to the legacy direct draw below (pixel-identical to
+        // the pre-atlas renderer) instead of re-shaping per frame.
+        // Batched: consecutive same-color runs share one primed fill color
+        // (no per-run SaveGState/SetFillColor/Restore — the state churn the
+        // issue calls out). Link underlines ride the primed color.
+        if (draw_run_batched(ctx, e, x, y, font_size, r, g, b, a)) {
             // Shaped link runs underline here (issue #25); the uncacheable
             // path below is covered inside draw_text_legacy instead.
             if (link_url && link_url_len > 0) {
-                CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
                 draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h), link_url, link_url_len);
             }
             return; // textured quad done: no shaping, no CPU compositing
@@ -2961,6 +3148,10 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         // document vs ~27k on the explicit-color path), so that shortcut
         // stays removed until the cause is understood. The shaping cache
         // still serves measure/hit-test paths with zero re-shape cost.
+        // (2026-10: the 1x tinted-mask blit lived here briefly and was
+        // reverted — downsampled blits under a damage clip never matched
+        // fresh renders pixel-exactly. See blit_tinted_mask_batched.)
+        platform_batch_end();
         draw_text_legacy(ctx, text, len, x, y, font_size, is_bold, is_italic, is_mono, is_heading,
                          r, g, b, a, 0, link_url, link_url_len);
         if (link_url && link_url_len > 0) {
@@ -2971,6 +3162,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     }
 
     // Uncacheable run (>510 bytes): legacy pixels + record.
+    platform_batch_end();
     draw_text_legacy(ctx, text, len, x, y, font_size, is_bold, is_italic, is_mono, is_heading,
                      r, g, b, a, 1, link_url, link_url_len);
 }
@@ -3749,8 +3941,23 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 // decoding the full image.) Pure CoreGraphics: safe off the main thread.
 // Returns 1 when the frame decoded.
 //
-// SIZE NOTE: this definition lives at end-of-file deliberately. __TEXT sits
-// ~12 bytes under a 16 KiB page boundary of the 200 KiB budget; a mid-file
+// Inline-code pill (issue #23): rounded-rect fill + 1px border. Pure
+// CoreGraphics (no NSBezierPath) so headless bitmap captures take the
+// identical path as windows. Same coordinate convention as
+// platform_draw_rect; the caller's damage clip confines pixels.
+// #389 (GPU): the pill cache (prerendered rounded-rect rasters keyed by
+// geometry+colors) lives at end-of-file per the SIZE NOTE (see
+// prime_frame_decode below) — mid-file bytes cascade ~3x via
+// page-boundary shifts, and the cache body is the largest new code on this
+// path. Only the thin dispatch stays here.
+static void pill_draw_cached_or_direct(float x, float y, float w, float h, float radius,
+                        unsigned char fr, unsigned char fg, unsigned char fb, unsigned char fa,
+                        unsigned char br, unsigned char bg, unsigned char bb, unsigned char ba);
+void platform_draw_pill(float x, float y, float w, float h, float radius,
+                        unsigned char fr, unsigned char fg, unsigned char fb, unsigned char fa,
+                        unsigned char br, unsigned char bg, unsigned char bb, unsigned char ba) {
+    pill_draw_cached_or_direct(x, y, w, h, radius, fr, fg, fb, fa, br, bg, bb, ba);
+}
 // function here shifts every function after it (branch ranges, literal pools
 // and alignment NOPs cascade ~3x the function's own bytes). At EOF nothing
 // follows it, so its bytes cost only themselves. Keep it tiny; check
@@ -3812,6 +4019,10 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 #endif
 
     render_fn(width, height);
+
+    // #389 (GPU): close the fill-color batch the text-run loop opened
+    // (idempotent; mirrors the drawRect-side close).
+    platform_batch_end();
 
     // Headless selection captures paint the same highlight as live draws.
     if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
@@ -3942,6 +4153,7 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_scrollable_block_count = 0;
     g_pending_dirty_valid = NO;
     render_fn(width, height);
+    platform_batch_end();
     paint_selection_highlight(ctx);
     NSRect box_prev = selection_bounds_expanded(24.0f);
     int rc = headless_dump_png(ctx, "/tmp/drag_phase_0.png");
@@ -3966,6 +4178,7 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
     render_fn(width, height);
+    platform_batch_end();
     paint_selection_highlight(ctx);
     CGContextRestoreGState(ctx);
     rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
@@ -3994,6 +4207,7 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
     render_fn(width, height);
+    platform_batch_end();
     paint_selection_highlight(ctx);
     CGContextRestoreGState(ctx);
     rc = headless_dump_png(ctx, "/tmp/drag_phase_2.png");
@@ -4674,6 +4888,123 @@ static void read_find_show(void) {
 #else
 #include "macos_plugin.m"
 #endif
+
+// Prerendered pill cache (#389 GPU): rounded-rect rasters keyed by
+// (geometry + fill + border). At EOF per the SIZE NOTE (see
+// prime_frame_decode above): the cache body is the largest new code on the
+// pill path, and mid-file bytes cascade ~3x via page-boundary shifts.
+// Key covers every input, so a hit paints bit-identical pixels to the
+// direct path (same radius clamp, same 1px hairline): one GPU textured
+// quad instead of per-frame arcs + stroke.
+#define PILL_CACHE_CAP 8
+typedef struct {
+    float w, h, r;
+    uint32_t fill;   // packed RGBA
+    uint32_t border; // packed RGBA
+    CGImageRef img;  // retained raster at RASTER_SCALE, NULL when empty
+    int iw, ih;      // raster px
+} PillCacheEntry;
+static PillCacheEntry g_pill_cache[PILL_CACHE_CAP]; // BSS: no binary cost
+
+static inline uint32_t pill_pack(unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+    return ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | a;
+}
+
+// Shared rounded-rect path builder (pill + copy-button bg): identical arcs
+// to the historical direct path, factored once.
+static void pill_build_path(CGContextRef ctx, float x, float y, float w, float h, float radius) {
+    float r = fminf(radius, fminf(w, h) * 0.5f);
+    float x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    CGContextMoveToPoint(ctx, x0 + r, y0);
+    CGContextAddLineToPoint(ctx, x1 - r, y0);
+    CGContextAddArcToPoint(ctx, x1, y0, x1, y0 + r, r);
+    CGContextAddLineToPoint(ctx, x1, y1 - r);
+    CGContextAddArcToPoint(ctx, x1, y1, x1 - r, y1, r);
+    CGContextAddLineToPoint(ctx, x0 + r, y1);
+    CGContextAddArcToPoint(ctx, x0, y1, x0, y1 - r, r);
+    CGContextAddLineToPoint(ctx, x0, y0 + r);
+    CGContextAddArcToPoint(ctx, x0, y0, x0 + r, y0, r);
+    CGContextClosePath(ctx);
+}
+
+// noinline: called from 2 sites (pill dispatch above, EOF prerender);
+// one shared copy keeps __TEXT small (same pattern as record_text_quad).
+static __attribute__((noinline)) void pill_fill_stroke(CGContextRef ctx,
+                        unsigned char fr, unsigned char fg, unsigned char fb, unsigned char fa,
+                        unsigned char br, unsigned char bg, unsigned char bb, unsigned char ba) {
+    CGContextSetRGBFillColor(ctx, fr / 255.0f, fg / 255.0f, fb / 255.0f, fa / 255.0f);
+    CGContextSetRGBStrokeColor(ctx, br / 255.0f, bg / 255.0f, bb / 255.0f, ba / 255.0f);
+    CGContextSetLineWidth(ctx, 1.0);
+    CGContextDrawPath(ctx, kCGPathFillStroke);
+}
+
+static void pill_draw_cached_or_direct(float x, float y, float w, float h, float radius,
+                        unsigned char fr, unsigned char fg, unsigned char fb, unsigned char fa,
+                        unsigned char br, unsigned char bg, unsigned char bb, unsigned char ba) {
+    if (!g_current_cg_context) return;
+    if (w <= 0.0f || h <= 0.0f) return;
+    CGContextRef ctx = g_current_cg_context;
+
+    // 1x destinations take the direct vector path (same clip-parity rule
+    // as blit_tinted_mask_batched): the slot holds a 2x raster, whose
+    // downsampled blit under a damage clip never matches a fresh render
+    // pixel-exactly (2026-10 drag-back residue, gestures 5/13/18: pill
+    // fringe rows differ on incremental passes that blit while fresh
+    // passes draw direct). No lookup, no prerender churn on 1x.
+    if (g_output_scale < 1.5f) {
+        pill_build_path(ctx, x, y, w, h, radius);
+        pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
+        return;
+    }
+
+    float r = fminf(radius, fminf(w, h) * 0.5f);
+    uint32_t fill = pill_pack(fr, fg, fb, fa);
+    uint32_t border = pill_pack(br, bg, bb, ba);
+    // Direct-mapped lookup: pills of one theme share few identities.
+    uint32_t key = (uint32_t)(w * 13.0f + h * 7.0f + r * 3.0f) ^ fill ^ (border * 0x9E3779B1u);
+    PillCacheEntry* slot = &g_pill_cache[key % PILL_CACHE_CAP];
+    if (slot->img && slot->w == w && slot->h == h && slot->r == r &&
+        slot->fill == fill && slot->border == border) {
+        CGContextSaveGState(ctx);
+        CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
+        CGContextTranslateCTM(ctx, x, y + h);
+        CGContextScaleCTM(ctx, 1.0f, -1.0f);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), slot->img);
+        CGContextRestoreGState(ctx);
+        return;
+    }
+    pill_build_path(ctx, x, y, w, h, r);
+    pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
+    // Prerender into the slot for next frame: rasterize the same path once
+    // into a 2x bitmap (evicting the collision). Pixel-identical by
+    // construction on native-scale dests: same path, same colors, same 1px
+    // hairline, snapped so the blit above lands 1:1 on the device grid
+    // (1x dests never reach here — direct path above, clip-parity).
+    {
+        int iw = (int)ceilf(w * RASTER_SCALE);
+        int ih = (int)ceilf(h * RASTER_SCALE);
+        if (iw > 0 && ih > 0 && iw <= 1024 && ih <= 256) {
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            CGContextRef bc = CGBitmapContextCreate(NULL, iw, ih, 8, iw * 4, cs,
+                kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+            CGColorSpaceRelease(cs);
+            if (bc) {
+                CGContextScaleCTM(bc, (float)RASTER_SCALE, (float)RASTER_SCALE);
+                pill_build_path(bc, 0, 0, w, h, r);
+                pill_fill_stroke(bc, fr, fg, fb, fa, br, bg, bb, ba);
+                CGImageRef img = CGBitmapContextCreateImage(bc);
+                CGContextRelease(bc);
+                if (img) {
+                    if (slot->img) CGImageRelease(slot->img);
+                    slot->img = img;
+                    slot->w = w; slot->h = h; slot->r = r;
+                    slot->fill = fill; slot->border = border;
+                    slot->iw = iw; slot->ih = ih;
+                }
+            }
+        }
+    }
+}
 
 // ZaTeX runtime math backend (LaTeX math plugin) lives in macos_zatex.m
 // and is included here — one TU, same outliner discipline as the plugin

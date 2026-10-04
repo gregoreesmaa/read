@@ -112,6 +112,12 @@ pub extern "c" fn platform_draw_text(
     link_url_len: c_int,
 ) void;
 
+/// Fill-color batch close (issue #389, GPU): idempotent; ends the primed
+/// group the text-run loop opens (same save/restore pairing the run loop
+/// owns). Called once per draw pass; partial passes that never drew text
+/// close a never-opened batch, which is a no-op.
+pub extern "c" fn platform_batch_end() void;
+
 /// Visited-link probe (issue #25): 1 when this URL was opened before.
 pub extern "c" fn platform_link_visited(url: ?[*]const u8, url_len: c_int) c_int;
 
@@ -223,6 +229,7 @@ pub extern "c" fn platform_math_engine_info(version: *u32, use_ex: *u32, conform
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;
+pub extern "c" fn platform_set_test_scroll(scroll_y: f32) void;
 pub extern "c" fn platform_set_test_hover(x: f32, y: f32) void;
 pub extern "c" fn platform_test_button_damage(bx: f32, by: f32, bw: f32, bh: f32, ox: *f32, oy: *f32, ow: *f32, oh: *f32) void;
 pub extern "c" fn platform_images_pending() c_int;
