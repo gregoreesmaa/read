@@ -70,10 +70,13 @@ def read_png(path):
 
 
 def main():
-    if len(sys.argv) != 4:
-        print('usage: fringe_localize.py <inc.png> <fresh.png> <label>')
+    if len(sys.argv) not in (4, 8):
+        print('usage: fringe_localize.py <inc.png> <fresh.png> <label> [x y w h]')
         return 2
     inc_path, fresh_path, label = sys.argv[1], sys.argv[2], sys.argv[3]
+    mask = None
+    if len(sys.argv) == 8:
+        mask = tuple(float(v) for v in sys.argv[4:8])
     wi, hi, chi, pi = read_png(inc_path)
     wf, hf, chf, pf = read_png(fresh_path)
     if (wi, hi, chi) != (wf, hf, chf):
@@ -87,6 +90,10 @@ def main():
     for y in range(hi):
         base = y * wi * chi
         for x in range(wi):
+            if mask is not None:
+                mx, my, mw, mh = mask
+                if not (mx <= x < mx + mw and my <= y < my + mh):
+                    continue
             o = base + x * chi
             dd = 0
             for c in range(chi):
@@ -107,7 +114,11 @@ def main():
                     ref = tuple(pf[o + c] for c in range(chi))
                     first.append((x, y, pix, ref))
     if n == 0:
-        print('FRINGE %s: identical' % label)
+        if mask is not None:
+            print('FRINGE %s: identical inside x[%.0f..%.0f] y[%.0f..%.0f]' %
+                  (label, mask[0], mask[0] + mask[2], mask[1], mask[1] + mask[3]))
+        else:
+            print('FRINGE %s: identical' % label)
         return 0
     print('FRINGE %s: n=%d maxd=%d bbox=x[%d..%d] y[%d..%d] w=%d h=%d' %
           (label, n, maxd, x0, x1, y0, y1, x1 - x0 + 1, y1 - y0 + 1))

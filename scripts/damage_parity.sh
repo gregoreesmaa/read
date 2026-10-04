@@ -262,26 +262,27 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     # TEMPORARY bisect (#389): on failing gestures only, replay the phase-1
     # damage on a FRESH bitmap (new process, zeroed bitmap, same
     # --scroll/--select, damage injected via --damage from the DRAGDMG line
-    # the harness prints to stderr).
-    # fresh+damage == inc  => damage path is self-consistent; the splitter
-    #   is cross-phase state on the shared bitmap (phase-0 pre-state etc).
-    # fresh+damage == fresh => the splitter is inside the damage path
-    #   (cull/record/clip); bisect further with narrowed damage rects.
+    # the harness prints to stderr). ALL comparisons are masked to within
+    # the damage rect (outside it, fresh+damage trivially differs: zeros
+    # vs phase-0 content — whole-image cmp there proved nothing).
+    # fresh+damage == fresh (inside) => damage path self-consistent;
+    #   splitter is cross-phase bitmap/process state.
+    # fresh+damage != fresh (inside) => splitter is inside the damage path
+    #   (cull/record/clip).
     # Either way the cmp oracles above stay the strict gate (|| true below).
     if [ "$gfail" = 1 ] && [ -s /tmp/sweep25_dragerr.txt ]; then
+        grep '^DRAGDMG' /tmp/sweep25_dragerr.txt || true
         bis_dmg=$(awk '/^DRAGDMG phase=1/{for(i=2;i<=NF;i++){split($i,a,"="); printf "%s%s", (i>2?",":""), a[2]}}' /tmp/sweep25_dragerr.txt)
         case "$bis_dmg" in
             *,*,*,*)
                 sleep 0.3
                 # shellcheck disable=SC2086
                 "$BIN" --screenshot /tmp/sweep25_bisA.png --settle-images --scroll $gs --damage $bis_dmg --select $ax1,$ay1,$ax2,$ay2 "$DOC" >/dev/null 2>&1 || true
-                if cmp -s /tmp/sweep25_bisA.png /tmp/drag_phase_1.png; then
-                    echo "BISECT g${gn}-phase1: fresh+damage == inc (damage path self-consistent; splitter is cross-phase state)"
-                elif cmp -s /tmp/sweep25_bisA.png /tmp/sweep25_freshA.png; then
-                    echo "BISECT g${gn}-phase1: fresh+damage == fresh (splitter is inside the damage path)"
-                else
-                    echo "BISECT g${gn}-phase1: fresh+damage matches neither (third mechanism)"
-                fi
+                bis_rect=$(printf '%s' "$bis_dmg" | tr ',' ' ')
+                # shellcheck disable=SC2086
+                python3 scripts/fringe_localize.py /tmp/sweep25_bisA.png /tmp/sweep25_freshA.png "g${gn}-bisA-vs-fresh" $bis_rect || true
+                # shellcheck disable=SC2086
+                python3 scripts/fringe_localize.py /tmp/drag_phase_1.png /tmp/sweep25_freshA.png "g${gn}-inc-vs-fresh" $bis_rect || true
                 ;;
         esac
     fi
