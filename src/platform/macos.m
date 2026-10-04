@@ -4020,6 +4020,13 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     g_current_cg_context = ctx;
 #ifdef TEST_HOOKS
     g_test_image_draws = 0;
+    // Round-5 decision diff: same pre-pass arming as phase 1 above, so the
+    // fresh-A census (records=/culled=) is real. Fresh renders carry no
+    // damage (full pass), so WASH culled lines must be absent here.
+    if (g_wash_trace_phase == 10) {
+        fprintf(stderr, "WASH phase=freshA damage=full\n");
+        platform_set_wash_trace(1);
+    }
 #endif
     // Headless render has no AppKit dirty rect: full redraw.
     g_pending_dirty_valid = NO;
@@ -4040,12 +4047,6 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     // Headless selection captures paint the same highlight as live draws.
     if (g_has_selection || g_select_all) {
-#ifdef TEST_HOOKS
-        if (g_wash_trace_phase == 10) {
-            fprintf(stderr, "WASH phase=freshA damage=full\n");
-            platform_set_wash_trace(1);
-        }
-#endif
         paint_selection_highlight(ctx);
 #ifdef TEST_HOOKS
         if (g_wash_trace_phase == 10) {
@@ -4202,23 +4203,24 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_scrollable_block_count = 0;
     g_pending_dirty = union_rect(box_prev, box_a);
     g_pending_dirty_valid = YES;
-#ifdef TEST_HOOKS
-    if (g_wash_trace_phase == 1)
-        fprintf(stderr, "WASH damage=1 x=%.1f y=%.1f w=%.1f h=%.1f\n",
-            g_pending_dirty.origin.x, g_pending_dirty.origin.y,
-            g_pending_dirty.size.width, g_pending_dirty.size.height);
-#endif
     CGContextSaveGState(ctx);
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
-    render_fn(width, height);
-    platform_batch_end();
 #ifdef TEST_HOOKS
+    // Round-5 decision diff: arm BEFORE render_fn so the culled-run census
+    // (platform_note_culled_run) accumulates through the damage-gated pass
+    // and WASH begin reports the true culled count. Wash/skip lines only
+    // emit inside paint_selection_highlight below, so render_fn contributes
+    // exactly the WASH culled lines.
     if (g_wash_trace_phase == 1) {
-        fprintf(stderr, "WASH phase=1\n");
+        fprintf(stderr, "WASH phase=1 damage x=%.1f y=%.1f w=%.1f h=%.1f\n",
+            g_pending_dirty.origin.x, g_pending_dirty.origin.y,
+            g_pending_dirty.size.width, g_pending_dirty.size.height);
         platform_set_wash_trace(1);
     }
 #endif
+    render_fn(width, height);
+    platform_batch_end();
     paint_selection_highlight(ctx);
 #ifdef TEST_HOOKS
     if (g_wash_trace_phase == 1) {
