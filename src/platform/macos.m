@@ -3758,6 +3758,8 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     render_fn(width, height);
     platform_batch_end();
 #ifdef DRAG_DIAG
+    // rev14: g_scroll_y is now SYNCED (render_fn ran) — safe to tag.
+    DRAGLOG("DIAG ph1 synced scroll=%.1f", g_scroll_y);
     {
         // Pre-wash pixels: proves whether the glyph layer already diverges
         // before any wash fill lands (then the wash trace is a red herring).
@@ -3896,10 +3898,11 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     { char abspath[160];
       // Per-gesture sidecar (rev15+). Sweep FAILS FAST (set -e): with one
       // sidecar per gesture name, the FAILING gesture's file survives even
-      // when later gestures never run. Name carries A-start (rev13: the
-      // only in-hand coordinates — g_scroll_y is stale until render_fn).
-      snprintf(abspath, sizeof abspath, "screenshots/drag_diag_ax%d_ay%d_bx%d_by%d.txt",
-          (int)(ax1*10.0f), (int)(ay1*10.0f), (int)(ax2*10.0f), (int)(ay2*10.0f));
+      // when later gestures never run. Name carries the SYNCED scroll
+      // (rev14: render_fn ran, so g_scroll_y is the --scroll value) plus
+      // A-start for uniqueness.
+      snprintf(abspath, sizeof abspath, "screenshots/drag_diag_s%d_ax%d_ay%d.txt",
+          (int)g_scroll_y, (int)(ax1*10.0f), (int)(ay1*10.0f));
       FILE* af = fopen(abspath, "w");
       if (af) { FILE* lf2 = fopen("/tmp/drag_diag.log", "r");
         if (lf2) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf2)) > 0) fwrite(b, 1, nr, af); fclose(lf2); }
