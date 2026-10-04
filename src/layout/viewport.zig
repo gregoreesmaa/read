@@ -731,7 +731,7 @@ test "findRowOffsetY lands row-exact inside wrapped paras (#386)" {
     const w1 = measureTextEx("aaa", 17.0, false, false, false, false);
     const sp = measureCharEx(' ', 17.0, false, false, false, false);
     // Force wrap after the first word by sizing the column just past it.
-    const cfg2 = ViewportConfig{
+    var cfg2 = ViewportConfig{
         .window_width = 64.0 + w1 + sp + 2.0,
         .window_height = 900,
         .scroll_y = 0,
@@ -739,12 +739,12 @@ test "findRowOffsetY lands row-exact inside wrapped paras (#386)" {
         .line_height = 29.75,
         .is_dark_theme = true,
     };
-    const top2 = findOffsetY(doc2, lb2[0..n2], cfg2, 0).?;
+    const top2 = findOffsetY(doc2, lb2[0..n2], &cfg2, 0).?;
     const late = std.mem.indexOf(u8, doc2, "hhh").?;
     const y_late = findRowOffsetY(doc2, lb2[0..n2], cfg2, 0, top2, late);
     try t.expect(y_late > top2);
     // Row-exact never lands above the block top nor past its refined bottom.
-    const u = refineLineHeight(doc2, lb2[0..n2], 0, cfg2, contentWidthOf(cfg2), contentXOf(cfg2));
+    const u = refineLineHeight(doc2, lb2[0..n2], 0, &cfg2, contentWidthOf(&cfg2), contentXOf(&cfg2));
     try t.expect(y_late <= top2 + u.height + 0.001);
 }
 
@@ -8739,7 +8739,7 @@ pub fn findRowOffsetY(
     }
     const start_off = lines[unit_start].offset;
     const rel = if (target > start_off) @min(target - start_off, jlen) else 0;
-    const rows = countRowsBefore(joined[0..jlen], rel, contentXOf(config), contentWidthOf(config), config.base_font_size);
+    const rows = countRowsBefore(joined[0..jlen], rel, contentXOf(&config), contentWidthOf(&config), config.base_font_size);
     return findRowY(unit_top_y, rows, config.line_height);
 }
 
