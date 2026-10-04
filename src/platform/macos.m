@@ -3891,10 +3891,10 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // the sidecar to the ABSOLUTE repo path too — the sweep's DOC is
     // showcase.md at the repo root, so the binary's CWD IS the root.
     { char abspath[160];
-      // RRIDGED anchor: absolute sidecar per gesture (rev15+). The sweep
-      // aborts at the FIRST failing gesture, so only that gesture's file
-      // exists — its name IS the failing gesture id. x1.0-proof int math:
-      // (int)(841.7*10)=8417.
+      // Per-gesture sidecar (rev15+). Sweep FAILS FAST (set -e): the LAST
+      // sidecar written before abort is gesture 5's trace... UNLESS the
+      // failing gesture is later. Name carries scroll+A-start; the reader
+      // matches it against the FAIL line coordinates.
       snprintf(abspath, sizeof abspath, "screenshots/drag_diag_s%d_ax%d_ay%d.txt", (int)g_scroll_y, (int)(ax1*10.0f), (int)(ay1*10.0f));
       FILE* af = fopen(abspath, "w");
       if (af) { FILE* lf2 = fopen("/tmp/drag_diag.log", "r");
