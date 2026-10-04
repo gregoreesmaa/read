@@ -3565,7 +3565,7 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     // Headless selection captures paint the same highlight as live draws.
 #ifdef DRAG_DIAG
-    DRAGLOG("DIAG fresh sel=%d records=%d start=(%.1f,%.1f) end=(%.1f,%.1f)", (int)(g_has_selection || g_select_all), g_text_record_count, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
+    DRAGLOG("DIAG fresh scroll=%.1f sel=%d records=%d start=(%.1f,%.1f) end=(%.1f,%.1f)", g_scroll_y, (int)(g_has_selection || g_select_all), g_text_record_count, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
     {
         unsigned char* pxf = CGBitmapContextGetData(ctx);
         size_t bprf = CGBitmapContextGetBytesPerRow(ctx);
@@ -3733,7 +3733,8 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_pending_dirty = union_rect(box_prev, box_a);
     g_pending_dirty_valid = YES;
 #ifdef DRAG_DIAG
-    DRAGLOG("DIAG ph1 box_prev=%.1f,%.1f,%.1f,%.1f box_a=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=A(%.1f,%.1f,%.1f,%.1f)",
+    DRAGLOG("DIAG ph1 scroll=%.1f box_prev=%.1f,%.1f,%.1f,%.1f box_a=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=A(%.1f,%.1f,%.1f,%.1f)",
+        g_scroll_y,
         box_prev.origin.x, box_prev.origin.y, box_prev.size.width, box_prev.size.height,
         box_a.origin.x, box_a.origin.y, box_a.size.width, box_a.size.height,
         g_pending_dirty.origin.x, g_pending_dirty.origin.y, g_pending_dirty.size.width, g_pending_dirty.size.height,
@@ -3821,7 +3822,8 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_pending_dirty = clearing ? box_a : union_rect(box_a, box_b);
     g_pending_dirty_valid = YES;
 #ifdef DRAG_DIAG
-    DRAGLOG("DIAG ph2 box_a=%.1f,%.1f,%.1f,%.1f box_b=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=B(%.1f,%.1f,%.1f,%.1f) clearing=%d",
+    DRAGLOG("DIAG ph2 scroll=%.1f box_a=%.1f,%.1f,%.1f,%.1f box_b=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=B(%.1f,%.1f,%.1f,%.1f) clearing=%d",
+        g_scroll_y,
         box_a.origin.x, box_a.origin.y, box_a.size.width, box_a.size.height,
         box_b.origin.x, box_b.origin.y, box_b.size.width, box_b.size.height,
         g_pending_dirty.origin.x, g_pending_dirty.origin.y, g_pending_dirty.size.width, g_pending_dirty.size.height,
@@ -3870,10 +3872,12 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
 #ifdef DRAG_DIAG
     // Exfiltrate the decision trace: copy the accumulated log into
-    // screenshots/ (uploaded always()) as a .txt sidecar next to the
-    // gesture's phase PNG.
+    // screenshots/ (uploaded always()) as a per-gesture file, so the
+    // failing gesture's trace is isolated from the passing ones.
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
-        FILE* pf = fopen("screenshots/drag_diag_tail.txt", "a");
+        char sidecar[128];
+        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_g%.0f_%d.bin", (double)(int)g_scroll_y, (int)(ax2*10)%100000);
+        FILE* pf = fopen(sidecar, "w");
         if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
         fclose(lf);
         remove("/tmp/drag_diag.log");
