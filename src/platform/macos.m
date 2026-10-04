@@ -3710,7 +3710,7 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     remove("/tmp/drag_diag.log");
     DRAGLOG("DIAG gesture scroll=%.1f A=(%.1f,%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f,%.1f)",
         g_scroll_y, ax1, ay1, ax2, ay2, bx1, by1, bx2, by2);
-    DRAGLOG("DIAG probe-alive TU=%s %s", __DATE__, __TIME__);
+    DRAGLOG("DIAG probe-alive rev=12");
 #endif
     g_select_start = NSMakePoint(ax1, ay1);
     g_select_end = NSMakePoint(ax1, ay1);
