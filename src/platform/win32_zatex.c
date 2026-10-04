@@ -18,8 +18,8 @@
 //   U+2215 (infix fraction slash) via GetGlyphIndicesW — a face that
 //   lacks it is skipped. Per-OS screenshot baselines absorb the raster
 //   difference.
-// - Advances are honest GDI ABC widths at the 100-unit face, so the
-//   ETO_GLYPH_INDEX draw below (which uses the font's own advances)
+// - Advances are honest integer GDI ABC widths at the 100-unit face, so
+//   the ETO_GLYPH_INDEX draw below (which uses the font's own advances)
 //   lands ink exactly where layout put it.
 // - Rule thickness is KaTeX parity 40/1000em for every kind (same
 //   constant as macOS: explicit, not file truth, not NULL).
@@ -314,7 +314,13 @@ static uint16_t zatex_glyph_id(const void *ctx, uint16_t font, uint32_t cp) {
 }
 
 // Advance in thousandths of an em (engine unit), at the 100px face:
-// ABC widths in px at 100px read directly as thousandths.
+// integer ABC widths in px at 100px read directly as thousandths.
+// NOTE: GetCharABCWidthsFloatW takes *code points*, not glyph ids —
+// passing a glyph id silently measures U+03C3-class codepoints instead
+// (issue #399 review: GDI widths ~20% off, layout AND draw shifted since
+// the ETO_GLYPH_INDEX draw below uses the font's true advances).
+// GetCharABCWidthsI takes glyph ids and returns integer ABCs (exact at
+// 100px, no float); GetCharWidthI covers non-TrueType faces.
 static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
     (void)ctx;
     (void)font;
@@ -326,12 +332,14 @@ static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
     HFONT old = (HFONT)SelectObject(dc, f);
     int32_t units = 500;
     WORD gi = glyph;
-    ABCFLOAT abc;
-    if (GetCharABCWidthsFloatW(dc, gi, gi, &abc)) {
-        float adv = abc.abcfA + abc.abcfB + abc.abcfC;
-        int32_t u = (int32_t)(adv * 10.0f + 0.5f);
+    ABC abc;
+    if (GetCharABCWidthsI(dc, 0, 1, &gi, &abc)) {
+        int adv = abc.abcA + abc.abcB + abc.abcC;
         // Zero-width glyphs (combining accents) report 0 like the file.
-        units = u < 0 ? 500 : u;
+        units = adv < 0 ? 500 : adv;
+    } else {
+        INT w = 0;
+        if (GetCharWidthI(dc, 0, 1, &gi, &w) && w >= 0) units = w;
     }
     SelectObject(dc, old);
     return units;

@@ -495,6 +495,10 @@ static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mo
 // is what the crisp/math acutance probes pin. Window + 1x headless text
 // stays antialiased.
 static int g_force_bilevel = 0;
+// Forced headless scale (defined with the TEST_HOOKS engine below;
+// extern here so platform_draw_text above can read the same word,
+// mirroring win32_zatex.c).
+extern float g_test_scale;
 #endif
 
 // Glyph-economy counters (TEST_HOOKS reader; ship never links the reader
@@ -502,15 +506,19 @@ static int g_force_bilevel = 0;
 static unsigned long long g_shape_hits = 0, g_shape_misses = 0, g_atlas_flushes = 0;
 
 // Measure a UTF-8 run with the run font (caller selects font into dc_mem).
-static float measure_run(HDC dc, const char* text, int len, float* out_h) {
+// out_ascent returns the font's tmAscent alongside (NULL when unneeded):
+// the GetTextMetricsW is already paid here, so ascent-anchored placement
+// costs no extra GDI call.
+static float measure_run(HDC dc, const char* text, int len, float* out_h, float* out_ascent) {
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 768);
-    if (wn <= 0) { if (out_h) *out_h = 0; return 0.0f; }
+    if (wn <= 0) { if (out_h) *out_h = 0; if (out_ascent) *out_ascent = 0; return 0.0f; }
     SIZE sz;
-    if (!GetTextExtentPoint32W(dc, wtmp, wn, &sz)) { if (out_h) *out_h = 0; return 0.0f; }
+    if (!GetTextExtentPoint32W(dc, wtmp, wn, &sz)) { if (out_h) *out_h = 0; if (out_ascent) *out_ascent = 0; return 0.0f; }
     TEXTMETRICW tm;
     GetTextMetricsW(dc, &tm);
     if (out_h) *out_h = (float)(tm.tmAscent + tm.tmDescent);
+    if (out_ascent) *out_ascent = (float)tm.tmAscent;
     // Trailing-space inclusion (records count the layout advance): GDI
     // already includes trailing spaces in GetTextExtentPoint32W.
     return (float)sz.cx;
@@ -519,7 +527,7 @@ static float measure_run(HDC dc, const char* text, int len, float* out_h) {
 // exact; CJK/combining fall back through the same API, never linear).
 static float x_for_byte_prefix(HDC dc, const char* text, int len, int bidx) {
     if (bidx <= 0) return 0.0f;
-    if (bidx >= len) return measure_run(dc, text, len, NULL);
+    if (bidx >= len) return measure_run(dc, text, len, NULL, NULL);
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 768);
     if (wn <= 0) return 0.0f;
@@ -704,7 +712,7 @@ void platform_register_text_run(const char* text, int len, float x, float y, flo
     if (g_draw_dc) {
         HFONT f = font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, text, len);
         HFONT old = f ? (HFONT)SelectObject(g_draw_dc, f) : NULL;
-        if (f) { rw = measure_run(g_draw_dc, text, len, &rh); SelectObject(g_draw_dc, old); }
+        if (f) { rw = measure_run(g_draw_dc, text, len, &rh, NULL); SelectObject(g_draw_dc, old); }
     }
     record_text_quad(text, len, x, y, rw, rh, font_size,
                      is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
@@ -738,8 +746,8 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     HFONT f = font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, text, len);
     if (!f) return;
     HFONT old = (HFONT)SelectObject(g_draw_dc, f);
-    float rh = font_size * 1.0f;
-    float rw = measure_run(g_draw_dc, text, len, &rh);
+    float rh = font_size * 1.0f, run_ascent = 0.0f;
+    float rw = measure_run(g_draw_dc, text, len, &rh, &run_ascent);
     record_text_quad(text, len, x, y, rw, rh, font_size,
                      is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
     g_shape_misses++;
@@ -753,12 +761,23 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 767);
     if (wn > 0) {
-        float ascent = font_size * 0.85f;
-        int iy = (int)floorf(y + ascent + 0.5f);
+        // Baseline-anchored placement (issue #401 threads 4176655377/
+        // 4176657394): glyph true baselines land on the shared y+0.85em
+        // line that the link-underline rule and the inline-code pill honor,
+        // within 0.5px at 1x ship. Real GDI TEXTMETRIC ascents run larger
+        // than 0.85em (Plex Serif 17px: tmAscent=20), so a cell sized
+        // round(size) from a round(y+size*0.85) baseline hung every run
+        // ~2-3px low. The baseline itself quantizes to integer device px
+        // (at most half a device px of drift); the cell top derives from
+        // the run font's own ascent, already measured once on the selected
+        // font alongside the run measure above (zero extra GDI calls). Same
+        // anchor contract as macos.m's dest_y (y + size*0.85 - ascent).
+        int pascent = run_ascent > 0.0f ? (int)(run_ascent + 0.5f) : (int)(font_size + 0.5f);
+        int iy = (int)floorf(y + font_size * 0.85f + 0.5f);
         int prev_bk = SetBkMode(g_draw_dc, TRANSPARENT);
         COLORREF prev_c = SetTextColor(g_draw_dc, RGB(r, g, b));
         int ix = (int)floorf(x + 0.5f);
-        int iy0 = iy - (int)(font_size + 0.5f);
+        int iy0 = iy - pascent;
 #ifdef TEST_HOOKS
         if (q_bilevel) {
             // Bi-level text ignores alpha blends: draw solid only when
@@ -766,7 +785,18 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             // face joins so RTL runs stay glyph-complete at 2x too.
             if (a == 255) {
                 int bidi = run_needs_bidi_face(text, len);
-                HFONT bf = CreateFontW(-(int)(font_size + 0.5f), 0, 0, 0,
+                // Under forced scale the headless DIB is device px, not
+                // doc px: draw with a true 2x font at doubled device
+                // coords so the 2x->1x box downsample keeps razor edges.
+                // Measured 2x bilevel ascents (Georgia-34: 32, Consolas-30:
+                // 28, Segoe-58: 62) are all even, so the doubled baseline
+                // keeps even parity with the status-quo origins the crisp
+                // acutance probe pins (odd cell-top shifts split edges
+                // across downsample pairs and read as blur).
+                float tscale = g_test_scale > 0.0f ? g_test_scale : 1.0f;
+                int dpx = (int)(font_size * tscale + 0.5f);
+                if (dpx < 1) dpx = 1;
+                HFONT bf = CreateFontW(-dpx, 0, 0, 0,
                     face_weight(is_bold, is_heading), is_italic ? TRUE : FALSE,
                     FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
@@ -775,7 +805,13 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
                     (is_mono ? L"Consolas" : (is_heading ? L"Segoe UI" : L"Georgia")));
                 if (bf) {
                     HFONT bo = (HFONT)SelectObject(g_draw_dc, bf);
-                    ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+                    TEXTMETRICW btm;
+                    int bascent = dpx;
+                    if (GetTextMetricsW(g_draw_dc, &btm) && btm.tmAscent > 0)
+                        bascent = (int)btm.tmAscent;
+                    int dix = (int)floorf(x * tscale + 0.5f);
+                    int diy = (int)floorf((y + font_size * 0.85f) * tscale + 0.5f);
+                    ExtTextOutW(g_draw_dc, dix, diy - bascent, 0, NULL, wtmp, wn, NULL);
                     SelectObject(g_draw_dc, bo);
                     DeleteObject(bf);
                 }
