@@ -360,22 +360,22 @@ fn pluginResolvePaths(
     bufs: [][256]u8,
     lens: []u8,
 ) usize {
-    const cap = @min(jobs.len, plugin_cache.MAX_PLUGIN_JOBS);
-    const n = plugin_cache.collectPluginJobs(bytes, lines, cache_root, jobs[0..cap]);
-    const take = @min(n, cap);
+    // collectPluginJobs caps at min(jobs.len, MAX_PLUGIN_JOBS) internally,
+    // so n needs no second min here (the old cap/take pair was identity).
+    // bufs tracks jobs 1:1 at every in-tree caller (16 slots each), so the
+    // old `i < bufs.len` guard was provably dead; index directly.
+    const n = plugin_cache.collectPluginJobs(bytes, lines, cache_root, jobs);
     var i: usize = 0;
-    while (i < take) : (i += 1) {
+    while (i < n) : (i += 1) {
         lens[i] = 0;
-        if (i < bufs.len) {
-            if (plugin_cache.cachePath(cache_root, jobs[i].renderer, jobs[i].hash, &bufs[i])) |p| {
-                if (p.len < bufs[i].len) {
-                    lens[i] = @intCast(p.len);
-                    bufs[i][p.len] = 0;
-                }
+        if (plugin_cache.cachePath(cache_root, jobs[i].renderer, jobs[i].hash, &bufs[i])) |p| {
+            if (p.len < bufs[i].len) {
+                lens[i] = @intCast(p.len);
+                bufs[i][p.len] = 0;
             }
         }
     }
-    return take;
+    return n;
 }
 
 /// Cache root for rendered PNGs (`<root>/read/plugins/<name>/<hex>.png`):
@@ -955,9 +955,9 @@ fn pluginKickForDocument() void {
         g_plugin_path_bufs[0..],
         g_plugin_path_lens[0..],
     );
-    // Explicit truncation at 16 rows (Task 4 review F2): collection caps
-    // there too, so this minimum documents the bound at the build.
-    g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    // resolvePaths returns take <= MAX_PLUGIN_JOBS already (collect caps
+    // internally), so a second min here would be identity, not truncation.
+    g_plugin_count = n;
     if (g_plugin_count == 0) return;
     var saw_ready = false;
     var i: usize = 0;
