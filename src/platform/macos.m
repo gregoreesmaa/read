@@ -3877,7 +3877,7 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
         char sidecar[128];
         int tag2 = (int)(fabsf(ax2)*10.0f + 0.5f);
-        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_a%d.bin", (int)g_scroll_y, tag2);
+        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_a%d.txt", (int)g_scroll_y, tag2);
         FILE* pf = fopen(sidecar, "w");
         if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
         fclose(lf);
