@@ -3886,6 +3886,11 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // Hard gate: only gestures whose scroll band is 300-500 (the three
     // failing scrolls 395/357/421) write sidecars — the sweep's passing
     // gestures would otherwise evict them through the 16 MiB artifact cap.
+    // NOTE (rev13): screenshots/ is CWD-relative — the damage run's CWD is
+    // the repo root (damage_parity.sh cds there), but VERIFY via probe:
+    // also drop a marker at the absolute path.
+    { FILE* absprobe = fopen("/tmp/drag_diag_cwd.txt", "a");
+      if (absprobe) { char cwd[512]; if (getcwd(cwd, sizeof cwd)) fprintf(absprobe, "cwd=%s scroll=%.1f\n", cwd, g_scroll_y); fclose(absprobe); } }
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf && g_scroll_y > 300.0f && g_scroll_y < 500.0f) {
         char sidecar[160];
         // Full gesture tag (truncated ints, never rounded): identifies the
