@@ -231,7 +231,7 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     drag="--scroll $gs --select-drag $ax1,$ay1,$ax2,$ay2,$bx1,$by1,$bx2,$by2"
     sleep 0.3
     # shellcheck disable=SC2086
-    "$BIN" --screenshot /tmp/sweep25_inc.png --settle-images $drag "$DOC" >/tmp/sweep25_dragerr.txt 2>&1
+    "$BIN" --screenshot /tmp/sweep25_inc.png --settle-images $drag "$DOC" >/dev/null 2>&1
     if [ "$bx1" = "0" ] && [ "$by1" = "0" ] && [ "$bx2" = "0" ] && [ "$by2" = "0" ]; then
         fresh_b=""
     else
@@ -243,63 +243,13 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     sleep 0.3
     # shellcheck disable=SC2086
     "$BIN" --screenshot /tmp/sweep25_freshA.png --settle-images --scroll $gs --select $ax1,$ay1,$ax2,$ay2 "$DOC" >/dev/null 2>&1
-    gfail=0
     if ! cmp -s /tmp/drag_phase_2.png /tmp/sweep25_freshB.png; then
         echo "FAIL: gesture $gn drag-back residue (scroll=$gs A=$ax1,$ay1,$ax2,$ay2 B=$bx1,$by1,$bx2,$by2)"
         fail=1
-        gfail=1
-        # TEMPORARY diagnostic (#389 gestures 5/12/13): localize the fringe
-        # (bbox + sample pixels) so it maps onto text records. Never gates.
-        python3 scripts/fringe_localize.py /tmp/drag_phase_2.png /tmp/sweep25_freshB.png "g${gn}-phase2" || true
     fi
     if ! cmp -s /tmp/drag_phase_1.png /tmp/sweep25_freshA.png; then
         echo "FAIL: gesture $gn extend-phase fringe differs (scroll=$gs A=$ax1,$ay1,$ax2,$ay2)"
         fail=1
-        gfail=1
-        # TEMPORARY diagnostic (#389 gestures 5/12/13): same for the extend phase.
-        python3 scripts/fringe_localize.py /tmp/drag_phase_1.png /tmp/sweep25_freshA.png "g${gn}-phase1" || true
-    fi
-    # TEMPORARY bisect (#389): on failing gestures only, replay the phase-1
-    # damage on a FRESH bitmap (new process, zeroed bitmap, same
-    # --scroll/--select, damage injected via --damage from the DRAGDMG line
-    # the harness prints to stderr). ALL comparisons are masked to within
-    # the damage rect (outside it, fresh+damage trivially differs: zeros
-    # vs phase-0 content — whole-image cmp there proved nothing).
-    # fresh+damage == fresh (inside) => damage path self-consistent;
-    #   splitter is cross-phase bitmap/process state.
-    # fresh+damage != fresh (inside) => splitter is inside the damage path
-    #   (cull/record/clip).
-    # Either way the cmp oracles above stay the strict gate (|| true below).
-    if [ "$gfail" = 1 ] && [ -s /tmp/sweep25_dragerr.txt ]; then
-        grep '^DRAGDMG' /tmp/sweep25_dragerr.txt || true
-        bis_dmg=$(awk '/^DRAGDMG phase=1/{for(i=3;i<=NF;i++){split($i,a,"="); printf "%s%s", (i>3?",":""), a[2]}}' /tmp/sweep25_dragerr.txt)
-        case "$bis_dmg" in
-            *,*,*,*)
-                sleep 0.3
-                # shellcheck disable=SC2086
-                "$BIN" --screenshot /tmp/sweep25_bisA.png --settle-images --scroll $gs --damage $bis_dmg --select $ax1,$ay1,$ax2,$ay2 "$DOC" >/dev/null 2>&1 || true
-                bis_rect=$(printf '%s' "$bis_dmg" | tr ',' ' ')
-                # shellcheck disable=SC2086
-                python3 scripts/fringe_localize.py /tmp/sweep25_bisA.png /tmp/sweep25_freshA.png "g${gn}-bisA-vs-fresh" $bis_rect || true
-                # shellcheck disable=SC2086
-                python3 scripts/fringe_localize.py /tmp/drag_phase_1.png /tmp/sweep25_freshA.png "g${gn}-inc-vs-fresh" $bis_rect || true
-                # TEMPORARY row-content probe (#389): which command rects
-                # cover the fringe rows? Dumps the command stream at the
-                # gesture scroll (full) and under the phase-1 damage
-                # (kept= flags show exactly what the damage path culled).
-                # Identifies pill vs text vs math runs at the fringe site.
-                sleep 0.3
-                # shellcheck disable=SC2086
-                "$BIN" --screenshot /tmp/sweep25_cmds.png --settle-images --scroll $gs --dump-commands "$DOC" 2>&1 | grep '^CMD ' > /tmp/sweep25_cmds_full.txt || true
-                sleep 0.3
-                # shellcheck disable=SC2086
-                "$BIN" --screenshot /tmp/sweep25_cmds.png --settle-images --scroll $gs --damage $bis_dmg --dump-commands "$DOC" 2>&1 | grep '^CMD ' > /tmp/sweep25_cmds_dmg.txt || true
-                echo "ROWPROBE g${gn}: inline_code_bg near fringe doc-y rows:"
-                grep 'inline_code_bg' /tmp/sweep25_cmds_full.txt | head -20 || true
-                echo "ROWPROBE g${gn}: text_run kept=0 under phase damage (culled):"
-                grep 'text_run' /tmp/sweep25_cmds_dmg.txt | grep -v 'kept=1' | head -20 || true
-                ;;
-        esac
     fi
 done < /tmp/sweep25_gestures.txt
 

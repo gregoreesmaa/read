@@ -4174,14 +4174,6 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_scrollable_block_count = 0;
     g_pending_dirty = union_rect(box_prev, box_a);
     g_pending_dirty_valid = YES;
-#ifdef TEST_HOOKS
-    // TEMPORARY diagnostic (#389 gestures 5/13/18): expose the phase damage
-    // so CI can replay it via --damage on a fresh render and bisect
-    // cross-phase state vs damage-path divergence. Remove before merge.
-    fprintf(stderr, "DRAGDMG phase=1 x=%.1f y=%.1f w=%.1f h=%.1f\n",
-        g_pending_dirty.origin.x, g_pending_dirty.origin.y,
-        g_pending_dirty.size.width, g_pending_dirty.size.height);
-#endif
     CGContextSaveGState(ctx);
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
@@ -4211,13 +4203,6 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_scrollable_block_count = 0;
     g_pending_dirty = clearing ? box_a : union_rect(box_a, box_b);
     g_pending_dirty_valid = YES;
-#ifdef TEST_HOOKS
-    // TEMPORARY diagnostic (#389 gestures 5/13/18): same for phase 2.
-    // Remove before merge.
-    fprintf(stderr, "DRAGDMG phase=2 x=%.1f y=%.1f w=%.1f h=%.1f\n",
-        g_pending_dirty.origin.x, g_pending_dirty.origin.y,
-        g_pending_dirty.size.width, g_pending_dirty.size.height);
-#endif
     CGContextSaveGState(ctx);
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
