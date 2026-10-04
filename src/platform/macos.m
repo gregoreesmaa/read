@@ -691,6 +691,24 @@ static CTLineRef shape_cached_line(const char* text, int len, float font_size,
     return NULL;
 }
 
+#ifdef DRAG_DIAG
+// Fix-round-4 wash-divergence probe: append-only per-record decision log.
+// File flag (like /tmp/read-draw-on): the harness discards stderr, so a
+// plain log file is the only channel that survives.
+static FILE* drag_log_file(void) {
+    static FILE* f = NULL;
+    static int opened = 0;
+    if (!opened) {
+        opened = 1;
+        f = fopen("/tmp/drag_diag.log", "a");
+    }
+    return f;
+}
+#define DRAGLOG(fmt, ...) do { FILE* _f = drag_log_file(); if (_f) { fprintf(_f, fmt "\n", ##__VA_ARGS__); fflush(_f); } } while (0)
+#else
+#define DRAGLOG(fmt, ...) do {} while (0)
+#endif
+
 #ifdef TEST_HOOKS
 // Scroll-sweep profiler counters: read-test only.
 void platform_glyph_cache_stats(uint64_t* hits, uint64_t* misses, uint64_t* flushes) {
@@ -973,7 +991,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                     DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
 #endif
 #ifdef DRAG_DIAG
-                fprintf(stderr, "DIAG skip band q=%d y=%.2f h=%.2f min=%.2f max=%.2f txt=%.16s\n", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+                DRAGLOG("DIAG skip band q=%d y=%.2f h=%.2f min=%.2f max=%.2f txt=%.16s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
 #endif
                 continue;
             }
@@ -1013,7 +1031,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                     DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
 #endif
 #ifdef DRAG_DIAG
-                fprintf(stderr, "DIAG skip edge q=%d y=%.2f h=%.2f min=%.2f max=%.2f inmin=%d inmax=%d txt=%.16s\n", q, rec->doc_y, rec->h, min_y, max_y, in_min_row, in_max_row, rec->text);
+                DRAGLOG("DIAG skip edge q=%d y=%.2f h=%.2f min=%.2f max=%.2f inmin=%d inmax=%d txt=%.16s", q, rec->doc_y, rec->h, min_y, max_y, in_min_row, in_max_row, rec->text);
 #endif
                 continue;
             }
@@ -1052,6 +1070,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                         // the gap bridge's fractional edges must agree
                         // clipped vs unclipped (2026-10 gestures 5/12/13).
                         float qglo = floorf(glo), qgy = floorf(view_y);
+#ifdef DRAG_DIAG
+                        DRAGLOG("DIAG gap q=%d glo=%.2f ghi=%.2f qglo=%.2f qgx2=%.2f txt=%.16s", q, glo, ghi, qglo, ceilf(ghi), rec->text);
+#endif
                         CGContextFillRect(ctx, CGRectMake(qglo, qgy, ceilf(ghi) - qglo, ceilf(view_y + rec->h) - qgy));
                     }
                 }
@@ -1103,7 +1124,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #endif
 #ifdef DRAG_DIAG
             if (c_end <= c_start)
-                fprintf(stderr, "DIAG skip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f txt=%.16s\n", q, c_start, c_end, rec->len, rec->x, rec->w, rec->text);
+                DRAGLOG("DIAG skip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f txt=%.16s", q, c_start, c_end, rec->len, rec->x, rec->w, rec->text);
 #endif
             }
             if (c_end > c_start) {
@@ -1114,7 +1135,7 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                     DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
 #endif
 #ifdef DRAG_DIAG
-                fprintf(stderr, "DIAG wash q=%d cs=%d ce=%d x1=%.2f x2=%.2f vy=%.2f h=%.2f qx1=%.2f qx2=%.2f txt=%.16s\n",
+                DRAGLOG("DIAG wash q=%d cs=%d ce=%d x1=%.2f x2=%.2f vy=%.2f h=%.2f qx1=%.2f qx2=%.2f txt=%.16s",
                     q, c_start, c_end, x1, x2, view_y, rec->h, floorf(x1), ceilf(x2), rec->text);
 #endif
                 // Quantize once here (floor/ceil outward) so the fill's
@@ -3543,6 +3564,9 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     platform_batch_end();
 
     // Headless selection captures paint the same highlight as live draws.
+#ifdef DRAG_DIAG
+    DRAGLOG("DIAG fresh sel=%d records=%d start=(%.1f,%.1f) end=(%.1f,%.1f)", (int)(g_has_selection || g_select_all), g_text_record_count, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
+#endif
     if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
     // Same for the hover copy button (--hover): headless screenshots
     // exercise the live paint, fringe stroke included. NSBezierPath and
@@ -3693,7 +3717,7 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_pending_dirty = union_rect(box_prev, box_a);
     g_pending_dirty_valid = YES;
 #ifdef DRAG_DIAG
-    fprintf(stderr, "DIAG ph1 box_prev=%.1f,%.1f,%.1f,%.1f box_a=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=A(%.1f,%.1f,%.1f,%.1f)\n",
+    DRAGLOG("DIAG ph1 box_prev=%.1f,%.1f,%.1f,%.1f box_a=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=A(%.1f,%.1f,%.1f,%.1f)",
         box_prev.origin.x, box_prev.origin.y, box_prev.size.width, box_prev.size.height,
         box_a.origin.x, box_a.origin.y, box_a.size.width, box_a.size.height,
         g_pending_dirty.origin.x, g_pending_dirty.origin.y, g_pending_dirty.size.width, g_pending_dirty.size.height,
@@ -3705,10 +3729,10 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     render_fn(width, height);
     platform_batch_end();
 #ifdef DRAG_DIAG
-    fprintf(stderr, "DIAG ph1 records=%d\n", g_text_record_count);
+    DRAGLOG("DIAG ph1 records=%d", g_text_record_count);
     for (int di = 0; di < g_text_record_count; di++) {
         QuadTextRecord* dr = &g_text_records[di];
-        fprintf(stderr, "DIAG ph1 rec%d x=%.2f docy=%.2f w=%.2f h=%.2f fs=%.1f txt=%.16s\n",
+        DRAGLOG("DIAG ph1 rec%d x=%.2f docy=%.2f w=%.2f h=%.2f fs=%.1f txt=%.16s",
             di, dr->x, dr->doc_y, dr->w, dr->h, dr->font_size, dr->text);
     }
 #endif
@@ -3736,11 +3760,26 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_scrollable_block_count = 0;
     g_pending_dirty = clearing ? box_a : union_rect(box_a, box_b);
     g_pending_dirty_valid = YES;
+#ifdef DRAG_DIAG
+    DRAGLOG("DIAG ph2 box_a=%.1f,%.1f,%.1f,%.1f box_b=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=B(%.1f,%.1f,%.1f,%.1f) clearing=%d",
+        box_a.origin.x, box_a.origin.y, box_a.size.width, box_a.size.height,
+        box_b.origin.x, box_b.origin.y, box_b.size.width, box_b.size.height,
+        g_pending_dirty.origin.x, g_pending_dirty.origin.y, g_pending_dirty.size.width, g_pending_dirty.size.height,
+        bx1, by1, bx2, by2, clearing);
+#endif
     CGContextSaveGState(ctx);
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
     render_fn(width, height);
     platform_batch_end();
+#ifdef DRAG_DIAG
+    DRAGLOG("DIAG ph2 records=%d", g_text_record_count);
+    for (int di = 0; di < g_text_record_count; di++) {
+        QuadTextRecord* dr = &g_text_records[di];
+        DRAGLOG("DIAG ph2 rec%d x=%.2f docy=%.2f w=%.2f h=%.2f fs=%.1f txt=%.16s",
+            di, dr->x, dr->doc_y, dr->w, dr->h, dr->font_size, dr->text);
+    }
+#endif
     paint_selection_highlight(ctx);
     CGContextRestoreGState(ctx);
     rc = headless_dump_png(ctx, "/tmp/drag_phase_2.png");

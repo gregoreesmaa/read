@@ -286,7 +286,9 @@ pub fn build(b: *std.Build) void {
         });
         exe_test.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos.m"),
-            .flags = &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1", "-DREAD_ANIMATED_GIF=1", stub_define},
+            // DRAG_DIAG=1 enables the fix-round-4 wash-divergence probe
+            // (/tmp/drag_diag.log); default 0 keeps the oracle bit-exact.
+            .flags = &.{"-fobjc-arc", "-Os", "-DTEST_HOOKS=1", "-DDRAG_DIAG=1", "-DREAD_ANIMATED_GIF=1", stub_define},
         });
     }
 
