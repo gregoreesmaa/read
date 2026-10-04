@@ -681,7 +681,7 @@ test "findOffsetY lands on the match block (#42)" {
     var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &line_buf, &fence);
     const lines = line_buf[0..n];
-    const cfg = ViewportConfig{
+    var cfg = ViewportConfig{
         .window_width = 1200,
         .window_height = 900,
         .scroll_y = 0,
@@ -717,7 +717,7 @@ test "findRowOffsetY lands row-exact inside wrapped paras (#386)" {
     };
     // Single-row paragraph: row-exact == block top.
     const off = std.mem.indexOf(u8, doc, "First").?;
-    const top = findOffsetY(doc, lines, cfg, off).?;
+    const top = findOffsetY(doc, lines, &cfg, off).?;
     var unit: usize = 0;
     while (unit < lines.len and lines[unit].offset + lines[unit].len <= off) : (unit += 1) {}
     unit = snapWindowStart(doc, lines, unit);

@@ -1501,7 +1501,7 @@ fn findMatchY(offset: usize) ?f32 {
         .join_buf = &g_joinbuf,
     };
     pluginAttachConfig(&vp_config);
-    const top = layout.findOffsetY(g_app.bytes, g_app.lines, vp_config, offset) orelse return null;
+    const top = layout.findOffsetY(g_app.bytes, g_app.lines, &vp_config, offset) orelse return null;
     // Row-exact landing (issue #386): resolve the containing unit and step
     // to the match's wrapped visual row in the same snap — the old chase
     // loop's follow-up steps converge here by construction, so the final
