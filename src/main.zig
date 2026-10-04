@@ -1820,6 +1820,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                     // Pixels culled, but the selection/hover/link record model
                     // must still be rebuilt (regression: partial draws starved
                     // it, breaking highlight painting — see damage.zig).
+                    bridge.platform_note_culled_run();
                     bridge.platform_register_text_run(
                         cmd.text.ptr,
                         @intCast(cmd.text.len),

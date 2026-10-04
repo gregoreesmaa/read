@@ -2477,6 +2477,18 @@ void platform_set_test_damage(float x, float y, float w, float h, int valid) {
     g_test_damage_valid = valid ? YES : NO;
 }
 int platform_text_record_count(void) { return g_text_record_count; }
+// rev16 census: how many text_runs onDraw culled (register-only) this pass.
+// Reset per render_fn call by the drag harness + fresh path via the phase
+// loggers (they already print g_text_record_count); the harness diffs
+// culled counts across incremental vs fresh.
+static int g_culled_runs = 0;
+void platform_note_culled_run(void) {
+#ifdef DRAG_DIAG
+    g_culled_runs++;
+#else
+    (void)0;
+#endif
+}
 // Image draws this pass, for the scroll-sweep profiler. Shape hits/misses
 // and atlas flushes come from platform_glyph_cache_stats.
 static unsigned long g_test_image_draws = 0;
@@ -3565,7 +3577,7 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     // Headless selection captures paint the same highlight as live draws.
 #ifdef DRAG_DIAG
-    DRAGLOG("DIAG fresh scroll=%.1f sel=%d records=%d start=(%.1f,%.1f) end=(%.1f,%.1f) rev=13", g_scroll_y, (int)(g_has_selection || g_select_all), g_text_record_count, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
+    DRAGLOG("DIAG fresh scroll=%.1f sel=%d records=%d culled=%d start=(%.1f,%.1f) end=(%.1f,%.1f) rev=16", g_scroll_y, (int)(g_has_selection || g_select_all), g_text_record_count, g_culled_runs, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
     {
         unsigned char* pxf = CGBitmapContextGetData(ctx);
         size_t bprf = CGBitmapContextGetBytesPerRow(ctx);
@@ -3748,6 +3760,9 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_text_record_count = 0;
     g_code_block_count = 0;
     g_scrollable_block_count = 0;
+#ifdef DRAG_DIAG
+    g_culled_runs = 0;
+#endif
     g_pending_dirty = union_rect(box_prev, box_a);
     g_pending_dirty_valid = YES;
 #ifdef DRAG_DIAG
@@ -3765,7 +3780,8 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     platform_batch_end();
 #ifdef DRAG_DIAG
     // rev14: g_scroll_y is now SYNCED (render_fn ran) — safe to tag.
-    DRAGLOG("DIAG ph1 synced scroll=%.1f", g_scroll_y);
+    // rev16: culled-run census — how many text_runs onDraw register-only'd.
+    DRAGLOG("DIAG ph1 synced scroll=%.1f records=%d culled=%d", g_scroll_y, g_text_record_count, g_culled_runs);
     {
         // Pre-wash pixels: proves whether the glyph layer already diverges
         // before any wash fill lands (then the wash trace is a red herring).
@@ -3839,6 +3855,9 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_text_record_count = 0;
     g_code_block_count = 0;
     g_scrollable_block_count = 0;
+#ifdef DRAG_DIAG
+    g_culled_runs = 0;
+#endif
     g_pending_dirty = clearing ? box_a : union_rect(box_a, box_b);
     g_pending_dirty_valid = YES;
 #ifdef DRAG_DIAG
@@ -3880,7 +3899,7 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
         }
         DRAGLOG("DIAG ph2 pix dmg=%d,%d,%d,%d sum=%llu cnt=%d", dx0, dy0, dx1-dx0, dy1-dy0, sum, cnt);
     }
-    DRAGLOG("DIAG ph2 records=%d", g_text_record_count);
+    DRAGLOG("DIAG ph2 records=%d culled=%d", g_text_record_count, g_culled_runs);
     for (int di = 0; di < g_text_record_count; di++) {
         QuadTextRecord* dr = &g_text_records[di];
         DRAGLOG("DIAG ph2 rec%d x=%.2f docy=%.2f w=%.2f h=%.2f fs=%.1f txt=%.16s",

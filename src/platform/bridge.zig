@@ -225,6 +225,7 @@ pub extern "c" fn platform_math_engine_info(version: *u32, use_ex: *u32, conform
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;
+pub extern "c" fn platform_note_culled_run() void;
 pub extern "c" fn platform_set_test_hover(x: f32, y: f32) void;
 pub extern "c" fn platform_test_button_damage(bx: f32, by: f32, bw: f32, bh: f32, ox: *f32, oy: *f32, ow: *f32, oh: *f32) void;
 pub extern "c" fn platform_images_pending() c_int;
