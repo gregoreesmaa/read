@@ -1100,16 +1100,16 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #endif
                 continue;
             }
-            // #389 (GPU): per-record damage cull. Records fully outside the
-            // compositor's dirty rect contribute no pixels this pass (their
-            // wash rects are view-space: rec->x is view x, view_y below).
-            if (g_pending_dirty_valid) {
-                float view_y_c = rec->doc_y - g_scroll_y;
-                CGRect wr = CGRectMake(rec->x, view_y_c, rec->w, rec->h);
-                CGRect dr = CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
-                                       g_pending_dirty.size.width, g_pending_dirty.size.height);
-                if (!CGRectIntersectsRect(wr, dr)) continue;
-            }
+            // No per-record damage cull here: the wash rect is the
+            // char-range sub-rect [x1,x2], not the record box. A record
+            // outside the damage can still own fringe pixels inside it
+            // (2026-10 gestures 5/12/13: extend-phase fringe differs when
+            // the endpoint lands mid-run — the fringe rect intersects the
+            // damage while the record box does not). The damage clip
+            // (CGContextClipToRect / platform_begin_clip) already confines
+            // pixels on partial passes; the gate at the drawRect call site
+            // (sel_box vs damage) keeps the wholesale skip. Same rule as
+            // the copy path below (selected_text_string culls nothing).
 
             // Strict edge resolution: an endpoint in the +-4px inclusion
             // slop but strictly outside the record band belongs to the gap,
