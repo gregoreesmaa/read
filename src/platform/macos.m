@@ -4960,6 +4960,18 @@ static void pill_draw_cached_or_direct(float x, float y, float w, float h, float
     if (w <= 0.0f || h <= 0.0f) return;
     CGContextRef ctx = g_current_cg_context;
 
+    // 1x destinations take the direct vector path (same clip-parity rule
+    // as blit_tinted_mask_batched): the slot holds a 2x raster, whose
+    // downsampled blit under a damage clip never matches a fresh render
+    // pixel-exactly (2026-10 drag-back residue, gestures 5/13/18: pill
+    // fringe rows differ on incremental passes that blit while fresh
+    // passes draw direct). No lookup, no prerender churn on 1x.
+    if (g_output_scale < 1.5f) {
+        pill_build_path(ctx, x, y, w, h, radius);
+        pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
+        return;
+    }
+
     float r = fminf(radius, fminf(w, h) * 0.5f);
     uint32_t fill = pill_pack(fr, fg, fb, fa);
     uint32_t border = pill_pack(br, bg, bb, ba);
@@ -4980,8 +4992,9 @@ static void pill_draw_cached_or_direct(float x, float y, float w, float h, float
     pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
     // Prerender into the slot for next frame: rasterize the same path once
     // into a 2x bitmap (evicting the collision). Pixel-identical by
-    // construction: same path, same colors, same 1px hairline, snapped so
-    // the blit above lands 1:1 on the device grid.
+    // construction on native-scale dests: same path, same colors, same 1px
+    // hairline, snapped so the blit above lands 1:1 on the device grid
+    // (1x dests never reach here — direct path above, clip-parity).
     {
         int iw = (int)ceilf(w * RASTER_SCALE);
         int ih = (int)ceilf(h * RASTER_SCALE);
