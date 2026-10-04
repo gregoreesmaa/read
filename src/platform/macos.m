@@ -3565,7 +3565,7 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 
     // Headless selection captures paint the same highlight as live draws.
 #ifdef DRAG_DIAG
-    DRAGLOG("DIAG fresh scroll=%.1f sel=%d records=%d start=(%.1f,%.1f) end=(%.1f,%.1f)", g_scroll_y, (int)(g_has_selection || g_select_all), g_text_record_count, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
+    DRAGLOG("DIAG fresh scroll=%.1f sel=%d records=%d start=(%.1f,%.1f) end=(%.1f,%.1f) rev=13", g_scroll_y, (int)(g_has_selection || g_select_all), g_text_record_count, g_select_start.x, g_select_start.y, g_select_end.x, g_select_end.y);
     {
         unsigned char* pxf = CGBitmapContextGetData(ctx);
         size_t bprf = CGBitmapContextGetBytesPerRow(ctx);
@@ -3708,9 +3708,12 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // even if fopen("a") elsewhere would concatenate. The remove ALSO
     // proves this probe runs (its absence later means the TU is stale).
     remove("/tmp/drag_diag.log");
-    DRAGLOG("DIAG gesture scroll=%.1f A=(%.1f,%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f,%.1f)",
-        g_scroll_y, ax1, ay1, ax2, ay2, bx1, by1, bx2, by2);
-    DRAGLOG("DIAG probe-alive rev=12");
+    // g_scroll_y is STALE here (render_fn syncs it): log the gesture args
+    // verbatim — the sweep passes --scroll, and ay1 doubles as the tag.
+    // rev13: scroll=0.0 in every header proved onDraw hadn't run yet.
+    DRAGLOG("DIAG gesture A=(%.1f,%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f,%.1f)",
+        ax1, ay1, ax2, ay2, bx1, by1, bx2, by2);
+    DRAGLOG("DIAG probe-alive rev=13");
 #endif
     g_select_start = NSMakePoint(ax1, ay1);
     g_select_end = NSMakePoint(ax1, ay1);
@@ -3891,16 +3894,17 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // the sidecar to the ABSOLUTE repo path too — the sweep's DOC is
     // showcase.md at the repo root, so the binary's CWD IS the root.
     { char abspath[160];
-      // Per-gesture sidecar (rev15+). Sweep FAILS FAST (set -e): the LAST
-      // sidecar written before abort is gesture 5's trace... UNLESS the
-      // failing gesture is later. Name carries scroll+A-start; the reader
-      // matches it against the FAIL line coordinates.
-      snprintf(abspath, sizeof abspath, "screenshots/drag_diag_s%d_ax%d_ay%d.txt", (int)g_scroll_y, (int)(ax1*10.0f), (int)(ay1*10.0f));
+      // Per-gesture sidecar (rev15+). Sweep FAILS FAST (set -e): with one
+      // sidecar per gesture name, the FAILING gesture's file survives even
+      // when later gestures never run. Name carries A-start (rev13: the
+      // only in-hand coordinates — g_scroll_y is stale until render_fn).
+      snprintf(abspath, sizeof abspath, "screenshots/drag_diag_ax%d_ay%d_bx%d_by%d.txt",
+          (int)(ax1*10.0f), (int)(ay1*10.0f), (int)(ax2*10.0f), (int)(ay2*10.0f));
       FILE* af = fopen(abspath, "w");
       if (af) { FILE* lf2 = fopen("/tmp/drag_diag.log", "r");
         if (lf2) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf2)) > 0) fwrite(b, 1, nr, af); fclose(lf2); }
         fclose(af); } }
-    { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf && g_scroll_y > 300.0f && g_scroll_y < 500.0f) {
+    { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
         char sidecar[160];
         // Full gesture tag (truncated ints, never rounded): identifies the
         // failing gesture without parsing the log body. Parenthesize the
