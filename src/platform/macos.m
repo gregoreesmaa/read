@@ -3703,6 +3703,11 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
 
     // Phase 0: caret baseline at A-start, FULL (the settled frame before the
     // drag begins). No highlight: collapsed selection paints nothing.
+#ifdef DRAG_DIAG
+    remove("/tmp/drag_diag.log");
+    DRAGLOG("DIAG gesture scroll=%.1f A=(%.1f,%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f,%.1f)",
+        g_scroll_y, ax1, ay1, ax2, ay2, bx1, by1, bx2, by2);
+#endif
     g_select_start = NSMakePoint(ax1, ay1);
     g_select_end = NSMakePoint(ax1, ay1);
     g_draw_seq++;
@@ -3875,12 +3880,13 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // screenshots/ (uploaded always()) as a per-gesture file, so the
     // failing gesture's trace is isolated from the passing ones.
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
-        char sidecar[128];
-        // Full gesture tag: scroll + both A endpoints (truncated, never
-        // rounded, so x.04/x.05 pairs stay distinct). Failing gestures:
-        // s395_ax805_ay891_ax841_ay595 / s357_... / s421_....
-        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_ax%d_ay%d_bx%d_by%d.txt",
-            (int)g_scroll_y, (int)fabsf(ax1)*10, (int)fabsf(ay1)*10, (int)fabsf(ax2)*10, (int)fabsf(ay2)*10);
+        char sidecar[160];
+        // Full gesture tag (truncated ints, never rounded): identifies the
+        // failing gesture without parsing the log body.
+        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_a%d_%d_%d_%d_b%d_%d_%d_%d.txt",
+            (int)g_scroll_y,
+            (int)ax1*10, (int)ay1*10, (int)ax2*10, (int)ay2*10,
+            (int)bx1*10, (int)by1*10, (int)bx2*10, (int)by2*10);
         FILE* pf = fopen(sidecar, "w");
         if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
         fclose(lf);
