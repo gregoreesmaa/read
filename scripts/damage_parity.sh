@@ -246,10 +246,15 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     if ! cmp -s /tmp/drag_phase_2.png /tmp/sweep25_freshB.png; then
         echo "FAIL: gesture $gn drag-back residue (scroll=$gs A=$ax1,$ay1,$ax2,$ay2 B=$bx1,$by1,$bx2,$by2)"
         fail=1
+        # TEMPORARY diagnostic (#389 gestures 5/12/13): localize the fringe
+        # (bbox + sample pixels) so it maps onto text records. Never gates.
+        python3 scripts/fringe_localize.py /tmp/drag_phase_2.png /tmp/sweep25_freshB.png "g${gn}-phase2" || true
     fi
     if ! cmp -s /tmp/drag_phase_1.png /tmp/sweep25_freshA.png; then
         echo "FAIL: gesture $gn extend-phase fringe differs (scroll=$gs A=$ax1,$ay1,$ax2,$ay2)"
         fail=1
+        # TEMPORARY diagnostic (#389 gestures 5/12/13): same for the extend phase.
+        python3 scripts/fringe_localize.py /tmp/drag_phase_1.png /tmp/sweep25_freshA.png "g${gn}-phase1" || true
     fi
 done < /tmp/sweep25_gestures.txt
 

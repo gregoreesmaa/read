@@ -466,6 +466,55 @@ static NSFont* get_font_for_style(float font_size, int is_bold, int is_italic, i
     return resolved;
 }
 
+// Uncached resolver: the registry walk above, one call per font-cache miss.
+static NSFont* font_resolve_uncached(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
+    // Diet (issue #391 __TEXT): PostScript-name literals are the long
+    // pole (~15 sites: "IBMPlexSerif-BoldItalic" etc. plus the Georgia
+    // rung). The bundled faces' FAMILY names ("IBM Plex Serif",
+    // "Space Grotesk", "JetBrains Mono") are short prefixes of those
+    // literals, and NSFontManager:fontWithFamily:traits:weight:size:
+    // resolves the style from traits — so one family literal covers all
+    // four body styles, one the headings, one the mono face. Lookup
+    // order and fallbacks are unchanged: bundled PostScript name first
+    // (exact face, byte-identical pixels), then the family+traits
+    // resolution, then the legacy system fallbacks. The three helpers
+    // live at end-of-file per the SIZE NOTE (see prime_frame_decode).
+    if (is_mono) {
+        NSFont* f = [NSFont fontWithName:@"JetBrainsMono-Regular" size:font_size];
+        if (!f) f = diet_mono_font(font_size, 0);
+        if (!f) f = [NSFont fontWithName:@"Menlo" size:font_size];
+        if (!f) f = [NSFont userFixedPitchFontOfSize:font_size];
+        return f;
+    }
+    if (is_heading) {
+        NSFont* f = nil;
+        if (is_bold) {
+            f = [NSFont fontWithName:@"SpaceGrotesk-Light_Bold" size:font_size];
+            if (!f) f = [NSFont fontWithName:@"SpaceGrotesk-Bold" size:font_size];
+        }
+        if (!f) f = diet_heading_font(font_size, is_bold);
+        if (!f) f = [NSFont boldSystemFontOfSize:font_size];
+        return f;
+    }
+    // Body text: IBM Plex Serif
+    NSFont* f = nil;
+    if (is_bold && is_italic) {
+        f = [NSFont fontWithName:@"IBMPlexSerif-BoldItalic" size:font_size];
+        if (!f) f = [NSFont fontWithName:@"IBMPlexSerif-Bold" size:font_size];
+    } else if (is_bold) {
+        f = [NSFont fontWithName:@"IBMPlexSerif-Bold" size:font_size];
+    } else if (is_italic) {
+        f = [NSFont fontWithName:@"IBMPlexSerif-Italic" size:font_size];
+    } else {
+        f = [NSFont fontWithName:@"IBMPlexSerif-Regular" size:font_size];
+    }
+    if (!f) f = diet_body_font(font_size, is_bold, is_italic);
+    if (!f) {
+        f = is_bold ? [NSFont boldSystemFontOfSize:font_size] : [NSFont systemFontOfSize:font_size];
+    }
+    return f;
+}
+
 // ---------------------------------------------------------------------------
 // Shaping economy: word-level shaped-run cache + packed atlas.
 //
