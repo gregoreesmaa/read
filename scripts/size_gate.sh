@@ -55,8 +55,17 @@ if [ "$OS_ID" = "pe" ]; then CORE_BUDGET=$((280 * 1024)); fi
 # bumped to 16 KiB by coordinator decision 2026-09-28 (§7 5%: 15*1.05=15.75,
 # round up) for #348 native math/ARM after exhausted honest diet (residual 694 B
 # plugin over: 4 area agents + whole-view ±0 + round-2/round-3/finisher/micro-diet
-# with measured probes, lean audit clean, small-loss evaluated, nothing qualifying).
-PLUGIN_BUDGET_KIB=16
+# with measured probes, lean audit clean, small-loss evaluated, nothing qualifying);
+# bumped to 17 KiB by implementer decision 2026-10-03 (§7 5%: 16*1.05=16.8,
+# round up) for the Win32/FreeType ZaTeX metrics backends (per-OS screenshot CI):
+# honest diet recovered 512 B (clip hoist, advance cache, DC caching, dead
+# probe-path cuts; measured 17920 -> 17408), residual 1024 B over with zero
+# headroom at 17 KiB — the next plugin change must diet first. Small-loss
+# candidates evaluated and rejected: astral surrogate mapping (tofu for
+# U+1D431-style math alphanumerics), x_scale draw stretch, per-run color
+# (engine caps=15 proves all live), exe-relative probe kept only where
+# release packaging installs the engine.
+PLUGIN_BUDGET_KIB=17
 PLUGIN_BUDGET=$((PLUGIN_BUDGET_KIB * 1024))
 
 # Build both accounts; zig-cache incrementality makes this a fast no-op

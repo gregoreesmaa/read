@@ -63,8 +63,10 @@ static Display* g_dpy = NULL;
 static Window g_win = 0;
 static GC g_gc = 0;
 static XImage* g_canvas = NULL; // 32-bit ZPixmap backing store, y-down
-static unsigned char* g_canvas_px = NULL;
-static int g_win_w = 1000, g_win_h = 750;
+// Canvas words are extern (not static): the math backend in
+// linux_zatex.c (same TU via #include) reads them for its atlas blit.
+unsigned char* g_canvas_px = NULL;
+int g_win_w = 1000, g_win_h = 750;
 static int g_depth = 24;
 static float g_scroll_y = 0.0f;
 static float g_overshoot = 0.0f;
@@ -484,6 +486,7 @@ static int atlas_alloc(int pw, int ph, short* out_x, short* out_y) {
     return 1;
 }
 
+void zatex_drop_math_rasters(void);
 static void atlas_flush(void) {
     if (g_atlas_px) memset(g_atlas_px, 0, (size_t)ATLAS_PX * ATLAS_PX);
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
@@ -491,6 +494,7 @@ static void atlas_flush(void) {
         g_glyph_cache[i].occupied = 0;
         g_glyph_cache[i].aw = 0;
     }
+    zatex_drop_math_rasters();
     g_atlas_flushes++;
 }
 
@@ -1715,47 +1719,14 @@ void platform_clear_selection(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Math stubs: size -> 1 (engine unavailable), last_error -> 0, draw no-op,
-// stats/info zeros. TEST_HOOKS-only readers stay under the same gate so
-// ship never links them.
+// ZaTeX runtime math backend (LaTeX math plugin) lives in linux_zatex.c
+// (FreeType metrics + direct draw); READ_PLUGIN_STUB=1 includes the empty
+// stub instead — same TU, same flags (AGENTS.md §7, macos.m precedent).
 // ---------------------------------------------------------------------------
-int platform_math_size(const char* tex, int tex_len, int display, float font_px,
-                       float* out_w, float* out_above, float* out_below) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    if (out_w) *out_w = 0;
-    if (out_above) *out_above = 0;
-    if (out_below) *out_below = 0;
-    return 1;
-}
-
-int platform_math_last_error(const char* tex, int tex_len, int display,
-                             unsigned int* out_offset, int* out_code) {
-    (void)tex; (void)tex_len; (void)display;
-    (void)out_offset; (void)out_code;
-    return 0;
-}
-
-void platform_draw_math(const char* tex, int tex_len, int display, float font_px,
-                        float x, float y_top,
-                        unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    (void)x; (void)y_top; (void)r; (void)g; (void)b; (void)a;
-}
-
-#ifdef TEST_HOOKS
-void platform_math_atlas_stats(uint64_t* hits, uint64_t* misses) {
-    if (hits) *hits = 0;
-    if (misses) *misses = 0;
-}
-
-void platform_math_engine_info(unsigned int* version, unsigned int* use_ex, unsigned int* conform_ran,
-                               int* conform_n, unsigned int* caps) {
-    if (version) *version = 0;
-    if (use_ex) *use_ex = 0;
-    if (conform_ran) *conform_ran = 0;
-    if (conform_n) *conform_n = 0;
-    if (caps) *caps = 0;
-}
+#if READ_PLUGIN_STUB
+#include "linux_zatex_stub.c"
+#else
+#include "linux_zatex.c"
 #endif
 
 // ---------------------------------------------------------------------------
@@ -2686,7 +2657,10 @@ void platform_set_test_damage(float x, float y, float w, float h, int valid) {
 }
 int platform_text_record_count(void) { return g_text_record_count; }
 unsigned long platform_test_image_draws(void) { return g_test_image_draws; }
-static float g_test_scale = 0.0f;
+// Extern linkage (not static): the math backend in linux_zatex.c (same
+// TU via #include) reads the same word for its atlas gate. Ship builds
+// never define it and the backend folds to the q == 1 path there.
+float g_test_scale = 0.0f;
 void platform_set_test_scale(float s) { g_test_scale = s; }
 void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
     g_sel_sx = x1; g_sel_sy = y1;

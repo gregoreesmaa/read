@@ -1477,44 +1477,15 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 }
 
 // ---------------------------------------------------------------------------
-// Math stubs (no engine on Windows v1): size 1 (unavailable → literal
-// fallback), error probe 0, draw no-op, atlas stats zero, engine info zero.
+// ZaTeX runtime math backend (LaTeX math plugin) lives in win32_zatex.c
+// (GDI metrics + direct draw); READ_PLUGIN_STUB=1 includes the empty
+// stub instead — same TU, same flags (AGENTS.md §7, macos.m precedent).
 // ---------------------------------------------------------------------------
-int platform_math_size(const char* tex, int tex_len, int display, float font_px,
-                       float* out_w, float* out_above, float* out_below) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    if (out_w) *out_w = 0;
-    if (out_above) *out_above = 0;
-    if (out_below) *out_below = 0;
-    return 1;
-}
-int platform_math_last_error(const char* tex, int tex_len, int display,
-                             unsigned int* out_offset, int* out_code) {
-    (void)tex; (void)tex_len; (void)display;
-    if (out_offset) *out_offset = 0;
-    if (out_code) *out_code = 0;
-    return 0;
-}
-void platform_draw_math(const char* tex, int tex_len, int display, float font_px,
-                        float x, float y_top,
-                        unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    (void)x; (void)y_top; (void)r; (void)g; (void)b; (void)a;
-}
-void platform_math_atlas_stats(unsigned long long* hits, unsigned long long* misses) {
-    if (hits) *hits = 0;
-    if (misses) *misses = 0;
-}
-void platform_math_engine_info(unsigned int* version, unsigned int* use_ex,
-                               unsigned int* conform_ran, int* conform_n,
-                               unsigned int* caps) {
-    if (version) *version = 0;
-    if (use_ex) *use_ex = 0;
-    if (conform_ran) *conform_ran = 0;
-    if (conform_n) *conform_n = 0;
-    if (caps) *caps = 0;
-}
-void zatex_drop_math_rasters(void) {}
+#if READ_PLUGIN_STUB
+#include "win32_zatex_stub.c"
+#else
+#include "win32_zatex.c"
+#endif
 
 // ---------------------------------------------------------------------------
 // Glyph-cache counters (TEST_HOOKS reader; same gate pattern as macos.m).
@@ -2655,8 +2626,12 @@ void platform_run_loop(void) {
 // top-down framebuffer + render_fn + shared stored-deflate PNG writer.
 // PROBE x,y=r,g,b,a stderr lines; g_test_scale forces the 2x path.
 // ---------------------------------------------------------------------------
+// TEST_HOOKS headless scale (read-test only): extern linkage (not
+// static) so the math backend in win32_zatex.c (same TU via #include)
+// reads the same word for its atlas gate. Ship builds never define it
+// and the backend folds to the q == 1 path there.
 #ifdef TEST_HOOKS
-static float g_test_scale = 0.0f;
+float g_test_scale = 0.0f;
 void platform_set_test_scale(float s) {
     g_test_scale = s;
 #ifdef TEST_HOOKS
@@ -2816,12 +2791,41 @@ static size_t png_write_rgba(const unsigned char* px, int w, int h,
 static int write_file_bytes(const char* path, const unsigned char* data, size_t n) {
     char npath[2048];
     if (normalize_path(path, (int)strlen(path), npath, (int)sizeof(npath)) != 0) return -1;
+    // Drive-rooted "/tmp/..." probe paths (the form Zig tests use)
+    // target the process drive's root (D:\tmp on CI runners).
+    // normalize_path already folds '/' to '\', so match the folded
+    // single-backslash root — never UNC ("\\server"). The root may
+    // not exist on bare runners (no shell step can create it across
+    // the MSYS volume split), so create the leaf directory here:
+    // writer and reader still agree on one path, creation is loud on
+    // failure, and ship behavior is untouched (ship never writes).
+    if (npath[0] == '\\' && npath[1] != '\\' && npath[1] != '\0') {
+        char dir[2048];
+        const char *sep = strrchr(npath, '\\');
+        if (sep && sep != npath) {
+            size_t dn = (size_t)(sep - npath);
+            if (dn < sizeof(dir)) {
+                memcpy(dir, npath, dn);
+                dir[dn] = '\0';
+                WCHAR wd[2048];
+                int wn2 = utf8_to_wide(dir, (int)dn, wd, 2047);
+                if (wn2 > 0) {
+                    wd[wn2] = 0;
+                    if (GetFileAttributesW(wd) == INVALID_FILE_ATTRIBUTES)
+                        CreateDirectoryW(wd, NULL);
+                }
+            }
+        }
+    }
     WCHAR w[2048];
     int wn = utf8_to_wide(npath, (int)strlen(npath), w, 2047);
     if (wn <= 0) return -1;
     w[wn] = 0;
     HANDLE fh = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (fh == INVALID_HANDLE_VALUE) return -1;
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "read: headless PNG create failed err=%lu path=%s\n", (unsigned long)GetLastError(), npath);
+        return -1;
+    }
     DWORD wr = 0;
     BOOL ok = WriteFile(fh, data, (DWORD)n, &wr, NULL);
     CloseHandle(fh);
