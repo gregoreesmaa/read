@@ -3882,11 +3882,13 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
         char sidecar[160];
         // Full gesture tag (truncated ints, never rounded): identifies the
-        // failing gesture without parsing the log body.
+        // failing gesture without parsing the log body. Parenthesize the
+        // float*10 products: (int)x*10 would truncate x FIRST (8000 vs
+        // 8000.0*10=80000) — the s0 sidecar above proved the bug.
         snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_a%d_%d_%d_%d_b%d_%d_%d_%d.txt",
             (int)g_scroll_y,
-            (int)ax1*10, (int)ay1*10, (int)ax2*10, (int)ay2*10,
-            (int)bx1*10, (int)by1*10, (int)bx2*10, (int)by2*10);
+            (int)(ax1*10.0f), (int)(ay1*10.0f), (int)(ax2*10.0f), (int)(ay2*10.0f),
+            (int)(bx1*10.0f), (int)(by1*10.0f), (int)(bx2*10.0f), (int)(by2*10.0f));
         FILE* pf = fopen(sidecar, "w");
         if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
         fclose(lf);
