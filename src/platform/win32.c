@@ -508,8 +508,14 @@ static unsigned long long g_shape_hits = 0, g_shape_misses = 0, g_atlas_flushes 
 // Measure a UTF-8 run with the run font (caller selects font into dc_mem).
 // out_ascent returns the font's tmAscent alongside (NULL when unneeded):
 // the GetTextMetricsW is already paid here, so ascent-anchored placement
-// costs no extra GDI call.
-static float measure_run(HDC dc, const char* text, int len, float* out_h, float* out_ascent) {
+// costs no extra GDI call. is_heading applies the layout -0.015em tracking
+// (viewport.zig:455 heading_tracking_em) to the ambient measure so the
+// record slot matches layout; draw applies the same tracking with
+// SetTextCharacterExtra (both restored to 0 after). Mono skips tracking,
+// same as layout. Zero-alloc: DC state + arithmetic only.
+static float measure_run_ex(HDC dc, const char* text, int len, float font_size,
+                            int is_heading, int is_mono,
+                            float* out_h, float* out_ascent) {
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 768);
     if (wn <= 0) { if (out_h) *out_h = 0; if (out_ascent) *out_ascent = 0; return 0.0f; }
@@ -521,7 +527,23 @@ static float measure_run(HDC dc, const char* text, int len, float* out_h, float*
     if (out_ascent) *out_ascent = (float)tm.tmAscent;
     // Trailing-space inclusion (records count the layout advance): GDI
     // already includes trailing spaces in GetTextExtentPoint32W.
-    return (float)sz.cx;
+    float w = (float)sz.cx;
+    if (is_heading && !is_mono && font_size > 0.0f && wn > 1)
+        w += (float)(wn - 1) * font_size * -0.015f;
+    return w;
+}
+static float measure_run(HDC dc, const char* text, int len, float* out_h, float* out_ascent) {
+    return measure_run_ex(dc, text, len, 0.0f, 0, 0, out_h, out_ascent);
+}
+// Heading tracking in device px for a run at font_size: same -0.015em the
+// layout assumes (viewport.zig:455). SetTextCharacterExtra takes an int per
+// extra inter-char gap; GDI adds it (wn-1) times, matching measure above.
+// Mono skips, same as layout. Rounds half away from zero (H1 34px -> -1,
+// H4 18.7px -> 0, which matches GDI's integer granularity).
+static int heading_tracking_px(float font_size, int is_heading, int is_mono) {
+    if (!is_heading || is_mono || font_size <= 0.0f) return 0;
+    float t = font_size * -0.015f;
+    return (int)(t < 0.0f ? t - 0.5f : t + 0.5f);
 }
 // Exact x for a UTF-8 byte prefix: cumulative advances (ASCII fast path is
 // exact; CJK/combining fall back through the same API, never linear).
@@ -712,7 +734,7 @@ void platform_register_text_run(const char* text, int len, float x, float y, flo
     if (g_draw_dc) {
         HFONT f = font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, text, len);
         HFONT old = f ? (HFONT)SelectObject(g_draw_dc, f) : NULL;
-        if (f) { rw = measure_run(g_draw_dc, text, len, &rh, NULL); SelectObject(g_draw_dc, old); }
+        if (f) { rw = measure_run_ex(g_draw_dc, text, len, font_size, is_heading, is_mono, &rh, NULL); SelectObject(g_draw_dc, old); }
     }
     record_text_quad(text, len, x, y, rw, rh, font_size,
                      is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
@@ -731,7 +753,7 @@ static void draw_link_underline(float x, float y, float w, float font_size, int 
     if (w <= 0.0f || font_size <= 0.0f) return;
     float gap_from = link_underline_track(url, url_len, x, y, w, font_size, hovered);
     hovered = g_last_ul.hovered;
-    float uy = y + font_size * 0.85f + fmaxf(1.5f, font_size * 0.10f);
+    float uy = roundf(y + font_size * 0.85f + fmaxf(1.5f, font_size * 0.10f));
     float th = hovered ? 2.0f : 1.0f;
     if (gap_from >= 0.0f && gap_from < x) fill_rgba(gap_from, uy, x - gap_from, th, r, g, b, a);
     fill_rgba(x, uy, w, th, r, g, b, a);
@@ -747,7 +769,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     if (!f) return;
     HFONT old = (HFONT)SelectObject(g_draw_dc, f);
     float rh = font_size * 1.0f, run_ascent = 0.0f;
-    float rw = measure_run(g_draw_dc, text, len, &rh, &run_ascent);
+    float rw = measure_run_ex(g_draw_dc, text, len, font_size, is_heading, is_mono, &rh, &run_ascent);
     record_text_quad(text, len, x, y, rw, rh, font_size,
                      is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
     g_shape_misses++;
@@ -761,6 +783,16 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 767);
     if (wn > 0) {
+        // Clip ink to the measured run slot (issue #401: GDI's drawn ink on
+        // URL runs bleeds ~2-4px past the measured width into the trailing
+        // run's slot, and the underline sized from rw rides along). Clamp
+        // with ExtTextOutW's lprc (ETO_CLIPPED), sized from the re-measure.
+        // Bridge signature stays untouched (clip-only fallback): the
+        // underline keeps the rw width, but the ink bleed is gone. The
+        // clip rect is in doc px (same space as the run origin); only the
+        // TEST_HOOKS bilevel path draws in device px, so it scales the
+        // rect by tscale below while the ship path uses it as-is.
+        RECT clip = { (int)x, (int)y, (int)ceilf(x + rw), (int)(y + rh) };
         // Baseline-anchored placement (issue #401 threads 4176655377/
         // 4176657394): glyph true baselines land on the shared y+0.85em
         // line that the link-underline rule and the inline-code pill honor,
@@ -776,6 +808,10 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         int iy = (int)floorf(y + font_size * 0.85f + 0.5f);
         int prev_bk = SetBkMode(g_draw_dc, TRANSPARENT);
         COLORREF prev_c = SetTextColor(g_draw_dc, RGB(r, g, b));
+        // Heading tracking: layout assumes -0.015em (viewport.zig:455) but
+        // GDI draws zero tracking. Set the inter-char extra so drawn ink
+        // lands inside the layout slot; restored to 0 below. Zero-alloc.
+        int prev_extra = SetTextCharacterExtra(g_draw_dc, heading_tracking_px(font_size, is_heading, is_mono));
         int ix = (int)floorf(x + 0.5f);
         int iy0 = iy - pascent;
 #ifdef TEST_HOOKS
@@ -811,19 +847,23 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
                         bascent = (int)btm.tmAscent;
                     int dix = (int)floorf(x * tscale + 0.5f);
                     int diy = (int)floorf((y + font_size * 0.85f) * tscale + 0.5f);
-                    ExtTextOutW(g_draw_dc, dix, diy - bascent, 0, NULL, wtmp, wn, NULL);
+                    // Bilevel path draws in device px: scale the doc-px clip.
+                    RECT dclip = { (int)(clip.left * tscale), (int)(clip.top * tscale),
+                                   (int)ceilf(clip.right * tscale), (int)(clip.bottom * tscale) };
+                    ExtTextOutW(g_draw_dc, dix, diy - bascent, ETO_CLIPPED, &dclip, wtmp, wn, NULL);
                     SelectObject(g_draw_dc, bo);
                     DeleteObject(bf);
                 }
             }
         } else {
-            ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+            ExtTextOutW(g_draw_dc, ix, iy0, ETO_CLIPPED, &clip, wtmp, wn, NULL);
         }
 #else
-        ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+        ExtTextOutW(g_draw_dc, ix, iy0, ETO_CLIPPED, &clip, wtmp, wn, NULL);
 #endif
         SetBkMode(g_draw_dc, prev_bk);
         SetTextColor(g_draw_dc, prev_c);
+        SetTextCharacterExtra(g_draw_dc, prev_extra);
     }
     SelectObject(g_draw_dc, old);
     if (link_url && link_url_len > 0) {
