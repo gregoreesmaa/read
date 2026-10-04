@@ -314,7 +314,10 @@ static uint16_t zatex_glyph_id(const void *ctx, uint16_t font, uint32_t cp) {
 }
 
 // Advance in thousandths of an em (engine unit), at the 100px face:
-// integer ABC widths in px at 100px read directly as thousandths.
+// integer ABC widths in px at 100px scale to thousandths × 10
+// (1px at a 100px em = 10/1000em, exact — integer math needs no
+// rounding, satisfying the trunc-zero hook contract by construction,
+// same ×10 as macos_zatex.m's adv.width / 100 * 1000).
 // NOTE: GetCharABCWidthsFloatW takes *code points*, not glyph ids —
 // passing a glyph id silently measures U+03C3-class codepoints instead
 // (issue #399 review: GDI widths ~20% off, layout AND draw shifted since
@@ -336,10 +339,12 @@ static int32_t zatex_advance(const void *ctx, uint16_t font, uint16_t glyph) {
     if (GetCharABCWidthsI(dc, 0, 1, &gi, &abc)) {
         int adv = abc.abcA + abc.abcB + abc.abcC;
         // Zero-width glyphs (combining accents) report 0 like the file.
-        units = adv < 0 ? 500 : adv;
+        // Trunc-zero per contract: adv >= 0 here (negatives fall back),
+        // so ×10 never rounds away from zero.
+        units = adv < 0 ? 500 : adv * 10;
     } else {
         INT w = 0;
-        if (GetCharWidthI(dc, 0, 1, &gi, &w) && w >= 0) units = w;
+        if (GetCharWidthI(dc, 0, 1, &gi, &w) && w >= 0) units = w * 10;
     }
     SelectObject(dc, old);
     return units;
@@ -669,6 +674,12 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
         {
             double bx = (double)rn->x * s2 - ix;
             double by = ((double)rn->baseline_y * s2 - iy);
+            // Same baseline anchor as the direct path below: the fresh
+            // snapshot DC also defaults to TA_TOP|TA_LEFT, so the run
+            // baseline must shift up by the run font's own tmAscent to
+            // read as the cell top.
+            TEXTMETRICW rtm;
+            if (GetTextMetricsW(snap, &rtm) && rtm.tmAscent > 0) by -= (double)rtm.tmAscent;
             int n = (int)rn->glyph_count;
             static WCHAR gbuf[4096];
             for (int k = 0; k < n; k++) gbuf[k] = (WCHAR)zatex_glyphs[rn->glyph_start + k];
@@ -807,9 +818,24 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
                                  (unsigned char)((c >> 8) & 255)));
         }
         HFONT old = (HFONT)SelectObject(dc, f);
+        // Baseline-anchored placement (same contract as platform_draw_text
+        // in win32.c:775-780): GDI defaults to TA_TOP|TA_LEFT (no
+        // SetTextAlign anywhere in src/platform/*.c), so oy reads as the
+        // cell top while rn->baseline_y is the glyph baseline — passing
+        // the baseline through as the top hung every run ~one ascent too
+        // low. The run baseline quantizes to integer device px and the
+        // cell top derives from the run font's own tmAscent (already
+        // selected, one paid query per run; formulas hold few runs).
+        // Inline math needs no extra offset: the caller derives y_top =
+        // baseline - above with the baseline on the shared y + 0.85em
+        // line text sits on (viewport.zig flowMathSpan), so glyph true
+        // baselines land on the text baseline exactly like body runs.
+        TEXTMETRICW rtm;
+        int rascent = 0;
+        if (GetTextMetricsW(dc, &rtm) && rtm.tmAscent > 0) rascent = (int)rtm.tmAscent;
         // View coords are non-negative in the visible band GDI clips to.
         int ox = (int)((double)x + (double)rn->x * s + 0.5);
-        int oy = (int)((double)y_top + (double)rn->baseline_y * s + 0.5);
+        int oy = (int)((double)y_top + (double)rn->baseline_y * s + 0.5) - rascent;
         double xs = (double)zatex_xscale[i] / 1000.0;
         if (xs != 1.0) {
             // Stretched runs (issue #354): scale x about the run origin
