@@ -3876,8 +3876,11 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // failing gesture's trace is isolated from the passing ones.
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
         char sidecar[128];
-        int tag2 = (int)(fabsf(ax2)*10.0f + 0.5f);
-        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_a%d.txt", (int)g_scroll_y, tag2);
+        // Full gesture tag: scroll + both A endpoints (truncated, never
+        // rounded, so x.04/x.05 pairs stay distinct). Failing gestures:
+        // s395_ax805_ay891_ax841_ay595 / s357_... / s421_....
+        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_ax%d_ay%d_bx%d_by%d.txt",
+            (int)g_scroll_y, (int)fabsf(ax1)*10, (int)fabsf(ay1)*10, (int)fabsf(ax2)*10, (int)fabsf(ay2)*10);
         FILE* pf = fopen(sidecar, "w");
         if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
         fclose(lf);
