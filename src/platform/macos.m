@@ -3883,7 +3883,10 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // Exfiltrate the decision trace: copy the accumulated log into
     // screenshots/ (uploaded always()) as a per-gesture file, so the
     // failing gesture's trace is isolated from the passing ones.
-    { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
+    // Hard gate: only gestures whose scroll band is 300-500 (the three
+    // failing scrolls 395/357/421) write sidecars — the sweep's passing
+    // gestures would otherwise evict them through the 16 MiB artifact cap.
+    { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf && g_scroll_y > 300.0f && g_scroll_y < 500.0f) {
         char sidecar[160];
         // Full gesture tag (truncated ints, never rounded): identifies the
         // failing gesture without parsing the log body. Parenthesize the
