@@ -398,7 +398,7 @@ static const WCHAR* face_for_style(int is_bold, int is_italic, int is_mono, int 
         if (is_bold) return L"JetBrains Mono";
         return L"JetBrains Mono";
     }
-    if (is_heading) return L"Space Grotesk";
+    if (is_heading) return L"Space Grotesk Light";
     if (is_bold && is_italic) return L"IBM Plex Serif";
     if (is_bold) return L"IBM Plex Serif";
     if (is_italic) return L"IBM Plex Serif";
@@ -414,18 +414,67 @@ static const WCHAR* face_fallback(int is_mono, int is_heading) {
     if (is_heading) return L"Segoe UI";
     return L"Georgia";
 }
-// Realize (and cache) an HFONT for this run. v1: one-entry cache — the
+// Bidi run scan (issue #50 follow-up): 1 when the UTF-8 run holds any
+// Hebrew/Arabic-script codepoint the bundled faces cannot cover (their
+// cmaps carry zero Hebrew/Arabic glyphs — verified per-file), else 0.
+// Pure byte walk, no DC, no allocation; hot path stays zero-alloc.
+static int run_needs_bidi_face(const char* text, int len) {
+    if (!text || len <= 0) return 0;
+    int i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)text[i];
+        if (c < 0x80) { i++; continue; }
+        unsigned cp = 0xFFFD;
+        int adv = 1;
+        if ((c & 0xE0) == 0xC0 && i + 1 < len) {
+            cp = ((unsigned)(c & 0x1F) << 6) | (text[i + 1] & 0x3F);
+            adv = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
+            cp = ((unsigned)(c & 0x0F) << 12) |
+                ((unsigned)(text[i + 1] & 0x3F) << 6) | (text[i + 2] & 0x3F);
+            adv = 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
+            cp = ((unsigned)(c & 0x07) << 18) |
+                ((unsigned)(text[i + 1] & 0x3F) << 12) |
+                ((unsigned)(text[i + 2] & 0x3F) << 6) | (text[i + 3] & 0x3F);
+            adv = 4;
+        }
+        // Hebrew + Arabic-family scripts, incl. presentation forms —
+        // the same RTL ranges src/core/bidi.zig detects (minus the
+        // weak Arabic-Indic digit carve-outs, which alone still need
+        // the covering face to avoid .notdef).
+        if ((cp >= 0x0590 && cp <= 0x08FF) ||
+            (cp >= 0xFB1D && cp <= 0xFDFD) ||
+            (cp >= 0xFE70 && cp <= 0xFEFF)) return 1;
+        i += adv;
+    }
+    return 0;
+}
+// Bidi covering faces: run-shaped typography (Times New Roman body,
+// Courier New mono — both carry full Hebrew + Arabic per the
+// GetGlyphIndicesW probe; headings stay Segoe UI, which covers too).
+static const WCHAR* face_bidi(int is_mono) {
+    return is_mono ? L"Courier New" : L"Times New Roman";
+}
+// Realize (and cache) an HFONT for this run. One-entry cache — the
 // reader draws long runs of identical style, so hit rate is high; misses
-// just recreate (no leak: the old font is deleted).
-static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
+// just recreate (no leak: the old font is deleted). The bidi bit joins the
+// key: Hebrew/Arabic runs select a covering face (the bundled faces carry
+// zero Hebrew/Arabic glyphs, and GDI linking otherwise substitutes an
+// environment-dependent Arial — issue #50 follow-up). NOTE: Zig-side
+// layout (measureTextEx) still uses the Plex-fallback width for these
+// runs (the #50 known limit), so this only changes glyphs, not geometry.
+static HFONT font_for_run_ex(float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
+                             const char* text, int len) {
     register_app_fonts();
-    static float c_size = -1; static int c_b = -1, c_i = -1, c_m = -1, c_h = -1;
+    int bidi = run_needs_bidi_face(text, len);
+    static float c_size = -1; static int c_b = -1, c_i = -1, c_m = -1, c_h = -1, c_d = -1;
     if (g_font_cache && c_size == font_size && c_b == is_bold && c_i == is_italic &&
-        c_m == is_mono && c_h == is_heading) return g_font_cache;
+        c_m == is_mono && c_h == is_heading && c_d == bidi) return g_font_cache;
     if (g_font_cache) { DeleteObject(g_font_cache); g_font_cache = NULL; }
     int px = (int)(font_size + 0.5f);
     if (px < 1) px = 1;
-    const WCHAR* faces[2] = { face_for_style(is_bold, is_italic, is_mono, is_heading),
+    const WCHAR* faces[2] = { bidi ? face_bidi(is_mono) : face_for_style(is_bold, is_italic, is_mono, is_heading),
                               face_fallback(is_mono, is_heading) };
     for (int k = 0; k < 2; k++) {
         g_font_cache = CreateFontW(-px, 0, 0, 0, face_weight(is_bold, is_heading),
@@ -434,8 +483,11 @@ static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mo
             DEFAULT_PITCH | FF_DONTCARE, faces[k]);
         if (g_font_cache) break;
     }
-    c_size = font_size; c_b = is_bold; c_i = is_italic; c_m = is_mono; c_h = is_heading;
+    c_size = font_size; c_b = is_bold; c_i = is_italic; c_m = is_mono; c_h = is_heading; c_d = bidi;
     return g_font_cache;
+}
+static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
+    return font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, NULL, 0);
 }
 #ifdef TEST_HOOKS
 // Forced-scale headless text uses bi-level (non-antialiased) glyphs: the
@@ -443,6 +495,10 @@ static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mo
 // is what the crisp/math acutance probes pin. Window + 1x headless text
 // stays antialiased.
 static int g_force_bilevel = 0;
+// Forced headless scale (defined with the TEST_HOOKS engine below;
+// extern here so platform_draw_text above can read the same word,
+// mirroring win32_zatex.c).
+extern float g_test_scale;
 #endif
 
 // Glyph-economy counters (TEST_HOOKS reader; ship never links the reader
@@ -450,24 +506,50 @@ static int g_force_bilevel = 0;
 static unsigned long long g_shape_hits = 0, g_shape_misses = 0, g_atlas_flushes = 0;
 
 // Measure a UTF-8 run with the run font (caller selects font into dc_mem).
-static float measure_run(HDC dc, const char* text, int len, float* out_h) {
+// out_ascent returns the font's tmAscent alongside (NULL when unneeded):
+// the GetTextMetricsW is already paid here, so ascent-anchored placement
+// costs no extra GDI call. is_heading applies the layout -0.015em tracking
+// (viewport.zig:455 heading_tracking_em) to the ambient measure so the
+// record slot matches layout; draw applies the same tracking with
+// SetTextCharacterExtra (both restored to 0 after). Mono skips tracking,
+// same as layout. Zero-alloc: DC state + arithmetic only.
+static float measure_run_ex(HDC dc, const char* text, int len, float font_size,
+                            int is_heading, int is_mono,
+                            float* out_h, float* out_ascent) {
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 768);
-    if (wn <= 0) { if (out_h) *out_h = 0; return 0.0f; }
+    if (wn <= 0) { if (out_h) *out_h = 0; if (out_ascent) *out_ascent = 0; return 0.0f; }
     SIZE sz;
-    if (!GetTextExtentPoint32W(dc, wtmp, wn, &sz)) { if (out_h) *out_h = 0; return 0.0f; }
+    if (!GetTextExtentPoint32W(dc, wtmp, wn, &sz)) { if (out_h) *out_h = 0; if (out_ascent) *out_ascent = 0; return 0.0f; }
     TEXTMETRICW tm;
     GetTextMetricsW(dc, &tm);
     if (out_h) *out_h = (float)(tm.tmAscent + tm.tmDescent);
+    if (out_ascent) *out_ascent = (float)tm.tmAscent;
     // Trailing-space inclusion (records count the layout advance): GDI
     // already includes trailing spaces in GetTextExtentPoint32W.
-    return (float)sz.cx;
+    float w = (float)sz.cx;
+    if (is_heading && !is_mono && font_size > 0.0f && wn > 1)
+        w += (float)(wn - 1) * font_size * -0.015f;
+    return w;
+}
+static float measure_run(HDC dc, const char* text, int len, float* out_h, float* out_ascent) {
+    return measure_run_ex(dc, text, len, 0.0f, 0, 0, out_h, out_ascent);
+}
+// Heading tracking in device px for a run at font_size: same -0.015em the
+// layout assumes (viewport.zig:455). SetTextCharacterExtra takes an int per
+// extra inter-char gap; GDI adds it (wn-1) times, matching measure above.
+// Mono skips, same as layout. Rounds half away from zero (H1 34px -> -1,
+// H4 18.7px -> 0, which matches GDI's integer granularity).
+static int heading_tracking_px(float font_size, int is_heading, int is_mono) {
+    if (!is_heading || is_mono || font_size <= 0.0f) return 0;
+    float t = font_size * -0.015f;
+    return (int)(t < 0.0f ? t - 0.5f : t + 0.5f);
 }
 // Exact x for a UTF-8 byte prefix: cumulative advances (ASCII fast path is
 // exact; CJK/combining fall back through the same API, never linear).
 static float x_for_byte_prefix(HDC dc, const char* text, int len, int bidx) {
     if (bidx <= 0) return 0.0f;
-    if (bidx >= len) return measure_run(dc, text, len, NULL);
+    if (bidx >= len) return measure_run(dc, text, len, NULL, NULL);
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 768);
     if (wn <= 0) return 0.0f;
@@ -510,7 +592,8 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     if (x_offset >= rec->w) return rec->len;
     HDC dc = g_draw_dc ? g_draw_dc : (g_memdc ? g_memdc : GetDC(NULL));
     int need_release = (!g_draw_dc && !g_memdc);
-    HFONT f = font_for_run(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
+    HFONT f = font_for_run_ex(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading,
+                              rec->text, rec->len);
     HFONT old = NULL;
     if (f) old = (HFONT)SelectObject(dc, f);
     int r = byte_index_at_x(dc, rec->text, rec->len, rec->w, x_offset);
@@ -523,7 +606,8 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     if (char_idx >= rec->len) return rec->w;
     HDC dc = g_draw_dc ? g_draw_dc : (g_memdc ? g_memdc : GetDC(NULL));
     int need_release = (!g_draw_dc && !g_memdc);
-    HFONT f = font_for_run(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
+    HFONT f = font_for_run_ex(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading,
+                              rec->text, rec->len);
     HFONT old = NULL;
     if (f) old = (HFONT)SelectObject(dc, f);
     // char_idx here is a UTF-16 index on macOS; our callers convert via
@@ -648,9 +732,9 @@ void platform_register_text_run(const char* text, int len, float x, float y, flo
     if (!text || len <= 0) return;
     float rw = w, rh = h;
     if (g_draw_dc) {
-        HFONT f = font_for_run(font_size, is_bold, is_italic, is_mono, is_heading);
+        HFONT f = font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, text, len);
         HFONT old = f ? (HFONT)SelectObject(g_draw_dc, f) : NULL;
-        if (f) { rw = measure_run(g_draw_dc, text, len, &rh); SelectObject(g_draw_dc, old); }
+        if (f) { rw = measure_run_ex(g_draw_dc, text, len, font_size, is_heading, is_mono, &rh, NULL); SelectObject(g_draw_dc, old); }
     }
     record_text_quad(text, len, x, y, rw, rh, font_size,
                      is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
@@ -669,7 +753,7 @@ static void draw_link_underline(float x, float y, float w, float font_size, int 
     if (w <= 0.0f || font_size <= 0.0f) return;
     float gap_from = link_underline_track(url, url_len, x, y, w, font_size, hovered);
     hovered = g_last_ul.hovered;
-    float uy = y + font_size * 0.85f + fmaxf(1.5f, font_size * 0.10f);
+    float uy = roundf(y + font_size * 0.85f + fmaxf(1.5f, font_size * 0.10f));
     float th = hovered ? 2.0f : 1.0f;
     if (gap_from >= 0.0f && gap_from < x) fill_rgba(gap_from, uy, x - gap_from, th, r, g, b, a);
     fill_rgba(x, uy, w, th, r, g, b, a);
@@ -681,11 +765,11 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
                         const char* link_url, int link_url_len) {
     if (!g_draw_dc || len <= 0 || !text) return;
     if (!link_url || link_url_len <= 0) g_last_ul.valid = 0;
-    HFONT f = font_for_run(font_size, is_bold, is_italic, is_mono, is_heading);
+    HFONT f = font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, text, len);
     if (!f) return;
     HFONT old = (HFONT)SelectObject(g_draw_dc, f);
-    float rh = font_size * 1.0f;
-    float rw = measure_run(g_draw_dc, text, len, &rh);
+    float rh = font_size * 1.0f, run_ascent = 0.0f;
+    float rw = measure_run_ex(g_draw_dc, text, len, font_size, is_heading, is_mono, &rh, &run_ascent);
     record_text_quad(text, len, x, y, rw, rh, font_size,
                      is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
     g_shape_misses++;
@@ -699,38 +783,101 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     WCHAR wtmp[768];
     int wn = utf8_to_wide(text, len, wtmp, 767);
     if (wn > 0) {
-        float ascent = font_size * 0.85f;
-        int iy = (int)floorf(y + ascent + 0.5f);
+        // Clip ink to the measured run slot (issue #401: GDI's drawn ink on
+        // URL runs bleeds ~2-4px past the measured width into the trailing
+        // run's slot, and the underline sized from rw rides along). Clamp
+        // with ExtTextOutW's lprc (ETO_CLIPPED), sized from the re-measure.
+        // Bridge signature stays untouched (clip-only fallback): the
+        // underline keeps the rw width, but the ink bleed is gone. The
+        // clip rect is in doc px (same space as the run origin); only the
+        // TEST_HOOKS bilevel path draws in device px, so it scales the
+        // rect by tscale below while the ship path uses it as-is.
+        RECT clip = { (int)x, (int)y, (int)ceilf(x + rw), (int)(y + rh) };
+        // Baseline-anchored placement (issue #401 threads 4176655377/
+        // 4176657394): glyph true baselines land on the shared y+0.85em
+        // line that the link-underline rule and the inline-code pill honor,
+        // within 0.5px at 1x ship. Real GDI TEXTMETRIC ascents run larger
+        // than 0.85em (Plex Serif 17px: tmAscent=20), so a cell sized
+        // round(size) from a round(y+size*0.85) baseline hung every run
+        // ~2-3px low. The baseline itself quantizes to integer device px
+        // (at most half a device px of drift); the cell top derives from
+        // the run font's own ascent, already measured once on the selected
+        // font alongside the run measure above (zero extra GDI calls). Same
+        // anchor contract as macos.m's dest_y (y + size*0.85 - ascent).
+        int pascent = run_ascent > 0.0f ? (int)(run_ascent + 0.5f) : (int)(font_size + 0.5f);
+        int iy = (int)floorf(y + font_size * 0.85f + 0.5f);
         int prev_bk = SetBkMode(g_draw_dc, TRANSPARENT);
         COLORREF prev_c = SetTextColor(g_draw_dc, RGB(r, g, b));
+        // Heading tracking: layout assumes -0.015em (viewport.zig:455) but
+        // GDI draws zero tracking. Set the inter-char extra so drawn ink
+        // lands inside the layout slot; restored to 0 below. Zero-alloc.
+        int prev_extra = SetTextCharacterExtra(g_draw_dc, heading_tracking_px(font_size, is_heading, is_mono));
         int ix = (int)floorf(x + 0.5f);
-        int iy0 = iy - (int)(font_size + 0.5f);
+        int iy0 = iy - pascent;
 #ifdef TEST_HOOKS
         if (q_bilevel) {
             // Bi-level text ignores alpha blends: draw solid only when
-            // fully opaque (all crisp-test runs are).
+            // fully opaque (all crisp-test runs are). The bidi covering
+            // face joins so RTL runs stay glyph-complete at 2x too.
             if (a == 255) {
-                HFONT bf = CreateFontW(-(int)(font_size + 0.5f), 0, 0, 0,
+                int bidi = run_needs_bidi_face(text, len);
+                // Under forced scale the headless DIB is device px, not
+                // doc px: draw with a true 2x font at doubled device
+                // coords so the 2x->1x box downsample keeps razor edges.
+                // Measured 2x bilevel ascents (Georgia-34: 32, Consolas-30:
+                // 28, Segoe-58: 62) are all even, so the doubled baseline
+                // keeps even parity with the status-quo origins the crisp
+                // acutance probe pins (odd cell-top shifts split edges
+                // across downsample pairs and read as blur).
+                float tscale = g_test_scale > 0.0f ? g_test_scale : 1.0f;
+                int dpx = (int)(font_size * tscale + 0.5f);
+                if (dpx < 1) dpx = 1;
+                HFONT bf = CreateFontW(-dpx, 0, 0, 0,
                     face_weight(is_bold, is_heading), is_italic ? TRUE : FALSE,
                     FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
                     DEFAULT_PITCH | FF_DONTCARE,
-                    is_mono ? L"Consolas" : (is_heading ? L"Segoe UI" : L"Georgia"));
+                    bidi ? face_bidi(is_mono) :
+                    (is_mono ? L"Consolas" : (is_heading ? L"Segoe UI" : L"Georgia")));
                 if (bf) {
                     HFONT bo = (HFONT)SelectObject(g_draw_dc, bf);
-                    ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+                    TEXTMETRICW btm;
+                    int bascent = dpx;
+                    if (GetTextMetricsW(g_draw_dc, &btm) && btm.tmAscent > 0)
+                        bascent = (int)btm.tmAscent;
+                    int dix = (int)floorf(x * tscale + 0.5f);
+                    int diy = (int)floorf((y + font_size * 0.85f) * tscale + 0.5f);
+                    // Bilevel path draws in device px: scale the doc-px clip.
+                    RECT dclip = { (int)(clip.left * tscale), (int)(clip.top * tscale),
+                                   (int)ceilf(clip.right * tscale), (int)(clip.bottom * tscale) };
+                    ExtTextOutW(g_draw_dc, dix, diy - bascent, ETO_CLIPPED, &dclip, wtmp, wn, NULL);
                     SelectObject(g_draw_dc, bo);
                     DeleteObject(bf);
                 }
             }
         } else {
-            ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+            ExtTextOutW(g_draw_dc, ix, iy0, ETO_CLIPPED, &clip, wtmp, wn, NULL);
+            // Fallback synthetic bold for headings (issue #401 fixC): the
+            // bundled SpaceGrotesk.ttf is a variable font whose Light-300
+            // master GDI rasterizes when FW_BOLD selects the family (GDI has
+            // no variation API), so headings render ~35% thin. Until a
+            // static wght=700 instance ships, overstrike the run at +1px x:
+            // one extra GDI call per heading run only, stroke-only (kerning
+            // stays Light-wide by design — see face_for_style). Clipped to
+            // the same layout slot: the rightmost +1px column is cut at the
+            // slot edge, every interior stem still thickens.
+            if (is_heading) ExtTextOutW(g_draw_dc, ix + 1, iy0, ETO_CLIPPED, &clip, wtmp, wn, NULL);
         }
 #else
-        ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+        ExtTextOutW(g_draw_dc, ix, iy0, ETO_CLIPPED, &clip, wtmp, wn, NULL);
+        // Same fallback overstrike as above (ship path): gated on
+        // is_heading, so the hot path pays one extra GDI call per heading
+        // run only; body/mono runs are untouched.
+        if (is_heading) ExtTextOutW(g_draw_dc, ix + 1, iy0, ETO_CLIPPED, &clip, wtmp, wn, NULL);
 #endif
         SetBkMode(g_draw_dc, prev_bk);
         SetTextColor(g_draw_dc, prev_c);
+        SetTextCharacterExtra(g_draw_dc, prev_extra);
     }
     SelectObject(g_draw_dc, old);
     if (link_url && link_url_len > 0) {
@@ -1477,44 +1624,15 @@ void platform_draw_image(const char* url, int url_len, float x, float y, float w
 }
 
 // ---------------------------------------------------------------------------
-// Math stubs (no engine on Windows v1): size 1 (unavailable → literal
-// fallback), error probe 0, draw no-op, atlas stats zero, engine info zero.
+// ZaTeX runtime math backend (LaTeX math plugin) lives in win32_zatex.c
+// (GDI metrics + direct draw); READ_PLUGIN_STUB=1 includes the empty
+// stub instead — same TU, same flags (AGENTS.md §7, macos.m precedent).
 // ---------------------------------------------------------------------------
-int platform_math_size(const char* tex, int tex_len, int display, float font_px,
-                       float* out_w, float* out_above, float* out_below) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    if (out_w) *out_w = 0;
-    if (out_above) *out_above = 0;
-    if (out_below) *out_below = 0;
-    return 1;
-}
-int platform_math_last_error(const char* tex, int tex_len, int display,
-                             unsigned int* out_offset, int* out_code) {
-    (void)tex; (void)tex_len; (void)display;
-    if (out_offset) *out_offset = 0;
-    if (out_code) *out_code = 0;
-    return 0;
-}
-void platform_draw_math(const char* tex, int tex_len, int display, float font_px,
-                        float x, float y_top,
-                        unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    (void)x; (void)y_top; (void)r; (void)g; (void)b; (void)a;
-}
-void platform_math_atlas_stats(unsigned long long* hits, unsigned long long* misses) {
-    if (hits) *hits = 0;
-    if (misses) *misses = 0;
-}
-void platform_math_engine_info(unsigned int* version, unsigned int* use_ex,
-                               unsigned int* conform_ran, int* conform_n,
-                               unsigned int* caps) {
-    if (version) *version = 0;
-    if (use_ex) *use_ex = 0;
-    if (conform_ran) *conform_ran = 0;
-    if (conform_n) *conform_n = 0;
-    if (caps) *caps = 0;
-}
-void zatex_drop_math_rasters(void) {}
+#if READ_PLUGIN_STUB
+#include "win32_zatex_stub.c"
+#else
+#include "win32_zatex.c"
+#endif
 
 // ---------------------------------------------------------------------------
 // Glyph-cache counters (TEST_HOOKS reader; same gate pattern as macos.m).
@@ -1757,6 +1875,14 @@ int platform_test_outline_build(void) {
     int rows = g_outline_row_count;
     g_outline_count = 0;
     return rows == 2 ? 1 : 0;
+}
+// RTL run-face contract probe (issue #50 follow-up): 0 when the primary
+// face covers the run, 1/2 when the bidi serif/mono face is needed.
+// Same scan as font_for_run's selector below; headless-safe (pure bytes).
+int platform_test_bidi_face(const char* text, int text_len, int is_mono, int is_heading) {
+    (void)is_heading;
+    if (!run_needs_bidi_face(text, text_len)) return 0;
+    return is_mono ? 2 : 1;
 }
 #endif
 
@@ -2655,8 +2781,12 @@ void platform_run_loop(void) {
 // top-down framebuffer + render_fn + shared stored-deflate PNG writer.
 // PROBE x,y=r,g,b,a stderr lines; g_test_scale forces the 2x path.
 // ---------------------------------------------------------------------------
+// TEST_HOOKS headless scale (read-test only): extern linkage (not
+// static) so the math backend in win32_zatex.c (same TU via #include)
+// reads the same word for its atlas gate. Ship builds never define it
+// and the backend folds to the q == 1 path there.
 #ifdef TEST_HOOKS
-static float g_test_scale = 0.0f;
+float g_test_scale = 0.0f;
 void platform_set_test_scale(float s) {
     g_test_scale = s;
 #ifdef TEST_HOOKS
@@ -2816,12 +2946,41 @@ static size_t png_write_rgba(const unsigned char* px, int w, int h,
 static int write_file_bytes(const char* path, const unsigned char* data, size_t n) {
     char npath[2048];
     if (normalize_path(path, (int)strlen(path), npath, (int)sizeof(npath)) != 0) return -1;
+    // Drive-rooted "/tmp/..." probe paths (the form Zig tests use)
+    // target the process drive's root (D:\tmp on CI runners).
+    // normalize_path already folds '/' to '\', so match the folded
+    // single-backslash root — never UNC ("\\server"). The root may
+    // not exist on bare runners (no shell step can create it across
+    // the MSYS volume split), so create the leaf directory here:
+    // writer and reader still agree on one path, creation is loud on
+    // failure, and ship behavior is untouched (ship never writes).
+    if (npath[0] == '\\' && npath[1] != '\\' && npath[1] != '\0') {
+        char dir[2048];
+        const char *sep = strrchr(npath, '\\');
+        if (sep && sep != npath) {
+            size_t dn = (size_t)(sep - npath);
+            if (dn < sizeof(dir)) {
+                memcpy(dir, npath, dn);
+                dir[dn] = '\0';
+                WCHAR wd[2048];
+                int wn2 = utf8_to_wide(dir, (int)dn, wd, 2047);
+                if (wn2 > 0) {
+                    wd[wn2] = 0;
+                    if (GetFileAttributesW(wd) == INVALID_FILE_ATTRIBUTES)
+                        CreateDirectoryW(wd, NULL);
+                }
+            }
+        }
+    }
     WCHAR w[2048];
     int wn = utf8_to_wide(npath, (int)strlen(npath), w, 2047);
     if (wn <= 0) return -1;
     w[wn] = 0;
     HANDLE fh = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (fh == INVALID_HANDLE_VALUE) return -1;
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "read: headless PNG create failed err=%lu path=%s\n", (unsigned long)GetLastError(), npath);
+        return -1;
+    }
     DWORD wr = 0;
     BOOL ok = WriteFile(fh, data, (DWORD)n, &wr, NULL);
     CloseHandle(fh);

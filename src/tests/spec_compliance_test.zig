@@ -2242,6 +2242,40 @@ test "spec compliance: triple emphasis nests bold inside italic" {
     try std.testing.expect(hasEmRun(cmds[0..m], "under", true, true));
 }
 
+test "regression: heading interior multi-space preserved (PR 401)" {
+    // Title whitespace: multi-space gaps inside a heading reach the
+    // flowSpans/flowWord path intact (no collapse), so the wide inter-word
+    // step survives in geometry. Platform-independent: asserts on command
+    // rects only, never on pixels.
+    const doc = "# A  B\n";
+    var lines: [8]simd.Line = undefined;
+    const n = scanDoc(doc, &lines);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    var cmds: [64]layout.DrawCommand = undefined;
+    var st = FullStore{};
+    const m = renderFull(doc, lines[0..n], n, &cmds, &st);
+    var ax: ?f32 = null;
+    var bx: ?f32 = null;
+    var aw: ?f32 = null;
+    for (cmds[0..m]) |c| {
+        if (c.kind != .text_run) continue;
+        if (std.mem.eql(u8, c.text, "A")) {
+            ax = c.rect.x;
+            aw = c.rect.w;
+        }
+        if (std.mem.eql(u8, c.text, "B")) bx = c.rect.x;
+    }
+    try std.testing.expect(ax != null and bx != null and aw != null);
+    const font_size = testCfg().base_font_size * layout.headingScale(1);
+    const one_space = layout.measureCharEx(' ', font_size, false, false, false, true);
+    // Two interior spaces land between the runs: B starts a full space
+    // past where a single-space gap would put it, and the measured gap
+    // (two spaces) matches bit-for-bit.
+    try std.testing.expectApproxEqAbs(ax.? + aw.? + 2.0 * one_space, bx.?, 0.01);
+    const collapsed = ax.? + aw.? + one_space;
+    try std.testing.expect(bx.? - collapsed > 0.5 * one_space);
+}
+
 test "spec compliance: unmatched emphasis delimiters stay literal" {
     const doc = "A *a plus **b plus _c stays.";
     var lines: [8]simd.Line = undefined;

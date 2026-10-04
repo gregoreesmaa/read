@@ -47,6 +47,13 @@ pub extern "c" fn platform_outline_add(level: c_int, y: f32, text: [*]const u8, 
 pub extern "c" fn platform_outline_show() void;
 pub extern "c" fn platform_test_outline_filter(text: [*]const u8, text_len: c_int, filter: [*]const u8, filter_len: c_int) c_int;
 pub extern "c" fn platform_test_outline_build() c_int;
+/// RTL run-face contract (issue #50 follow-up, Windows): which fallback
+/// face the backend would select for a run of this text under this style.
+/// 0 = primary face covers the run (no bidi substitution); 1 = the bidi
+/// serif face (body/headings); 2 = the bidi mono face. Other backends
+/// answer 0 (CoreText cascades, Linux falls back per glyph). Headless-safe:
+/// pure UTF-8 scan, no window needed. Test-hooks builds only.
+pub extern "c" fn platform_test_bidi_face(text: [*]const u8, text_len: c_int, is_mono: c_int, is_heading: c_int) c_int;
 
 /// Current rubber-band overshoot in points (positive = content shifted
 /// down). Synced every draw; the platform translates the frame by it.

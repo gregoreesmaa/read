@@ -33,6 +33,7 @@
 #include <math.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_MULTIPLE_MASTERS_H
 #include <fontconfig/fontconfig.h>
 #include <png.h>
 
@@ -63,8 +64,10 @@ static Display* g_dpy = NULL;
 static Window g_win = 0;
 static GC g_gc = 0;
 static XImage* g_canvas = NULL; // 32-bit ZPixmap backing store, y-down
-static unsigned char* g_canvas_px = NULL;
-static int g_win_w = 1000, g_win_h = 750;
+// Canvas words are extern (not static): the math backend in
+// linux_zatex.c (same TU via #include) reads them for its atlas blit.
+unsigned char* g_canvas_px = NULL;
+int g_win_w = 1000, g_win_h = 750;
 static int g_depth = 24;
 static float g_scroll_y = 0.0f;
 static float g_overshoot = 0.0f;
@@ -349,7 +352,38 @@ static void register_app_fonts(void) {
         FT_New_Face(g_ft, p, 0, &g_face_italic);
     }
     p = font_asset_path("SpaceGrotesk.ttf");
-    if (p) FT_New_Face(g_ft, p, 0, &g_face_head);
+    if (p && FT_New_Face(g_ft, p, 0, &g_face_head) == 0) {
+        // SpaceGrotesk.ttf is variable (wght 300-700, default 300); headings
+        // force bold so pin wght to 700. Cold path; a failed pin keeps the
+        // default but stays visible (issue #401 fixC: assert the return —
+        // previously only the axis count was guarded and the Set call's
+        // result was ignored, so a silent no-pin read as "thin headings").
+        FT_MM_Var* mm = NULL;
+        if (FT_Get_MM_Var(g_face_head, &mm) == 0 && mm != NULL) {
+            FT_Fixed c[4];
+            FT_UInt n = mm->num_axis < 4 ? mm->num_axis : 4;
+            for (FT_UInt i = 0; i < n; i++)
+                c[i] = (mm->axis[i].tag == 0x77676874UL) ? (700 << 16) : mm->axis[i].def;
+            if (n && FT_Set_Var_Design_Coordinates(g_face_head, n, c) != 0) {
+                // Pin rejected: drop back to the default instance rather
+                // than render a half-pinned face (embolden below still
+                // applies, so headings stay bold, just Light-metrics).
+                FT_Set_Var_Design_Coordinates(g_face_head, 0, NULL);
+            }
+#ifdef TEST_HOOKS
+            // Pin readback (issue #401 fixC): log the live wght coordinate
+            // the Set call above left behind (expect 700). TEST_HOOKS only:
+            // cold path, one stderr line per process, ship never links it.
+            {
+                FT_Fixed rc[4] = { 0, 0, 0, 0 };
+                FT_UInt rn = 0;
+                if (FT_Get_Var_Design_Coordinates(g_face_head, 4, rc, &rn) == 0 && rn > 0)
+                    fprintf(stderr, "[fixC] heading wght pin: %ld\n", (long)(rc[0] >> 16));
+            }
+#endif
+            FT_Done_MM_Var(g_ft, mm);
+        }
+    }
     p = font_asset_path("JetBrainsMono.ttf");
     if (p) FT_New_Face(g_ft, p, 0, &g_face_mono);
     g_fc = FcInitLoadConfigAndFonts();
@@ -484,6 +518,7 @@ static int atlas_alloc(int pw, int ph, short* out_x, short* out_y) {
     return 1;
 }
 
+void zatex_drop_math_rasters(void);
 static void atlas_flush(void) {
     if (g_atlas_px) memset(g_atlas_px, 0, (size_t)ATLAS_PX * ATLAS_PX);
     g_atlas_x = g_atlas_y = g_atlas_shelf_h = 0;
@@ -491,6 +526,7 @@ static void atlas_flush(void) {
         g_glyph_cache[i].occupied = 0;
         g_glyph_cache[i].aw = 0;
     }
+    zatex_drop_math_rasters();
     g_atlas_flushes++;
 }
 
@@ -536,7 +572,23 @@ static GlyphEntry* glyph_ensure(uint32_t cp, int style, int px, int is_mono_face
     if (FT_Set_Pixel_Sizes(face, 0, (FT_UInt)px) != 0) return NULL;
     // Bold synthesis for the Plex Bold face is native; faux-bold the
     // fallback/mono faces lightly like the mac double-strike path.
-    if (FT_Load_Glyph(face, gi, FT_LOAD_RENDER) != 0) return NULL;
+    // Headings (issue #401 fixC): the variable Space Grotesk pin above can
+    // still read thin at 1x grayscale even when wght=700 holds (grayscale
+    // stem coverage, not a missed pin), so embolden heading outlines at
+    // raster time — FT_Outline_Embolden at ~1/64 em, atlas-time only,
+    // zero-alloc, keyed by the heading style bit already in the cache key.
+    // Implements the linux.c:554-555 comment for real.
+    int do_embolden = (style & 8) && face == g_face_head;
+    if (do_embolden) {
+        if (FT_Load_Glyph(face, gi, FT_LOAD_DEFAULT) != 0) return NULL;
+        // 1/64 em in 26.6 outline units: 1em = px*64 units, so 1/64 em =
+        // px units (≈0.27px at 17px). Ink grows, advance untouched, so the
+        // Zig-side Light-metrics tables stay the source of truth.
+        FT_Pos strength = (FT_Pos)px;
+        if (strength < 1) strength = 1;
+        FT_Outline_Embolden(&face->glyph->outline, strength);
+        if (FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL) != 0) return NULL;
+    } else if (FT_Load_Glyph(face, gi, FT_LOAD_RENDER) != 0) return NULL;
     FT_Bitmap* bm = &face->glyph->bitmap;
     int pw = (int)bm->width, ph = (int)bm->rows;
     atlas_ensure();
@@ -1715,47 +1767,14 @@ void platform_clear_selection(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Math stubs: size -> 1 (engine unavailable), last_error -> 0, draw no-op,
-// stats/info zeros. TEST_HOOKS-only readers stay under the same gate so
-// ship never links them.
+// ZaTeX runtime math backend (LaTeX math plugin) lives in linux_zatex.c
+// (FreeType metrics + direct draw); READ_PLUGIN_STUB=1 includes the empty
+// stub instead — same TU, same flags (AGENTS.md §7, macos.m precedent).
 // ---------------------------------------------------------------------------
-int platform_math_size(const char* tex, int tex_len, int display, float font_px,
-                       float* out_w, float* out_above, float* out_below) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    if (out_w) *out_w = 0;
-    if (out_above) *out_above = 0;
-    if (out_below) *out_below = 0;
-    return 1;
-}
-
-int platform_math_last_error(const char* tex, int tex_len, int display,
-                             unsigned int* out_offset, int* out_code) {
-    (void)tex; (void)tex_len; (void)display;
-    (void)out_offset; (void)out_code;
-    return 0;
-}
-
-void platform_draw_math(const char* tex, int tex_len, int display, float font_px,
-                        float x, float y_top,
-                        unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
-    (void)tex; (void)tex_len; (void)display; (void)font_px;
-    (void)x; (void)y_top; (void)r; (void)g; (void)b; (void)a;
-}
-
-#ifdef TEST_HOOKS
-void platform_math_atlas_stats(uint64_t* hits, uint64_t* misses) {
-    if (hits) *hits = 0;
-    if (misses) *misses = 0;
-}
-
-void platform_math_engine_info(unsigned int* version, unsigned int* use_ex, unsigned int* conform_ran,
-                               int* conform_n, unsigned int* caps) {
-    if (version) *version = 0;
-    if (use_ex) *use_ex = 0;
-    if (conform_ran) *conform_ran = 0;
-    if (conform_n) *conform_n = 0;
-    if (caps) *caps = 0;
-}
+#if READ_PLUGIN_STUB
+#include "linux_zatex_stub.c"
+#else
+#include "linux_zatex.c"
 #endif
 
 // ---------------------------------------------------------------------------
@@ -2686,7 +2705,10 @@ void platform_set_test_damage(float x, float y, float w, float h, int valid) {
 }
 int platform_text_record_count(void) { return g_text_record_count; }
 unsigned long platform_test_image_draws(void) { return g_test_image_draws; }
-static float g_test_scale = 0.0f;
+// Extern linkage (not static): the math backend in linux_zatex.c (same
+// TU via #include) reads the same word for its atlas gate. Ship builds
+// never define it and the backend folds to the q == 1 path there.
+float g_test_scale = 0.0f;
 void platform_set_test_scale(float s) { g_test_scale = s; }
 void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
     g_sel_sx = x1; g_sel_sy = y1;
@@ -2805,6 +2827,12 @@ int platform_test_outline_build(void) {
     int ok = (g_outline_row_count == 2) ? 1 : 0;
     g_outline_count = 0;
     return ok;
+}
+// RTL run-face probe (issue #50 follow-up): other backends cascade, so
+// Hebrew/Arabic runs never need substitution — always 0. Headless-safe.
+int platform_test_bidi_face(const char* text, int text_len, int is_mono, int is_heading) {
+    (void)text; (void)text_len; (void)is_mono; (void)is_heading;
+    return 0;
 }
 // Pixel probe (TEST_HOOKS): up to 8 headless probe points.
 static int g_probe_count = 0;

@@ -250,13 +250,22 @@ static void zatex_try_load(void) {
         }
     }
 #endif
-    // Bundle Resources first (shipped app), then the documented install
-    // path. Nothing else is probed: production surfaces a minimal
-    // interface, never a search-path hunt.
+    // Bundle Resources first (shipped app), then READ_ZATEX_LIB (CI/test:
+    // absolute path from the pinned submodule build), then the
+    // documented install path. Nothing else is probed: production
+    // surfaces a minimal interface, never a search-path hunt.
     static const char *paths[] = {
         NULL, // filled below: bundle Resources/libzatex.dylib
+        NULL, // filled below: $READ_ZATEX_LIB
         "/usr/local/lib/libzatex.dylib",
     };
+    char env_path[1024];
+    env_path[0] = '\0';
+    const char *env = getenv("READ_ZATEX_LIB");
+    if (env && env[0]) {
+        size_t n = strlen(env);
+        if (n < sizeof(env_path)) memcpy(env_path, env, n + 1);
+    }
     char bundle_path[1024];
     bundle_path[0] = '\0';
     CFBundleRef bundle = CFBundleGetMainBundle();
@@ -274,7 +283,8 @@ static void zatex_try_load(void) {
             CFRelease(res);
         }
     }
-    for (int k = 0; k < 2; k++) {
+    paths[1] = env_path[0] ? env_path : NULL;
+    for (int k = 0; k < 3; k++) {
         const char *path = (k == 0) ? bundle_path : paths[k];
         if (!path || !path[0]) continue;
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
@@ -687,6 +697,11 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
     // take the frozen v1 stride-20 path, bit-identical to before (issue
     // #354 acceptance on the installed dylib). One shared post-pass below
     // normalizes tails (0 tail reads as identity/ambient, defensive).
+    // Space-pressure routing (issues #366/#378): status 6 with
+    // nonzero needs inside the ceilings routes to FALLBACK (the
+    // scripted double's NOSPACE script is in-ceiling on every call, so
+    // a re-issue could never satisfy it; genuine pool exhaustion
+    // reports zeroed needs and keeps the typed overflow below).
     int32_t rc;
     if (zatex_negotiated_ex)
         rc = zatex_layout_ex(ntx, (size_t)nlen, display ? true : false, &zatex_metrics,
@@ -697,6 +712,14 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
         rc = zatex_layout(ntx, (size_t)nlen, display ? true : false, &zatex_metrics,
                           zatex_runs, ZATEX_RUNS_CAP, zatex_rules, ZATEX_RULES_CAP,
                           zatex_glyphs, ZATEX_GLYPHS_CAP, out);
+    if (rc == 6 &&
+        out->nruns <= ZATEX_RUNS_CAP && out->nrules <= ZATEX_RULES_CAP &&
+        (out->nruns > 0 || out->nrules > 0)) {
+        zatex_err_key = zatex_key_of(tex, tex_len, display);
+        zatex_err_offset = out->err_offset;
+        zatex_err_code = out->err_code;
+        return ZATEX_FALLBACK;
+    }
     if (rc == 0) {
         uint32_t n = out->nruns < ZATEX_RUNS_CAP ? out->nruns : ZATEX_RUNS_CAP;
         if (zatex_negotiated_ex) {
@@ -723,10 +746,8 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
     zatex_err_code = out->err_code;
     if (rc == 1) return ZATEX_UNSUPPORTED;
     if (rc == 6 || rc == 7) {
-        // Overflow, not retryable: our buffers are the engine ceilings
-        // (see the header note), so needs arrive zeroed — even maximum
-        // buffers cannot lay this formula out. One diagnostic per
-        // formula; the reader still falls back literally.
+        // Overflow: zeroed or over-ceiling needs (issue #366). One
+        // diagnostic per formula; the reader falls back literally.
         if (zatex_last_diag_key != zatex_err_key) {
             zatex_last_diag_key = zatex_err_key;
             fprintf(stderr, "read: math over engine ceilings (status %d, need %u runs/%u rules) — literal fallback\n",
