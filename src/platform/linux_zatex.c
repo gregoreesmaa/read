@@ -542,12 +542,13 @@ static void zatex_blit_cached(ZatexAtlasEntry *e, float x, float y_top,
         }
     }
 }
+#endif
 
+#ifdef TEST_HOOKS
 // Rasterize a laid-out formula into a cached 8-bit coverage slice at
 // the destination device scale: one FreeType gray render per glyph at
 // run_px * q, composited max-coverage into the slice. Returns 1 with a
 // live slice, 0 to draw direct.
-#ifdef TEST_HOOKS
 static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, float font_px,
                            float x, float y_top) {
     extern float g_test_scale;
