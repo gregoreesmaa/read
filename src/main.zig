@@ -3642,14 +3642,7 @@ test "math per-run color paints red on capable engines (issue #365)" {
             const amb_rc = bridge.platform_render_to_png(MATHCOLOR_AMBIENT_PATH, 600, 200, mathColorAmbientFn);
             std.debug.print("\n[MATHCOLOR] double ambient rc={d} probe_rc={d}\n", .{ amb_rc, probe_rc });
             try t.expectEqual(@as(c_int, 0), amb_rc);
-            // NOTE (diagnosing, 2026-10-04): the red_frac read below
-            // throws FileNotFound on the macOS double step while rc=0
-            // proves the write landed — the metrics open is under
-            // investigation; the ambient render itself is the pin.
-            const m_dbl = crispPngMetrics(alloc, MATHCOLOR_AMBIENT_PATH) catch |err| {
-                std.debug.print("\n[MATHCOLOR] double metrics err={s}\n", .{@errorName(err)});
-                return;
-            };
+            const m_dbl = try crispPngMetrics(alloc, MATHCOLOR_AMBIENT_PATH);
             std.debug.print("\n[MATHCOLOR] double ambient red_frac={d:.4}\n", .{m_dbl.red_frac});
             try t.expect(m_dbl.red_frac < 0.02);
             return;
