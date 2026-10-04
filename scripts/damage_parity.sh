@@ -272,7 +272,7 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     # Either way the cmp oracles above stay the strict gate (|| true below).
     if [ "$gfail" = 1 ] && [ -s /tmp/sweep25_dragerr.txt ]; then
         grep '^DRAGDMG' /tmp/sweep25_dragerr.txt || true
-        bis_dmg=$(awk '/^DRAGDMG phase=1/{for(i=2;i<=NF;i++){split($i,a,"="); printf "%s%s", (i>2?",":""), a[2]}}' /tmp/sweep25_dragerr.txt)
+        bis_dmg=$(awk '/^DRAGDMG phase=1/{for(i=3;i<=NF;i++){split($i,a,"="); printf "%s%s", (i>3?",":""), a[2]}}' /tmp/sweep25_dragerr.txt)
         case "$bis_dmg" in
             *,*,*,*)
                 sleep 0.3
