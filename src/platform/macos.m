@@ -342,11 +342,11 @@ static NSRect copy_button_damage_rect(CodeBlockRecord* b) {
 static void paint_copy_button(CGContextRef ctx);
 
 // Font-name diet (#391 __TEXT): helpers defined at end-of-file per the SIZE
-// NOTE; forward declarations so font_resolve_uncached can call them.
+// NOTE; forward declarations so font_resolve_uncached (declared near the
+// top, defined below get_font_for_style) can call them.
 static NSFont* diet_body_font(float size, int is_bold, int is_italic);
 static NSFont* diet_heading_font(float size, int is_bold);
 static NSFont* diet_mono_font(float size, int unused);
-static NSFont* font_resolve_uncached(float font_size, int is_bold, int is_italic, int is_mono, int is_heading);
 
 static void register_app_fonts(void) {
     static BOOL registered = NO;
