@@ -666,7 +666,7 @@ test "controls: accurate document height computation ensures tables and end of d
     const accurate_height = layout.computeDocumentHeightEx(
         showcase_doc,
         lines_buf[0..line_count],
-        vp_config,
+        &vp_config,
         null,
         null,
     );
@@ -686,7 +686,7 @@ test "controls: accurate document height computation ensures tables and end of d
     const cmd_count = layout.layoutViewport(
         showcase_doc,
         lines_buf[0..line_count],
-        table_scroll_config,
+        &table_scroll_config,
         &commands_buf,
     );
 
@@ -835,15 +835,16 @@ fn trailingY(doc: []const u8, size_fn: *const fn ([*]const u8, c_int, *f32, *f32
     var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines_buf, &in_fence);
     var commands_buf: [256]layout.DrawCommand = undefined;
+    var trail_cfg = layout.ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+        .image_size_fn = size_fn,
+    };
     const count = layout.layoutViewport(
         doc,
         lines_buf[0..n],
-        .{
-            .window_width = 1000.0,
-            .window_height = 750.0,
-            .scroll_y = 0.0,
-            .image_size_fn = size_fn,
-        },
+        &trail_cfg,
         &commands_buf,
     );
     for (commands_buf[0..count]) |cmd| {
@@ -897,15 +898,16 @@ fn layoutAt(doc: []const u8, scroll: f32, size_fn: *const fn ([*]const u8, c_int
     var lines_buf: [32]simd.Line = undefined;
     var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines_buf, &in_fence);
+    var at_cfg = layout.ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = scroll,
+        .image_size_fn = size_fn,
+    };
     return layout.layoutViewport(
         doc,
         lines_buf[0..n],
-        .{
-            .window_width = 1000.0,
-            .window_height = 750.0,
-            .scroll_y = scroll,
-            .image_size_fn = size_fn,
-        },
+        &at_cfg,
         out,
     );
 }
@@ -987,11 +989,12 @@ fn layoutDoc(doc: []const u8, out: []layout.DrawCommand) usize {
     var lines_buf: [64]simd.Line = undefined;
     var in_fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &lines_buf, &in_fence);
-    return layout.layoutViewport(doc, lines_buf[0..n], .{
+    var doc_cfg = layout.ViewportConfig{
         .window_width = 1000.0,
         .window_height = 750.0,
         .scroll_y = 0.0,
-    }, out);
+    };
+    return layout.layoutViewport(doc, lines_buf[0..n], &doc_cfg, out);
 }
 
 test "controls: rtl paragraph right-aligns, ltr paragraph stays left (issue #50)" {

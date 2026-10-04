@@ -156,7 +156,10 @@ _Static_assert(__builtin_offsetof(ZatexLayout, err_code) == 48, "err_code append
 #define ZATEX_RUNS_CAP 256
 #define ZATEX_RULES_CAP 64
 #define ZATEX_GLYPHS_CAP 4096
-#define ZATEX_INPUT_CAP 65536
+// Input ceiling (issue #388: was 65536 — a full 64 KiB BSS scratch for one
+// NFC pass; 4096 covers every formula layout pass below, which strides
+// runs/glyphs at the same bound, and longer inputs already fall back).
+#define ZATEX_INPUT_CAP 4096
 
 // Status contract for platform_math_size (mirrors the Zig seam):
 // 0 = laid out, dims valid; 1 = engine unavailable (no dylib);
@@ -420,8 +423,11 @@ static int32_t zatex_conform_count = 0;
 #endif
 // Draw scratch (BSS; main thread only): shared by the direct run loop and
 // the atlas rasterizer below — one owner, sequential use, no nesting.
-static CGPoint zatex_pos[4096];
-static CGGlyph zatex_gbuf[4096];
+// Issue #388: 1024 glyphs/points per run (was 4096) — runs stride glyphs
+// at ZATEX_GLYPHS_CAP only in aggregate; a single CTFontDrawGlyphs call
+// never needs more than one run's worth, and runs past the cap skip.
+static CGPoint zatex_pos[1024];
+static CGGlyph zatex_gbuf[1024];
 
 // ---------------------------------------------------------------------------
 // Formula atlas (issue #355): Retina pre-raster for math runs, mirroring
@@ -539,6 +545,10 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
     for (uint32_t i = 0; i < lo->nruns; i++) {
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
+        uint32_t n = rn->glyph_count;
+        // Scratch bound (issue #388: zatex_gbuf/zatex_pos are 1024 now);
+        // over-cap runs skip exactly like zero-count runs above.
+        if (n > 1024) continue;
         double run_px = (double)font_px * (double)rn->size_units / 1000.0;
         if (run_px <= 0) continue;
         CTFontRef rf = CTFontCreateCopyWithAttributes(zatex_font, (CGFloat)(run_px * RASTER_SCALE), NULL, NULL);
@@ -575,7 +585,7 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
             CGContextScaleCTM(g_atlas_ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), 1.0);
             base = 0.0;
         }
-        uint32_t n = rn->glyph_count;
+        // n already bounded to 1024 by the loop guard above.
         int64_t acc = 0;
         for (uint32_t k = 0; k < n; k++) {
             uint16_t gl = zatex_glyphs[rn->glyph_start + k];
@@ -919,6 +929,10 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
     for (uint32_t i = 0; i < lo.nruns; i++) {
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
+        uint32_t n = rn->glyph_count;
+        // Scratch bound (issue #388: 1024 now); over-cap runs skip, same
+        // rule as the atlas rasterizer above.
+        if (n > 1024) continue;
         if (zatex_has_color) {
             uint32_t c = zatex_colors[i];
             uint32_t want = c ? c : ambient_w;
@@ -954,7 +968,7 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         // always 1000).
         CGContextScaleCTM(ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), -1.0);
         CGContextSetTextPosition(ctx, 0, 0);
-        uint32_t n = rn->glyph_count;
+        // n already bounded to 1024 by the loop guard above.
         int64_t acc = 0;
         for (uint32_t k = 0; k < n; k++) {
             uint16_t g = zatex_glyphs[rn->glyph_start + k];

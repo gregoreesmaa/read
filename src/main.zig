@@ -278,6 +278,11 @@ var g_reduce_motion: bool = false;
 fn retargetScroll(target: f32) void {
     if (g_reduce_motion) {
         snapScroll(target);
+        // Synchronous landing (see snapScroll): the tick edge never fires.
+        // Reduce Motion takes the synchronous path (issue #388): release
+        // here instead so keyboard/anchor jumps still shrink RSS. Zero
+        // extra cost on the animated path (this branch never runs there).
+        releaseSettledPages();
         return;
     }
     g_smooth.setTarget(target, g_app.max_scroll_y);
@@ -1324,8 +1329,15 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
     foldPendingScroll(1.0);
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
+    const was_settled = g_smooth.settled();
     g_smooth.current = layout.SmoothScroll.quantize(g_smooth.current, 1.0);
     g_app.scroll_y = g_smooth.current;
+    // Goldilocks steady state (issue #388): the tick just settled a scroll
+    // that moved — drop clean pages outside viewport +/-1 screen. Gated on
+    // the settled EDGE (not every settled frame) so a static screen costs
+    // zero syscalls; the map/byte math is a few integer ops, never on the
+    // layout hot path.
+    if (settled and !was_settled) releaseSettledPages();
     // Rubber-band decay keeps the timer alive past scroll settle (full
     // redraws: the translate moves every pixel) and parks exactly at zero.
     // Coalesced with the scroll frame: one invalidation below covers both
@@ -1334,6 +1346,18 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
         return 1;
     }
     return if (settled and !plugin_flying and !plugin_changed) 0 else 1;
+}
+
+/// Goldilocks steady state (issue #388): scroll just settled — drop clean
+/// pages outside viewport +/-1 screen. Same window model as the cold-open
+/// release above; dropped pages fault back on the next scroll. Best-effort,
+/// zero allocations. Never fires while gliding: only the settled edge.
+fn releaseSettledPages() void {
+    const bytes = g_app.bytes;
+    if (bytes.len < mmap.min_advise_bytes) return;
+    const hint = bytesPerScreenHint(bytes);
+    const w = mmap.goldilocksScrollWindow(g_app.scroll_y, g_app.window_height, bytes.len, hint);
+    if (w.end > w.start) bytesReleaseOutside(bytes, w.start, w.end);
 }
 
 /// Display preferences pushed by the platform (launch, Reduce Motion
@@ -1350,6 +1374,42 @@ fn onDisplay(category_class: c_int, reduce_motion: c_int) callconv(.c) void {
     } else {
         snapScroll(g_app.scroll_y);
     }
+}
+
+/// Goldilocks RSS release (issue #388): after the full scan + metrics
+/// touched every page of a large file, drop clean pages outside the first
+/// viewport +/-1 screen. Dropped pages fault back from the file on scroll;
+/// the mapping stays open and zero-copy. Best-effort (madvise may no-op),
+/// zero allocations, cold path only — never on the scroll hot path (the
+/// steady-state twin lives in onTick, gated on settle).
+fn releaseColdPages(bytes: []const u8) void {
+    if (bytes.len < mmap.min_advise_bytes) return;
+    const hint = bytesPerScreenHint(bytes);
+    const w = mmap.goldilocksScrollWindow(0.0, g_app.window_height, bytes.len, hint);
+    // Empty mapping or a zero hint: no window, no syscall noise.
+    if (w.end > w.start) bytesReleaseOutside(bytes, w.start, w.end);
+}
+
+/// Test seam: the madvise itself lives one call away so unit tests can pin
+/// the window math without touching the real mapping.
+fn bytesReleaseOutside(bytes: []const u8, keep_start: usize, keep_end: usize) void {
+    mmap.releaseOutsideWindow(bytes, keep_start, keep_end);
+}
+
+/// Bytes-per-screen density for the Goldilocks window: the scan already
+/// knows the average line length, so one screen of pixels maps to a real
+/// byte count instead of a guess. Zero when unknown (empty doc, zero
+/// window) — callers treat that as "no window".
+fn bytesPerScreenHint(bytes: []const u8) usize {
+    if (bytes.len == 0 or g_app.line_count == 0) return 0;
+    if (g_app.window_height <= 0.0) return 0;
+    const avg_line: usize = bytes.len / @max(g_app.line_count, 1);
+    // Lines per screen at the live geometry: window height over the
+    // effective line advance (base * 1.75 layout constant, AGENTS.md §3).
+    const advance: f32 = g_text_scale.effectiveBase() * 1.75;
+    if (advance <= 0.0) return 0;
+    const lines_per_screen: usize = @intFromFloat(@max(g_app.window_height / advance, 1.0));
+    return @min(bytes.len, avg_line *| lines_per_screen);
 }
 
 fn updateDocumentMetrics() void {
@@ -1370,7 +1430,7 @@ fn updateDocumentMetrics() void {
     const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
-        vp_config,
+        &vp_config,
         &g_checkpoints,
         &g_checkpoint_count,
     );
@@ -1516,7 +1576,7 @@ fn anchorTargetY(frag: []const u8) ?f32 {
     return layout.anchorScrollY(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
-        vp_config,
+        &vp_config,
         frag,
     );
 }
@@ -1573,6 +1633,9 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     layout.mathBoxCacheReset(&g_math_box_cache);
     layout.tokenCacheReset(&g_token_cache);
     updateDocumentMetrics();
+    // Cold path like the open path above: scan + metrics touched every
+    // page, so keep only the first viewport +/-1 screen resident.
+    releaseColdPages(g_app.bytes);
     // Plugin renders (issue #323): per-doc table, cache-hit stat-marking,
     // probe and FIFO launch. No-op in read-test/headless binaries.
     pluginKickForDocument();
@@ -1734,7 +1797,7 @@ fn findMatchY(offset: usize) ?f32 {
         .join_buf = &g_joinbuf,
     };
     pluginAttachConfig(&vp_config);
-    const top = layout.findOffsetY(g_app.bytes, g_app.lines, vp_config, offset) orelse return null;
+    const top = layout.findOffsetY(g_app.bytes, g_app.lines, &vp_config, offset) orelse return null;
     // Row-exact landing (issue #386): resolve the containing unit and step
     // to the match's wrapped visual row in the same snap — the old chase
     // loop's follow-up steps converge here by construction, so the final
@@ -1912,10 +1975,11 @@ var g_outline_arena: [512 * layout.OUTLINE_TEXT_MAX]u8 = undefined;
 /// the native picker. Jumps reuse on_scroll_to (exact y, no slug roundtrip,
 /// so duplicate headings land precisely). Cold path: zero heap.
 fn onOutlineOpen() callconv(.c) void {
+    var measure_cfg = measureConfig();
     const n = layout.collectHeadings(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
-        measureConfig(),
+        &measure_cfg,
         &g_outline_arena,
         &g_outline_marks,
     );
@@ -2087,7 +2151,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         .window_height = g_app.window_height,
         .scroll_y = g_app.scroll_y,
         .base_font_size = g_text_scale.effectiveBase(),
-        .block_scroll_x = g_app.block_scroll_x,
+        .block_scroll_x = &g_app.block_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
         .image_size_fn = gatedImageSize,
@@ -2116,7 +2180,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         cmd_count = layout.layoutViewport(
             g_app.bytes,
             g_app.lines[0..g_app.line_count],
-            vp_config,
+            &vp_config,
             &g_commands_buffer,
         );
         const take = @min(cmd_count, g_scroll_cached_cmds.len);
@@ -2924,6 +2988,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Compute accurate total document height and max scroll limit
     updateDocumentMetrics();
+    // Goldilocks cold release (issue #388): scan + metrics just touched
+    // every page; keep only the first viewport +/-1 screen resident.
+    releaseColdPages(g_app.bytes);
     // Plugin renders (issue #323): per-doc table, cache-hit stat-marking,
     // probe and FIFO launch. No-op in read-test/headless binaries.
     pluginKickForDocument();
