@@ -1925,7 +1925,10 @@ static NSString* selected_text_string(void) {
             (unsigned long)phase, (unsigned long)momentum);
 #endif
     }
-    [self setNeedsDisplay:YES];
+    // No direct invalidation here (#384): the Zig fold arms the 120Hz tick
+    // and its fire is the single invalidation point (scroll-blit + exposed
+    // strip, overshoot coalesced). Direct input redraws would double every
+    // frame the timer already covers.
 }
 
 // Issue #315 removed zoom: pinch and double-tap smart magnify are gone.
@@ -2301,6 +2304,31 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
     invalidate_rect(NSMakeRect(x, y, w, h));
 }
 
+// Scroll-blit path (#384): pure vertical scrolls copy the overlapping
+// pixels instead of repainting them. scrollRect:by: shifts the backing
+// store by the view-space delta (flipped view: scrolling down moves pixels
+// up) and invalidates only the exposed strip; AppKit then asks for just
+// that strip, which the Zig side paints from the y-shifted layout cache.
+// A delta covering the view shares no pixels: fall back to full. Coalesced
+// with the tick: the timer fire below is the single invalidation point for
+// scroll + overshoot, so no frame pays two setNeedsDisplay calls.
+void platform_request_scroll(float old_scroll_y, float new_scroll_y) {
+    NSView* v = damage_target_view();
+    if (!v) return;
+    float dy = new_scroll_y - old_scroll_y; // scroll coords: down positive
+    float h = (float)v.bounds.size.height;
+    float w = (float)v.bounds.size.width;
+    if (dy == 0.0f) return;
+    if (fabsf(dy) >= h || w <= 0.0f || h <= 0.0f) {
+        [v setNeedsDisplay:YES];
+        return;
+    }
+    // scrollRect is in view coords (flipped here: origin top-left). Pixels
+    // move opposite the scroll: content scrolled down by dy shows rows from
+    // dy pixels above, so the copy shifts by -dy.
+    [v scrollRect:v.bounds by:NSMakeSize(0.0f, -dy)];
+}
+
 // ---------------------------------------------------------------------------
 // Scroll smoothing driver: a 120Hz runloop timer (CoreFoundation only — no
 // new framework) that eases the displayed offset toward the Zig-side
@@ -2310,6 +2338,12 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
 // ---------------------------------------------------------------------------
 static CFRunLoopTimerRef g_smooth_timer = NULL;
 static CFAbsoluteTime g_smooth_last = 0;
+// Last scroll/overshoot the compositor actually consumed. The fire below is
+// the single invalidation point per frame (#384): overshoot-only decay and
+// scroll steps coalesce into one setNeedsDisplay, and a parked-timer frame
+// whose offsets never moved invalidates nothing at all.
+static float g_drawn_scroll_y = 0.0f;
+static float g_drawn_overshoot = 0.0f;
 
 static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
     (void)timer; (void)info;
@@ -2318,6 +2352,7 @@ static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
     g_smooth_last = now;
     if (dt_ms < 0.0) dt_ms = 0.0;
     if (dt_ms > 50.0) dt_ms = 50.0; // clamped: menu-drag stalls must not teleport
+    float scroll_before = g_scroll_y;
     int more = 0;
     if (g_callbacks.on_tick) more = g_callbacks.on_tick((float)dt_ms);
     if (!more && g_smooth_timer) {
@@ -2325,8 +2360,21 @@ static void smooth_timer_fire(CFRunLoopTimerRef timer, void* info) {
         CFRelease(g_smooth_timer);
         g_smooth_timer = NULL;
     }
-    NSView* v = damage_target_view();
-    if (v) [v setNeedsDisplay:YES];
+    // Single invalidation (#384): the blit covers a moved scroll (pixels
+    // shifted + exposed strip invalidated); overshoot decay joins the same
+    // frame instead of paying a second setNeedsDisplay. Skip entirely when
+    // more==0 and neither offset moved since the last consumed frame.
+    if (g_scroll_y != scroll_before) {
+        platform_request_scroll(scroll_before, g_scroll_y);
+    } else if (g_overshoot != g_drawn_overshoot || g_scroll_y != g_drawn_scroll_y) {
+        NSView* v = damage_target_view();
+        if (v) [v setNeedsDisplay:YES];
+    } else if (more) {
+        NSView* v = damage_target_view();
+        if (v) [v setNeedsDisplay:YES];
+    }
+    g_drawn_scroll_y = g_scroll_y;
+    g_drawn_overshoot = g_overshoot;
 }
 
 void platform_smooth_kick(void) {
@@ -2414,6 +2462,8 @@ int platform_get_pending_damage(float* x, float* y, float* w, float* h) {
 
 void platform_sync_overshoot(float overshoot) {
     g_overshoot = overshoot;
+    // No invalidation here: the 120Hz tick fire is the single invalidation
+    // point (#384) and coalesces overshoot decay with the scroll frame.
 }
 
 void platform_sync_scroll(float scroll_y) {
@@ -2422,6 +2472,7 @@ void platform_sync_scroll(float scroll_y) {
     // frame and mouseMoved re-establishes URL hover on the next move.
     if (scroll_y != g_scroll_y) g_hover_link_hash = 0;
     g_scroll_y = scroll_y;
+    g_drawn_scroll_y = scroll_y;
 }
 
 void platform_set_scroll_info(float scroll_y, float max_scroll_y, float view_h) {

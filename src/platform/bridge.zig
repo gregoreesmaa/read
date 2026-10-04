@@ -62,6 +62,10 @@ pub extern "c" fn platform_init(
 pub extern "c" fn platform_run_loop() void;
 pub extern "c" fn platform_request_redraw() void;
 pub extern "c" fn platform_request_redraw_rect(x: f32, y: f32, w: f32, h: f32) void;
+/// Scroll-blit request (#384): copy the overlapping region by the scroll
+/// delta, then invalidate only the exposed strip. View coords, flipped
+/// (origin top-left). Falls back to full when the delta covers the view.
+pub extern "c" fn platform_request_scroll(old_scroll_y: f32, new_scroll_y: f32) void;
 /// Returns 1 and fills out the dirty rect AppKit reported for this draw,
 /// or 0 when there is no pending damage (headless render, first draw).
 pub extern "c" fn platform_get_pending_damage(x: *f32, y: *f32, w: *f32, h: *f32) c_int;

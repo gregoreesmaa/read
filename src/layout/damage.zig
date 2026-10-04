@@ -137,13 +137,44 @@ pub const Damage = struct {
 };
 
 /// Full-vs-partial policy shared by the Zig compositor and the platform layer.
-/// Resize, scroll, and theme toggle repaint every pixel, so they go full.
-/// Cursor blink, selection, keystroke, GIF tick, and hover submit the exact box.
+/// Resize and theme toggle repaint every pixel, so they go full. Scroll
+/// blits on the platform (#384: `-scrollRect:by:` moves the overlapping
+/// pixels, only the exposed strip repaints), so scroll submits the exact
+/// strip instead of full. Cursor blink, selection, keystroke, GIF tick, and
+/// hover submit the exact box.
 pub fn damageForCause(cause: DamageCause, exact: DirtyRect, view_w: f32, view_h: f32) Damage {
     return switch (cause) {
-        .resize, .scroll, .theme_toggle => Damage.fullView(view_w, view_h, cause),
+        .resize, .theme_toggle => Damage.fullView(view_w, view_h, cause),
+        .scroll => scrollStripDamage(exact, view_w, view_h),
         .cursor_blink, .selection, .keystroke, .gif_tick, .hover, .unknown => Damage.partial(exact, cause),
     };
+}
+
+/// Expose-strip damage for a scroll blit (#384): the platform copies the
+/// overlapping region and only the uncovered strip (|dy| tall, full width)
+/// needs repainting. An empty or view-covering strip collapses to full (a
+/// jump larger than the viewport shares no pixels with the old frame).
+pub fn scrollStripDamage(exact: DirtyRect, view_w: f32, view_h: f32) Damage {
+    if (exact.w <= 0.0 or exact.h <= 0.0) return Damage.fullView(view_w, view_h, .scroll);
+    const x0 = @max(exact.x, 0.0);
+    const x1 = @min(exact.x + exact.w, view_w);
+    const y0 = @max(exact.y, 0.0);
+    const y1 = @min(exact.y + exact.h, view_h);
+    if (x1 <= x0 or y1 <= y0) return Damage.fullView(view_w, view_h, .scroll);
+    const strip: DirtyRect = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    if (strip.coversView(view_w, view_h)) return Damage.fullView(view_w, view_h, .scroll);
+    return Damage.partial(strip, .scroll);
+}
+
+/// Expose strip for a vertical scroll delta: full view width, |dy| tall,
+/// anchored at the edge the content moved away from (scrolling down exposes
+/// the bottom; scrolling up exposes the top). |dy| >= view height means no
+/// pixel survives, so the rect covers the view (callers collapse to full).
+pub fn scrollExposeStrip(dy: f32, view_w: f32, view_h: f32) DirtyRect {
+    const h = @min(@abs(dy), view_h);
+    if (h <= 0.0) return .empty;
+    const y: f32 = if (dy > 0.0) view_h - h else 0.0;
+    return .{ .x = 0.0, .y = y, .w = view_w, .h = h };
 }
 
 pub const MAX_DAMAGE_RECTS = 16;
@@ -246,9 +277,13 @@ test "damage: full-screen redraw only on resize-class events" {
     try std.testing.expectEqual(view_w, rsz.rect.w);
     try std.testing.expectEqual(view_h, rsz.rect.h);
 
-    // Scroll and theme toggle also repaint every pixel (documented full).
-    try std.testing.expect(damageForCause(.scroll, tiny, view_w, view_h).full);
+    // Resize and theme toggle repaint every pixel (documented full).
+    // Scroll submits the exposed strip only (blit path, #384).
     try std.testing.expect(damageForCause(.theme_toggle, tiny, view_w, view_h).full);
+    const scrolled = damageForCause(.scroll, tiny, view_w, view_h);
+    try std.testing.expect(!scrolled.full);
+    try std.testing.expectEqual(tiny.x, scrolled.rect.x);
+    try std.testing.expectEqual(tiny.h, scrolled.rect.h);
 
     // Cursor blink, keystroke, GIF tick stay partial with the exact box.
     const caret = damageForCause(.cursor_blink, tiny, view_w, view_h);
@@ -266,6 +301,34 @@ test "damage: full-screen redraw only on resize-class events" {
     try std.testing.expectEqual(tiny.y, gif.rect.y);
     try std.testing.expectEqual(tiny.w, gif.rect.w);
     try std.testing.expectEqual(tiny.h, gif.rect.h);
+}
+
+test "damage: scroll expose strips anchor to the uncovered edge" {
+    // Scrolling down by 40px exposes the bottom 40px; up exposes the top.
+    const down = scrollExposeStrip(40.0, 1000.0, 750.0);
+    try std.testing.expectEqual(@as(f32, 0.0), down.x);
+    try std.testing.expectEqual(@as(f32, 710.0), down.y);
+    try std.testing.expectEqual(@as(f32, 1000.0), down.w);
+    try std.testing.expectEqual(@as(f32, 40.0), down.h);
+    const up = scrollExposeStrip(-40.0, 1000.0, 750.0);
+    try std.testing.expectEqual(@as(f32, 0.0), up.y);
+    try std.testing.expectEqual(@as(f32, 40.0), up.h);
+    // Zero delta exposes nothing; a jump past the viewport covers it.
+    try std.testing.expect(scrollExposeStrip(0.0, 1000.0, 750.0).isEmpty());
+    const jump = scrollExposeStrip(900.0, 1000.0, 750.0);
+    try std.testing.expect(jump.coversView(1000.0, 750.0));
+    // Strip damage clips to the view and collapses degenerate input to full.
+    const clipped = scrollStripDamage(.{ .x = -10, .y = 710, .w = 2000, .h = 40 }, 1000.0, 750.0);
+    try std.testing.expect(!clipped.full);
+    try std.testing.expectEqual(@as(f32, 0.0), clipped.rect.x);
+    try std.testing.expectEqual(@as(f32, 1000.0), clipped.rect.w);
+    try std.testing.expect(scrollStripDamage(.empty, 1000.0, 750.0).full);
+    try std.testing.expect(scrollStripDamage(.{ .x = 0, .y = 0, .w = 1000, .h = 750 }, 1000.0, 750.0).full);
+    // A blit strip culls far-away pixels but keeps the exposed rows.
+    const dmg = damageForCause(.scroll, down, 1000.0, 750.0);
+    try std.testing.expect(!dmg.full);
+    try std.testing.expect(dmg.keeps(100.0, 720.0, 600.0, 24.0));
+    try std.testing.expect(!dmg.keeps(100.0, 100.0, 600.0, 24.0));
 }
 
 test "damage: exact bounding boxes for cursor blink, keystroke, GIF tick" {
