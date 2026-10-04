@@ -3869,14 +3869,14 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     CGContextRestoreGState(ctx);
     rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
 #ifdef DRAG_DIAG
-    // Exfiltrate the decision trace through the PNG tail: headless_dump_png
-    // writes /tmp/drag_phase_1.png; append the accumulated log there too so
-    // it survives as a CI artifact (screenshots/ is uploaded always()).
-    // NOTE: appending corrupts the PNG — the diag branch never gates merges.
+    // Exfiltrate the decision trace: copy the accumulated log into
+    // screenshots/ (uploaded always()) as a .txt sidecar next to the
+    // gesture's phase PNG.
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
-        FILE* pf = fopen("/tmp/drag_phase_1.png", "ab");
+        FILE* pf = fopen("screenshots/drag_diag_tail.txt", "a");
         if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
         fclose(lf);
+        remove("/tmp/drag_diag.log");
     } }
 #endif
     if (rc != 0) { CGContextRelease(ctx); return rc; }
