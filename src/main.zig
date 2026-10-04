@@ -1191,11 +1191,6 @@ var g_sweep_step: f32 = 0.0;
 // Two-phase drag-back residue test state (read-test binary only): selection A
 // then shrink to B, painted incrementally on one bitmap. See --select-drag.
 var g_drag_active: bool = false;
-// Fix-round 5 decision diff (read-test binary only, temporary): --wash-trace
-// arms the TEST_HOOKS per-record wash trace around one paint pass so the
-// failing-gesture decision diff (phase-1 vs fresh-A) names the exact record
-// and branch. Stderr only, never pixels. Removed before merge.
-var g_wash_trace_phase: c_int = 0;
 // First-paint gate for deferred image decodes (see platform_arm_images):
 // image records park until the first frame is committed, then decode.
 // Headless one-shot screenshots never arm (deterministic placeholders).
@@ -2934,19 +2929,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     if (args_it.next()) |sc_str| {
                         bridge.platform_set_test_scale(std.fmt.parseFloat(f32, sc_str) catch 0.0);
                     }
-                } else if (std.mem.eql(u8, arg, "--wash-trace")) {
-                    // Fix-round 5 decision diff (temporary): arms the
-                    // TEST_HOOKS per-record wash trace. Value is a phase
-                    // selector: 1 traces drag phase 1 only, 10 traces the
-                    // fresh-A render only, 11 traces both (each arm
-                    // self-labels WASH phase=). Stderr only, never pixels.
-                    if (args_it.next()) |wt_str| {
-                        const v = std.fmt.parseInt(c_int, wt_str, 10) catch 0;
-                        if (v == 1 or v == 10 or v == 11) {
-                            g_wash_trace_phase = v;
-                            bridge.platform_set_wash_trace_phase(v);
-                        }
-                    }
                 } else if (std.mem.eql(u8, arg, "--select-drag")) {
                     // Drag-back residue test: caret baseline, extend to A,
                     // shrink to B — every phase after the first incremental
@@ -3100,14 +3082,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // records, and wash share the swept coordinate space.
             bridge.platform_set_test_scroll(g_app.scroll_y);
             const v = g_drag_vals;
-            // Fix-round 5: --wash-trace latches a phase selector (1 = drag
-            // phase 1, 10 = fresh-A, 11 = both). The drag arm traces only
-            // when bit 1 is set; the fresh arm only on bit 10 — never leak
-            // a trace into the wrong arm of a two-process diff.
-            // platform_set_wash_trace_phase is TEST_HOOKS-only (see
-            // bridge.zig), so ship never links it.
-            if (g_wash_trace_phase == 1 or g_wash_trace_phase == 11)
-                bridge.platform_set_wash_trace_phase(1);
             const r = bridge.platform_render_select_drag_png(sc_path, 1200, 900, onDraw,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
             if (r == 0) {
@@ -3146,11 +3120,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Fix-round 4: fresh --select references must render at the swept
         // --scroll like the drag phases do (same hook as above).
         bridge.platform_set_test_scroll(g_app.scroll_y);
-        // Fix-round 5: --wash-trace latches a phase selector (see the drag
-        // arm above); the fresh arm traces only when bit 10 is set.
-        // TEST_HOOKS-only so ship never links it.
-        if (g_wash_trace_phase == 10 or g_wash_trace_phase == 11)
-            bridge.platform_set_wash_trace_phase(10);
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});

@@ -58,21 +58,6 @@ jobs:
         run: ./zig-out/bin/read-test --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
       - name: Damage parity (selection records under partial redraws)
         run: sh scripts/damage_parity.sh ./zig-out/bin/read-test showcase.md
-      - name: Round-5 decision diff (TEMPORARY, gestures 5/12/13)
-        if: always()
-        run: |
-          ./zig-out/bin/read-test --screenshot /tmp/w5_p1.png --settle-images --scroll 395 --wash-trace 1 --select-drag 805.3,891.2,841.7,595.4,805.3,891.2,822.3,753.1 showcase.md 2>/tmp/w5_phase1.log >/dev/null || true
-          ./zig-out/bin/read-test --screenshot /tmp/w5_fa.png --settle-images --scroll 395 --wash-trace 10 --select 805.3,891.2,841.7,595.4 showcase.md 2>/tmp/w5_freshA.log >/dev/null || true
-          echo '--- phase1 (gesture 5 extend) ---'
-          grep -c '^WASH ' /tmp/w5_phase1.log || true
-          grep '^WASH \(begin\|end\|damage\)' /tmp/w5_phase1.log || true
-          echo '--- freshA (gesture 5 reference) ---'
-          grep -c '^WASH ' /tmp/w5_freshA.log || true
-          grep '^WASH \(begin\|end\|damage\)' /tmp/w5_freshA.log || true
-          echo '--- wash-line diff (sorted) ---'
-          diff <(grep '^WASH wash ' /tmp/w5_phase1.log | sort) <(grep '^WASH wash ' /tmp/w5_freshA.log | sort) || true
-          echo '--- skip-line diff (sorted) ---'
-          diff <(grep '^WASH skip ' /tmp/w5_phase1.log | sort) <(grep '^WASH skip ' /tmp/w5_freshA.log | sort) || true
       - name: Render short fuzz (scroll/select/drag/damage/scale/atlas oracles)
         run: ./scripts/fuzz_render.sh ./zig-out/bin/read-test showcase.md 2
       - name: test_cases discipline (exactly 1 scrollable-doc case)
