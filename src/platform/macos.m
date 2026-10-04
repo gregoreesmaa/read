@@ -2639,6 +2639,18 @@ unsigned long platform_test_image_draws(void) { return g_test_image_draws; }
 // + coverage-mask blits) so per-frame pixel behavior can be diffed.
 static float g_test_scale = 0.0f;
 void platform_set_test_scale(float s) { g_test_scale = s; }
+// Headless scroll for --scroll in the drag/fresh harnesses (fix-round 4):
+// onDraw syncs g_scroll_y from g_app.scroll_y, but the drag harness sets
+// each phase's damage from selection boxes computed BEFORE render_fn runs
+// — with a stale zero scroll those boxes (doc_y - 0) miss the damage
+// union, and fresh --select renders at scroll 0 while sweep gestures are
+// doc-space at --scroll N. Syncing here puts damage, records, and wash in
+// the swept coordinate space on every phase. Live path unaffected (the
+// hook only runs headless; drawRect syncs from the real scroller).
+void platform_set_test_scroll(float scroll_y) {
+    g_scroll_y = scroll_y;
+    g_hover_link_hash = 0;
+}
 void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
     // Doc-space endpoints (issue #55 pin: --select takes document coords);
     // #314 readers resolve the owning block live per read, so the hook

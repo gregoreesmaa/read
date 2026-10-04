@@ -3076,6 +3076,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // residue test compares incremental vs fresh renders pixel-wise,
             // so decodes must not land mid-test. Placeholders throughout.
             g_headless_oneshot = true;
+            // Fix-round 4: sweep gestures are doc-space at --scroll N, but
+            // the drag TU computed damage from selection boxes with a stale
+            // zero scroll — sync the platform scroll first so damage,
+            // records, and wash share the swept coordinate space.
+            bridge.platform_set_test_scroll(g_app.scroll_y);
             const v = g_drag_vals;
             const r = bridge.platform_render_select_drag_png(sc_path, 1200, 900, onDraw,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
@@ -3112,6 +3117,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // never win the race today either); suppress the first-paint arm
         // so no decode CPU lands in the startup window at all.
         g_headless_oneshot = true;
+        // Fix-round 4: fresh --select references must render at the swept
+        // --scroll like the drag phases do (same hook as above).
+        bridge.platform_set_test_scroll(g_app.scroll_y);
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});
