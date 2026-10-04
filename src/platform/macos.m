@@ -3726,6 +3726,12 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     platform_batch_end();
     paint_selection_highlight(ctx);
     NSRect box_prev = selection_bounds_expanded(24.0f);
+#ifdef DRAG_DIAG
+    // rev15: phase-0 runs render_fn FIRST, so g_scroll_y is synced here.
+    // Tag the log with it: the sweep's FAIL line prints the same --scroll.
+    DRAGLOG("DIAG ph0 synced scroll=%.1f box_prev=%.1f,%.1f,%.1f,%.1f", g_scroll_y,
+        box_prev.origin.x, box_prev.origin.y, box_prev.size.width, box_prev.size.height);
+#endif
     int rc = headless_dump_png(ctx, "/tmp/drag_phase_0.png");
     if (rc != 0) { CGContextRelease(ctx); return rc; }
 
@@ -3895,33 +3901,29 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // sidecar away; rev13: no sidecar at all). Belt and suspenders: write
     // the sidecar to the ABSOLUTE repo path too — the sweep's DOC is
     // showcase.md at the repo root, so the binary's CWD IS the root.
-    { char abspath[160];
-      // Per-gesture sidecar (rev15+). Sweep FAILS FAST (set -e): with one
-      // sidecar per gesture name, the FAILING gesture's file survives even
-      // when later gestures never run. Name carries the SYNCED scroll
-      // (rev14: render_fn ran, so g_scroll_y is the --scroll value) plus
-      // A-start for uniqueness.
-      snprintf(abspath, sizeof abspath, "screenshots/drag_diag_s%d_ax%d_ay%d.txt",
-          (int)g_scroll_y, (int)(ax1*10.0f), (int)(ay1*10.0f));
-      FILE* af = fopen(abspath, "w");
-      if (af) { FILE* lf2 = fopen("/tmp/drag_diag.log", "r");
-        if (lf2) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf2)) > 0) fwrite(b, 1, nr, af); fclose(lf2); }
-        fclose(af); } }
-    { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
-        char sidecar[160];
-        // Full gesture tag (truncated ints, never rounded): identifies the
-        // failing gesture without parsing the log body. Parenthesize the
-        // float*10 products: (int)x*10 would truncate x FIRST (8000 vs
-        // 8000.0*10=80000) — the s0 sidecar above proved the bug.
-        snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_a%d_%d_%d_%d_b%d_%d_%d_%d.txt",
-            (int)g_scroll_y,
-            (int)(ax1*10.0f), (int)(ay1*10.0f), (int)(ax2*10.0f), (int)(ay2*10.0f),
-            (int)(bx1*10.0f), (int)(by1*10.0f), (int)(bx2*10.0f), (int)(by2*10.0f));
+    // One sidecar per gesture (rev15+). Sweep FAILS FAST (set -e): with
+    // one file per gesture name, the FAILING gesture's file survives even
+    // when later gestures never run. Scroll comes from the phase-0 log
+    // line (rev15: g_scroll_y in this TU is stale — the drag TU never
+    // receives --scroll; onDraw's sync lands only in g_* via render_fn).
+    { int sscroll = 0;
+      FILE* lf0 = fopen("/tmp/drag_diag.log", "r");
+      if (lf0) { char ln[256];
+        while (fgets(ln, sizeof ln, lf0)) {
+          float fsc = 0;
+          if (sscanf(ln, "DIAG ph0 synced scroll=%f", &fsc) == 1) { sscroll = (int)fsc; break; }
+        }
+        fclose(lf0); }
+      char sidecar[160];
+      snprintf(sidecar, sizeof sidecar, "screenshots/drag_diag_s%d_ax%d_ay%d.txt",
+          sscroll, (int)(ax1*10.0f), (int)(ay1*10.0f));
+      FILE* lf = fopen("/tmp/drag_diag.log", "r");
+      if (lf) {
         FILE* pf = fopen(sidecar, "w");
         if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
         fclose(lf);
         remove("/tmp/drag_diag.log");
-    } }
+      } }
 #endif
     if (rc != 0) { CGContextRelease(ctx); return rc; }
 
