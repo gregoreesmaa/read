@@ -3886,11 +3886,16 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     // Hard gate: only gestures whose scroll band is 300-500 (the three
     // failing scrolls 395/357/421) write sidecars — the sweep's passing
     // gestures would otherwise evict them through the 16 MiB artifact cap.
-    // NOTE (rev13): screenshots/ is CWD-relative — the damage run's CWD is
-    // the repo root (damage_parity.sh cds there), but VERIFY via probe:
-    // also drop a marker at the absolute path.
-    { FILE* absprobe = fopen("/tmp/drag_diag_cwd.txt", "a");
-      if (absprobe) { char cwd[512]; if (getcwd(cwd, sizeof cwd)) fprintf(absprobe, "cwd=%s scroll=%.1f\n", cwd, g_scroll_y); fclose(absprobe); } }
+    // CWD-relative screenshots/ failed twice (rev11: upload sharded the
+    // sidecar away; rev13: no sidecar at all). Belt and suspenders: write
+    // the sidecar to the ABSOLUTE repo path too — the sweep's DOC is
+    // showcase.md at the repo root, so the binary's CWD IS the root.
+    { char abspath[160];
+      snprintf(abspath, sizeof abspath, "/Users/runner/work/read/read/screenshots/drag_diag_s%d.txt", (int)g_scroll_y);
+      FILE* af = fopen(abspath, "w");
+      if (af) { FILE* lf2 = fopen("/tmp/drag_diag.log", "r");
+        if (lf2) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf2)) > 0) fwrite(b, 1, nr, af); fclose(lf2); }
+        fclose(af); } }
     { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf && g_scroll_y > 300.0f && g_scroll_y < 500.0f) {
         char sidecar[160];
         // Full gesture tag (truncated ints, never rounded): identifies the
