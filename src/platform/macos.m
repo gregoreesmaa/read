@@ -972,6 +972,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
 #endif
+#ifdef DRAG_DIAG
+                fprintf(stderr, "DIAG skip band q=%d y=%.2f h=%.2f min=%.2f max=%.2f txt=%.16s\n", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+#endif
                 continue;
             }
             // No per-record damage cull here: the wash rect is the
@@ -1008,6 +1011,9 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+#endif
+#ifdef DRAG_DIAG
+                fprintf(stderr, "DIAG skip edge q=%d y=%.2f h=%.2f min=%.2f max=%.2f inmin=%d inmax=%d txt=%.16s\n", q, rec->doc_y, rec->h, min_y, max_y, in_min_row, in_max_row, rec->text);
 #endif
                 continue;
             }
@@ -1095,6 +1101,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f miny=%.2f maxy=%.2f sx=%.2f sy=%.2f ex=%.2f ey=%.2f txt=%.12s", q, c_start, c_end, rec->len, rec->x, rec->w, min_y, max_y, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, rec->text);
 #endif
+#ifdef DRAG_DIAG
+            if (c_end <= c_start)
+                fprintf(stderr, "DIAG skip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f txt=%.16s\n", q, c_start, c_end, rec->len, rec->x, rec->w, rec->text);
+#endif
             }
             if (c_end > c_start) {
                 float x1 = rec->x + get_x_for_char_index(rec, c_start);
@@ -1102,6 +1112,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlpaint q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f txt=%.12s", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, rec->text);
+#endif
+#ifdef DRAG_DIAG
+                fprintf(stderr, "DIAG wash q=%d cs=%d ce=%d x1=%.2f x2=%.2f vy=%.2f h=%.2f qx1=%.2f qx2=%.2f txt=%.16s\n",
+                    q, c_start, c_end, x1, x2, view_y, rec->h, floorf(x1), ceilf(x2), rec->text);
 #endif
                 // Quantize once here (floor/ceil outward) so the fill's
                 // fractional edges land on identical device pixels whether
@@ -3678,11 +3692,26 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_scrollable_block_count = 0;
     g_pending_dirty = union_rect(box_prev, box_a);
     g_pending_dirty_valid = YES;
+#ifdef DRAG_DIAG
+    fprintf(stderr, "DIAG ph1 box_prev=%.1f,%.1f,%.1f,%.1f box_a=%.1f,%.1f,%.1f,%.1f dmg=%.1f,%.1f,%.1f,%.1f sel=A(%.1f,%.1f,%.1f,%.1f)\n",
+        box_prev.origin.x, box_prev.origin.y, box_prev.size.width, box_prev.size.height,
+        box_a.origin.x, box_a.origin.y, box_a.size.width, box_a.size.height,
+        g_pending_dirty.origin.x, g_pending_dirty.origin.y, g_pending_dirty.size.width, g_pending_dirty.size.height,
+        ax1, ay1, ax2, ay2);
+#endif
     CGContextSaveGState(ctx);
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
     render_fn(width, height);
     platform_batch_end();
+#ifdef DRAG_DIAG
+    fprintf(stderr, "DIAG ph1 records=%d\n", g_text_record_count);
+    for (int di = 0; di < g_text_record_count; di++) {
+        QuadTextRecord* dr = &g_text_records[di];
+        fprintf(stderr, "DIAG ph1 rec%d x=%.2f docy=%.2f w=%.2f h=%.2f fs=%.1f txt=%.16s\n",
+            di, dr->x, dr->doc_y, dr->w, dr->h, dr->font_size, dr->text);
+    }
+#endif
     paint_selection_highlight(ctx);
     CGContextRestoreGState(ctx);
     rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
