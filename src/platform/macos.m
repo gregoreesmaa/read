@@ -3867,7 +3867,18 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
 #endif
     paint_selection_highlight(ctx);
     CGContextRestoreGState(ctx);
-    rc = headless_dump_png(ctx, "/tmp/drag_phase_2.png");
+    rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
+#ifdef DRAG_DIAG
+    // Exfiltrate the decision trace through the PNG tail: headless_dump_png
+    // writes /tmp/drag_phase_1.png; append the accumulated log there too so
+    // it survives as a CI artifact (screenshots/ is uploaded always()).
+    // NOTE: appending corrupts the PNG — the diag branch never gates merges.
+    { FILE* lf = fopen("/tmp/drag_diag.log", "r"); if (lf) {
+        FILE* pf = fopen("/tmp/drag_phase_1.png", "ab");
+        if (pf) { char b[4096]; size_t nr; while ((nr = fread(b, 1, sizeof b, lf)) > 0) fwrite(b, 1, nr, pf); fclose(pf); }
+        fclose(lf);
+    } }
+#endif
     if (rc != 0) { CGContextRelease(ctx); return rc; }
 
     g_current_cg_context = NULL;
