@@ -14,19 +14,24 @@ engine lays out glyph runs, the reader paints them.
    **this is the version a release ships**; see
    [release.md](release.md)).
 2. `/usr/local/lib/libzatex.dylib` (manual install).
+3. `$READ_ZATEX_LIB` (CI/test override: absolute path to the engine built
+   from the pinned `third_party/zatex` submodule).
 
-Nothing else is probed. When neither exists — or the engine refuses the
+Nothing else is probed. When none exists — or the engine refuses the
 input — formulae fall back to source text, byte-identical to the
 pre-math reader (fences render as code cards, islands as literal text).
 
 ## Obtain an engine
 
-No versioned engine binaries exist yet, so build from source:
+Build from the pinned submodule (no separate clone needed):
 
 ```bash
-git clone https://github.com/gregoreesmaa/zatex
-# build packages/zatex per its README, then:
-cp <build-output>/libzatex.dylib /usr/local/lib/libzatex.dylib
+git submodule update --init third_party/zatex
+cd third_party/zatex/packages/zatex && zig build
+# macOS: zig-out/lib/libzatex.dylib
+# Linux: zig-out/lib/libzatex.so
+# Windows: zig-out/lib/zatex.dll
+cp <build-output>/libzatex.dylib /usr/local/lib/libzatex.dylib  # macOS manual install
 ```
 
 Release bundles vendor the file above into `Resources/` at bundle time
@@ -35,10 +40,12 @@ it otherwise); `scripts/check_app_bundle.sh` reports which case holds.
 
 ## Platform scope
 
-Math is Darwin-only. The native Cocoa/CoreText window has no Linux
-implementation (`build.zig`: app-shell tests and the `read`/`read-test`
-binaries link Darwin-only); the Linux CI job covers the core
-(scan/layout/parser) only.
+Math renders live on all three OSes. Each platform serves the same
+`ZatexMetrics` host contract through its native text stack —
+CoreText (`src/platform/macos_zatex.m`), FreeType
+(`src/platform/linux_zatex.c`), GDI (`src/platform/win32_zatex.c`) —
+so layout agrees and only glyph rasterization differs (covered by
+per-OS screenshot baselines in `screenshots/<os>/`).
 
 ## Supported spellings
 
