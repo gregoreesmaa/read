@@ -231,7 +231,7 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     drag="--scroll $gs --select-drag $ax1,$ay1,$ax2,$ay2,$bx1,$by1,$bx2,$by2"
     sleep 0.3
     # shellcheck disable=SC2086
-    "$BIN" --screenshot /tmp/sweep25_inc.png --settle-images $drag "$DOC" >/dev/null 2>&1
+    "$BIN" --screenshot /tmp/sweep25_inc.png --settle-images $drag "$DOC" >/tmp/sweep25_dragerr.txt 2>&1
     if [ "$bx1" = "0" ] && [ "$by1" = "0" ] && [ "$bx2" = "0" ] && [ "$by2" = "0" ]; then
         fresh_b=""
     else
@@ -243,9 +243,11 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     sleep 0.3
     # shellcheck disable=SC2086
     "$BIN" --screenshot /tmp/sweep25_freshA.png --settle-images --scroll $gs --select $ax1,$ay1,$ax2,$ay2 "$DOC" >/dev/null 2>&1
+    gfail=0
     if ! cmp -s /tmp/drag_phase_2.png /tmp/sweep25_freshB.png; then
         echo "FAIL: gesture $gn drag-back residue (scroll=$gs A=$ax1,$ay1,$ax2,$ay2 B=$bx1,$by1,$bx2,$by2)"
         fail=1
+        gfail=1
         # TEMPORARY diagnostic (#389 gestures 5/12/13): localize the fringe
         # (bbox + sample pixels) so it maps onto text records. Never gates.
         python3 scripts/fringe_localize.py /tmp/drag_phase_2.png /tmp/sweep25_freshB.png "g${gn}-phase2" || true
@@ -253,8 +255,35 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
     if ! cmp -s /tmp/drag_phase_1.png /tmp/sweep25_freshA.png; then
         echo "FAIL: gesture $gn extend-phase fringe differs (scroll=$gs A=$ax1,$ay1,$ax2,$ay2)"
         fail=1
+        gfail=1
         # TEMPORARY diagnostic (#389 gestures 5/12/13): same for the extend phase.
         python3 scripts/fringe_localize.py /tmp/drag_phase_1.png /tmp/sweep25_freshA.png "g${gn}-phase1" || true
+    fi
+    # TEMPORARY bisect (#389): on failing gestures only, replay the phase-1
+    # damage on a FRESH bitmap (new process, zeroed bitmap, same
+    # --scroll/--select, damage injected via --damage from the DRAGDMG line
+    # the harness prints to stderr).
+    # fresh+damage == inc  => damage path is self-consistent; the splitter
+    #   is cross-phase state on the shared bitmap (phase-0 pre-state etc).
+    # fresh+damage == fresh => the splitter is inside the damage path
+    #   (cull/record/clip); bisect further with narrowed damage rects.
+    # Either way the cmp oracles above stay the strict gate (|| true below).
+    if [ "$gfail" = 1 ] && [ -s /tmp/sweep25_dragerr.txt ]; then
+        bis_dmg=$(awk '/^DRAGDMG phase=1/{for(i=2;i<=NF;i++){split($i,a,"="); printf "%s%s", (i>2?",":""), a[2]}}' /tmp/sweep25_dragerr.txt)
+        case "$bis_dmg" in
+            *,*,*,*)
+                sleep 0.3
+                # shellcheck disable=SC2086
+                "$BIN" --screenshot /tmp/sweep25_bisA.png --settle-images --scroll $gs --damage $bis_dmg --select $ax1,$ay1,$ax2,$ay2 "$DOC" >/dev/null 2>&1 || true
+                if cmp -s /tmp/sweep25_bisA.png /tmp/drag_phase_1.png; then
+                    echo "BISECT g${gn}-phase1: fresh+damage == inc (damage path self-consistent; splitter is cross-phase state)"
+                elif cmp -s /tmp/sweep25_bisA.png /tmp/sweep25_freshA.png; then
+                    echo "BISECT g${gn}-phase1: fresh+damage == fresh (splitter is inside the damage path)"
+                else
+                    echo "BISECT g${gn}-phase1: fresh+damage matches neither (third mechanism)"
+                fi
+                ;;
+        esac
     fi
 done < /tmp/sweep25_gestures.txt
 
