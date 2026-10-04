@@ -818,9 +818,21 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             }
         } else {
             ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+            // Fallback synthetic bold for headings (issue #401 fixC): the
+            // bundled SpaceGrotesk.ttf is a variable font whose Light-300
+            // master GDI rasterizes when FW_BOLD selects the family (GDI has
+            // no variation API), so headings render ~35% thin. Until a
+            // static wght=700 instance ships, overstrike the run at +1px x:
+            // one extra GDI call per heading run only, stroke-only (kerning
+            // stays Light-wide by design — see face_for_style).
+            if (is_heading) ExtTextOutW(g_draw_dc, ix + 1, iy0, 0, NULL, wtmp, wn, NULL);
         }
 #else
         ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
+        // Same fallback overstrike as above (ship path): gated on
+        // is_heading, so the hot path pays one extra GDI call per heading
+        // run only; body/mono runs are untouched.
+        if (is_heading) ExtTextOutW(g_draw_dc, ix + 1, iy0, 0, NULL, wtmp, wn, NULL);
 #endif
         SetBkMode(g_draw_dc, prev_bk);
         SetTextColor(g_draw_dc, prev_c);
