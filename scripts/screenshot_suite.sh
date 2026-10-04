@@ -8,11 +8,134 @@ set -euo pipefail
 OUTPUT_DIR="${1:-screenshots}"
 mkdir -p "$OUTPUT_DIR"
 
+# Plugin-cache root shared by the suite and the test binary (the seeding
+# cp below must land where read-test's stat-exists lookup probes).
+suite_cache_root() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            # Windows: the exe never sees MSYS's HOME/TMPDIR synthesis, so
+            # pluginCacheRoot falls to "/tmp/..." which normalize_path
+            # drive-roots to C:\tmp (GitHub runners and dev boxes are C:).
+            # MSYS's own /tmp lives elsewhere — seeding there never resolves.
+            printf '/c/tmp/read-plugin-cache'
+            ;;
+        *)
+            if [ -n "${HOME:-}" ]; then printf '%s/Library/Caches' "$HOME";
+            else printf '%s/read-plugin-cache' "${TMPDIR:-/tmp}"; fi
+            ;;
+    esac
+}
+
 echo "Step 1: Running all tests and strict benchmarks (ReleaseFast)..."
-zig build test -Doptimize=ReleaseFast --summary all
+# Engine-absent gate: the suite pins engine-absent skips here (same
+# stance as the CI strict-gate step). The live engine enters only for
+# the captures below (Step 3 exports READ_LIVE_MATH per-shot; the
+# backend loads $READ_ZATEX_LIB there). Scrub the ambient env so a
+# CI-exported engine path cannot leak live behavior into the gate.
+env -u READ_ZATEX_LIB -u ZATEX_TEST_DYLIB zig build test -Doptimize=ReleaseFast --summary all
 
 echo "Step 2: Building Read executable in ReleaseFast mode..."
 zig build -Doptimize=ReleaseFast
+
+# Slim mode (CI: CI_SUITE=slim): the high-impact subset only — showcase
+# docs + states, one highlight language, one frame per plugin renderer,
+# live math, images, RTL, and the single scrollable-doc case. Drops: the
+# 19 extra highlight languages, plugin tall/wide/scrolled companions,
+# math_scrolled_bottom + math gallery, and all mdtest scroll sweeps
+# (~120 → 25 PNGs per OS). Full mode (default) is unchanged below.
+run_slim() {
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/text_wrapping.png" test_cases/text_wrapping.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/spacings_headings.png" test_cases/spacings_headings.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks.png" test_cases/code_and_tasks.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_hanging_indent.png" --scroll 800 test_cases/code_and_tasks.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/list_indent_text.png" test_cases/list_indent_text.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/list_indent_code.png" test_cases/list_indent_code.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/tables_formatting.png" test_cases/tables_formatting.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/code_and_tasks_scroll_end.png" --scroll-x-end test_cases/code_and_tasks.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/tables_formatting_scroll_end.png" --scroll-x-end test_cases/tables_formatting.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_fallback.png" test_cases/plugin_fallback.md
+    # Math, LIVE (READ_LIVE_MATH opts the test binary into the ship math
+    # path; every other capture below stays fallback-pinned — highlight.md
+    # and plugin_fallback.md contain $ fences whose committed shots must
+    # stay literal). Requires the engine from the CI engine-build step
+    # ($READ_ZATEX_LIB in CI, system path locally); without one these
+    # two fall back and differ from baseline (loud, not silent).
+    READ_LIVE_MATH=1 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math.png" test_cases/math.md
+    READ_LIVE_MATH=1 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_scrolled.png" --scroll 400 test_cases/math.md
+    # Plugin seeds (same fence-hash + cache pre-seed as the full flow;
+    # one renderer per shot, initial fold only).
+    command -v python3 >/dev/null 2>&1 || { echo "FAIL: slim needs python3 for fence hashing" >&2; exit 1; }
+    cache_root="$(suite_cache_root)"
+    slim_seed_mermaid() {
+        seed_hash=$(python3 - "test_cases/plugin_mermaid.md" <<'EOF'
+import sys
+lines = open(sys.argv[1]).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.lstrip().startswith('```') and l.lstrip()[3:].strip().split(' ')[:1] == ['mermaid'])
+end = next(i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith('```'))
+src = '\n'.join(lines[start + 1:end]).encode()
+h = 0xCBF29CE484222325
+M = (1 << 64) - 1
+for b in (0).to_bytes(1, 'big') + b'\x00' + src:
+    h ^= b
+    h = (h * 0x100000001B3) & M
+print('%016x' % h)
+EOF
+)
+        [ -n "$seed_hash" ] || { echo "FAIL: slim mermaid fence hash empty" >&2; exit 1; }
+        mkdir -p "$cache_root/read/plugins/mermaid"
+        cp test_cases/assets/mermaid-seed.png "$cache_root/read/plugins/mermaid/$seed_hash.png"
+    }
+    slim_seed_ordinal() {
+        # $1 = md file, $2 = info token, $3 = renderer, $4 = seed png, $5 = plugin dir
+        slim_hash=$(python3 - src/core/plugin_cache.zig "$1" "$2" "$3" <<'EOF'
+import re, sys
+zig_src, md_path, info_token, renderer = sys.argv[1:5]
+m = re.search(r"Renderer\s*=\s*enum\s*\{([^}]*)\}", open(zig_src).read())
+ordinal = [x.strip() for x in m.group(1).split(",") if x.strip()].index(renderer)
+lines = open(md_path).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.lstrip().startswith('```') and l.lstrip()[3:].strip().split(' ')[:1] == [info_token])
+end = next(i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith('```'))
+src = '\n'.join(lines[start + 1:end]).encode()
+h = 0xCBF29CE484222325
+M = (1 << 64) - 1
+for b in bytes([ordinal]) + b'\x00' + src:
+    h ^= b
+    h = (h * 0x100000001B3) & M
+print('%016x' % h)
+EOF
+)
+        [ -n "$slim_hash" ] || { echo "FAIL: slim $3 fence hash empty" >&2; exit 1; }
+        mkdir -p "$cache_root/read/plugins/$5"
+        cp "$4" "$cache_root/read/plugins/$5/$slim_hash.png"
+    }
+    slim_seed_mermaid
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid.png" --settle-images test_cases/plugin_mermaid.md
+    slim_seed_ordinal test_cases/plugin_d2.md d2 d2 test_cases/assets/d2-seed.png d2
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2.png" --settle-images test_cases/plugin_d2.md
+    slim_seed_ordinal test_cases/plugin_graphviz.md dot graphviz test_cases/assets/graphviz-seed.png graphviz
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz.png" --settle-images test_cases/plugin_graphviz.md
+    slim_seed_ordinal test_cases/plugin_plantuml.md plantuml plantuml test_cases/assets/plantuml-seed.png plantuml
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml.png" --settle-images test_cases/plugin_plantuml.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/admonitions.png" test_cases/admonitions.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/highlight_zig.png" test_cases/highlight.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/bare_links.png" test_cases/bare_links.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/frontmatter.png" test_cases/frontmatter.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/scrollable_doc.png" --scroll 500 test_cases/scrollable_doc.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/images.png" test_cases/images.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/images_settled.png" --settle-images test_cases/images.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/images_scrolled.png" --scroll 450 test_cases/images.md
+    ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/rtl_bidi.png" test_cases/rtl_bidi.md
+}
+
+if [ "${CI_SUITE:-}" = "slim" ]; then
+    echo "Step 3 (slim): Capturing high-impact subset into $OUTPUT_DIR..."
+    run_slim
+    echo "Slim screenshot captures complete in $OUTPUT_DIR:"
+    ls -lh "$OUTPUT_DIR"
+    exit 0
+fi
 
 echo "Step 3: Capturing distinct visual regression test cases into $OUTPUT_DIR..."
 
@@ -111,7 +234,7 @@ print('%016x' % h)
 EOF
 )
 [ -n "$seed_hash" ] || { echo "FAIL: case 4e fence hash empty" >&2; exit 1; }
-if [ -n "${HOME:-}" ]; then cache_root="$HOME/Library/Caches"; else cache_root="${TMPDIR:-/tmp}/read-plugin-cache"; fi
+cache_root="$(suite_cache_root)"
 mkdir -p "$cache_root/read/plugins/mermaid"
 cp test_cases/assets/mermaid-seed.png "$cache_root/read/plugins/mermaid/$seed_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_mermaid.png" --settle-images test_cases/plugin_mermaid.md
@@ -131,7 +254,7 @@ cp test_cases/assets/mermaid-seed.png "$cache_root/read/plugins/mermaid/$seed_ha
 # viewport plus three --scroll frames covering middle/deep/bottom.
 # Both seed through the shipped stat-exists path with zero child processes.
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: cases 4f/4g need python3 for fence hashing" >&2; exit 1; }
-if [ -n "${HOME:-}" ]; then cache_root="$HOME/Library/Caches"; else cache_root="${TMPDIR:-/tmp}/read-plugin-cache"; fi
+cache_root="$(suite_cache_root)"
 mkdir -p "$cache_root/read/plugins/mermaid"
 many_hashes=$(python3 - "test_cases/plugin_mermaid_many.md" <<'EOF'
 import sys
@@ -324,7 +447,7 @@ print('%016x' % h)
 EOF
 )
 [ -n "$d2_hash" ] || { echo "FAIL: case 4i fence hash empty" >&2; exit 1; }
-if [ -n "${HOME:-}" ]; then cache_root="$HOME/Library/Caches"; else cache_root="${TMPDIR:-/tmp}/read-plugin-cache"; fi
+cache_root="$(suite_cache_root)"
 mkdir -p "$cache_root/read/plugins/d2"
 cp test_cases/assets/d2-seed.png "$cache_root/read/plugins/d2/$d2_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2.png" --settle-images test_cases/plugin_d2.md
@@ -385,7 +508,7 @@ EOF
 cp test_cases/assets/d2-seed-wide.png "$cache_root/read/plugins/d2/$wide_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_d2_wide.png" --settle-images test_cases/plugin_d2_wide.md
 [ -n "$graphviz_hash" ] || { echo "FAIL: case 4j fence hash empty" >&2; exit 1; }
-if [ -n "${HOME:-}" ]; then cache_root="$HOME/Library/Caches"; else cache_root="${TMPDIR:-/tmp}/read-plugin-cache"; fi
+cache_root="$(suite_cache_root)"
 mkdir -p "$cache_root/read/plugins/graphviz"
 cp test_cases/assets/graphviz-seed.png "$cache_root/read/plugins/graphviz/$graphviz_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz.png" --settle-images test_cases/plugin_graphviz.md
@@ -446,7 +569,7 @@ EOF
 cp test_cases/assets/graphviz-seed-wide.png "$cache_root/read/plugins/graphviz/$wide_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_graphviz_wide.png" --settle-images test_cases/plugin_graphviz_wide.md
 [ -n "$plantuml_hash" ] || { echo "FAIL: case 4k fence hash empty" >&2; exit 1; }
-if [ -n "${HOME:-}" ]; then cache_root="$HOME/Library/Caches"; else cache_root="${TMPDIR:-/tmp}/read-plugin-cache"; fi
+cache_root="$(suite_cache_root)"
 mkdir -p "$cache_root/read/plugins/plantuml"
 cp test_cases/assets/plantuml-seed.png "$cache_root/read/plugins/plantuml/$plantuml_hash.png"
 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/plugin_plantuml.png" --settle-images test_cases/plugin_plantuml.md
