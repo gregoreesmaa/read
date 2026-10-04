@@ -1977,9 +1977,12 @@ pub const MathBoxCacheEntry = struct {
     tex_len: usize = 0,
     font_px: f32 = 0,
     display: bool = false,
+    // Refusals latch as the zero-area box mathBoxQuery never emits (it
+    // nulls w <= 0 or above + below <= 0), so no separate fail bit: a hit
+    // with a zero-area box is a latched refusal. `hit` doubles as the
+    // valid flag; reset clears it.
     box: MathBox = .{ .w = 0, .above = 0, .below = 0, .font_px = 0, .display = false },
     hit: bool = false,
-    fail: bool = false,
 };
 pub const MathBoxCache = [MATH_BOX_CACHE_LEN]MathBoxCacheEntry;
 
@@ -2002,8 +2005,9 @@ fn mathBox(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSizeFn) ?
 /// slices hit exactly, and a same-slot eviction re-queries rather than
 /// aliasing (the loser re-fills the slot).
 /// Misses (and refused formulas) call through exactly once and fill the
-/// direct-mapped slot — including `fail` latching, so a repeatedly
-/// refused formula pays one FFI refusal per table cycle, not per frame.
+/// direct-mapped slot — refusals latch as the zero-area box below, so a
+/// repeatedly refused formula pays one FFI refusal per table cycle, not
+/// per frame.
 fn mathBoxCached(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSizeFn, cache: ?*MathBoxCache) ?MathBox {
     const q = size_fn orelse return null;
     if (comptime math_stub) return null;
@@ -2015,7 +2019,9 @@ fn mathBoxCached(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSiz
     if (display) h ^= 0xA24BAED4963EE407;
     const slot = tab[@as(usize, h) % MATH_BOX_CACHE_LEN];
     if (slot.hit and slot.tex_ptr == key and slot.tex_len == tex.len and slot.font_px == font_px and slot.display == display) {
-        if (slot.fail) return null;
+        // Zero-area box is the latched refusal (mathBoxQuery never emits
+        // one); nonzero boxes replay bitwise-identically.
+        if (slot.box.w <= 0 or slot.box.above + slot.box.below <= 0) return null;
         return slot.box;
     }
     const got = mathBoxQuery(tex, display, font_px, q);
@@ -2026,7 +2032,6 @@ fn mathBoxCached(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSiz
         .display = display,
         .box = got orelse .{ .w = 0, .above = 0, .below = 0, .font_px = 0, .display = false },
         .hit = true,
-        .fail = got == null,
     };
     return got;
 }
@@ -5032,9 +5037,12 @@ pub const TokenCacheEntry = struct {
     line_len: usize = 0,
     lang: highlight.Lang = .none,
     seg_count: u8 = 0,
-    is_null: bool = false,
-    hit: bool = false,
+    // Null (untokenizable-line) outcomes latch as seg_count == 0 with hit
+    // set — tokenize never emits an empty non-null prefix for a nonempty
+    // line (empty lines bypass the table above), so 0 unambiguously means
+    // null. No separate is_null bit.
     segs: [highlight.MAX_SEGMENTS]highlight.Segment = undefined,
+    hit: bool = false,
 };
 pub const TokenCache = [TOKEN_CACHE_LEN]TokenCacheEntry;
 
@@ -5056,7 +5064,9 @@ pub fn tokenizeCached(lang: highlight.Lang, line: []const u8, out: []highlight.S
     const idx = h % TOKEN_CACHE_LEN;
     const slot = &tab[idx];
     if (slot.hit and slot.line_ptr == key and slot.line_len == line.len and slot.lang == lang) {
-        if (slot.is_null) return null;
+        // seg_count == 0 is the latched null (see the entry comment); the
+        // hit path copies the latched segments into the caller's buffer.
+        if (slot.seg_count == 0) return null;
         const n = @min(@as(usize, slot.seg_count), out.len);
         @memcpy(out[0..n], slot.segs[0..n]);
         return out[0..n];
@@ -5067,11 +5077,9 @@ pub fn tokenizeCached(lang: highlight.Lang, line: []const u8, out: []highlight.S
     slot.lang = lang;
     slot.hit = true;
     if (got) |runs| {
-        slot.is_null = false;
         slot.seg_count = @intCast(@min(runs.len, slot.segs.len));
         @memcpy(slot.segs[0..slot.seg_count], runs[0..slot.seg_count]);
     } else {
-        slot.is_null = true;
         slot.seg_count = 0;
     }
     return got;
