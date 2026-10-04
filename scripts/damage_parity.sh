@@ -283,6 +283,21 @@ while read -r gs ax1 ay1 ax2 ay2 bx1 by1 bx2 by2; do
                 python3 scripts/fringe_localize.py /tmp/sweep25_bisA.png /tmp/sweep25_freshA.png "g${gn}-bisA-vs-fresh" $bis_rect || true
                 # shellcheck disable=SC2086
                 python3 scripts/fringe_localize.py /tmp/drag_phase_1.png /tmp/sweep25_freshA.png "g${gn}-inc-vs-fresh" $bis_rect || true
+                # TEMPORARY row-content probe (#389): which command rects
+                # cover the fringe rows? Dumps the command stream at the
+                # gesture scroll (full) and under the phase-1 damage
+                # (kept= flags show exactly what the damage path culled).
+                # Identifies pill vs text vs math runs at the fringe site.
+                sleep 0.3
+                # shellcheck disable=SC2086
+                "$BIN" --screenshot /tmp/sweep25_cmds.png --settle-images --scroll $gs --dump-commands "$DOC" 2>&1 | grep '^CMD ' > /tmp/sweep25_cmds_full.txt || true
+                sleep 0.3
+                # shellcheck disable=SC2086
+                "$BIN" --screenshot /tmp/sweep25_cmds.png --settle-images --scroll $gs --damage $bis_dmg --dump-commands "$DOC" 2>&1 | grep '^CMD ' > /tmp/sweep25_cmds_dmg.txt || true
+                echo "ROWPROBE g${gn}: inline_code_bg near fringe doc-y rows:"
+                grep 'inline_code_bg' /tmp/sweep25_cmds_full.txt | head -20 || true
+                echo "ROWPROBE g${gn}: text_run kept=0 under phase damage (culled):"
+                grep 'text_run' /tmp/sweep25_cmds_dmg.txt | grep -v 'kept=1' | head -20 || true
                 ;;
         esac
     fi
