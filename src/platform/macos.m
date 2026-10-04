@@ -1006,6 +1006,36 @@ static void display_push(int force) {
     [self addTrackingArea:area];
 }
 
+// Fix-round 5 (PR #398 gestures 5/12/13): TEST_HOOKS failing-gesture
+// decision diff. Both arms now render at the swept scroll, so any
+// remaining extend-phase diff is inside THESE paint decisions under
+// identical scrolled inputs. The census names the branch (count lines
+// with records= then wash=/skip and diff phase-1 vs fresh-A logs):
+//  - records=/culled= per phase: record-model census via the damage-gated
+//    register path (TEST_HOOKS only; compiled out of ship).
+//  - wash q= vs skip q=: per-record decision with char range + rect.
+// A wash line on one side whose q= is absent on the other = record-model
+// divergence; identical q= sets with different x1/x2 = char-map
+// divergence; identical q=/cs=/ce= with different qx1/qw/qy/qh =
+// quantization divergence; identical census + identical wash set =
+// decision-identical (mechanism is downstream: state cleared BETWEEN the
+// decision and the pixel, i.e. batch/text state — not named here).
+// TEMPORARY: remove before merge; never ship (gated TEST_HOOKS-only).
+#ifdef TEST_HOOKS
+static int g_wash_trace_on = 0;
+static int g_wash_traced = 0;
+static int g_wash_culled_runs = 0;
+static int g_wash_trace_phase = 0;
+void platform_set_wash_trace(int on) {
+    g_wash_trace_on = on ? 1 : 0;
+    g_wash_traced = 0;
+    g_wash_culled_runs = 0;
+}
+void platform_set_wash_trace_phase(int phase) { g_wash_trace_phase = phase; }
+void platform_note_culled_run(void) {
+    g_wash_culled_runs++;
+}
+#endif
 // Flowing per-line selection highlight over the rebuilt text records.
 // Shared by live drawRect and headless screenshots so --select captures
 // exercise the real painter (regression: highlight used to render as a
@@ -1067,6 +1097,10 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
             if (!min_in && min_d <= 4.0f) min_y = min_edge;
             if (!max_in && max_d <= 4.0f) max_y = max_edge;
         }
+#ifdef TEST_HOOKS
+        if (g_wash_trace_on)
+            fprintf(stderr, "WASH begin records=%d culled=%d sel=%.1f,%.1f,%.1f,%.1f scroll=%.1f\n", g_text_record_count, g_wash_culled_runs, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, g_scroll_y);
+#endif
 
         // Endpoint rows at row granularity: runs on one visual row share
         // first/last status by doc_y, not by per-record band. Mixed-height
@@ -1097,6 +1131,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlskip band q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+                if (g_wash_trace_on)
+                    fprintf(stderr, "WASH skip q=%d why=band y=%.2f h=%.2f min=%.2f max=%.2f txt=%.16s\n", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
 #endif
                 continue;
             }
@@ -1134,6 +1170,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlskip edge q=%d y=%.1f h=%.1f min=%.1f max=%.1f txt=%.12s", q, rec->doc_y, rec->h, min_y, max_y, rec->text);
+                if (g_wash_trace_on)
+                    fprintf(stderr, "WASH skip q=%d why=edge y=%.2f h=%.2f min=%.2f max=%.2f inrow=%d,%d txt=%.16s\n", q, rec->doc_y, rec->h, min_y, max_y, in_min_row ? 1 : 0, in_max_row ? 1 : 0, rec->text);
 #endif
                 continue;
             }
@@ -1184,6 +1222,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
                         DBGLOG("EV hlskip xrow q=%d x=%.1f w=%.1f l=%.1f r=%.1f txt=%.12s", q, rec->x, rec->w, left_x, right_x, rec->text);
+                    if (g_wash_trace_on)
+                        fprintf(stderr, "WASH skip q=%d why=xrow x=%.2f w=%.2f l=%.2f r=%.2f txt=%.16s\n", q, rec->x, rec->w, left_x, right_x, rec->text);
 #endif
                     continue;
                 }
@@ -1195,6 +1235,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
                         DBGLOG("EV hlskip xfirst q=%d x=%.1f w=%.1f s=%.1f txt=%.12s", q, rec->x, rec->w, start_x, rec->text);
+                    if (g_wash_trace_on)
+                        fprintf(stderr, "WASH skip q=%d why=xfirst x=%.2f w=%.2f s=%.2f txt=%.16s\n", q, rec->x, rec->w, start_x, rec->text);
 #endif
                     continue;
                 }
@@ -1206,6 +1248,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                     if (g_text_record_count < 400)
                         DBGLOG("EV hlskip xlast q=%d x=%.1f w=%.1f e=%.1f txt=%.12s", q, rec->x, rec->w, end_x, rec->text);
+                    if (g_wash_trace_on)
+                        fprintf(stderr, "WASH skip q=%d why=xlast x=%.2f w=%.2f e=%.2f txt=%.16s\n", q, rec->x, rec->w, end_x, rec->text);
 #endif
                     continue;
                 }
@@ -1220,6 +1264,8 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
 #ifdef TEST_HOOKS
                 if (g_text_record_count < 400)
                     DBGLOG("EV hlskip empty q=%d cs=%d ce=%d len=%d x=%.2f w=%.2f miny=%.2f maxy=%.2f sx=%.2f sy=%.2f ex=%.2f ey=%.2f txt=%.12s", q, c_start, c_end, rec->len, rec->x, rec->w, min_y, max_y, top_pt.x, top_pt.y, bot_pt.x, bot_pt.y, rec->text);
+                if (g_wash_trace_on)
+                    fprintf(stderr, "WASH skip q=%d why=empty cs=%d ce=%d len=%d x=%.2f w=%.2f txt=%.16s\n", q, c_start, c_end, rec->len, rec->x, rec->w, rec->text);
 #endif
             }
             if (c_end > c_start) {
@@ -1238,7 +1284,14 @@ if ((g_has_selection || g_select_all) && g_text_record_count > 0) {
                 // gestures 5/12/13, all fractional endpoint coords). Same
                 // rule as selection_bounds_expanded's damage quantization.
                 float qx1 = floorf(x1), qy = floorf(view_y);
-                CGContextFillRect(ctx, CGRectMake(qx1, qy, ceilf(x2) - qx1, ceilf(view_y + rec->h) - qy));
+                float qw = ceilf(x2) - qx1, qh = ceilf(view_y + rec->h) - qy;
+#ifdef TEST_HOOKS
+                if (g_wash_trace_on) {
+                    fprintf(stderr, "WASH wash q=%d cs=%d ce=%d x=%.2f w=%.2f x1=%.2f x2=%.2f vy=%.2f h=%.2f qx1=%.2f qw=%.2f qy=%.2f qh=%.2f txt=%.16s\n", q, c_start, c_end, rec->x, rec->w, x1, x2, view_y, rec->h, qx1, qw, qy, qh, rec->text);
+                    g_wash_traced++;
+                }
+#endif
+                CGContextFillRect(ctx, CGRectMake(qx1, qy, qw, qh));
             }
         }
     }
@@ -2683,6 +2736,10 @@ void platform_test_button_damage(float bx, float by, float bw, float bh,
     if (ow) *ow = d.size.width;
     if (oh) *oh = d.size.height;
 }
+// Fix-round 5 decision diff (TEST_HOOKS only, temporary): arm/disarm the
+// per-record wash trace around one paint pass (see g_wash_trace_on above).
+void platform_set_wash_trace(int on);
+void platform_note_culled_run(void);
 #endif
 
 // Returns the dirty rect AppKit reported for the in-progress draw, for
@@ -2845,6 +2902,12 @@ void platform_register_text_run(const char* text, int len, float x, float y, flo
     }
     record_text_quad(text, len, x, y, rec_w, rec_h, font_size,
                      is_bold, is_italic, is_mono, is_heading, link_url, link_url_len);
+#ifdef TEST_HOOKS
+    if (g_wash_trace_on) {
+        platform_note_culled_run();
+        fprintf(stderr, "WASH culled x=%.2f y=%.2f w=%.2f h=%.2f txt=%.16s\n", x, y, rec_w, rec_h, text);
+    }
+#endif
     // Culled link runs draw no pixels but must advance the underline
     // continuation (#101) with the same shaped width, so a partial-damage
     // draw bridges its visible words exactly like a full draw.
@@ -3976,7 +4039,21 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     platform_batch_end();
 
     // Headless selection captures paint the same highlight as live draws.
-    if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
+    if (g_has_selection || g_select_all) {
+#ifdef TEST_HOOKS
+        if (g_wash_trace_phase == 10) {
+            fprintf(stderr, "WASH phase=freshA damage=full\n");
+            platform_set_wash_trace(1);
+        }
+#endif
+        paint_selection_highlight(ctx);
+#ifdef TEST_HOOKS
+        if (g_wash_trace_phase == 10) {
+            platform_set_wash_trace(0);
+            fprintf(stderr, "WASH end phase=freshA washed=%d\n", g_wash_traced);
+        }
+#endif
+    }
     // Same for the hover copy button (--hover): headless screenshots
     // exercise the live paint, fringe stroke included. NSBezierPath and
     // NSString draw into the AppKit context stack (nil headlessly), not
@@ -4125,12 +4202,30 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     g_scrollable_block_count = 0;
     g_pending_dirty = union_rect(box_prev, box_a);
     g_pending_dirty_valid = YES;
+#ifdef TEST_HOOKS
+    if (g_wash_trace_phase == 1)
+        fprintf(stderr, "WASH damage=1 x=%.1f y=%.1f w=%.1f h=%.1f\n",
+            g_pending_dirty.origin.x, g_pending_dirty.origin.y,
+            g_pending_dirty.size.width, g_pending_dirty.size.height);
+#endif
     CGContextSaveGState(ctx);
     CGContextClipToRect(ctx, CGRectMake(g_pending_dirty.origin.x, g_pending_dirty.origin.y,
         g_pending_dirty.size.width, g_pending_dirty.size.height));
     render_fn(width, height);
     platform_batch_end();
+#ifdef TEST_HOOKS
+    if (g_wash_trace_phase == 1) {
+        fprintf(stderr, "WASH phase=1\n");
+        platform_set_wash_trace(1);
+    }
+#endif
     paint_selection_highlight(ctx);
+#ifdef TEST_HOOKS
+    if (g_wash_trace_phase == 1) {
+        platform_set_wash_trace(0);
+        fprintf(stderr, "WASH end phase=1 washed=%d\n", g_wash_traced);
+    }
+#endif
     CGContextRestoreGState(ctx);
     rc = headless_dump_png(ctx, "/tmp/drag_phase_1.png");
     if (rc != 0) { CGContextRelease(ctx); return rc; }
