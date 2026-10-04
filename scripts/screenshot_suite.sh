@@ -26,6 +26,15 @@ suite_cache_root() {
     esac
 }
 
+# Live-engine path for the Step-3 math captures: saved BEFORE the Step-1
+# gate scrub below. The scrub is scoped to the `zig build test` child
+# (engine-absent gate stance, same as the CI strict-gate steps), but
+# re-exporting the saved value at the captures keeps math.png live even
+# when the suite itself is launched with a scrubbed env — on
+# Linux/Windows there is no system install path, so without it the
+# dlopen finds nothing and the shots silently fall back to literal.
+SAVED_READ_ZATEX_LIB="${READ_ZATEX_LIB:-}"
+
 echo "Step 1: Running all tests and strict benchmarks (ReleaseFast)..."
 # Engine-absent gate: the suite pins engine-absent skips here (same
 # stance as the CI strict-gate step). The live engine enters only for
@@ -57,9 +66,16 @@ run_slim() {
     # Math, LIVE (READ_LIVE_MATH opts the test binary into the ship math
     # path; every other capture below stays fallback-pinned — highlight.md
     # and plugin_fallback.md contain $ fences whose committed shots must
-    # stay literal). Requires the engine from the CI engine-build step
-    # ($READ_ZATEX_LIB in CI, system path locally); without one these
-    # two fall back and differ from baseline (loud, not silent).
+    # stay literal). Restores the engine path saved before the Step-1
+    # scrub: on Linux/Windows CI only $READ_ZATEX_LIB points at the
+    # per-OS engine build, and the gate scrub otherwise starves the dlopen
+    # (macOS CI exports libzatex.dylib; a local macOS run may instead rely
+    # on the /usr/local/lib install, so absence there is not fatal).
+    # Fails LOUD here rather than committing fallback PNGs as if live.
+    if [ -n "$SAVED_READ_ZATEX_LIB" ]; then export READ_ZATEX_LIB="$SAVED_READ_ZATEX_LIB"; fi
+    if [ "$(uname -s)" != "Darwin" ] && [ ! -f "${READ_ZATEX_LIB:-}" ]; then
+        echo "FAIL: math captures need READ_ZATEX_LIB pointing at the engine build" >&2; exit 1
+    fi
     READ_LIVE_MATH=1 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math.png" test_cases/math.md
     READ_LIVE_MATH=1 ./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/math_scrolled.png" --scroll 400 test_cases/math.md
     # Plugin seeds (same fence-hash + cache pre-seed as the full flow;

@@ -3927,6 +3927,12 @@ int platform_test_outline_build(void) {
     g_outline_count = 0;
     return rows == 2 ? 1 : 0;
 }
+// RTL run-face probe (issue #50 follow-up): CoreText cascades, so
+// Hebrew/Arabic runs never need substitution — always 0. Headless-safe.
+int platform_test_bidi_face(const char* text, int text_len, int is_mono, int is_heading) {
+    (void)text; (void)text_len; (void)is_mono; (void)is_heading;
+    return 0;
+}
 #endif
 
 // Open files (issue #43): Cmd+O panel, window drag-and-drop, Dock-icon

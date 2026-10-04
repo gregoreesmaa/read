@@ -398,7 +398,7 @@ static const WCHAR* face_for_style(int is_bold, int is_italic, int is_mono, int 
         if (is_bold) return L"JetBrains Mono";
         return L"JetBrains Mono";
     }
-    if (is_heading) return L"Space Grotesk";
+    if (is_heading) return L"Space Grotesk Light";
     if (is_bold && is_italic) return L"IBM Plex Serif";
     if (is_bold) return L"IBM Plex Serif";
     if (is_italic) return L"IBM Plex Serif";
@@ -414,18 +414,67 @@ static const WCHAR* face_fallback(int is_mono, int is_heading) {
     if (is_heading) return L"Segoe UI";
     return L"Georgia";
 }
-// Realize (and cache) an HFONT for this run. v1: one-entry cache — the
+// Bidi run scan (issue #50 follow-up): 1 when the UTF-8 run holds any
+// Hebrew/Arabic-script codepoint the bundled faces cannot cover (their
+// cmaps carry zero Hebrew/Arabic glyphs — verified per-file), else 0.
+// Pure byte walk, no DC, no allocation; hot path stays zero-alloc.
+static int run_needs_bidi_face(const char* text, int len) {
+    if (!text || len <= 0) return 0;
+    int i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)text[i];
+        if (c < 0x80) { i++; continue; }
+        unsigned cp = 0xFFFD;
+        int adv = 1;
+        if ((c & 0xE0) == 0xC0 && i + 1 < len) {
+            cp = ((unsigned)(c & 0x1F) << 6) | (text[i + 1] & 0x3F);
+            adv = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
+            cp = ((unsigned)(c & 0x0F) << 12) |
+                ((unsigned)(text[i + 1] & 0x3F) << 6) | (text[i + 2] & 0x3F);
+            adv = 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
+            cp = ((unsigned)(c & 0x07) << 18) |
+                ((unsigned)(text[i + 1] & 0x3F) << 12) |
+                ((unsigned)(text[i + 2] & 0x3F) << 6) | (text[i + 3] & 0x3F);
+            adv = 4;
+        }
+        // Hebrew + Arabic-family scripts, incl. presentation forms —
+        // the same RTL ranges src/core/bidi.zig detects (minus the
+        // weak Arabic-Indic digit carve-outs, which alone still need
+        // the covering face to avoid .notdef).
+        if ((cp >= 0x0590 && cp <= 0x08FF) ||
+            (cp >= 0xFB1D && cp <= 0xFDFD) ||
+            (cp >= 0xFE70 && cp <= 0xFEFF)) return 1;
+        i += adv;
+    }
+    return 0;
+}
+// Bidi covering faces: run-shaped typography (Times New Roman body,
+// Courier New mono — both carry full Hebrew + Arabic per the
+// GetGlyphIndicesW probe; headings stay Segoe UI, which covers too).
+static const WCHAR* face_bidi(int is_mono) {
+    return is_mono ? L"Courier New" : L"Times New Roman";
+}
+// Realize (and cache) an HFONT for this run. One-entry cache — the
 // reader draws long runs of identical style, so hit rate is high; misses
-// just recreate (no leak: the old font is deleted).
-static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
+// just recreate (no leak: the old font is deleted). The bidi bit joins the
+// key: Hebrew/Arabic runs select a covering face (the bundled faces carry
+// zero Hebrew/Arabic glyphs, and GDI linking otherwise substitutes an
+// environment-dependent Arial — issue #50 follow-up). NOTE: Zig-side
+// layout (measureTextEx) still uses the Plex-fallback width for these
+// runs (the #50 known limit), so this only changes glyphs, not geometry.
+static HFONT font_for_run_ex(float font_size, int is_bold, int is_italic, int is_mono, int is_heading,
+                             const char* text, int len) {
     register_app_fonts();
-    static float c_size = -1; static int c_b = -1, c_i = -1, c_m = -1, c_h = -1;
+    int bidi = run_needs_bidi_face(text, len);
+    static float c_size = -1; static int c_b = -1, c_i = -1, c_m = -1, c_h = -1, c_d = -1;
     if (g_font_cache && c_size == font_size && c_b == is_bold && c_i == is_italic &&
-        c_m == is_mono && c_h == is_heading) return g_font_cache;
+        c_m == is_mono && c_h == is_heading && c_d == bidi) return g_font_cache;
     if (g_font_cache) { DeleteObject(g_font_cache); g_font_cache = NULL; }
     int px = (int)(font_size + 0.5f);
     if (px < 1) px = 1;
-    const WCHAR* faces[2] = { face_for_style(is_bold, is_italic, is_mono, is_heading),
+    const WCHAR* faces[2] = { bidi ? face_bidi(is_mono) : face_for_style(is_bold, is_italic, is_mono, is_heading),
                               face_fallback(is_mono, is_heading) };
     for (int k = 0; k < 2; k++) {
         g_font_cache = CreateFontW(-px, 0, 0, 0, face_weight(is_bold, is_heading),
@@ -434,8 +483,11 @@ static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mo
             DEFAULT_PITCH | FF_DONTCARE, faces[k]);
         if (g_font_cache) break;
     }
-    c_size = font_size; c_b = is_bold; c_i = is_italic; c_m = is_mono; c_h = is_heading;
+    c_size = font_size; c_b = is_bold; c_i = is_italic; c_m = is_mono; c_h = is_heading; c_d = bidi;
     return g_font_cache;
+}
+static HFONT font_for_run(float font_size, int is_bold, int is_italic, int is_mono, int is_heading) {
+    return font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, NULL, 0);
 }
 #ifdef TEST_HOOKS
 // Forced-scale headless text uses bi-level (non-antialiased) glyphs: the
@@ -510,7 +562,8 @@ static int get_char_index_at_x(QuadTextRecord* rec, float x_offset) {
     if (x_offset >= rec->w) return rec->len;
     HDC dc = g_draw_dc ? g_draw_dc : (g_memdc ? g_memdc : GetDC(NULL));
     int need_release = (!g_draw_dc && !g_memdc);
-    HFONT f = font_for_run(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
+    HFONT f = font_for_run_ex(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading,
+                              rec->text, rec->len);
     HFONT old = NULL;
     if (f) old = (HFONT)SelectObject(dc, f);
     int r = byte_index_at_x(dc, rec->text, rec->len, rec->w, x_offset);
@@ -523,7 +576,8 @@ static float get_x_for_char_index(QuadTextRecord* rec, int char_idx) {
     if (char_idx >= rec->len) return rec->w;
     HDC dc = g_draw_dc ? g_draw_dc : (g_memdc ? g_memdc : GetDC(NULL));
     int need_release = (!g_draw_dc && !g_memdc);
-    HFONT f = font_for_run(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading);
+    HFONT f = font_for_run_ex(rec->font_size, rec->is_bold, rec->is_italic, rec->is_mono, rec->is_heading,
+                              rec->text, rec->len);
     HFONT old = NULL;
     if (f) old = (HFONT)SelectObject(dc, f);
     // char_idx here is a UTF-16 index on macOS; our callers convert via
@@ -648,7 +702,7 @@ void platform_register_text_run(const char* text, int len, float x, float y, flo
     if (!text || len <= 0) return;
     float rw = w, rh = h;
     if (g_draw_dc) {
-        HFONT f = font_for_run(font_size, is_bold, is_italic, is_mono, is_heading);
+        HFONT f = font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, text, len);
         HFONT old = f ? (HFONT)SelectObject(g_draw_dc, f) : NULL;
         if (f) { rw = measure_run(g_draw_dc, text, len, &rh); SelectObject(g_draw_dc, old); }
     }
@@ -681,7 +735,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
                         const char* link_url, int link_url_len) {
     if (!g_draw_dc || len <= 0 || !text) return;
     if (!link_url || link_url_len <= 0) g_last_ul.valid = 0;
-    HFONT f = font_for_run(font_size, is_bold, is_italic, is_mono, is_heading);
+    HFONT f = font_for_run_ex(font_size, is_bold, is_italic, is_mono, is_heading, text, len);
     if (!f) return;
     HFONT old = (HFONT)SelectObject(g_draw_dc, f);
     float rh = font_size * 1.0f;
@@ -708,14 +762,17 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
 #ifdef TEST_HOOKS
         if (q_bilevel) {
             // Bi-level text ignores alpha blends: draw solid only when
-            // fully opaque (all crisp-test runs are).
+            // fully opaque (all crisp-test runs are). The bidi covering
+            // face joins so RTL runs stay glyph-complete at 2x too.
             if (a == 255) {
+                int bidi = run_needs_bidi_face(text, len);
                 HFONT bf = CreateFontW(-(int)(font_size + 0.5f), 0, 0, 0,
                     face_weight(is_bold, is_heading), is_italic ? TRUE : FALSE,
                     FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
                     DEFAULT_PITCH | FF_DONTCARE,
-                    is_mono ? L"Consolas" : (is_heading ? L"Segoe UI" : L"Georgia"));
+                    bidi ? face_bidi(is_mono) :
+                    (is_mono ? L"Consolas" : (is_heading ? L"Segoe UI" : L"Georgia")));
                 if (bf) {
                     HFONT bo = (HFONT)SelectObject(g_draw_dc, bf);
                     ExtTextOutW(g_draw_dc, ix, iy0, 0, NULL, wtmp, wn, NULL);
@@ -1728,6 +1785,14 @@ int platform_test_outline_build(void) {
     int rows = g_outline_row_count;
     g_outline_count = 0;
     return rows == 2 ? 1 : 0;
+}
+// RTL run-face contract probe (issue #50 follow-up): 0 when the primary
+// face covers the run, 1/2 when the bidi serif/mono face is needed.
+// Same scan as font_for_run's selector below; headless-safe (pure bytes).
+int platform_test_bidi_face(const char* text, int text_len, int is_mono, int is_heading) {
+    (void)is_heading;
+    if (!run_needs_bidi_face(text, text_len)) return 0;
+    return is_mono ? 2 : 1;
 }
 #endif
 

@@ -33,6 +33,7 @@
 #include <math.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_MULTIPLE_MASTERS_H
 #include <fontconfig/fontconfig.h>
 #include <png.h>
 
@@ -351,7 +352,19 @@ static void register_app_fonts(void) {
         FT_New_Face(g_ft, p, 0, &g_face_italic);
     }
     p = font_asset_path("SpaceGrotesk.ttf");
-    if (p) FT_New_Face(g_ft, p, 0, &g_face_head);
+    if (p && FT_New_Face(g_ft, p, 0, &g_face_head) == 0) {
+        // SpaceGrotesk.ttf is variable (wght 300-700, default 300); headings
+        // force bold so pin wght to 700. Cold path; failures keep default.
+        FT_MM_Var* mm = NULL;
+        if (FT_Get_MM_Var(g_face_head, &mm) == 0 && mm != NULL) {
+            FT_Fixed c[4];
+            FT_UInt n = mm->num_axis < 4 ? mm->num_axis : 4;
+            for (FT_UInt i = 0; i < n; i++)
+                c[i] = (mm->axis[i].tag == 0x77676874UL) ? (700 << 16) : mm->axis[i].def;
+            if (n) FT_Set_Var_Design_Coordinates(g_face_head, n, c);
+            FT_Done_MM_Var(g_ft, mm);
+        }
+    }
     p = font_asset_path("JetBrainsMono.ttf");
     if (p) FT_New_Face(g_ft, p, 0, &g_face_mono);
     g_fc = FcInitLoadConfigAndFonts();
@@ -2779,6 +2792,12 @@ int platform_test_outline_build(void) {
     int ok = (g_outline_row_count == 2) ? 1 : 0;
     g_outline_count = 0;
     return ok;
+}
+// RTL run-face probe (issue #50 follow-up): other backends cascade, so
+// Hebrew/Arabic runs never need substitution — always 0. Headless-safe.
+int platform_test_bidi_face(const char* text, int text_len, int is_mono, int is_heading) {
+    (void)text; (void)text_len; (void)is_mono; (void)is_heading;
+    return 0;
 }
 // Pixel probe (TEST_HOOKS): up to 8 headless probe points.
 static int g_probe_count = 0;

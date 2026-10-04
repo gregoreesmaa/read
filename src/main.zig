@@ -4517,4 +4517,24 @@ test "outline picker contracts: filter + panel build (#48)" {
     }
 }
 
+test "windows bidi run face: hebrew/arabic runs substitute, latin does not (#50)" {
+    // Windows GDI has no cascade: Hebrew/Arabic runs must select a covering
+    // face (bundled Plex/Grotesk/Mono carry zero Hebrew/Arabic glyphs).
+    // Other backends answer 0 (macOS cascades, Linux falls back per glyph),
+    // so only the Windows read-test executes the substitution arms.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const latin = "Hello world";
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_bidi_face(latin.ptr, @intCast(latin.len), 0, 0));
+        const heb = "שלום עולם";
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_bidi_face(heb.ptr, @intCast(heb.len), 0, 0));
+        const arb = "مرحبا بالعالم";
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_bidi_face(arb.ptr, @intCast(arb.len), 0, 0));
+        // Headings substitute through the same serif face; mono through its own.
+        try t.expectEqual(@as(c_int, 1), bridge.platform_test_bidi_face(heb.ptr, @intCast(heb.len), 0, 1));
+        try t.expectEqual(@as(c_int, 2), bridge.platform_test_bidi_face(heb.ptr, @intCast(heb.len), 1, 0));
+        try t.expectEqual(@as(c_int, 0), bridge.platform_test_bidi_face(latin.ptr, @intCast(latin.len), 1, 0));
+    }
+}
+
 
