@@ -505,11 +505,12 @@ static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, flo
                              (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
     // #389 (GPU): None when the blit is snapped 1:1 (dest device size ==
     // mask size: no resampling either way, so no pixel change on live
-    // Retina), Default only while actually downsampling (headless 1x
-    // harness drawing forced-2x masks: nearest mangles thin STIX stems,
-    // measured 142.8 vs 149.9 bilinear on the corrected raster). The math
-    // crisp budget in the #355 test pins both arms: it runs forced-scale
-    // (downsample arm) and would fail loudly if the 1:1 arm ever resampled.
+    // Retina), Default only while actually downsampling (a fractional
+    // destination scale; the old 142.8 vs 149.9 numbers were measured
+    // through the downsampling headless harness, so re-measure there —
+    // the 2026-10 truthful 2x backing takes the 1:1 arm). The math crisp
+    // budget in the #355 test pins the 1:1 arm and would fail loudly if
+    // it ever resampled.
     // The snapped origin above is exact on the device grid by construction
     // (roundf-then-divide), and the dest size is the mask size exactly, so
     // the 1:1 arm is taken exactly when no resampling happens.
@@ -986,4 +987,14 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         CGContextRestoreGState(ctx);
         CFRelease(rf);
     }
+    // Leave the ambient fill behind (2026-10): painted runs switch the
+    // fill per run, and the #389 text batch keys its prime on color — a
+    // leaked run paint would recolor later same-group text until the next
+    // group change. Restoring ambient makes the leak self-healing (equal
+    // colors need no prime, different ones re-prime).
+    if (cur_w != ambient_w)
+        CGContextSetRGBFillColor(ctx, ((ambient_w >> 24) & 255) / 255.0,
+                                      ((ambient_w >> 16) & 255) / 255.0,
+                                      ((ambient_w >> 8) & 255) / 255.0,
+                                      (ambient_w & 255) / 255.0);
 }

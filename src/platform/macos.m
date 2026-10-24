@@ -2805,8 +2805,15 @@ void platform_draw_rect(float x, float y, float w, float h, unsigned char r, uns
     if (!g_current_cg_context) return;
     CGContextRef ctx = g_current_cg_context;
 
+    // Contained: fills run mid-frame between text runs, and the #389 batch
+    // primes one fill color per group — an uncontained set here recolors
+    // every later same-group run until the next group change (e.g. code
+    // text after its background). Pixels are identical; only the state
+    // leak is removed.
+    CGContextSaveGState(ctx);
     CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
     CGContextFillRect(ctx, CGRectMake(x, y, w, h));
+    CGContextRestoreGState(ctx);
 }
 
 void platform_register_code_block(float x, float y, float w, float h, const char* code_text, int code_len) {
@@ -3046,9 +3053,9 @@ static __attribute__((noinline)) void draw_text_legacy(CGContextRef ctx, const c
 // incremental drag repaints never matched fresh renders pixel-exactly
 // (2026-10 drag-back residue across every gesture, extend phase included).
 // 1x falls back to the legacy direct draw below (pixel-identical to the
-// pre-atlas renderer). Under the caller's primed fill color (no
-// Save/Restore, no state sets — the whole group composites as one GPU
-// batch). Falls back to 0 when there is no raster.
+// pre-atlas renderer). Under the caller's primed fill color (no state sets
+// — the whole group composites as one GPU batch). Falls back to 0 when
+// there is no raster.
 static inline int blit_tinted_mask_batched(CGContextRef ctx, ShapedEntry* e,
         float x, float y, float font_size) {
     if (!e || e->aw == 0 || !e->slice) return 0;
@@ -3057,8 +3064,18 @@ static inline int blit_tinted_mask_batched(CGContextRef ctx, ShapedEntry* e,
     float dest_y = roundf((y + font_size * 0.85f - e->ascent) * g_output_scale) / g_output_scale;
     CGRect dest = CGRectMake(dest_x, dest_y,
         (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
+    // ClipToMask INTERSECTS the current clip: without this save/restore the
+    // first run's mask would narrow the shared batch clip to its own rect
+    // and every later same-group run would paint into the (usually empty)
+    // intersection — Retina frames showed only the first run per color
+    // group, and fills after text vanished the same way (2026-10). The
+    // hoisted fill color + interpolation survive the restore (set above the
+    // save), so the group's state churn stays hoisted; only the clip is
+    // per-run. Bare save/restore sets no state, so the GPU batch is kept.
+    CGContextSaveGState(ctx);
     CGContextClipToMask(ctx, dest, e->slice);
     CGContextFillRect(ctx, dest);
+    CGContextRestoreGState(ctx);
     return 1;
 }
 
@@ -3074,11 +3091,14 @@ static inline uint32_t run_color_group(unsigned char r, unsigned char g, unsigne
 
 // Batched text-run draw (#389 GPU): consecutive same-color runs share one
 // primed fill color + interpolation (hoisted here — the per-run
-// SaveGState/SetFillColor/Restore churn the issue calls out is gone); a
-// group change re-primes once. Link underlines ride the primed color (they
-// use the run's own color), so they set no state either. Behavior-neutral:
-// priming sets the same values the unbatched blit set, and the group
-// closes (Restore) at pass end via platform_batch_end.
+// SetFillColor churn the issue calls out is gone); a group change
+// re-primes once. Each run still saves/restores around its own ClipToMask
+// (see blit_tinted_mask_batched): the save sets no state, so the GPU batch
+// is kept, while the clip never leaks across runs. Link underlines ride
+// the primed color (they use the run's own color), so they set no state
+// either. Behavior-neutral: priming sets the same values the unbatched
+// blit set, and the group closes (Restore) at pass end via
+// platform_batch_end.
 static int g_batch_open = 0;
 static uint32_t g_batch_group = 0xFFFFFFFFu;
 
@@ -3982,13 +4002,27 @@ static int prime_frame_decode(CGImageRef img) {
 int platform_render_to_png(const char* output_path, int width, int height, void (*render_fn)(int width, int height)) {
     if (!output_path || width <= 0 || height <= 0 || !render_fn) return -1;
 
+    // Backing store matches the destination scale (2026-10): a forced 2x
+    // used to rasterize 2x atlas art into a 1x bitmap, downsampling every
+    // blit, so the harness proved nothing about live Retina pixels. Now
+    // the bitmap is width*scale device px with a matching CTM scale —
+    // exactly a live Retina backing — and the blit's 1:1 snap is exercised
+    // for real. Default (scale 1) bitmaps are byte-identical to before.
+    float backing = 1.0f;
+#ifdef TEST_HOOKS
+    if (g_test_scale > 0.0f) backing = g_test_scale;
+#endif
+    int pixel_w = (int)(width * backing);
+    int pixel_h = (int)(height * backing);
+    if (pixel_w <= 0 || pixel_h <= 0) return -2;
+
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(
         NULL,
-        width,
-        height,
+        (size_t)pixel_w,
+        (size_t)pixel_h,
         8,
-        width * 4,
+        (size_t)pixel_w * 4,
         colorSpace,
         kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
     );
@@ -3997,8 +4031,8 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
     if (!ctx) return -2;
 
     // Flip context coordinate space to match flipped view
-    CGContextTranslateCTM(ctx, 0, height);
-    CGContextScaleCTM(ctx, 1.0f, -1.0f);
+    CGContextTranslateCTM(ctx, 0, pixel_h);
+    CGContextScaleCTM(ctx, backing, -backing);
 
     g_text_record_count = 0;
     g_code_block_count = 0;
@@ -4010,14 +4044,9 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
 #endif
     // Headless render has no AppKit dirty rect: full redraw.
     g_pending_dirty_valid = NO;
-    // Headless bitmap contexts are 1x: cached lines draw directly so
-    // screenshots match the pre-atlas renderer pixel-for-pixel.
-    g_output_scale = 1.0f;
-#ifdef TEST_HOOKS
-    // Forced scale (platform_set_test_scale): exercise the live Retina atlas
-    // path headlessly for per-frame pixel diffs.
-    if (g_test_scale > 0.0f) g_output_scale = g_test_scale;
-#endif
+    // Destination scale for this render (1x default). A forced scale takes
+    // the live Retina atlas path on a matching backing store (sized above).
+    g_output_scale = backing;
 
     render_fn(width, height);
 
@@ -4054,8 +4083,10 @@ int platform_render_to_png(const char* output_path, int width, int height, void 
             // y-down view coords back onto memory row == y. (The old
             // height-1-qy mapping read mirrored rows; the PNG was always
             // correct — verified visually against probe ground truth.)
-            size_t brow = (size_t)qy;
-            size_t o = brow * bpr + (size_t)qx * 4;
+            // Probe coords stay in view points: scale to backing device px
+            // (no-op at 1x) so probes agree with the PNG at any scale.
+            size_t brow = (size_t)(qy * backing);
+            size_t o = brow * bpr + (size_t)(qx * backing) * 4;
             fprintf(stderr, "PROBE %d,%d=%d,%d,%d,%d\n", qx, qy,
                     bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]);
         }
@@ -4114,13 +4145,25 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
 {
     if (!output_path || width <= 0 || height <= 0 || !render_fn) return -1;
 
+    // Backing store matches the destination scale (2026-10): same truthful
+    // Retina backing as render_to_png, so --force-scale 2 drag phases
+    // exercise the live 1:1 blit under damage clips. Default bitmaps are
+    // byte-identical to before.
+    float backing = 1.0f;
+#ifdef TEST_HOOKS
+    if (g_test_scale > 0.0f) backing = g_test_scale;
+#endif
+    int pixel_w = (int)(width * backing);
+    int pixel_h = (int)(height * backing);
+    if (pixel_w <= 0 || pixel_h <= 0) return -2;
+
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(
         NULL,
-        width,
-        height,
+        (size_t)pixel_w,
+        (size_t)pixel_h,
         8,
-        width * 4,
+        (size_t)pixel_w * 4,
         colorSpace,
         kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
     );
@@ -4129,15 +4172,10 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
     if (!ctx) return -2;
 
     // Flip context coordinate space to match flipped view
-    CGContextTranslateCTM(ctx, 0, height);
-    CGContextScaleCTM(ctx, 1.0f, -1.0f);
-    // Headless bitmap contexts are 1x: cached lines draw directly.
-    g_output_scale = 1.0f;
-#ifdef TEST_HOOKS
-    // Forced scale (platform_set_test_scale): same live-atlas exercise as
-    // render_to_png, for every drag phase below.
-    if (g_test_scale > 0.0f) g_output_scale = g_test_scale;
-#endif
+    CGContextTranslateCTM(ctx, 0, pixel_h);
+    CGContextScaleCTM(ctx, backing, -backing);
+    // Headless bitmap contexts are 1x by default: cached lines draw directly.
+    g_output_scale = backing;
 
     g_has_selection = YES;
     g_select_all = NO;
@@ -4974,8 +5012,14 @@ static void pill_draw_cached_or_direct(float x, float y, float w, float h, float
         CGContextRestoreGState(ctx);
         return;
     }
+    // Contained like platform_draw_rect: a cache miss paints the vector path
+    // directly mid-frame, and its fill/stroke sets must not leak into the
+    // #389 text batch prime. Pixels are identical; only the state leak is
+    // removed.
+    CGContextSaveGState(ctx);
     pill_build_path(ctx, x, y, w, h, r);
     pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
+    CGContextRestoreGState(ctx);
     // Prerender into the slot for next frame: rasterize the same path once
     // into a 2x bitmap (evicting the collision). Pixel-identical by
     // construction on native-scale dests: same path, same colors, same 1px

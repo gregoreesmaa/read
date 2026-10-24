@@ -3192,11 +3192,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
 const CRISP_PNG_W: c_int = 600;
 const CRISP_PNG_H: c_int = 260;
 const CRISP_PNG_PATH = "/tmp/crisp_regression.png";
-// Calibrated (2026-09, arm64, bundled IBM Plex Serif / Space Grotesk /
-// JetBrains Mono): blurry atlas blits score acutance 155.2 with edge_frac
-// 0.1340 (stable across runs); snapped 1:1 blits score 182.5 with 0.0765.
-// Thresholds sit at the midpoints with margin on both sides.
-const CRISP_ACUTANCE_MIN: f64 = 169.0;
+// Calibrated (2026-10, arm64, bundled IBM Plex Serif / Space Grotesk /
+// JetBrains Mono): the forced-2x harness allocates a true 2x backing, and
+// the batch-clip fix paints all four runs below. Snapped 1:1 blits score
+// acutance 157.5 with edge_frac 0.0757. The edge_frac signature matches
+// the old basis (0.0765), confirming the 1:1 snap; acutance reads lower
+// than the old 182.5 because genuine 2x antialiasing replaced downsample
+// aliasing (the old basis rasterized 2x art into a 1x bitmap and,
+// pre-fix, effectively painted the first run only). Floor sits ~8% under
+// the measured value, same margin convention as before: acutance guards
+// gross blur/void, edge_frac is the primary 1:1 pin.
+const CRISP_ACUTANCE_MIN: f64 = 145.0;
 const CRISP_EDGE_FRAC_MAX: f64 = 0.105;
 
 fn crispRenderFn(w: c_int, h: c_int) callconv(.c) void {
@@ -3411,9 +3417,11 @@ const MATH355_PNG_PATH = "/tmp/math_atlas_355.png";
 const MATH355_PNG_W: c_int = 600;
 const MATH355_PNG_H: c_int = 260;
 // Math-only acutance floor (issue #355 follow-up): thin STIX strokes
-// through the 1x-harness 2x→1x downsample read softer than body ink, so
-// math carries its own bar instead of the shared body one. Calibrated on
-// the corrected (unmirrored) raster at 149.9 — the 189.5 previously
+// read softer than body ink, so math carries its own bar instead of the
+// shared body one. Calibrated on the corrected (unmirrored) raster at
+// 149.9 under the old downsampling harness (2026-10: forced-2x now backs
+// a true 2x bitmap, which resamples nothing 1:1 and should score at or
+// above this floor; re-measure where libzatex exists) — the 189.5 previously
 // recorded here came from a vertically MIRRORED raster, so acutance alone
 // cannot pin orientation; the hit/miss asserts below pin the hot path and
 // this bar guards blur regressions (unsnapped origins, wrong filter).
@@ -3513,9 +3521,10 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
         // Pixels first (measured in every phase, red or green): math ink
         // must be present and must not fringe past the math crisp budget
         // (MATH355_ACUTANCE_MIN above; the edge cap stays shared). The
-        // blit uses bilinear sampling (see zatex_blit_cached): nearest
-        // scores ~143 here because the 1x harness bitmap downsamples
-        // forced-2x masks, so these thresholds pin that choice too.
+        // blit uses bilinear sampling (see zatex_blit_cached); the old
+        // nearest-vs-bilinear numbers were measured through the
+        // downsampling harness, so re-measure that choice where libzatex
+        // exists instead of trusting them against the true 2x backing.
         const m = try crispPngMetrics(alloc, MATH355_PNG_PATH);
         std.debug.print("\n[MATH355] acutance={d:.1} edge_frac={d:.4} hits={d}+{d} misses={d}+{d}\n", .{ m.acutance, m.edge_frac, h0, h2 - h0, m0, m2 - m0 });
         try t.expect(m.acutance >= MATH355_ACUTANCE_MIN);
