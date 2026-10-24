@@ -582,3 +582,8 @@ done
 
 echo "Screenshot regression captures complete in $OUTPUT_DIR:"
 ls -lh "$OUTPUT_DIR"
+
+# TEMPORARY DIAGNOSTIC (do not merge): README head at scroll 0 + scrolled,
+# to inspect a reported paragraph-tail rendering issue on real hardware.
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/readme_head.png" README.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/readme_head_scrolled.png" --scroll 400 README.md
