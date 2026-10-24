@@ -1717,6 +1717,19 @@ pub fn flowSpace(pen: *FlowPen, space_w: f32, rtl: bool) void {
     }
 }
 
+/// Alt text of a linked image `[![alt](src)](href)` when `text` is exactly
+/// one complete image. Null unless the shape is exact -- on doubt the caller
+/// keeps the raw text (today's behavior).
+fn linkedImageAlt(text: []const u8) ?[]const u8 {
+    if (text.len < 7 or text[0] != '!' or text[1] != '[') return null;
+    var j: usize = 2;
+    while (j < text.len and text[j] != ']') : (j += 1) {}
+    if (j + 1 >= text.len or text[j + 1] != '(') return null;
+    if (text[text.len - 1] != ')') return null;
+    if (std.mem.indexOf(u8, text[2..j], "![") != null) return null;
+    return text[2..j];
+}
+
 /// Flows words and spaces of one span-text at the pen. Inline code spans
 /// (never block code: `is_block_code`) flow atomically through
 /// `flowCodeSpan` — one pill, no mid-span wrap. Pen advancement is
@@ -1730,6 +1743,14 @@ pub fn flowSpans(
     ctx: FlowCtx,
     is_block_code: bool,
 ) void {
+    // Linked image `[![alt](src)](href)`: flow the alt text (keeps the
+    // link target), never the raw inner markup. Inline spans carry raw
+    // link text for the spec harness's re-parse; the app has no re-parse
+    // pass, so raw markup would paint literally (README badge row).
+    var text = span_text;
+    if (style.link and !style.code and link_target != null) {
+        if (linkedImageAlt(span_text)) |alt| text = alt;
+    }
     // Issue #40 <br>: forced line break. Measure and render share this
     // path, so wrapped heights match bit-for-bit.
     if (style.line_break) {
@@ -1740,20 +1761,20 @@ pub fn flowSpans(
     // Out-of-subset tags stay pill-free muted mono (issue #40 fallback):
     // only true inline code takes the pill path.
     if (style.code and !is_block_code and !style.html_tag) {
-        flowCodeSpan(span_text, style, link_target, pen, ctx);
+        flowCodeSpan(text, style, link_target, pen, ctx);
         return;
     }
     const space_w = measureCharEx(' ', ctx.font_size, false, false, false, style.heading);
     var i: usize = 0;
-    while (i < span_text.len) {
-        if (span_text[i] == ' ') {
+    while (i < text.len) {
+        if (text[i] == ' ') {
             flowSpace(pen, space_w, ctx.rtl);
             i += 1;
             continue;
         }
         const w_start = i;
-        while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
-        flowWord(span_text[w_start..i], style, link_target, pen, ctx);
+        while (i < text.len and text[i] != ' ') : (i += 1) {}
+        flowWord(text[w_start..i], style, link_target, pen, ctx);
     }
 }
 
@@ -11019,3 +11040,36 @@ test "energy #385: plugin lookup stops at first row past the query" {
     try std.testing.expect(pluginFenceGeom(null, 0).state == null);
 }
 
+
+
+test "inline: linked image flows alt text, never raw markup" {
+    // `[![alt](src)](href)` must flow the alt text as a link run. Before
+    // the linkedImageAlt rewrite the outer link span carried the raw inner
+    // markup (`![CI](...)`) painted in link blue (README badge row).
+    const doc = "See [![CI](https://example.com/badge.svg)](https://example.com) here.\n";
+    var lines_buf: [8]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(doc, &lines_buf, &in_fence);
+    try std.testing.expect(line_count > 0);
+    var cmds: [128]DrawCommand = undefined;
+    const n = layoutViewport(doc, lines_buf[0..line_count], &.{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    }, &cmds);
+    try std.testing.expect(n > 0);
+    var saw_alt_link = false;
+    for (cmds[0..n]) |cmd| {
+        if (cmd.kind != .text_run) continue;
+        if (std.mem.indexOf(u8, cmd.text, "![") != null) {
+            std.debug.print("raw markup run: [{s}]\n", .{cmd.text});
+        }
+        try std.testing.expect(std.mem.indexOf(u8, cmd.text, "![") == null);
+        if (cmd.style.link and std.mem.eql(u8, cmd.text, "CI")) {
+            saw_alt_link = true;
+            try std.testing.expect(cmd.link_target != null);
+            try std.testing.expectEqualStrings("https://example.com", cmd.link_target.?);
+        }
+    }
+    try std.testing.expect(saw_alt_link);
+}

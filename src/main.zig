@@ -1260,6 +1260,14 @@ fn foldPendingScroll(backing_scale: f32) void {
     }
 }
 
+/// Present a synchronously-settled scroll step (Reduce Motion snap, or
+/// any path that lands settled with no timer armed): sync the platform
+/// mirror and blit pixels + strip in one call. No-op when nothing moved.
+fn presentSettledScroll(before: f32) void {
+    bridge.platform_sync_scroll(g_app.scroll_y);
+    bridge.platform_request_scroll(before, g_app.scroll_y);
+}
+
 fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int, event_ms: f64) callconv(.c) void {
     // NSEvent timestamp (issue #385): the platform stamps each scroll
     // event with its own monotonic time, so the gesture/scroll-lock
@@ -1279,6 +1287,7 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int,
     const locked = g_scroll_lock.processScroll(cond.dx, cond.dy, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
+    const scroll_before = g_app.scroll_y;
         // Routing (precise 1:1 vs eased wheel) lives in
         // MotionPolicy.applyVertical, pinned by strict tests; the full
         // rationale is documented there. Precise deltas coalesce per vsync
@@ -1295,7 +1304,11 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int,
         } else {
             applyVerticalScroll(locked.dy, precise != 0);
         }
-        if (!g_smooth.settled()) bridge.platform_smooth_kick();
+        if (!g_smooth.settled()) {
+            bridge.platform_smooth_kick();
+        } else {
+            presentSettledScroll(scroll_before);
+        }
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);
@@ -1332,6 +1345,12 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
     const was_settled = g_smooth.settled();
     g_smooth.current = layout.SmoothScroll.quantize(g_smooth.current, 1.0);
     g_app.scroll_y = g_smooth.current;
+    // The timer fire keys its single invalidation on the platform
+    // mirror moving during this tick (scroll-blit when moved, skip when
+    // still). Sync every tick: a synchronously-settling step (precise
+    // 1:1 snap, small eased step) would otherwise park the timer with
+    // zero invalidation and the frame would never present.
+    bridge.platform_sync_scroll(g_app.scroll_y);
     // Goldilocks steady state (issue #388): the tick just settled a scroll
     // that moved — drop clean pages outside viewport +/-1 screen. Gated on
     // the settled EDGE (not every settled frame) so a static screen costs
@@ -4875,5 +4894,57 @@ test "outline picker contracts: filter + panel build (#48)" {
         try t.expectEqual(@as(c_int, 0), outlineFilterCase("Hi", "hello"));
         // Panel construction: two adds build two native rows headlessly.
         try t.expectEqual(@as(c_int, 1), bridge.platform_test_outline_build());
+    }
+}
+
+test "settled scroll steps sync the platform mirror (scroll presents)" {
+    // A synchronously-settling scroll (precise 1:1 snap, Reduce Motion)
+    // produces no timer frames, so the tick/present path must sync the
+    // platform mirror itself. The timer fire keys its single
+    // invalidation on the mirror moving: without the sync it sees no
+    // movement, invalidates nothing, and the scroll never presents
+    // until some unrelated redraw (e.g. selection) shows the new offset.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const s_scroll = g_app.scroll_y;
+        const s_max = g_app.max_scroll_y;
+        const s_smooth = g_smooth;
+        const s_pd = g_pending_dy;
+        const s_pp = g_pending_precise;
+        const s_ps = g_pending_scroll;
+        const s_rm = g_reduce_motion;
+        const s_mirror = bridge.platform_test_scroll_synced();
+        defer {
+            g_app.scroll_y = s_scroll;
+            g_app.max_scroll_y = s_max;
+            g_smooth = s_smooth;
+            g_pending_dy = s_pd;
+            g_pending_precise = s_pp;
+            g_pending_scroll = s_ps;
+            g_reduce_motion = s_rm;
+            bridge.platform_sync_scroll(s_mirror);
+        }
+        g_app.max_scroll_y = 10000.0;
+        g_app.scroll_y = 0.0;
+        g_smooth = .{ .current = 0.0, .target = 0.0 };
+        g_reduce_motion = false;
+        bridge.platform_sync_scroll(0.0);
+        // Precise 1:1 step, coalesced exactly like a trackpad event, then
+        // one vsync tick: the step settles synchronously and the timer
+        // parks (more == 0) -- the mirror must still advance.
+        g_pending_dy = -40.0;
+        g_pending_precise = true;
+        g_pending_scroll = true;
+        const more = onTick(8.0);
+        try t.expectEqual(@as(c_int, 0), more);
+        try t.expectEqual(@as(f32, 40.0), g_app.scroll_y);
+        try t.expectEqual(@as(f32, 40.0), bridge.platform_test_scroll_synced());
+        // Reduce Motion snap path (no tick involved): same guarantee.
+        g_app.scroll_y = 0.0;
+        g_smooth = .{ .current = 0.0, .target = 0.0 };
+        bridge.platform_sync_scroll(0.0);
+        g_app.scroll_y = 80.0;
+        presentSettledScroll(0.0);
+        try t.expectEqual(@as(f32, 80.0), bridge.platform_test_scroll_synced());
     }
 }

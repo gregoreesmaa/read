@@ -2700,6 +2700,7 @@ void platform_set_test_scroll(float scroll_y) {
     g_scroll_y = scroll_y;
     g_hover_link_hash = 0;
 }
+float platform_test_scroll_synced(void) { return g_scroll_y; }
 void platform_set_test_selection(float x1, float y1, float x2, float y2, int enable) {
     // Doc-space endpoints (issue #55 pin: --select takes document coords);
     // #314 readers resolve the owning block live per read, so the hook
