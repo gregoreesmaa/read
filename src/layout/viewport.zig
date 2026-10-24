@@ -4369,7 +4369,8 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
         },
         .ordered => {
             const num = quotedNumber(ux, i, body.number, sq.depth);
-            const marker = orderedMarkerText(ux, num, body.delim, sq.body[0..@min(body.prefix_len, sq.body.len)]);
+            const marker_vis = y + ux.config.line_height >= 0 and y <= ux.vp_bottom;
+            const marker = if (marker_vis) orderedMarkerText(ux, num, body.delim, sq.body[0..@min(body.prefix_len, sq.body.len)]) else sq.body[0..@min(body.prefix_len, sq.body.len)];
             const op = @min(body.prefix_len, sq.body.len);
             const item_text = sq.body[op + skipSpaces(sq.body[op..]) ..];
             quote_rtl = bidi.baseDirection(item_text) == .rtl;
@@ -4502,7 +4503,8 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         const own = parseListNumber(text_slice[0..d]);
         const delim: u8 = if (d < text_slice.len and text_slice[d] == ')') ')' else '.';
         const num = orderedNumber(ux, i, own, info.indent);
-        const marker = orderedMarkerText(ux, num, delim, text_slice[0..@min(prefix_len, text_slice.len)]);
+        const marker_vis = y + ux.config.line_height >= 0 and y <= ux.vp_bottom;
+        const marker = if (marker_vis) orderedMarkerText(ux, num, delim, text_slice[0..@min(prefix_len, text_slice.len)]) else text_slice[0..@min(prefix_len, text_slice.len)];
         const rtl = leadParaDirection(ux, item_text, i + 1);
         if (y + ux.config.line_height >= 0 and y <= ux.vp_bottom) {
             emitCmd(ux, .{
@@ -5187,6 +5189,29 @@ pub fn renderViewportCore(
 
         const line_info = lines[i];
 
+        // Scroll-invariant scratch stores: a unit that emits no text_run
+        // borrows no marker/entity slot text, so its slot use rolls back
+        // exactly. Prefix units above the viewport then consume nothing in
+        // either walk, and visible units consume identically with and
+        // without checkpoints. (Marker pushes are additionally gated at
+        // their sites; this covers every store uniformly.)
+        const rb_m: usize = if (unit_cx.config.ordered_markers) |st| st.count else 0;
+        const rb_e: usize = if (unit_cx.config.entities) |st| st.count else 0;
+        const rb_c: usize = cmd_count;
+        defer {
+            var rb_text: bool = false;
+            var rb_k: usize = rb_c;
+            while (rb_k < cmd_count) : (rb_k += 1) {
+                if (commands_out[rb_k].kind == .text_run) {
+                    rb_text = true;
+                    break;
+                }
+            }
+            if (!rb_text) {
+                if (unit_cx.config.ordered_markers) |st| st.count = rb_m;
+                if (unit_cx.config.entities) |st| st.count = rb_e;
+            }
+        }
         // Early exit if past bottom of viewport
         if (cur_y > vp_bottom) break;
 
@@ -6063,12 +6088,17 @@ pub fn layoutViewport(
             var y_skip: f32 = 0.0;
             var id_skip: usize = 0;
             var k = s0;
+            // The re-walk measures only (its units sit above the viewport),
+            // so its entity slot use is discarded: the render walk below
+            // must start from the same store state as the exact walk.
+            const rw_e: usize = if (config.entities) |st| st.count else 0;
             while (k < cp.line_idx and k < lines.len) {
                 const u = refineLineHeight(bytes, lines, k, config, cw, cx);
                 y_skip += u.height;
                 id_skip += countScrollableBlocks(lines, k, @min(k + @max(u.consumed, 1), lines.len));
                 k += @max(u.consumed, 1);
             }
+            if (config.entities) |st| st.count = rw_e;
             i = s0;
             cur_y = cp.y - y_skip - config.scroll_y;
             next_block_id = cp.next_block_id -| @min(id_skip, cp.next_block_id);
@@ -7447,6 +7477,424 @@ test "scroll: preallocated ring reused across frames, output is pure (issue #13)
         try std.testing.expectEqual(cmd_a.rect.w, cmd_b.rect.w);
         try std.testing.expectEqual(cmd_a.rect.h, cmd_b.rect.h);
         try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+    }
+}
+
+test "scroll: checkpoint deep seeks match exact layout across all block types" {
+    // A deep scroll must render exactly what the exact top-down walk renders:
+    // the checkpoint fast path only skips already-measured prefix lines, so
+    // every scrolled frame has to be command-identical with and without it.
+    // Any height/refine mismatch blanks or shifts the viewport once scrolling
+    // passes the 800px seek threshold (the live "nothing renders after I
+    // scroll" shape). Sweep every block type past that threshold.
+    const allocator = std.testing.allocator;
+
+    const chunk =
+        \\# Chapter Heading One
+        \\Paragraph line one of text with some **bold** and *italic* words.
+        \\Paragraph line two carrying a [link](https://example.com) and `code`.
+        \\Entity check: fish &amp; chips &lt;tag&gt; in flowing text here.
+        \\## Sub Heading Two
+        \\### Sub Sub Heading Three
+        \\- Bullet list item alpha with enough words to wrap a little bit
+        \\- Bullet list item beta
+        \\1. Ordered item one
+        \\2. Ordered item two
+        \\- [ ] Task open item
+        \\- [x] Task done item
+        \\> A quoted line to vary the command stream.
+        \\>> A nested quoted line deeper still.
+        \\```zig
+        \\const x: u32 = 1;
+        \\// fenced code stays mono
+        \\```
+        \\    indented code line one
+        \\    indented code line two
+        \\| cell a | cell b |
+        \\| --- | --- |
+        \\| cell c | cell d |
+        \\![alt text](image.png)
+        \\---
+        \\Setext Title Line
+        \\===
+        \\[ref]: https://example.com
+        \\```math
+        \\E = mc^2
+        \\Entity row alpha &amp; beta &lt;gamma&gt; here.
+        \\Entity row delta &quot;quoted&quot; &apos;apos&apos; there.
+        \\```
+        \\```mermaid
+        \\graph TD
+        \\    A-->B
+        \\```
+        \\```
+        \\```
+        \\نص عربي مختلط with English words here
+        \\1.  Deeply nested one
+        \\    1.  nested two
+        \\        1.  nested three
+        \\            1.  nested four
+        \\> quote
+        \\> > nested quote
+        \\> > > deep quote
+        \\| w1 | w2 | w3 | w4 | w5 | w6 | w7 | w8 |
+        \\| --- | --- | --- | --- | --- | --- | --- | --- |
+        \\| c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 |
+        \\
+    ;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var rep: usize = 0;
+    while (rep < 24) : (rep += 1) {
+        try buffer.appendSlice(allocator, chunk);
+    }
+    const mem = buffer.items;
+
+    var lines_buf: [2048]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
+    try std.testing.expect(line_count > 400);
+    const lines = lines_buf[0..line_count];
+
+    var checkpoints: [128]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    var markers = OrderedMarkerStore{};
+    var entities = EntityStore{};
+    var join_buf: [JOIN_BUF_LEN]u8 = undefined;
+    const base_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base_cfg, &checkpoints, &cp_count);
+    try std.testing.expect(cp_count > 0);
+    try std.testing.expect(doc_h > 3000.0);
+
+    var cmds_plain: [2048]DrawCommand = undefined;
+    var cmds_seek: [2048]DrawCommand = undefined;
+    var off: f32 = 0.0;
+    while (off <= doc_h) : (off += 53.0) {
+        markers.reset();
+        entities.reset();
+        const n_plain = layoutViewport(mem, lines, &.{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = off,
+            .ordered_markers = &markers,
+            .entities = &entities,
+            .join_buf = &join_buf,
+        }, &cmds_plain);
+        markers.reset();
+        entities.reset();
+        const n_seek = layoutViewport(mem, lines, &.{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = off,
+            .ordered_markers = &markers,
+            .entities = &entities,
+            .join_buf = &join_buf,
+            .checkpoints = checkpoints[0..cp_count],
+        }, &cmds_seek);
+        if (n_plain != n_seek) {
+            std.debug.print("\nscroll mismatch at off={d}: plain={d} seek={d}\n", .{ off, n_plain, n_seek });
+        }
+        try std.testing.expectEqual(n_plain, n_seek);
+        // Content must actually paint while a screen of document remains:
+        // background-only frames here mean a blank viewport after scrolling.
+        if (off + 750.0 <= doc_h) {
+            if (n_plain <= 1) {
+                std.debug.print("\nblank viewport at off={d} (doc_h={d})\n", .{ off, doc_h });
+            }
+            try std.testing.expect(n_plain > 1);
+        }
+        for (cmds_plain[0..n_plain], 0..) |cmd_a, idx| {
+            const cmd_b = cmds_seek[idx];
+            if (cmd_a.kind != cmd_b.kind) {
+                std.debug.print("\nkind mismatch at off={d} idx={d}: {s} vs {s}\n", .{ off, idx, @tagName(cmd_a.kind), @tagName(cmd_b.kind) });
+            }
+            try std.testing.expectEqual(cmd_a.kind, cmd_b.kind);
+            {
+                const d = @abs(cmd_a.rect.x - cmd_b.rect.x);
+                if (d > 0.01) std.debug.print("\nrect.x mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.x, cmd_b.rect.x });
+                try std.testing.expect(d <= 0.01);
+            }
+            {
+                const d = @abs(cmd_a.rect.y - cmd_b.rect.y);
+                if (d > 0.01) std.debug.print("\nrect.y mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.y, cmd_b.rect.y });
+                try std.testing.expect(d <= 0.01);
+            }
+            {
+                const d = @abs(cmd_a.rect.w - cmd_b.rect.w);
+                if (d > 0.01) std.debug.print("\nrect.w mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.w, cmd_b.rect.w });
+                try std.testing.expect(d <= 0.01);
+            }
+            {
+                const d = @abs(cmd_a.rect.h - cmd_b.rect.h);
+                if (d > 0.01) std.debug.print("\nrect.h mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.h, cmd_b.rect.h });
+                try std.testing.expect(d <= 0.01);
+            }
+            try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+            try std.testing.expectEqual(cmd_a.scrollable_id, cmd_b.scrollable_id);
+            // ABSOLUTE scroll truth (not just seek-vs-plain consistency):
+            // every scrolled text run must sit at the same document height
+            // as in the exact scroll-zero full-document layout. A layout
+            // that misplaces content once scrolled shows the user the wrong
+            // (or no) pixels after scrolling, even when both paths agree.
+            // (Checked below against the full-document frame.)
+            {
+                const d = @abs(cmd_a.max_scroll_x - cmd_b.max_scroll_x);
+                if (d > 0.01) std.debug.print("\nmax_scroll_x mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.max_scroll_x, cmd_b.max_scroll_x });
+                try std.testing.expect(d <= 0.01);
+            }
+        }
+    }
+}
+
+test "scroll: scrolled frames land on exact document positions (absolute)" {
+    // Absolute scroll truth: a scrolled frame must show the same bytes at
+    // the same document heights as the exact scroll-zero full-document
+    // layout. Seek-vs-plain agreement alone cannot catch a placement bug
+    // shared by both walks; this pins placement against document truth,
+    // the user-visible "the right content is painted after scrolling".
+    const allocator = std.testing.allocator;
+
+    const chunk =
+        \\# Chapter Heading One
+        \\Paragraph line one of text with some **bold** and *italic* words.
+        \\Paragraph line two carrying a [link](https://example.com) and `code`.
+        \\Entity check: fish &amp; chips &lt;tag&gt; in flowing text here.
+        \\## Sub Heading Two
+        \\- Bullet list item alpha with enough words to wrap a little bit
+        \\- Bullet list item beta
+        \\1. Ordered item one
+        \\2. Ordered item two
+        \\- [ ] Task open item
+        \\- [x] Task done item
+        \\> A quoted line to vary the command stream.
+        \\```zig
+        \\const x: u32 = 1;
+        \\```
+        \\    indented code line one
+        \\    indented code line two
+        \\| cell a | cell b |
+        \\| --- | --- |
+        \\| cell c | cell d |
+        \\![alt text](image.png)
+        \\---
+        \\
+    ;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var rep: usize = 0;
+    while (rep < 12) : (rep += 1) {
+        try buffer.appendSlice(allocator, chunk);
+    }
+    const mem = buffer.items;
+
+    var lines_buf: [1024]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
+    try std.testing.expect(line_count > 200);
+    const lines = lines_buf[0..line_count];
+
+    var checkpoints: [64]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    var markers = OrderedMarkerStore{};
+    var entities = EntityStore{};
+    var join_buf: [JOIN_BUF_LEN]u8 = undefined;
+    const base_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base_cfg, &checkpoints, &cp_count);
+    try std.testing.expect(doc_h > 3000.0);
+
+    // Exact scroll-zero frame of the whole document (tall window, no cull).
+    var full_cmds: [8192]DrawCommand = undefined;
+    markers.reset();
+    entities.reset();
+    const full_n = layoutViewport(mem, lines, &.{
+        .window_width = 1000.0,
+        .window_height = doc_h + 200.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    }, &full_cmds);
+    try std.testing.expect(full_n > 10);
+    try std.testing.expect(full_n < full_cmds.len - 16);
+
+    // Snapshot document truth with owned text: later scrolled layouts
+    // reuse (and overwrite) the entity/marker stores the full frame
+    // borrowed from, so comparisons must own their strings.
+    const Snap = struct {
+        kind: DrawCommandKind,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        text: []const u8,
+    };
+    var snaps: [8192]Snap = undefined;
+    var snap_n: usize = 0;
+    for (full_cmds[0..full_n]) |c| {
+        if (c.kind != .text_run) continue;
+        const owned = if (c.text.len > 0) try allocator.dupe(u8, c.text) else @as([]const u8, "");
+        snaps[snap_n] = .{ .kind = c.kind, .x = c.rect.x, .y = c.rect.y, .w = c.rect.w, .h = c.rect.h, .text = owned };
+        snap_n += 1;
+    }
+    defer {
+        for (snaps[0..snap_n]) |s| {
+            if (s.text.len > 0) allocator.free(s.text);
+        }
+    }
+    try std.testing.expect(snap_n > 10);
+
+    // Twelve frames from top to bottom (checkpoint seeks engage past 800).
+    var cmds: [2048]DrawCommand = undefined;
+    var oi: usize = 0;
+    while (oi < 12) : (oi += 1) {
+        const off = doc_h * @as(f32, @floatFromInt(oi)) / 11.0;
+        markers.reset();
+        entities.reset();
+        const n = layoutViewport(mem, lines, &.{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = off,
+            .ordered_markers = &markers,
+            .entities = &entities,
+            .join_buf = &join_buf,
+            .checkpoints = checkpoints[0..cp_count],
+        }, &cmds);
+        if (off + 750.0 <= doc_h) {
+            try std.testing.expect(n > 1);
+        }
+        for (cmds[0..n]) |c| {
+            if (c.kind != .text_run) continue;
+            const want_y = c.rect.y + off;
+            var found = false;
+            for (snaps[0..snap_n]) |s| {
+                if (!std.mem.eql(u8, s.text, c.text)) continue;
+                if (@abs(s.y - want_y) > 0.5) continue;
+                if (@abs(s.x - c.rect.x) > 0.01) continue;
+                if (@abs(s.w - c.rect.w) > 0.01) continue;
+                if (@abs(s.h - c.rect.h) > 0.01) continue;
+                found = true;
+                break;
+            }
+            if (!found) {
+                std.debug.print("\nmisplaced run at off={d}: text='{s}' view_y={d} want_doc_y={d}\n", .{ off, c.text, c.rect.y, want_y });
+            }
+            try std.testing.expect(found);
+        }
+    }
+}
+
+test "scroll: entity-dense deep seeks match exact layout" {
+    // 400 ordered items with one entity each: many units, many
+    // checkpoints, real seeks. Prefix decodes (400+) overflow the 32-slot
+    // entity store, while the seek window (~25 units) fits. Without the
+    // per-unit rollback the exact walk starves (visible raw "&amp;")
+    // while the seek walk decodes (visible "&") and the frames diverge.
+    // Ordered markers ride along, so marker gating is covered at scale.
+    const allocator = std.testing.allocator;
+    const chunk =
+        \\1. Fish &amp; chips here now.
+        \\
+    ;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var rep: usize = 0;
+    while (rep < 400) : (rep += 1) {
+        try buffer.appendSlice(allocator, chunk);
+    }
+    const mem = buffer.items;
+    var lines_buf: [512]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
+    std.debug.print("\nprobe setup: lines={d}\n", .{line_count});
+    try std.testing.expect(line_count > 300);
+    const lines = lines_buf[0..line_count];
+    var checkpoints: [24]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    var markers = OrderedMarkerStore{};
+    var entities = EntityStore{};
+    var join_buf: [JOIN_BUF_LEN]u8 = undefined;
+    const base_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base_cfg, &checkpoints, &cp_count);
+    std.debug.print("\nprobe lines={d} doc_h={d} cps={d}\n", .{ line_count, doc_h, cp_count });
+    try std.testing.expect(doc_h > 5000.0);
+    try std.testing.expect(cp_count > 2);
+    var cmds_plain: [2048]DrawCommand = undefined;
+    var cmds_seek: [2048]DrawCommand = undefined;
+    const off: f32 = doc_h * 0.75;
+    markers.reset();
+    entities.reset();
+    const n_plain = layoutViewport(mem, lines, &.{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = off,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    }, &cmds_plain);
+    markers.reset();
+    entities.reset();
+    const n_seek = layoutViewport(mem, lines, &.{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = off,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+        .checkpoints = checkpoints[0..cp_count],
+    }, &cmds_seek);
+    if (n_plain != n_seek) {
+        std.debug.print("\nprobe count mismatch at off={d}: plain={d} seek={d}\n", .{ off, n_plain, n_seek });
+    }
+    try std.testing.expectEqual(n_plain, n_seek);
+    for (cmds_plain[0..n_plain], 0..) |cmd_a, idx| {
+        const cmd_b = cmds_seek[idx];
+        if (cmd_a.kind != cmd_b.kind) {
+            std.debug.print("\nprobe kind mismatch at off={d} idx={d}: {s} vs {s}\n", .{ off, idx, @tagName(cmd_a.kind), @tagName(cmd_b.kind) });
+        }
+        try std.testing.expectEqual(cmd_a.kind, cmd_b.kind);
+        if (!std.mem.eql(u8, cmd_a.text, cmd_b.text)) {
+            std.debug.print("\nprobe text mismatch at off={d} idx={d} kind={s} rect=({d},{d},{d},{d}): [{s}] vs [{s}]\n", .{ off, idx, @tagName(cmd_a.kind), cmd_a.rect.x, cmd_a.rect.y, cmd_a.rect.w, cmd_a.rect.h, cmd_a.text, cmd_b.text });
+        }
+        try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+    }
+    // Absolute: the visible window (~25 units) fits the 32-slot store,
+    // so its entities must render decoded. Without the per-unit
+    // rollback, prefix units (400+) exhaust the slots and the visible
+    // rows show raw "&amp;" in the exact walk while the seek walk (fewer
+    // prefix units) decodes them: same-document scroll divergence.
+    for ([2][]DrawCommand{ cmds_plain[0..n_plain], cmds_seek[0..n_seek] }) |cmds| {
+        var seen_amp: bool = false;
+        for (cmds) |cmd| {
+            if (cmd.kind == .text_run and cmd.text.len == 1 and cmd.text[0] == '&') {
+                seen_amp = true;
+                break;
+            }
+        }
+        if (!seen_amp) {
+            std.debug.print("\nprobe: no decoded & run at off={d} (e={d})\n", .{ off, entities.count });
+        }
+        try std.testing.expect(seen_amp);
     }
 }
 
@@ -10570,3 +11018,4 @@ test "energy #385: plugin lookup stops at first row past the query" {
     try std.testing.expect(pluginFenceGeom(rows[0..], 9).state == null);
     try std.testing.expect(pluginFenceGeom(null, 0).state == null);
 }
+
