@@ -582,3 +582,8 @@ done
 
 echo "Screenshot regression captures complete in $OUTPUT_DIR:"
 ls -lh "$OUTPUT_DIR"
+
+# TEMPORARY DIAGNOSTIC (do not merge): README at forced Retina scale to
+# inspect live-only glyph smearing on real hardware (1x headless is clean).
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/readme_head_2x.png" --force-scale 2 README.md
+./zig-out/bin/read-test --screenshot "$OUTPUT_DIR/readme_head_2x_scrolled.png" --scroll 400 --force-scale 2 README.md
