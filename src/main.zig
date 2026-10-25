@@ -165,10 +165,11 @@ fn imageSizeCacheReset() void {
 
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
-// Scroll fast path (#384): the live document-space layout result one scroll
-// frame produced, rented from the same static buffer as the full path (no
-// second ring). A pure scroll_y shift y-offsets it in place instead of
-// re-running layout at 120 Hz. Any content/config change invalidates via
+// Scroll fast path (#384): the live document-space layout result one
+// scroll frame produced, rented from the same static buffer as the full
+// path (no second ring). Same-scroll damage repaints reuse it instead of
+// re-running layout; scroll changes always re-lay out (the cache holds
+// viewport-window rows only). Any content/config change invalidates via
 // invalidateScrollCache below; the reuse check itself pins the full key.
 var g_scroll_cache: layout.ScrollFrameCache = .{};
 var g_scroll_cached_cmds: [MAX_COMMANDS]layout.DrawCommand = undefined;
@@ -2213,10 +2214,13 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     var t_layout_ns: u64 = 0;
     if (build_options.test_hooks and g_sweep_active) t_layout_ns = nowNs();
-    // Scroll fast path (#384): pure scroll_y shifts reuse the cached frame
-    // by y-offset instead of re-running layout. Registration/state records
-    // replay verbatim, so the text model rebuilds bit-identically and the
-    // damage-parity contract holds. Any other change misses and re-lays out.
+    // Scroll fast path (#384): same-scroll damage repaints (selection,
+    // GIF ticks, hover) reuse the cached frame instead of re-running
+    // layout. Registration/state records replay verbatim, so the text
+    // model rebuilds bit-identically and the damage-parity contract holds.
+    // Scroll changes always miss and re-lay out: the cache holds
+    // viewport-window rows only, and a shifted replay would serve stale
+    // rows past the fold (live blank expose strips).
     var cmd_count: usize = 0;
     const content_id = scrollContentId();
     if (g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0)) |n| {

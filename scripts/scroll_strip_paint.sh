@@ -37,9 +37,18 @@ render() {
     # $1 = out png, rest = extra args; binary chatter goes to stdout
     # so callers can harvest --dump-commands, stderr stays for DBGLOG.
     # --dump-commands rides after the doc, same position as fuzz_render.
+    # Fail loudly: a crashed render must never pass silently behind a
+    # stale PNG from an earlier check.
     sleep 0.3
+    rm -f "$1"
     # shellcheck disable=SC2086
-    "$BIN" --screenshot "$1" --settle-images $2 "$DOC" --dump-commands 2>/dev/null
+    rc=0
+    "$BIN" --screenshot "$1" --settle-images $2 "$DOC" --dump-commands 2>/tmp/strip_stderr.log || rc=$?
+    if [ $rc -ne 0 ] || [ ! -f "$1" ]; then
+        echo "FAIL: render $1 exited $rc (stderr tail):"
+        tail -5 /tmp/strip_stderr.log || true
+        exit 2
+    fi
 }
 
 check_strip() {
@@ -115,9 +124,14 @@ def rows_nonbg(px, w, h, ch, y0, y1, bg):
 
 wf, hf, chf, full = load_png(pf)
 wp, hp, chp, part = load_png(pp)
-# Reference and strip renders share one backing multiple here (same
-# scale flag), so device-px strips line up 1:1; keep the ratio anyway.
-fx, fy = wp / wf, hp / hf
+# Points to device px: the strip spec is in view points (1200x900), while
+# a forced-2x backing stores device pixels. The PNG ratio cannot supply
+# this (both renders share one backing, so the ratio is 1 even at 2x) —
+# divide by the point size instead.
+fx, fy = wf / 1200.0, hf / 900.0
+assert abs(fx - wp / 1200.0) < 0.01 and abs(fy - hp / 900.0) < 0.01, (wf, hf, wp, hp)
+assert abs(fx - round(fx)) < 0.01 and abs(fy - round(fy)) < 0.01, (fx, fy)
+print("%s: full=%dx%d part=%dx%d" % (label, wf, hf, wp, hp))
 bgf = min(max(full[o], full[o + 1], full[o + 2])
           for o in (0, (wf - 1) * chf, (hf - 1) * wf * chf, (hf * wf - 1) * chf))
 # Strip in device px, end-exclusive (points times backing multiple): the
@@ -125,6 +139,29 @@ bgf = min(max(full[o], full[o + 1], full[o + 2])
 # correctly leaves it blank under its hard clip.
 x0, y0 = int(sx * fx), int(sy * fy)
 x1, y1 = int((sx + sw) * fx), int((sy + sh) * fy)
+def profile(px, w, h, ch, bg):
+    bands = []
+    cur = None
+    for y in range(h):
+        base = y * w * ch
+        n = 0
+        for x in range(w):
+            o = base + x * ch
+            if max(px[o], px[o + 1], px[o + 2]) - bg > 8:
+                n += 1
+        if n > w // 100:
+            if cur is None:
+                cur = [y, y, 0]
+            cur[1] = y
+            cur[2] += n
+        else:
+            if cur is not None:
+                bands.append(cur)
+                cur = None
+    if cur is not None:
+        bands.append(cur)
+    return ["%d-%d" % (s, e) for s, e, t in bands[:12]]
+
 ref = rows_nonbg(full, wf, hf, chf, y0, y1, bgf)
 if ref < 1000:
     print("FAIL: %s reference strip has no paint (%d)" % (label, ref))
@@ -133,6 +170,8 @@ got = rows_nonbg(part, wp, hp, chp, y0, y1, bgf)
 print("%s: reference=%d strip=%d" % (label, ref, got))
 if got < ref // 2:
     print("FAIL: %s strip paints %d vs reference %d (want >= half)" % (label, got, ref))
+    print("full paint bands: %s" % " ".join(profile(full, wf, hf, chf, bgf)))
+    print("part paint bands: %s" % " ".join(profile(part, wp, hp, chp, bgf)))
     sys.exit(1)
 # Pixel-identity inside the strip (damage must not move a pixel), with
 # a row profile so failures say WHERE (edge-only fringe vs shifted rows
@@ -155,6 +194,8 @@ if bad > 100:
     print("diff rows %d-%d, worst rows: %s" % (
         ys[0], ys[-1],
         ", ".join("%d:%d" % (y, rows[y]) for y in sorted(rows, key=rows.get, reverse=True)[:8])))
+    print("full paint bands: %s" % " ".join(profile(full, wf, hf, chf, bgf)))
+    print("part paint bands: %s" % " ".join(profile(part, wp, hp, chp, bgf)))
     sys.exit(1)
 print("ok: " + label)
 EOF
