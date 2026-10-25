@@ -144,9 +144,9 @@ EOF
 }
 
 check_repaint 0 "--force-scale 1" "1x top (pill lines)"
+# Isolation mode first: fresh layout on both passes. Diverges from the
+# default run only when the scroll-frame snapshot path is implicated.
+check_repaint 0 "--force-scale 2" "2x top fresh-layout" "--no-reuse"
 check_repaint 0 "--force-scale 2" "2x top (pill lines)"
 check_repaint 800 "--force-scale 2" "2x scrolled (pill lines)"
 check_repaint 200.37 "--force-scale 2" "2x fractional scroll"
-# Isolation mode: fresh layout on both passes. Diverges from the default
-# run only when the scroll-frame snapshot path is implicated.
-check_repaint 0 "--force-scale 2" "2x top fresh-layout" "--no-reuse"
