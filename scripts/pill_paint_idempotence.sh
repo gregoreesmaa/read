@@ -39,6 +39,7 @@ if ! probe_hooks "$BIN"; then
     probe_hooks "$BIN" || { echo "FAIL: hooks binary still reports no screenshot"; exit 2; }
 fi
 
+GATE_FAIL=0
 check_repaint() {
     # $1 = scroll, $2 = scale flag, $3 = label, $4 = extra flags (e.g. --no-reuse)
     sleep 0.3
@@ -47,9 +48,10 @@ check_repaint() {
     "$BIN" --screenshot /tmp/idem_scratch.png $2 --scroll "$1" --repaint-idempotence ${4:-} --dump-commands "$DOC" >/tmp/idem_out.txt 2>&1 || {
         echo "FAIL: $3 render exited nonzero (tail):"
         tail -5 /tmp/idem_out.txt || true
-        exit 2
+        GATE_FAIL=1
+        return 0
     }
-    [ -f "$P0" ] && [ -f "$P1" ] && [ -f "$P2" ] || { echo "FAIL: $3 missing phase PNGs"; exit 2; }
+    [ -f "$P0" ] && [ -f "$P1" ] && [ -f "$P2" ] || { echo "FAIL: $3 missing phase PNGs"; GATE_FAIL=1; return 0; }
     # Stage the phases for the run's screenshot artifacts (diagnostic aid:
     # lets a failing gate be inspected pixel-by-pixel after the fact).
     mkdir -p screenshots
@@ -58,7 +60,7 @@ check_repaint() {
     cp "$P1" "screenshots/repaint_phase_1_s${1}_${mode_tag}.png" 2>/dev/null || true
     cp "$P2" "screenshots/repaint_phase_2_s${1}_${mode_tag}.png" 2>/dev/null || true
     grep -h '^REPAINT ' /tmp/idem_out.txt | tail -3 || true
-    python3 - "$3" "$P0" "$P1" "$P2" <<'EOF'
+    if ! python3 - "$3" "$P0" "$P1" "$P2" <<'EOF'
 import struct, sys, zlib
 label, pa, pb, pc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
@@ -186,7 +188,12 @@ if not (ok01 and ok12):
     sys.exit(1)
 print("PASS: %s all phases byte-identical, non-blank" % label)
 EOF
+    then GATE_FAIL=1
+    fi
+    return 0
 }
+
+check_repaint 0 "--force-scale 1" "1x top (pill lines)"
 
 check_repaint 0 "--force-scale 1" "1x top (pill lines)"
 # Tier isolation first (diagnostic bypasses, removed before merge): a PASS
@@ -199,3 +206,9 @@ check_repaint 0 "--force-scale 2" "2x top fresh-layout" "--no-reuse"
 check_repaint 0 "--force-scale 2" "2x top (pill lines)"
 check_repaint 800 "--force-scale 2" "2x scrolled (pill lines)"
 check_repaint 200.37 "--force-scale 2" "2x fractional scroll"
+
+if [ "$GATE_FAIL" -ne 0 ]; then
+    echo "FAIL: pill repaint idempotence gate failed (see rows above)"
+    exit 1
+fi
+echo "PASS: pill repaint idempotence gate green"
