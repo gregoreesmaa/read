@@ -1325,11 +1325,13 @@ pub const EdgeSpring = struct {
 /// ring rental like `g_commands_buffer`: hit = in-place caller-buffer shift,
 /// miss = full `layoutViewport` + snapshot.
 ///
-/// Scope guard: covers only the pure-scroll fast path. Registration-only
-/// records (`register_scrollable_block`, clips, anchors) replay verbatim —
-/// state rebuild stays bit-identical — while pixel rects translate by the
-/// scroll delta. Callers must route any content/config change through
-/// `invalidate` first; stale reuse reads as frozen or torn rows.
+/// Scope guard: covers only the same-scroll fast path (damage-only
+/// repaints: selection, GIF ticks, hover). Registration-only records
+/// (`register_scrollable_block`, clips, anchors) replay verbatim — state
+/// rebuild stays bit-identical. Scroll changes MUST miss (see `reuse`):
+/// the snapshot holds viewport-window rows only, and a shifted replay
+/// would serve stale rows past the fold. Callers must route any
+/// content/config change through `invalidate` first.
 pub const ScrollFrameCache = struct {
     valid: bool = false,
     count: usize = 0,
@@ -1384,11 +1386,17 @@ pub const ScrollFrameCache = struct {
             self.hover_epoch == hover_epoch;
     }
 
-    /// Pure-scroll reuse: translate cached rect y by the scroll delta into
-    /// the caller buffer (same buffer the full path rents). Registration
-    /// and clip records replay unchanged; `fill_rect` backgrounds always
-    /// span the view, so they replay unchanged too. Returns the count on a
-    /// hit, null on any mismatch (caller runs full layout instead).
+    /// Same-scroll reuse: replay the cached frame verbatim into the caller
+    /// buffer (same buffer the full path rents). Registration, clip, and
+    /// fill records replay unchanged. Scroll changes MUST miss: the cache
+    /// holds viewport-window rows only (`renderViewportCore` stops at the
+    /// viewport bottom), so a y-shifted replay would serve stale rows —
+    /// the expose strip's fresh rows are never in the stream, `keeps()`
+    /// culls the shifted rows out of the strip, and live scrolling shows
+    /// sliding stale pixels with blank strips below the fold. Fresh layout
+    /// per scroll step is microseconds (strict layout budgets), so no fast
+    /// path is lost that correctness needs. Returns the count on a hit,
+    /// null on any mismatch (caller runs full layout instead).
     pub fn reuse(
         self: *const ScrollFrameCache,
         cached: []const DrawCommand,
@@ -1399,25 +1407,17 @@ pub const ScrollFrameCache = struct {
     ) ?usize {
         if (!self.valid) return null;
         if (!self.configMatches(cfg, content_id, hover_epoch)) return null;
+        // Scroll moved: miss so the caller lays out fresh rows. Damage-only
+        // frames (same scroll) replay verbatim and skip layout.
+        if (cfg.scroll_y != self.scroll_y) return null;
         if (self.count > out.len) return null;
         if (cached.len < self.count) return null;
-        const dy = self.scroll_y - cfg.scroll_y;
-        var i: usize = 0;
-        while (i < self.count) : (i += 1) {
-            var c = cached[i];
-            switch (c.kind) {
-                .register_scrollable_block, .begin_clip, .end_clip, .fill_rect => {},
-                else => {
-                    c.rect.y += dy;
-                },
-            }
-            out[i] = c;
-        }
+        @memcpy(out[0..self.count], cached[0..self.count]);
         return self.count;
     }
 };
 
-test "scroll cache: pure scroll reuses by y-shift, anything else misses" {
+test "scroll cache: same-scroll repaints reuse verbatim, scroll changes miss" {
     const cmds = [_]DrawCommand{
         .{ .kind = .fill_rect, .rect = .{ .x = 0, .y = 0, .w = 800, .h = 600 } },
         .{ .kind = .text_run, .rect = .{ .x = 100, .y = 120, .w = 200, .h = 24 }, .text = "row" },
@@ -1428,12 +1428,17 @@ test "scroll cache: pure scroll reuses by y-shift, anything else misses" {
     try std.testing.expect(cache.reuse(&cmds, emptyCmds(), base, 7, 0) == null);
     cache.snapshot(&cmds, cmds.len, base, 7, 0, 2.0);
     var out: [8]DrawCommand = undefined;
-    const moved_cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 40.0 };
-    const n = cache.reuse(&cmds, &out, moved_cfg, 7, 0).?;
+    // Same scroll (damage-only repaint): verbatim replay, layout skipped.
+    const n = cache.reuse(&cmds, &out, base, 7, 0).?;
     try std.testing.expectEqual(cmds.len, n);
     try std.testing.expectEqual(@as(f32, 0.0), out[0].rect.y);
-    try std.testing.expectEqual(@as(f32, 80.0), out[1].rect.y);
+    try std.testing.expectEqual(@as(f32, 120.0), out[1].rect.y);
     try std.testing.expectEqual(@as(f32, 200.0), out[2].rect.y);
+    // Any scroll change misses: the snapshot holds viewport-window rows
+    // only, so a shifted replay would serve stale rows past the fold
+    // (live scroll showed sliding stale pixels with blank expose strips).
+    const moved_cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 40.0 };
+    try std.testing.expect(cache.reuse(&cmds, &out, moved_cfg, 7, 0) == null);
     try std.testing.expect(cache.reuse(&cmds, &out, moved_cfg, 8, 0) == null);
     var theme_cfg = moved_cfg;
     theme_cfg.is_dark_theme = !base.is_dark_theme;
@@ -1447,6 +1452,81 @@ test "scroll cache: pure scroll reuses by y-shift, anything else misses" {
 fn emptyCmds() []DrawCommand {
     var buf: [1]DrawCommand = undefined;
     return buf[0..0];
+}
+
+test "scroll cache: scrolled frames never reuse stale rows (live blank strips)" {
+    // End-to-end over real layout: frame 1 at scroll 0 snapshots the
+    // initial viewport; a scrolled frame MUST miss (fresh layout lays out
+    // the rows the snapshot never held), otherwise the expose strip paints
+    // nothing: reuse would shift stale rows out of the strip and keeps()
+    // culls the rest. Live this read as sliding stale pixels with blank
+    // strips below the fold.
+    const doc =
+        \\# Title
+        \\
+        \\Alpha line one two three.
+        \\Bravo line one two three.
+        \\Charlie line one two three.
+        \\Delta line one two three.
+        \\Echo line one two three.
+        \\Foxtrot line one two three.
+        \\Golf line one two three.
+        \\Hotel line one two three.
+        \\India line one two three.
+        \\Juliet line one two three.
+        \\Kilo line one two three.
+        \\Lima line one two three.
+        \\Mike line one two three.
+        \\November line one two three.
+        \\Oscar line one two three.
+        \\Papa line one two three.
+        \\Quebec line one two three.
+        \\Romeo line one two three.
+        \\Sierra line one two three.
+        \\Tango line one two three.
+        \\Uniform line one two three.
+        \\Victor line one two three.
+        \\Whiskey line one two three.
+        \\Xray line one two three.
+        \\Yankee line one two three.
+        \\Zulu line one two three.
+    ;
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    try std.testing.expect(n > 0);
+
+    var cmds0: [256]DrawCommand = undefined;
+    var cfg0 = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+    const n0 = layoutViewport(doc, lines_buf[0..n], &cfg0, &cmds0);
+    try std.testing.expect(n0 > 0);
+
+    var cache = ScrollFrameCache{};
+    cache.snapshot(cmds0[0..n0], n0, cfg0, 7, 0, 1.0);
+    var out: [256]DrawCommand = undefined;
+    // Same scroll still replays (damage-only frames skip layout).
+    try std.testing.expectEqual(n0, cache.reuse(cmds0[0..n0], &out, cfg0, 7, 0).?);
+    // Scrolled frame misses: fresh layout must provide the new rows.
+    var cfg1 = cfg0;
+    cfg1.scroll_y = 400.0;
+    try std.testing.expect(cache.reuse(cmds0[0..n0], &out, cfg1, 7, 0) == null);
+    var cmds1: [256]DrawCommand = undefined;
+    const n1 = layoutViewport(doc, lines_buf[0..n], &cfg1, &cmds1);
+    try std.testing.expect(n1 > 0);
+    // The fresh frame covers the viewport with rows the snapshot never
+    // held: at least one text run sits inside [0, window_height).
+    var covered = false;
+    for (cmds1[0..n1]) |c| {
+        if (c.kind == .text_run and c.rect.y + c.rect.h > 0.0 and c.rect.y < cfg1.window_height) {
+            covered = true;
+            break;
+        }
+    }
+    try std.testing.expect(covered);
 }
 
 test "scroll quantize: whole device pixels, passthrough on bad scale" {
