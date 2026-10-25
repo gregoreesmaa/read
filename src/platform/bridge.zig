@@ -358,3 +358,27 @@ pub extern "c" fn platform_render_to_png(
     height: c_int,
     render_fn: *const fn (width: c_int, height: c_int) callconv(.c) void,
 ) c_int;
+/// Repaint-idempotence probe: same frame twice on one bitmap (warm caches
+/// on pass two). Test-hooks builds only.
+pub extern "c" fn platform_render_repaint_png(
+    out_a: [*:0]const u8,
+    out_b: [*:0]const u8,
+    out_c: [*:0]const u8,
+    width: c_int,
+    height: c_int,
+    render_fn: *const fn (width: c_int, height: c_int) callconv(.c) void,
+) c_int;
+/// Tier-isolation bypasses (test binary only): force legacy direct paint.
+pub extern "c" fn platform_set_test_bypass(pill_direct: c_int, shape_direct: c_int) void;
+/// Scroll-copy plan query: copy/seam-band decision for dy,scale,view_h,
+/// overshoot. Test-hooks builds only.
+pub extern "c" fn platform_probe_scroll_plan(
+    dy: f32,
+    scale: f32,
+    view_h: f32,
+    overshoot: f32,
+    use_copy: *c_int,
+    copy_dy: *f32,
+    band_y: *f32,
+    band_h: *f32,
+) void;

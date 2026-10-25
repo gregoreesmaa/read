@@ -1192,6 +1192,16 @@ var g_sweep_step: f32 = 0.0;
 // Two-phase drag-back residue test state (read-test binary only): selection A
 // then shrink to B, painted incrementally on one bitmap. See --select-drag.
 var g_drag_active: bool = false;
+// Repaint-idempotence probe state (read-test binary only): same frame drawn
+// twice on one bitmap, caches warm on the second pass. See --repaint-idempotence.
+var g_repaint_active: bool = false;
+// Tier-isolation bypasses (test binary only): force legacy direct paint
+// to name a divergent raster cache tier.
+var g_pill_direct: bool = false;
+var g_shape_direct: bool = false;
+// Force fresh layout on every draw (test binary only): isolates the reuse
+// path when the idempotence probe diverges. See --no-reuse.
+var g_no_reuse: bool = false;
 // First-paint gate for deferred image decodes (see platform_arm_images):
 // image records park until the first frame is committed, then decode.
 // Headless one-shot screenshots never arm (deterministic placeholders).
@@ -2223,7 +2233,11 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     // rows past the fold (live blank expose strips).
     var cmd_count: usize = 0;
     const content_id = scrollContentId();
-    if (g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0)) |n| {
+    // Test-only layout forcing (idempotence isolation): comptime-folded away
+    // in ship builds so the hot path keeps its exact shape and __TEXT.
+    const force_layout = build_options.test_hooks and g_no_reuse;
+    const reused: ?usize = if (force_layout) null else g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0);
+    if (reused) |n| {
         cmd_count = n;
     } else {
         cmd_count = layout.layoutViewport(
@@ -2952,6 +2966,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     if (args_it.next()) |sc_str| {
                         bridge.platform_set_test_scale(std.fmt.parseFloat(f32, sc_str) catch 0.0);
                     }
+                } else if (std.mem.eql(u8, arg, "--repaint-idempotence")) {
+                    // Repaint-idempotence probe (pill MISS/HIT parity): the
+                    // dispatch below draws the same scrolled frame twice on
+                    // one bitmap (caches warm on pass two, like live
+                    // scrolling) to fixed /tmp paths the caller diffs.
+                    // Needs --screenshot as well (all headless dispatch does).
+                    g_repaint_active = true;
+                } else if (std.mem.eql(u8, arg, "--no-reuse")) {
+                    // Idempotence-probe isolation: every draw re-runs layout
+                    // instead of replaying the scroll-frame snapshot.
+                    g_no_reuse = true;
+                } else if (std.mem.eql(u8, arg, "--pill-direct")) {
+                    // Tier-isolation bypass (test binary only).
+                    g_pill_direct = true;
+                } else if (std.mem.eql(u8, arg, "--shape-direct")) {
+                    // Tier-isolation bypass (test binary only).
+                    g_shape_direct = true;
+                } else if (std.mem.startsWith(u8, arg, "--probe-scroll-plan=")) {
+                    // Scroll-copy plan query (copy/seam-band residue rules):
+                    // dy,scale,view_h,overshoot in points; prints USE_COPY,
+                    // quantized copy delta, and the seam band to repaint.
+                    var it = std.mem.splitScalar(u8, arg["--probe-scroll-plan=".len..], ',');
+                    const qdy = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const qscale = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const qvh = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const qover = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    var quse: c_int = 0;
+                    var qcopy: f32 = 0;
+                    var qby: f32 = 0;
+                    var qbh: f32 = 0;
+                    bridge.platform_probe_scroll_plan(qdy, qscale, qvh, qover, &quse, &qcopy, &qby, &qbh);
+                    std.debug.print("SCROLLPLAN={d},{d:.2},{d:.2},{d:.2}\n", .{ quse, qcopy, qby, qbh });
                 } else if (std.mem.eql(u8, arg, "--select-drag")) {
                     // Drag-back residue test: caret baseline, extend to A,
                     // shrink to B — every phase after the first incremental
@@ -3135,6 +3181,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (r != 0) std.c.exit(1);
             }
             std.c.exit(0);
+        }
+        // Repaint-idempotence probe (read-test binary only): the same
+        // scrolled frame twice on one bitmap, no clear between passes.
+        // Pass two hits warm caches (pill rasters, shape slices, atlas) —
+        // exactly the live-scroll state — so any byte difference between
+        // the two phases is a cache-state-dependent paint defect.
+        if (build_options.test_hooks and g_repaint_active) {
+            g_headless_oneshot = true;
+            bridge.platform_set_test_scroll(g_app.scroll_y);
+            bridge.platform_set_test_bypass(if (g_pill_direct) 1 else 0, if (g_shape_direct) 1 else 0);
+            const r = bridge.platform_render_repaint_png("/tmp/repaint_phase_0.png", "/tmp/repaint_phase_1.png", "/tmp/repaint_phase_2.png", 1200, 900, onDraw);
+            if (r == 0) {
+                std.debug.print("Repaint capture generated\n", .{});
+                std.c.exit(0);
+            } else {
+                std.debug.print("Repaint capture failed (code {d})\n", .{r});
+                std.c.exit(1);
+            }
         }
         // Plain one-shot: placeholders are the expected output (decodes
         // never win the race today either); suppress the first-paint arm

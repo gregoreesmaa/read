@@ -62,6 +62,10 @@ jobs:
         run: sh scripts/retina_text_coverage.sh ./zig-out/bin/read-test
       - name: Scroll expose-strip paint (live scroll frame shape)
         run: sh scripts/scroll_strip_paint.sh ./zig-out/bin/read-test
+      - name: Pill repaint idempotence (warm-cache MISS/HIT parity)
+        run: sh scripts/pill_paint_idempotence.sh ./zig-out/bin/read-test
+      - name: Scroll-copy plan (expose-copy residue rules)
+        run: sh scripts/scroll_copy_plan.sh ./zig-out/bin/read-test
       - name: Render short fuzz (scroll/select/drag/damage/scale/atlas oracles)
         run: ./scripts/fuzz_render.sh ./zig-out/bin/read-test showcase.md 2
       - name: test_cases discipline (exactly 1 scrollable-doc case)
