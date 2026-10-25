@@ -2594,21 +2594,56 @@ void platform_request_redraw_rect(float x, float y, float w, float h) {
 // A delta covering the view shares no pixels: fall back to full. Coalesced
 // with the tick: the timer fire below is the single invalidation point for
 // scroll + overshoot, so no frame pays two setNeedsDisplay calls.
+// Pure plan for a scroll copy (no AppKit): unit-probed from the test
+// binary (see --probe-scroll-plan) so CI pins the residue rules below
+// without a window.
+typedef struct { int use_copy; float copy_dy; float band_y; float band_h; } ScrollCopyPlan;
+static ScrollCopyPlan scroll_copy_plan(float dy, float scale, float view_h, float overshoot) {
+    ScrollCopyPlan p = { 0, 0.0f, 0.0f, 0.0f };
+    if (dy == 0.0f || scale <= 0.0f) return p; // full: nothing moved / unknown grid
+    if (overshoot != 0.0f) return p; // full: rubber-band translate shifts the whole scene
+    if (!(view_h > 0.0f) || fabsf(dy) >= view_h) return p; // full: no shared pixels
+    // Device-quantized copy: a fractional scrollRect shift resamples the
+    // whole backing store, and the next frame copies the resampled pixels
+    // again — drift that reads as residue. Copy by whole device pixels; the
+    // seam sliver (at most half a device px between the quantized copy and
+    // the exact-offset strip paint) is covered by the band below.
+    float qdy = roundf(dy * scale) / scale;
+    if (!(qdy > 0.0f || qdy < 0.0f)) return p; // full: a sub-device-pixel nudge (or non-finite input) repaints cheaply and exactly
+    p.use_copy = 1;
+    p.copy_dy = qdy;
+    // Seam band: 2pt on the copy/strip boundary (the copy's far side is
+    // exact — only the boundary disagrees with fresh paint). Flipped view
+    // coords (origin top-left): scrolling down exposes the bottom strip,
+    // so the seam sits atop it; scrolling up mirrors.
+    float seam_h = 2.0f;
+    if (qdy > 0.0f) p.band_y = view_h - fabsf(qdy) - seam_h;
+    else p.band_y = fabsf(qdy);
+    if (p.band_y < 0.0f) p.band_y = 0.0f;
+    p.band_h = seam_h;
+    return p;
+}
 void platform_request_scroll(float old_scroll_y, float new_scroll_y) {
     NSView* v = damage_target_view();
     if (!v) return;
     float dy = new_scroll_y - old_scroll_y; // scroll coords: down positive
     float h = (float)v.bounds.size.height;
     float w = (float)v.bounds.size.width;
-    if (dy == 0.0f) return;
-    if (fabsf(dy) >= h || w <= 0.0f || h <= 0.0f) {
+    if (dy == 0.0f) return; // settled present: nothing moved, no invalidation
+    ScrollCopyPlan plan = scroll_copy_plan(dy, g_output_scale, h, g_overshoot);
+    if (!plan.use_copy || w <= 0.0f) {
         [v setNeedsDisplay:YES];
         return;
     }
     // scrollRect is in view coords (flipped here: origin top-left). Pixels
     // move opposite the scroll: content scrolled down by dy shows rows from
     // dy pixels above, so the copy shifts by -dy.
-    [v scrollRect:v.bounds by:NSMakeSize(0.0f, -dy)];
+    [v scrollRect:v.bounds by:NSMakeSize(0.0f, -plan.copy_dy)];
+    // scrollRect invalidates the exposed strip itself; the seam band above
+    // repaints the boundary the quantized copy and the exact-offset layout
+    // paint from opposite sides of, so a fringe can neither survive this
+    // frame nor propagate into the next copy.
+    if (plan.band_h > 0.0f) invalidate_rect(NSMakeRect(0.0f, plan.band_y, w, plan.band_h));
 }
 
 // ---------------------------------------------------------------------------
@@ -4267,6 +4302,80 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
 
     return success ? 0 : -5;
 }
+
+// Repaint-idempotence probe (pill-cache MISS/HIT parity): render the same
+// frame twice onto one bitmap without clearing — caches stay warm across
+// the two passes exactly like live scrolling — and dump both phases. Any
+// byte difference is a cache-state-dependent paint defect (a miss painting
+// differently from a hit); identical bytes prove MISS≡HIT. Full damage
+// both phases: this isolates cache-state paint, not damage culling (the
+// strip-parity script covers that axis separately). Test binary only.
+int platform_render_repaint_png(const char* out_a, const char* out_b, int width, int height,
+    void (*render_fn)(int width, int height))
+{
+    if (!out_a || !out_b || width <= 0 || height <= 0 || !render_fn) return -1;
+
+    float backing = 1.0f;
+#ifdef TEST_HOOKS
+    if (g_test_scale > 0.0f) backing = g_test_scale;
+#endif
+    int pixel_w = (int)(width * backing);
+    int pixel_h = (int)(height * backing);
+    if (pixel_w <= 0 || pixel_h <= 0) return -2;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(
+        NULL,
+        (size_t)pixel_w,
+        (size_t)pixel_h,
+        8,
+        (size_t)pixel_w * 4,
+        colorSpace,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
+    );
+    CGColorSpaceRelease(colorSpace);
+
+    if (!ctx) return -2;
+
+    // Flip context coordinate space to match flipped view
+    CGContextTranslateCTM(ctx, 0, pixel_h);
+    CGContextScaleCTM(ctx, backing, -backing);
+    g_output_scale = backing;
+    g_current_cg_context = ctx;
+
+    for (int phase = 0; phase < 2; phase++) {
+        g_draw_seq++;
+        g_text_record_count = 0;
+        g_code_block_count = 0;
+        g_scrollable_block_count = 0;
+        g_last_ul.valid = NO; // link-underline continuation is per-render (#101)
+        // Headless repaint has no AppKit dirty rect: full redraw, both phases.
+        g_pending_dirty_valid = NO;
+        render_fn(width, height);
+        platform_batch_end();
+        // Headless selection captures paint the same highlight as live draws.
+        if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
+        int rc = headless_dump_png(ctx, phase == 0 ? out_a : out_b);
+        if (rc != 0) { g_current_cg_context = NULL; CGContextRelease(ctx); return rc; }
+    }
+
+    g_current_cg_context = NULL;
+    g_pending_dirty_valid = NO;
+
+    CGContextRelease(ctx);
+    return 0;
+}
+
+// Scroll-copy plan probe: report the copy/seam-band decision for the given
+// (dy, scale, view height, overshoot) so CI pins the residue rules headlessly.
+void platform_probe_scroll_plan(float dy, float scale, float view_h, float overshoot,
+    int* use_copy, float* copy_dy, float* band_y, float* band_h) {
+    ScrollCopyPlan p = scroll_copy_plan(dy, scale, view_h, overshoot);
+    if (use_copy) *use_copy = p.use_copy;
+    if (copy_dy) *copy_dy = p.copy_dy;
+    if (band_y) *band_y = p.band_y;
+    if (band_h) *band_h = p.band_h;
+}
 #endif
 
 // Native window tabbing (#49): two AppKit calls, no custom chrome. Kept at
@@ -4996,59 +5105,78 @@ static void pill_draw_cached_or_direct(float x, float y, float w, float h, float
         return;
     }
 
+    // Device-snapped blit origin (same convention as
+    // blit_tinted_mask_batched): fractional pill positions — cumulative
+    // text advances are fractional at any scroll offset — must not
+    // phase-shift the nearest-neighbor blit frame to frame, or pill
+    // borders shimmer against their device-snapped glyphs while the
+    // visible set churns (live flicker on pill-dense lines).
+    float dest_x = roundf(x * g_output_scale) / g_output_scale;
+    float dest_y = roundf(y * g_output_scale) / g_output_scale;
+
     float r = fminf(radius, fminf(w, h) * 0.5f);
     uint32_t fill = pill_pack(fr, fg, fb, fa);
     uint32_t border = pill_pack(br, bg, bb, ba);
     // Direct-mapped lookup: pills of one theme share few identities.
     uint32_t key = (uint32_t)(w * 13.0f + h * 7.0f + r * 3.0f) ^ fill ^ (border * 0x9E3779B1u);
     PillCacheEntry* slot = &g_pill_cache[key % PILL_CACHE_CAP];
-    if (slot->img && slot->w == w && slot->h == h && slot->r == r &&
-        slot->fill == fill && slot->border == border) {
-        CGContextSaveGState(ctx);
-        CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
-        CGContextTranslateCTM(ctx, x, y + h);
-        CGContextScaleCTM(ctx, 1.0f, -1.0f);
-        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), slot->img);
-        CGContextRestoreGState(ctx);
-        return;
-    }
-    // Contained like platform_draw_rect: a cache miss paints the vector path
-    // directly mid-frame, and its fill/stroke sets must not leak into the
-    // #389 text batch prime. Pixels are identical; only the state leak is
-    // removed.
-    CGContextSaveGState(ctx);
-    pill_build_path(ctx, x, y, w, h, r);
-    pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
-    CGContextRestoreGState(ctx);
-    // Prerender into the slot for next frame: rasterize the same path once
-    // into a 2x bitmap (evicting the collision). Pixel-identical by
-    // construction on native-scale dests: same path, same colors, same 1px
-    // hairline, snapped so the blit above lands 1:1 on the device grid
-    // (1x dests never reach here — direct path above, clip-parity).
-    {
-        int iw = (int)ceilf(w * RASTER_SCALE);
-        int ih = (int)ceilf(h * RASTER_SCALE);
-        if (iw > 0 && ih > 0 && iw <= 1024 && ih <= 256) {
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-            CGContextRef bc = CGBitmapContextCreate(NULL, iw, ih, 8, iw * 4, cs,
-                kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-            CGColorSpaceRelease(cs);
-            if (bc) {
-                CGContextScaleCTM(bc, (float)RASTER_SCALE, (float)RASTER_SCALE);
-                pill_build_path(bc, 0, 0, w, h, r);
-                pill_fill_stroke(bc, fr, fg, fb, fa, br, bg, bb, ba);
-                CGImageRef img = CGBitmapContextCreateImage(bc);
-                CGContextRelease(bc);
-                if (img) {
-                    if (slot->img) CGImageRelease(slot->img);
-                    slot->img = img;
-                    slot->w = w; slot->h = h; slot->r = r;
-                    slot->fill = fill; slot->border = border;
-                    slot->iw = iw; slot->ih = ih;
+    // A miss prerenders into the slot first; the blit below is then shared
+    // by both states, so a miss paints bit-identically to later hits and
+    // slot churn (8 entries vs dozens of pill identities, evicting every
+    // scroll frame) costs only re-rasterization, never a pixel pop.
+    // Direct vector paint survives only as the fallback when the prerender
+    // cannot land (oversize pill or a failed bitmap); it stays contained
+    // so the #389 batch prime never leaks.
+    if (!(slot->img && slot->w == w && slot->h == h && slot->r == r &&
+          slot->fill == fill && slot->border == border)) {
+        // Prerender into the slot: rasterize the same path once into a 2x
+        // bitmap (evicting the collision). Pixel-identical by construction
+        // on native-scale dests: same path, same colors, same 1px hairline
+        // (1x dests never reach here — direct path above, clip-parity).
+        {
+            int iw = (int)ceilf(w * RASTER_SCALE);
+            int ih = (int)ceilf(h * RASTER_SCALE);
+            if (iw > 0 && ih > 0 && iw <= 1024 && ih <= 256) {
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                CGContextRef bc = CGBitmapContextCreate(NULL, iw, ih, 8, iw * 4, cs,
+                    kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+                CGColorSpaceRelease(cs);
+                if (bc) {
+                    CGContextScaleCTM(bc, (float)RASTER_SCALE, (float)RASTER_SCALE);
+                    pill_build_path(bc, 0, 0, w, h, r);
+                    pill_fill_stroke(bc, fr, fg, fb, fa, br, bg, bb, ba);
+                    CGImageRef img = CGBitmapContextCreateImage(bc);
+                    CGContextRelease(bc);
+                    if (img) {
+                        if (slot->img) CGImageRelease(slot->img);
+                        slot->img = img;
+                        slot->w = w; slot->h = h; slot->r = r;
+                        slot->fill = fill; slot->border = border;
+                        slot->iw = iw; slot->ih = ih;
+                    }
                 }
             }
         }
     }
+    if (slot->img && slot->w == w && slot->h == h && slot->r == r &&
+        slot->fill == fill && slot->border == border) {
+        // Raster-sized blit rect (never the user-space w/h): the slot holds
+        // ceil-sized texels, so sizing from iw/ih keeps the texel map 1:1
+        // on the snapped origin above.
+        float bw = (float)slot->iw / (float)RASTER_SCALE;
+        float bh = (float)slot->ih / (float)RASTER_SCALE;
+        CGContextSaveGState(ctx);
+        CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
+        CGContextTranslateCTM(ctx, dest_x, dest_y + bh);
+        CGContextScaleCTM(ctx, 1.0f, -1.0f);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, bw, bh), slot->img);
+        CGContextRestoreGState(ctx);
+        return;
+    }
+    CGContextSaveGState(ctx);
+    pill_build_path(ctx, dest_x, dest_y, w, h, r);
+    pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
+    CGContextRestoreGState(ctx);
 }
 
 // ZaTeX runtime math backend (LaTeX math plugin) lives in macos_zatex.m
