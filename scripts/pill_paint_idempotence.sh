@@ -43,7 +43,7 @@ check_repaint() {
     sleep 0.3
     rm -f "$P0" "$P1"
     # shellcheck disable=SC2086
-    "$BIN" --screenshot /tmp/idem_scratch.png $2 --scroll "$1" --repaint-idempotence ${4:-} "$DOC" >/tmp/idem_out.txt 2>&1 || {
+    "$BIN" --screenshot /tmp/idem_scratch.png $2 --scroll "$1" --repaint-idempotence ${4:-} --dump-commands "$DOC" >/tmp/idem_out.txt 2>&1 || {
         echo "FAIL: $3 render exited nonzero (tail):"
         tail -5 /tmp/idem_out.txt || true
         exit 2
@@ -119,6 +119,34 @@ print("%s: %dx%d ink=%d" % (label, w0, h0, ink))
 if ink < 10000:
     print("FAIL: %s renders blank (vacuous pass)" % label)
     sys.exit(1)
+# Command-stream parity: split the --dump-commands output by REPAINT
+# phase marker and diff. A divergence here means the paint loop saw
+# different commands per pass (layout/reuse side), not warm-cache paint.
+txt = open("/tmp/idem_out.txt").read()
+blocks, cur = [], []
+for ln in txt.split("\n"):
+    if ln.startswith("REPAINT phase="):
+        if cur:
+            blocks.append(cur)
+        cur = []
+    elif ln.startswith("CMD ") or ln.startswith("Commands: "):
+        cur.append(ln)
+if cur:
+    blocks.append(cur)
+if len(blocks) >= 2:
+    b0, b1 = blocks[-2], blocks[-1]
+    if b0 == b1:
+        print("%s: command streams identical (%d cmds)" % (label, len(b0)))
+    else:
+        print("FAIL: %s command streams differ (%d vs %d cmds)" % (label, len(b0), len(b1)))
+        s0, s1 = set(b0), set(b1)
+        for ln in sorted(s0 - s1)[:10]:
+            print("  pass0-only: %s" % ln[:160])
+        for ln in sorted(s1 - s0)[:10]:
+            print("  pass1-only: %s" % ln[:160])
+        sys.exit(1)
+else:
+    print("note: %s found %d command blocks, skipping stream diff" % (label, len(blocks)))
 diff_n = 0
 x0, y0, x1, y1 = w0, h0, -1, -1
 samples = []
