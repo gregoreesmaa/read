@@ -3114,6 +3114,19 @@ static inline int blit_tinted_mask_batched(CGContextRef ctx, ShapedEntry* e,
     return 1;
 }
 
+// Diagnostic bypasses (idempotence tier isolation; REMOVED before merge):
+// force the legacy direct paint paths at any scale to name a divergent
+// raster cache tier. BSS globals (zero file bytes); the setter is
+// TEST_HOOKS-gated. Ship reads fold to the constant shape (always 0).
+static int g_pill_direct = 0;
+static int g_shape_direct = 0;
+#ifdef TEST_HOOKS
+void platform_set_test_bypass(int pill_direct, int shape_direct) {
+    g_pill_direct = pill_direct;
+    g_shape_direct = shape_direct;
+}
+#endif
+
 // Group id for the per-frame fill-color batcher below: runs sharing one
 // group paint under a single hoisted SetFillColor (no state churn between
 // runs), which is what lets the GPU batch the textured quads. Opaque text
@@ -3190,7 +3203,8 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         // Batched: consecutive same-color runs share one primed fill color
         // (no per-run SaveGState/SetFillColor/Restore — the state churn the
         // issue calls out). Link underlines ride the primed color.
-        if (draw_run_batched(ctx, e, x, y, font_size, r, g, b, a)) {
+        // g_shape_direct is the diagnostic bypass (removed before merge).
+        if (!g_shape_direct && draw_run_batched(ctx, e, x, y, font_size, r, g, b, a)) {
             // Shaped link runs underline here (issue #25); the uncacheable
             // path below is covered inside draw_text_legacy instead.
             if (link_url && link_url_len > 0) {
@@ -5108,7 +5122,8 @@ static void pill_draw_cached_or_direct(float x, float y, float w, float h, float
     // pixel-exactly (2026-10 drag-back residue, gestures 5/13/18: pill
     // fringe rows differ on incremental passes that blit while fresh
     // passes draw direct). No lookup, no prerender churn on 1x.
-    if (g_output_scale < 1.5f) {
+    // g_pill_direct is the diagnostic bypass (removed before merge).
+    if (g_pill_direct || g_output_scale < 1.5f) {
         pill_build_path(ctx, x, y, w, h, radius);
         pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
         return;

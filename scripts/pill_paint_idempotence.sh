@@ -189,7 +189,11 @@ EOF
 }
 
 check_repaint 0 "--force-scale 1" "1x top (pill lines)"
-# Isolation mode first: fresh layout on both passes. Diverges from the
+# Tier isolation first (diagnostic bypasses, removed before merge): a PASS
+# under a bypass with a FAIL in the default run names the divergent cache.
+check_repaint 0 "--force-scale 2" "2x top pill-direct" "--pill-direct"
+check_repaint 0 "--force-scale 2" "2x top shape-direct" "--shape-direct"
+# Isolation mode: fresh layout on both passes. Diverges from the
 # default run only when the scroll-frame snapshot path is implicated.
 check_repaint 0 "--force-scale 2" "2x top fresh-layout" "--no-reuse"
 check_repaint 0 "--force-scale 2" "2x top (pill lines)"

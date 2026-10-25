@@ -1195,6 +1195,10 @@ var g_drag_active: bool = false;
 // Repaint-idempotence probe state (read-test binary only): same frame drawn
 // twice on one bitmap, caches warm on the second pass. See --repaint-idempotence.
 var g_repaint_active: bool = false;
+// Diagnostic bypasses (removed before merge): force legacy direct paint
+// to name a divergent raster cache tier.
+var g_pill_direct: bool = false;
+var g_shape_direct: bool = false;
 // Force fresh layout on every draw (test binary only): isolates the reuse
 // path when the idempotence probe diverges. See --no-reuse.
 var g_no_reuse: bool = false;
@@ -2973,6 +2977,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     // Idempotence-probe isolation: every draw re-runs layout
                     // instead of replaying the scroll-frame snapshot.
                     g_no_reuse = true;
+                } else if (std.mem.eql(u8, arg, "--pill-direct")) {
+                    // Diagnostic bypass (removed before merge).
+                    g_pill_direct = true;
+                } else if (std.mem.eql(u8, arg, "--shape-direct")) {
+                    // Diagnostic bypass (removed before merge).
+                    g_shape_direct = true;
                 } else if (std.mem.startsWith(u8, arg, "--probe-scroll-plan=")) {
                     // Scroll-copy plan query (copy/seam-band residue rules):
                     // dy,scale,view_h,overshoot in points; prints USE_COPY,
@@ -3180,6 +3190,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (build_options.test_hooks and g_repaint_active) {
             g_headless_oneshot = true;
             bridge.platform_set_test_scroll(g_app.scroll_y);
+            bridge.platform_set_test_bypass(if (g_pill_direct) 1 else 0, if (g_shape_direct) 1 else 0);
             const r = bridge.platform_render_repaint_png("/tmp/repaint_phase_0.png", "/tmp/repaint_phase_1.png", "/tmp/repaint_phase_2.png", 1200, 900, onDraw);
             if (r == 0) {
                 std.debug.print("Repaint capture generated\n", .{});

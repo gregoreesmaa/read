@@ -368,6 +368,8 @@ pub extern "c" fn platform_render_repaint_png(
     height: c_int,
     render_fn: *const fn (width: c_int, height: c_int) callconv(.c) void,
 ) c_int;
+/// Diagnostic bypasses (removed before merge): force legacy direct paint.
+pub extern "c" fn platform_set_test_bypass(pill_direct: c_int, shape_direct: c_int) void;
 /// Scroll-copy plan query: copy/seam-band decision for dy,scale,view_h,
 /// overshoot. Test-hooks builds only.
 pub extern "c" fn platform_probe_scroll_plan(
