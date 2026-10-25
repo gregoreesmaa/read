@@ -18,6 +18,9 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+# Diagnostic: per-run mask/geometry trace (removed before merge).
+export READ_TRACE_RUNS=1
+
 BIN="${1:-zig-out/bin/read-test}"
 DOC="README.md"
 P0="/tmp/repaint_phase_0.png"
@@ -60,6 +63,9 @@ check_repaint() {
     cp "$P1" "screenshots/repaint_phase_1_s${1}_${mode_tag}.png" 2>/dev/null || true
     cp "$P2" "screenshots/repaint_phase_2_s${1}_${mode_tag}.png" 2>/dev/null || true
     grep -h '^REPAINT ' /tmp/idem_out.txt | tail -3 || true
+    # Surface the per-run mask/blit trace for the divergent runs (the mask
+    # FNV names re-rasterization; aw/ah/asc/dx/dy name geometry shifts).
+    grep -h '^TRACERUN txt=\(before\|typography\)' /tmp/idem_out.txt | tail -18 || true
     if ! python3 - "$3" "$P0" "$P1" "$P2" <<'EOF'
 import struct, sys, zlib
 label, pa, pb, pc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]

@@ -3179,6 +3179,33 @@ static int draw_run_batched(CGContextRef ctx, ShapedEntry* e,
 void platform_draw_text(const char* text, int len, float x, float y, float font_size, int is_bold, int is_italic, int is_mono, int is_heading, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const char* link_url, int link_url_len) {
     if (!g_current_cg_context || len <= 0 || !text) return;
     CGContextRef ctx = g_current_cg_context;
+#ifdef TEST_HOOKS
+    // Diagnostic run tracer (removed before merge): FNV over the blitted
+    // mask texels + blit geometry per run per pass, to name a warm-cache
+    // paint divergence. Active only with READ_TRACE_RUNS=1 in the env.
+    static int trace_runs = -1;
+    if (trace_runs < 0) trace_runs = getenv("READ_TRACE_RUNS") ? 1 : 0;
+#define TRACE_RUN(e_, via_) do { \
+    if (trace_runs && (e_)) { \
+        unsigned long long _h = 1469598103934665603ull; \
+        if ((e_)->slice && g_atlas_px) { \
+            for (int _yy = 0; _yy < (e_)->ah; _yy++) \
+                for (int _xx = 0; _xx < (e_)->aw; _xx++) { \
+                    _h ^= g_atlas_px[((e_)->ay + _yy) * ATLAS_PX + ((e_)->ax + _xx)]; \
+                    _h *= 1099511628211ull; \
+                } \
+        } \
+        char _tb[13]; int _tn = len < 12 ? len : 12; \
+        memcpy(_tb, text, _tn); _tb[_tn] = '\0'; \
+        float _dx = roundf(x * g_output_scale) / g_output_scale; \
+        float _dy = roundf((y + font_size * 0.85f - (e_)->ascent) * g_output_scale) / g_output_scale; \
+        fprintf(stderr, "TRACERUN txt=%s via=%s aw=%d ah=%d asc=%.3f dx=%.2f dy=%.2f maskfnv=%llx slice=%p\n", \
+            _tb, via_, (e_)->aw, (e_)->ah, (double)(e_)->ascent, (double)_dx, (double)_dy, _h, (void*)(e_)->slice); \
+    } \
+} while (0)
+#else
+#define TRACE_RUN(e_, via_) do {} while (0)
+#endif
     // A non-link run breaks link-underline continuation (#101): without
     // this a link resuming after an intervening word would bridge over it.
     if (!link_url || link_url_len <= 0) g_last_ul.valid = NO;
@@ -3210,6 +3237,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             if (link_url && link_url_len > 0) {
                 draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h), link_url, link_url_len);
             }
+            TRACE_RUN(e, "blit");
             return; // textured quad done: no shaping, no CPU compositing
         }
         // 1x destination (or missing slice): legacy pixels, no re-record.
@@ -3228,6 +3256,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
             CGContextSetRGBFillColor(ctx, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
             draw_link_underline(ctx, x, y, e->w, font_size, link_run_hovered(x, y, e->w, e->h), link_url, link_url_len);
         }
+        TRACE_RUN(e, "legacy");
         return;
     }
 
