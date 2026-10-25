@@ -1195,6 +1195,9 @@ var g_drag_active: bool = false;
 // Repaint-idempotence probe state (read-test binary only): same frame drawn
 // twice on one bitmap, caches warm on the second pass. See --repaint-idempotence.
 var g_repaint_active: bool = false;
+// Force fresh layout on every draw (test binary only): isolates the reuse
+// path when the idempotence probe diverges. See --no-reuse.
+var g_no_reuse: bool = false;
 // First-paint gate for deferred image decodes (see platform_arm_images):
 // image records park until the first frame is committed, then decode.
 // Headless one-shot screenshots never arm (deterministic placeholders).
@@ -2226,7 +2229,10 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     // rows past the fold (live blank expose strips).
     var cmd_count: usize = 0;
     const content_id = scrollContentId();
-    if (g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0)) |n| {
+    // Test-only layout forcing (idempotence isolation): comptime-folded away
+    // in ship builds so the hot path keeps its exact shape and __TEXT.
+    const force_layout = build_options.test_hooks and g_no_reuse;
+    if (!force_layout and g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0)) |n| {
         cmd_count = n;
     } else {
         cmd_count = layout.layoutViewport(
@@ -2962,6 +2968,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     // scrolling) to fixed /tmp paths the caller diffs.
                     // Needs --screenshot as well (all headless dispatch does).
                     g_repaint_active = true;
+                } else if (std.mem.eql(u8, arg, "--no-reuse")) {
+                    // Idempotence-probe isolation: every draw re-runs layout
+                    // instead of replaying the scroll-frame snapshot.
+                    g_no_reuse = true;
                 } else if (std.mem.startsWith(u8, arg, "--probe-scroll-plan=")) {
                     // Scroll-copy plan query (copy/seam-band residue rules):
                     // dy,scale,view_h,overshoot in points; prints USE_COPY,

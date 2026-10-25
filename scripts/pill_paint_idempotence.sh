@@ -39,11 +39,11 @@ if ! probe_hooks "$BIN"; then
 fi
 
 check_repaint() {
-    # $1 = scroll, $2 = scale flag, $3 = label
+    # $1 = scroll, $2 = scale flag, $3 = label, $4 = extra flags (e.g. --no-reuse)
     sleep 0.3
     rm -f "$P0" "$P1"
     # shellcheck disable=SC2086
-    "$BIN" --screenshot /tmp/idem_scratch.png $2 --scroll "$1" --repaint-idempotence "$DOC" >/tmp/idem_out.txt 2>&1 || {
+    "$BIN" --screenshot /tmp/idem_scratch.png $2 --scroll "$1" --repaint-idempotence ${4:-} "$DOC" >/tmp/idem_out.txt 2>&1 || {
         echo "FAIL: $3 render exited nonzero (tail):"
         tail -5 /tmp/idem_out.txt || true
         exit 2
@@ -52,8 +52,9 @@ check_repaint() {
     # Stage the phases for the run's screenshot artifacts (diagnostic aid:
     # lets a failing gate be inspected pixel-by-pixel after the fact).
     mkdir -p screenshots
-    cp "$P0" "screenshots/repaint_phase_0_s$1.png" 2>/dev/null || true
-    cp "$P1" "screenshots/repaint_phase_1_s$1.png" 2>/dev/null || true
+    mode_tag=$(echo "${4:-reuse}" | tr -d -)
+    cp "$P0" "screenshots/repaint_phase_0_s${1}_${mode_tag}.png" 2>/dev/null || true
+    cp "$P1" "screenshots/repaint_phase_1_s${1}_${mode_tag}.png" 2>/dev/null || true
     grep -h '^REPAINT ' /tmp/idem_out.txt | tail -2 || true
     python3 - "$3" "$P0" "$P1" <<'EOF'
 import struct, sys, zlib
@@ -146,3 +147,6 @@ check_repaint 0 "--force-scale 1" "1x top (pill lines)"
 check_repaint 0 "--force-scale 2" "2x top (pill lines)"
 check_repaint 800 "--force-scale 2" "2x scrolled (pill lines)"
 check_repaint 200.37 "--force-scale 2" "2x fractional scroll"
+# Isolation mode: fresh layout on both passes. Diverges from the default
+# run only when the scroll-frame snapshot path is implicated.
+check_repaint 0 "--force-scale 2" "2x top fresh-layout" "--no-reuse"
