@@ -1195,7 +1195,7 @@ var g_drag_active: bool = false;
 // Repaint-idempotence probe state (read-test binary only): same frame drawn
 // twice on one bitmap, caches warm on the second pass. See --repaint-idempotence.
 var g_repaint_active: bool = false;
-// Diagnostic bypasses (removed before merge): force legacy direct paint
+// Tier-isolation bypasses (test binary only): force legacy direct paint
 // to name a divergent raster cache tier.
 var g_pill_direct: bool = false;
 var g_shape_direct: bool = false;
@@ -2978,10 +2978,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     // instead of replaying the scroll-frame snapshot.
                     g_no_reuse = true;
                 } else if (std.mem.eql(u8, arg, "--pill-direct")) {
-                    // Diagnostic bypass (removed before merge).
+                    // Tier-isolation bypass (test binary only).
                     g_pill_direct = true;
                 } else if (std.mem.eql(u8, arg, "--shape-direct")) {
-                    // Diagnostic bypass (removed before merge).
+                    // Tier-isolation bypass (test binary only).
                     g_shape_direct = true;
                 } else if (std.mem.startsWith(u8, arg, "--probe-scroll-plan=")) {
                     // Scroll-copy plan query (copy/seam-band residue rules):

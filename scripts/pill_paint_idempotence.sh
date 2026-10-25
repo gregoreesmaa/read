@@ -18,7 +18,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-# Diagnostic: per-run mask/geometry trace (removed before merge).
+# Diagnostic: per-run mask/geometry trace (test binary only, env-gated).
 export READ_TRACE_RUNS=1
 
 BIN="${1:-zig-out/bin/read-test}"
@@ -200,9 +200,7 @@ EOF
 }
 
 check_repaint 0 "--force-scale 1" "1x top (pill lines)"
-
-check_repaint 0 "--force-scale 1" "1x top (pill lines)"
-# Tier isolation first (diagnostic bypasses, removed before merge): a PASS
+# Tier isolation first (test-binary bypasses): a PASS
 # under a bypass with a FAIL in the default run names the divergent cache.
 check_repaint 0 "--force-scale 2" "2x top pill-direct" "--pill-direct"
 check_repaint 0 "--force-scale 2" "2x top shape-direct" "--shape-direct"

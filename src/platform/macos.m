@@ -3192,7 +3192,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
     if (!g_current_cg_context || len <= 0 || !text) return;
     CGContextRef ctx = g_current_cg_context;
 #ifdef TEST_HOOKS
-    // Diagnostic run tracer (removed before merge): FNV over the blitted
+    // Diagnostic run tracer (test binary only, env-gated): FNV over the blitted
     // mask texels + blit geometry per run per pass, to name a warm-cache
     // paint divergence. Active only with READ_TRACE_RUNS=1 in the env.
     static int trace_runs = -1;
@@ -3242,7 +3242,7 @@ void platform_draw_text(const char* text, int len, float x, float y, float font_
         // Batched: consecutive same-color runs share one primed fill color
         // (no per-run SaveGState/SetFillColor/Restore — the state churn the
         // issue calls out). Link underlines ride the primed color.
-        // g_shape_direct is the diagnostic bypass (removed before merge).
+        // g_shape_direct is the tier-isolation bypass (test binary only).
         if (!g_shape_direct && draw_run_batched(ctx, e, x, y, font_size, r, g, b, a)) {
             // Shaped link runs underline here (issue #25); the uncacheable
             // path below is covered inside draw_text_legacy instead.
@@ -5163,7 +5163,7 @@ static void pill_draw_cached_or_direct(float x, float y, float w, float h, float
     // pixel-exactly (2026-10 drag-back residue, gestures 5/13/18: pill
     // fringe rows differ on incremental passes that blit while fresh
     // passes draw direct). No lookup, no prerender churn on 1x.
-    // g_pill_direct is the diagnostic bypass (removed before merge).
+    // g_pill_direct is the tier-isolation bypass (test binary only).
     if (g_pill_direct || g_output_scale < 1.5f) {
         pill_build_path(ctx, x, y, w, h, radius);
         pill_fill_stroke(ctx, fr, fg, fb, fa, br, bg, bb, ba);
