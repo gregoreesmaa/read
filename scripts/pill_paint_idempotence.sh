@@ -49,66 +49,89 @@ check_repaint() {
         exit 2
     }
     [ -f "$P0" ] && [ -f "$P1" ] || { echo "FAIL: $3 missing phase PNGs"; exit 2; }
-    if ! cmp -s "$P0" "$P1"; then
-        echo "FAIL: $3 phases differ (cache-state-dependent paint)"
-        exit 1
-    fi
-    python3 - "$3" "$P0" <<'EOF'
+    grep -h '^REPAINT ' /tmp/idem_out.txt | tail -2 || true
+    python3 - "$3" "$P0" "$P1" <<'EOF'
 import struct, sys, zlib
-label, path = sys.argv[1], sys.argv[2]
-d = open(path, "rb").read()
-assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a png: " + path
-pos, w, h, depth, ctype, idat = 8, 0, 0, 0, 0, b""
-while pos < len(d):
-    ln = struct.unpack(">I", d[pos:pos + 4])[0]
-    typ = d[pos + 4:pos + 8]
-    data = d[pos + 8:pos + 8 + ln]
-    if typ == b"IHDR":
-        w, h, depth, ctype = struct.unpack(">IIBB", data[:10])
-    elif typ == b"IDAT":
-        idat += data
-    elif typ == b"IEND":
-        break
-    pos += 12 + ln
-assert depth == 8 and ctype in (2, 6), (path, w, h, depth, ctype)
-ch = 3 if ctype == 2 else 4
-raw = zlib.decompress(idat)
-stride = w * ch
-prev = bytearray(stride)
-p = 0
-bg = None
+label, pa, pb = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def load(path):
+    d = open(path, "rb").read()
+    assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a png: " + path
+    pos, w, h, depth, ctype, idat = 8, 0, 0, 0, 0, b""
+    while pos < len(d):
+        ln = struct.unpack(">I", d[pos:pos + 4])[0]
+        typ = d[pos + 4:pos + 8]
+        data = d[pos + 8:pos + 8 + ln]
+        if typ == b"IHDR":
+            w, h, depth, ctype = struct.unpack(">IIBB", data[:10])
+        elif typ == b"IDAT":
+            idat += data
+        elif typ == b"IEND":
+            break
+        pos += 12 + ln
+    assert depth == 8 and ctype in (2, 6), (path, w, h, depth, ctype)
+    ch = 3 if ctype == 2 else 4
+    raw = zlib.decompress(idat)
+    stride = w * ch
+    prev = bytearray(stride)
+    p = 0
+    px = bytearray(w * h * ch)
+    for y in range(h):
+        f = raw[p]; p += 1
+        line = bytearray(raw[p:p + stride]); p += stride
+        if f == 1:
+            for i in range(ch, stride):
+                line[i] = (line[i] + line[i - ch]) & 255
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif f == 3:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                b = prev[i]
+                c = prev[i - ch] if i >= ch else 0
+                d0, d1, d2 = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                pr = a if (d0 <= d1 and d0 <= d2) else (b if d1 <= d2 else c)
+                line[i] = (line[i] + pr) & 255
+        px[y * stride:(y + 1) * stride] = line
+        prev = line
+    return w, h, ch, px
+
+w0, h0, ch0, px0 = load(pa)
+w1, h1, ch1, px1 = load(pb)
+assert (w0, h0, ch0) == (w1, h1, ch1), ((w0, h0, ch0), (w1, h1, ch1))
+bg = max(px0[0], px0[1], px0[2])
 ink = 0
-for y in range(h):
-    f = raw[p]; p += 1
-    line = bytearray(raw[p:p + stride]); p += stride
-    if f == 1:
-        for i in range(ch, stride):
-            line[i] = (line[i] + line[i - ch]) & 255
-    elif f == 2:
-        for i in range(stride):
-            line[i] = (line[i] + prev[i]) & 255
-    elif f == 3:
-        for i in range(stride):
-            a = line[i - ch] if i >= ch else 0
-            line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
-    elif f == 4:
-        for i in range(stride):
-            a = line[i - ch] if i >= ch else 0
-            b = prev[i]
-            c = prev[i - ch] if i >= ch else 0
-            pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
-            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-            line[i] = (line[i] + pr) & 255
-    if bg is None:
-        bg = max(line[0], line[1], line[2])
-    for x in range(w):
-        o = x * ch
-        if max(line[o], line[o + 1], line[o + 2]) - bg > 8:
-            ink += 1
-    prev = line
-print("%s: %dx%d ink=%d" % (label, w, h, ink))
+for o in range(0, len(px0), ch0):
+    if max(px0[o], px0[o + 1], px0[o + 2]) - bg > 8:
+        ink += 1
+print("%s: %dx%d ink=%d" % (label, w0, h0, ink))
 if ink < 10000:
     print("FAIL: %s renders blank (vacuous pass)" % label)
+    sys.exit(1)
+diff_n = 0
+x0, y0, x1, y1 = w0, h0, -1, -1
+samples = []
+for y in range(h0):
+    base = y * w0 * ch0
+    for x in range(w0):
+        o = base + x * ch0
+        if px0[o:o + ch0] != px1[o:o + ch0]:
+            diff_n += 1
+            if x < x0: x0 = x
+            if x > x1: x1 = x
+            if y < y0: y0 = y
+            if y > y1: y1 = y
+            if len(samples) < 8:
+                samples.append((x, y, list(px0[o:o + ch0]), list(px1[o:o + ch0])))
+if diff_n:
+    print("FAIL: %s phases differ: n=%d bbox=x[%d,%d] y[%d,%d]" % (label, diff_n, x0, x1, y0, y1))
+    for s in samples:
+        print("  px%s pass0=%s pass1=%s" % (s[0:2], s[2], s[3]))
     sys.exit(1)
 print("PASS: %s phases byte-identical, non-blank" % label)
 EOF

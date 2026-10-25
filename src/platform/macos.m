@@ -4353,6 +4353,12 @@ int platform_render_repaint_png(const char* out_a, const char* out_b, int width,
         g_pending_dirty_valid = NO;
         render_fn(width, height);
         platform_batch_end();
+        // Warm-cache accounting per phase: hits/misses/flushes pin down
+        // which cache tier diverged when the phase PNGs differ.
+        fprintf(stderr, "REPAINT phase=%d shape_hits=%llu shape_misses=%llu atlas_flushes=%llu\n",
+            phase, (unsigned long long)g_shape_hits,
+            (unsigned long long)g_shape_misses,
+            (unsigned long long)g_atlas_flushes);
         // Headless selection captures paint the same highlight as live draws.
         if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
         int rc = headless_dump_png(ctx, phase == 0 ? out_a : out_b);
