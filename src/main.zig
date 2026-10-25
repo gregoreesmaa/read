@@ -2232,7 +2232,8 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     // Test-only layout forcing (idempotence isolation): comptime-folded away
     // in ship builds so the hot path keeps its exact shape and __TEXT.
     const force_layout = build_options.test_hooks and g_no_reuse;
-    if (!force_layout and g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0)) |n| {
+    const reused: ?usize = if (force_layout) null else g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0);
+    if (reused) |n| {
         cmd_count = n;
     } else {
         cmd_count = layout.layoutViewport(
