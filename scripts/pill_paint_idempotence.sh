@@ -49,6 +49,11 @@ check_repaint() {
         exit 2
     }
     [ -f "$P0" ] && [ -f "$P1" ] || { echo "FAIL: $3 missing phase PNGs"; exit 2; }
+    # Stage the phases for the run's screenshot artifacts (diagnostic aid:
+    # lets a failing gate be inspected pixel-by-pixel after the fact).
+    mkdir -p screenshots
+    cp "$P0" "screenshots/repaint_phase_0_s$1.png" 2>/dev/null || true
+    cp "$P1" "screenshots/repaint_phase_1_s$1.png" 2>/dev/null || true
     grep -h '^REPAINT ' /tmp/idem_out.txt | tail -2 || true
     python3 - "$3" "$P0" "$P1" <<'EOF'
 import struct, sys, zlib
