@@ -816,10 +816,22 @@ static void shape_rasterize_entry(ShapedEntry* e, NSFont* nsFont, NSString* str,
     int pw = (int)ceil(e->w * RASTER_SCALE);
     int ph = (int)ceil(e->h * RASTER_SCALE);
     if (pw <= 0 || ph <= 0) return;
+    // Gutter the shelf cell by 1px per side: glyph ink can overhang its
+    // typographic cell by a device pixel (zero-slack cells from integer
+    // widths, italic/swash overhang, rounding), and an unguttered rasterize
+    // stomps the neighboring live slice — a warm-cache-only divergence
+    // (cold blits pre-spill, warm blits post-spill). Overhang now lands in
+    // dead gutter space no slice ever maps; integer padding keeps the
+    // baseline snap phase bit-identical, so masks are unchanged except for
+    // the eliminated spill.
     short ax = 0, ay = 0;
-    if (!atlas_alloc(pw, ph, &ax, &ay)) {
-        atlas_flush();
-        if (!atlas_alloc(pw, ph, &ax, &ay)) return; // larger than atlas: caller draws direct
+    {
+        short bx = 0, by = 0;
+        if (!atlas_alloc(pw + 2, ph + 2, &bx, &by)) {
+            atlas_flush();
+            if (!atlas_alloc(pw + 2, ph + 2, &bx, &by)) return; // larger than atlas: caller draws direct
+        }
+        ax = bx + 1; ay = by + 1;
     }
 
     // White coverage mask, 2x supersampled for Retina-crisp blits.
