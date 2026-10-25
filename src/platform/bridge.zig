@@ -363,6 +363,7 @@ pub extern "c" fn platform_render_to_png(
 pub extern "c" fn platform_render_repaint_png(
     out_a: [*:0]const u8,
     out_b: [*:0]const u8,
+    out_c: [*:0]const u8,
     width: c_int,
     height: c_int,
     render_fn: *const fn (width: c_int, height: c_int) callconv(.c) void,

@@ -3180,7 +3180,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (build_options.test_hooks and g_repaint_active) {
             g_headless_oneshot = true;
             bridge.platform_set_test_scroll(g_app.scroll_y);
-            const r = bridge.platform_render_repaint_png("/tmp/repaint_phase_0.png", "/tmp/repaint_phase_1.png", 1200, 900, onDraw);
+            const r = bridge.platform_render_repaint_png("/tmp/repaint_phase_0.png", "/tmp/repaint_phase_1.png", "/tmp/repaint_phase_2.png", 1200, 900, onDraw);
             if (r == 0) {
                 std.debug.print("Repaint capture generated\n", .{});
                 std.c.exit(0);

@@ -4310,10 +4310,10 @@ int platform_render_select_drag_png(const char* output_path, int width, int heig
 // differently from a hit); identical bytes prove MISS≡HIT. Full damage
 // both phases: this isolates cache-state paint, not damage culling (the
 // strip-parity script covers that axis separately). Test binary only.
-int platform_render_repaint_png(const char* out_a, const char* out_b, int width, int height,
+int platform_render_repaint_png(const char* out_a, const char* out_b, const char* out_c, int width, int height,
     void (*render_fn)(int width, int height))
 {
-    if (!out_a || !out_b || width <= 0 || height <= 0 || !render_fn) return -1;
+    if (!out_a || !out_b || !out_c || width <= 0 || height <= 0 || !render_fn) return -1;
 
     float backing = 1.0f;
 #ifdef TEST_HOOKS
@@ -4343,7 +4343,10 @@ int platform_render_repaint_png(const char* out_a, const char* out_b, int width,
     g_output_scale = backing;
     g_current_cg_context = ctx;
 
-    for (int phase = 0; phase < 2; phase++) {
+    // Three passes: P0 cold, P1/P2 warm. P0!=P1==P2 isolates warm-cache
+    // state; P0!=P1!=P2 isolates per-pass accumulation (mutating caches).
+    const char* outs[3] = { out_a, out_b, out_c };
+    for (int phase = 0; phase < 3; phase++) {
         g_draw_seq++;
         g_text_record_count = 0;
         g_code_block_count = 0;
@@ -4361,7 +4364,7 @@ int platform_render_repaint_png(const char* out_a, const char* out_b, int width,
             (unsigned long long)g_atlas_flushes);
         // Headless selection captures paint the same highlight as live draws.
         if (g_has_selection || g_select_all) paint_selection_highlight(ctx);
-        int rc = headless_dump_png(ctx, phase == 0 ? out_a : out_b);
+        int rc = headless_dump_png(ctx, outs[phase]);
         if (rc != 0) { g_current_cg_context = NULL; CGContextRelease(ctx); return rc; }
     }
 

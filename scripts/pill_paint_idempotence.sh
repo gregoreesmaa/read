@@ -22,6 +22,7 @@ BIN="${1:-zig-out/bin/read-test}"
 DOC="README.md"
 P0="/tmp/repaint_phase_0.png"
 P1="/tmp/repaint_phase_1.png"
+P2="/tmp/repaint_phase_2.png"
 
 probe_hooks() {
     out=$("$1" --screenshot /tmp/idem_probe.png --force-scale 1 --scroll 0 "$DOC" 2>&1) || return 1
@@ -41,24 +42,25 @@ fi
 check_repaint() {
     # $1 = scroll, $2 = scale flag, $3 = label, $4 = extra flags (e.g. --no-reuse)
     sleep 0.3
-    rm -f "$P0" "$P1"
+    rm -f "$P0" "$P1" "$P2"
     # shellcheck disable=SC2086
     "$BIN" --screenshot /tmp/idem_scratch.png $2 --scroll "$1" --repaint-idempotence ${4:-} --dump-commands "$DOC" >/tmp/idem_out.txt 2>&1 || {
         echo "FAIL: $3 render exited nonzero (tail):"
         tail -5 /tmp/idem_out.txt || true
         exit 2
     }
-    [ -f "$P0" ] && [ -f "$P1" ] || { echo "FAIL: $3 missing phase PNGs"; exit 2; }
+    [ -f "$P0" ] && [ -f "$P1" ] && [ -f "$P2" ] || { echo "FAIL: $3 missing phase PNGs"; exit 2; }
     # Stage the phases for the run's screenshot artifacts (diagnostic aid:
     # lets a failing gate be inspected pixel-by-pixel after the fact).
     mkdir -p screenshots
     mode_tag=$(echo "${4:-reuse}" | tr -d -)
     cp "$P0" "screenshots/repaint_phase_0_s${1}_${mode_tag}.png" 2>/dev/null || true
     cp "$P1" "screenshots/repaint_phase_1_s${1}_${mode_tag}.png" 2>/dev/null || true
-    grep -h '^REPAINT ' /tmp/idem_out.txt | tail -2 || true
-    python3 - "$3" "$P0" "$P1" <<'EOF'
+    cp "$P2" "screenshots/repaint_phase_2_s${1}_${mode_tag}.png" 2>/dev/null || true
+    grep -h '^REPAINT ' /tmp/idem_out.txt | tail -3 || true
+    python3 - "$3" "$P0" "$P1" "$P2" <<'EOF'
 import struct, sys, zlib
-label, pa, pb = sys.argv[1], sys.argv[2], sys.argv[3]
+label, pa, pb, pc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 def load(path):
     d = open(path, "rb").read()
@@ -109,7 +111,8 @@ def load(path):
 
 w0, h0, ch0, px0 = load(pa)
 w1, h1, ch1, px1 = load(pb)
-assert (w0, h0, ch0) == (w1, h1, ch1), ((w0, h0, ch0), (w1, h1, ch1))
+w2, h2, ch2, px2 = load(pc)
+assert (w0, h0, ch0) == (w1, h1, ch1) == (w2, h2, ch2), ((w0, h0, ch0), (w1, h1, ch1), (w2, h2, ch2))
 bg = max(px0[0], px0[1], px0[2])
 ink = 0
 for o in range(0, len(px0), ch0):
@@ -133,41 +136,55 @@ for ln in txt.split("\n"):
         cur.append(ln)
 if cur:
     blocks.append(cur)
-if len(blocks) >= 2:
-    b0, b1 = blocks[-2], blocks[-1]
+def stream_diff(b0, b1, n0, n1):
     if b0 == b1:
         print("%s: command streams identical (%d cmds)" % (label, len(b0)))
-    else:
-        print("FAIL: %s command streams differ (%d vs %d cmds)" % (label, len(b0), len(b1)))
-        s0, s1 = set(b0), set(b1)
-        for ln in sorted(s0 - s1)[:10]:
-            print("  pass0-only: %s" % ln[:160])
-        for ln in sorted(s1 - s0)[:10]:
-            print("  pass1-only: %s" % ln[:160])
+        return True
+    print("FAIL: %s command streams differ pass%d vs pass%d (%d vs %d cmds)" % (label, n0, n1, len(b0), len(b1)))
+    s0, s1 = set(b0), set(b1)
+    for ln in sorted(s0 - s1)[:10]:
+        print("  pass%d-only: %s" % (n0, ln[:160]))
+    for ln in sorted(s1 - s0)[:10]:
+        print("  pass%d-only: %s" % (n1, ln[:160]))
+    return False
+
+if len(blocks) >= 3:
+    ok01 = stream_diff(blocks[-3], blocks[-2], 0, 1)
+    ok12 = stream_diff(blocks[-2], blocks[-1], 1, 2)
+    if not (ok01 and ok12):
         sys.exit(1)
 else:
     print("note: %s found %d command blocks, skipping stream diff" % (label, len(blocks)))
-diff_n = 0
-x0, y0, x1, y1 = w0, h0, -1, -1
-samples = []
-for y in range(h0):
-    base = y * w0 * ch0
-    for x in range(w0):
-        o = base + x * ch0
-        if px0[o:o + ch0] != px1[o:o + ch0]:
-            diff_n += 1
-            if x < x0: x0 = x
-            if x > x1: x1 = x
-            if y < y0: y0 = y
-            if y > y1: y1 = y
-            if len(samples) < 8:
-                samples.append((x, y, list(px0[o:o + ch0]), list(px1[o:o + ch0])))
-if diff_n:
-    print("FAIL: %s phases differ: n=%d bbox=x[%d,%d] y[%d,%d]" % (label, diff_n, x0, x1, y0, y1))
-    for s in samples:
-        print("  px%s pass0=%s pass1=%s" % (s[0:2], s[2], s[3]))
+
+def pix_diff(pxA, pxB, nA, nB):
+    diff_n = 0
+    x0, y0, x1, y1 = w0, h0, -1, -1
+    samples = []
+    for y in range(h0):
+        base = y * w0 * ch0
+        for x in range(w0):
+            o = base + x * ch0
+            if pxA[o:o + ch0] != pxB[o:o + ch0]:
+                diff_n += 1
+                if x < x0: x0 = x
+                if x > x1: x1 = x
+                if y < y0: y0 = y
+                if y > y1: y1 = y
+                if len(samples) < 8:
+                    samples.append((x, y, list(pxA[o:o + ch0]), list(pxB[o:o + ch0])))
+    if diff_n:
+        print("FAIL: %s pass%d vs pass%d differ: n=%d bbox=x[%d,%d] y[%d,%d]" % (label, nA, nB, diff_n, x0, x1, y0, y1))
+        for s in samples:
+            print("  px%s pass%d=%s pass%d=%s" % (s[0:2], nA, s[2], nB, s[3]))
+        return False
+    print("%s: pass%d vs pass%d byte-identical" % (label, nA, nB))
+    return True
+
+ok01 = pix_diff(px0, px1, 0, 1)
+ok12 = pix_diff(px1, px2, 1, 2)
+if not (ok01 and ok12):
     sys.exit(1)
-print("PASS: %s phases byte-identical, non-blank" % label)
+print("PASS: %s all phases byte-identical, non-blank" % label)
 EOF
 }
 
