@@ -60,6 +60,8 @@ jobs:
         run: sh scripts/damage_parity.sh ./zig-out/bin/read-test showcase.md
       - name: Retina text coverage (2x batch-clip regression)
         run: sh scripts/retina_text_coverage.sh ./zig-out/bin/read-test
+      - name: Scroll expose-strip paint (live scroll frame shape)
+        run: sh scripts/scroll_strip_paint.sh ./zig-out/bin/read-test
       - name: Render short fuzz (scroll/select/drag/damage/scale/atlas oracles)
         run: ./scripts/fuzz_render.sh ./zig-out/bin/read-test showcase.md 2
       - name: test_cases discipline (exactly 1 scrollable-doc case)
