@@ -19,6 +19,18 @@ chmod +x "$APP/Contents/MacOS/Read"
 cp "$ROOT/assets/icon/Read.icns" "$APP/Contents/Resources/Read.icns"
 cp "$ROOT/scripts/read-plugin-render.sh" "$APP/Contents/Resources/read-plugin-render.sh"
 chmod +x "$APP/Contents/Resources/read-plugin-render.sh"
+# Font vendoring (issue #390): Typography ships inside the bundle under
+# Resources/Fonts (IBM Plex Serif + Space Grotesk + JetBrains Mono), so the
+# platform layer resolves bundle-relative FIRST with zero source-tree stats
+# on the launch path (see register_app_fonts in src/platform/macos.m).
+# The vendored TTFs are data files, never linked: the ship __TEXT budget is
+# untouched (verify with scripts/size_gate.sh).
+mkdir -p "$APP/Contents/Resources/Fonts"
+for f in IBMPlexSerif-Regular.ttf IBMPlexSerif-Bold.ttf IBMPlexSerif-Italic.ttf SpaceGrotesk.ttf JetBrainsMono.ttf; do
+    [ -f "$ROOT/assets/fonts/$f" ] || { echo "bundle: missing font: assets/fonts/$f" >&2; exit 1; }
+    cp "$ROOT/assets/fonts/$f" "$APP/Contents/Resources/Fonts/$f"
+done
+echo "bundle: vendored 5 fonts to Resources/Fonts"
 # Engine vendoring (issue #367): bundle Resources/libzatex.dylib is FIRST
 # in the runtime load path (src/platform/macos_zatex.m), so a vendored
 # engine is the version that release ships. Source: $4, then

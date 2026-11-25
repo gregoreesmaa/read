@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy — Read docs</title>
+<meta name="description" content="How Read handles remote images.">
+<style>
+:root { color-scheme: dark light; --bg: #121212; --fg: #E0E0E0; --muted: #9a9a9a; --card: #1b1b1b; --accent: #7cc4ff; }
+@media (prefers-color-scheme: light) { :root { --bg: #FAFAFA; --fg: #1E2022; --muted: #666; --card: #fff; --accent: #0b5fff; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.75 Georgia, "IBM Plex Serif", serif; }
+.wrap { max-width: 680px; margin: 0 auto; padding: 48px 24px 96px; }
+h1 { font-family: "Space Grotesk", system-ui, sans-serif; }
+a { color: var(--accent); }
+nav { font-family: system-ui, sans-serif; font-size: 15px; margin-bottom: 32px; }
+ul { padding-left: 22px; }
+code, kbd { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .9em; }
+kbd { background: var(--card); border: 1px solid #8885; border-radius: 6px; padding: 1px 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav><a href="index.html">&larr; Read docs</a></nav>
+<h1>Privacy: remote images</h1>
+<p>Remote images (<code>https://…</code>) load by default so documents render completely — but a tracking pixel would otherwise leak your IP with zero indication. The policy:</p>
+<ul>
+<li>A visible indicator appears whenever the document contains remote content; press <kbd>i</kbd> to drop <strong>all</strong> remote images to placeholders (again to re-allow).</li>
+<li><strong>HTTPS-only</strong>: plain-<code>http://</code> URLs are never fetched. URLs with embedded credentials are never fetched either.</li>
+<li><strong>No credentials, cookies, or Referer</strong> are stored or sent. Redirects capped at 3, 8s timeout, 8 MiB body limit — a tarpit degrades to a placeholder, never a hang.</li>
+<li>Blocked URLs never reach the loader, so a malicious doc with 10k remote images costs layout only.</li>
+</ul>
+<p>Enforced in <code>src/core/remote_policy.zig</code> and pinned by unit tests.</p>
+</div>
+</body>
+</html>

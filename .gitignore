@@ -9,3 +9,5 @@ artifacts/
 !assets/images/*.png
 !test_cases/assets/*.png
 .zig-cache-global/
+\
+.tmp/\

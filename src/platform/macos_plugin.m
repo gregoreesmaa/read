@@ -9,10 +9,9 @@
 #include <sys/wait.h> // waitpid/WNOHANG/WIFEXITED for the reap drain
 #include <sys/stat.h> // outfile validation (exists + nonzero + mtime)
 #include <time.h> // start stamp for the mtime check
-#include <unistd.h> // access/unlink
+#include <unistd.h> // access/unlink/write(2) diagnostics (no fprintf/stdio)
 #include <fcntl.h> // O_WRONLY for the quiet-spawn redirections
-#include <stdio.h> // snprintf/fprintf/stderr
-#include <string.h> // strcmp/strlen/strchr
+#include <string.h> // strcmp/strlen/strchr/memcpy
 #include <crt_externs.h> // _NSGetEnviron: children inherit our environment
 #include <sys/types.h> // pid_t
 
@@ -48,9 +47,8 @@ static char plugin_out[PLUGIN_MAX_INFLIGHT][512];
 static char plugin_hist_out[PLUGIN_HIST][512];
 static char plugin_hist_ok[PLUGIN_HIST];
 static int plugin_hist_pos = 0;
-// Bounded "%s" copy (snprintf(dst, 512, "%s", src) without the format
-// machinery: snprintf was the only format call in ship, and the import
-// plus per-site setup cost __TEXT for zero behavior delta).
+// Bounded "%s" copy (no snprintf: the format call costs __TEXT for zero
+// behavior delta).
 static void plugin_copy512(char dst[512], const char* src) {
     size_t n = strlen(src);
     if (n > 511) n = 511;
@@ -86,6 +84,15 @@ static int plugin_spawnq(const char* file, char* const argv[], pid_t* pid) {
     return rc;
 }
 
+// write(2) diagnostics, never fprintf (issue #391 __TEXT diet): stderr is
+// unbuffered so bytes hit the fd in order either way, and stdio format
+// machinery never links into ship. Literal + one dynamic part at a time.
+static void plugin_diag2(const char* a, const char* b) {
+    if (a) (void)write(STDERR_FILENO, a, strlen(a));
+    if (b) (void)write(STDERR_FILENO, b, strlen(b));
+    (void)write(STDERR_FILENO, "\n", 1);
+}
+
 // Non-blocking launch of `renderer srcfile outfile`. Returns 1 active
 // (slot spent), 0 queued (table full: silent, the cache retries later),
 // -1 failed (bad args, unresolvable or unlaunchable binary: no slot
@@ -107,7 +114,7 @@ int launchPluginRender(const char* renderer, const char* srcfile, const char* ou
     char* const argv[] = { (char*)renderer, (char*)srcfile, (char*)outfile, NULL };
     pid_t pid = 0;
     if (plugin_spawnq(renderer, argv, &pid) != 0) {
-        fprintf(stderr, "read: plugin render launch failed: %s\n", renderer);
+        plugin_diag2("read: plugin render launch failed: ", renderer);
         return -1;
     }
     plugin_pid[slot] = pid;
@@ -135,7 +142,21 @@ int pollPluginCompletions(void) {
         int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
             stat(plugin_out[i], &st) == 0 && st.st_size > 0 &&
             st.st_mtime >= plugin_start[i];
-        if (!ok) fprintf(stderr, "read: plugin render failed pid=%d out=%s\n", (int)pid, plugin_out[i]);
+        if (!ok) {
+            // pid is numeric: at most 20 digits + sign + NUL; no format call.
+            char pbuf[32];
+            int n = 0;
+            long pv = (long)pid;
+            if (pv < 0) { pbuf[n++] = '-'; pv = -pv; }
+            char rev[24];
+            int rn = 0;
+            if (pv == 0) rev[rn++] = '0';
+            while (pv > 0 && rn < (int)sizeof(rev)) { rev[rn++] = (char)('0' + pv % 10); pv /= 10; }
+            while (rn > 0 && n < (int)sizeof(pbuf) - 1) pbuf[n++] = rev[--rn];
+            pbuf[n] = '\0';
+            plugin_diag2("read: plugin render failed pid=", pbuf);
+            plugin_diag2(" out=", plugin_out[i]);
+        }
         plugin_hist_record(plugin_out[i], ok);
         plugin_pid[i] = 0;
         drained++;

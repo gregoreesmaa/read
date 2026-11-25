@@ -34,6 +34,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_MULTIPLE_MASTERS_H
+#include FT_OUTLINE_H
 #include <fontconfig/fontconfig.h>
 #include <png.h>
 
@@ -376,8 +377,7 @@ static void register_app_fonts(void) {
             // cold path, one stderr line per process, ship never links it.
             {
                 FT_Fixed rc[4] = { 0, 0, 0, 0 };
-                FT_UInt rn = 0;
-                if (FT_Get_Var_Design_Coordinates(g_face_head, 4, rc, &rn) == 0 && rn > 0)
+                if (n && FT_Get_Var_Design_Coordinates(g_face_head, n < 4 ? n : 4, rc) == 0)
                     fprintf(stderr, "[fixC] heading wght pin: %ld\n", (long)(rc[0] >> 16));
             }
 #endif

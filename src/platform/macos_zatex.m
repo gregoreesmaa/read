@@ -59,7 +59,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <unistd.h> // write(2) diagnostics (no fprintf/stdio, issue #391)
 #include <CoreText/CoreText.h>
 #include <CoreGraphics/CoreGraphics.h>
 
@@ -156,7 +156,10 @@ _Static_assert(__builtin_offsetof(ZatexLayout, err_code) == 48, "err_code append
 #define ZATEX_RUNS_CAP 256
 #define ZATEX_RULES_CAP 64
 #define ZATEX_GLYPHS_CAP 4096
-#define ZATEX_INPUT_CAP 65536
+// Input ceiling (issue #388: was 65536 — a full 64 KiB BSS scratch for one
+// NFC pass; 4096 covers every formula layout pass below, which strides
+// runs/glyphs at the same bound, and longer inputs already fall back).
+#define ZATEX_INPUT_CAP 4096
 
 // Status contract for platform_math_size (mirrors the Zig seam):
 // 0 = laid out, dims valid; 1 = engine unavailable (no dylib);
@@ -430,8 +433,11 @@ static int32_t zatex_conform_count = 0;
 #endif
 // Draw scratch (BSS; main thread only): shared by the direct run loop and
 // the atlas rasterizer below — one owner, sequential use, no nesting.
-static CGPoint zatex_pos[4096];
-static CGGlyph zatex_gbuf[4096];
+// Issue #388: 1024 glyphs/points per run (was 4096) — runs stride glyphs
+// at ZATEX_GLYPHS_CAP only in aggregate; a single CTFontDrawGlyphs call
+// never needs more than one run's worth, and runs past the cap skip.
+static CGPoint zatex_pos[1024];
+static CGGlyph zatex_gbuf[1024];
 
 // ---------------------------------------------------------------------------
 // Formula atlas (issue #355): Retina pre-raster for math runs, mirroring
@@ -507,15 +513,22 @@ static void zatex_blit_cached(CGContextRef ctx, ZatexAtlasEntry *e, float x, flo
     float q = g_output_scale;
     CGRect dest = CGRectMake(roundf(x * q) / q, roundf(y_top * q) / q,
                              (float)e->aw / (float)RASTER_SCALE, (float)e->ah / (float)RASTER_SCALE);
+    // #389 (GPU): None when the blit is snapped 1:1 (dest device size ==
+    // mask size: no resampling either way, so no pixel change on live
+    // Retina), Default only while actually downsampling (a fractional
+    // destination scale; the old 142.8 vs 149.9 numbers were measured
+    // through the downsampling headless harness, so re-measure there —
+    // the 2026-10 truthful 2x backing takes the 1:1 arm). The math crisp
+    // budget in the #355 test pins the 1:1 arm and would fail loudly if
+    // it ever resampled.
+    // The snapped origin above is exact on the device grid by construction
+    // (roundf-then-divide), and the dest size is the mask size exactly, so
+    // the 1:1 arm is taken exactly when no resampling happens.
+    float dest_w_dev = dest.size.width * q;
+    float dest_h_dev = dest.size.height * q;
+    BOOL snapped_one_to_one = (dest_w_dev == (float)e->aw && dest_h_dev == (float)e->ah);
     CGContextSaveGState(ctx);
-    // Bilinear, not None like the body blit: the headless harness bitmap
-    // is 1x, so forced-2x masks downsample there — nearest mangles thin
-    // STIX stems in that configuration (measured 142.8 vs 149.9 bilinear
-    // on the corrected raster) while bilinear reads true mask quality.
-    // On live Retina the blit is snapped 1:1, where no resampling happens
-    // either way, so this changes no ship pixel — and the math crisp
-    // budget in the #355 test pins the choice.
-    CGContextSetInterpolationQuality(ctx, kCGInterpolationDefault);
+    CGContextSetInterpolationQuality(ctx, snapped_one_to_one ? kCGInterpolationNone : kCGInterpolationDefault);
     CGContextClipToMask(ctx, dest, e->slice);
     CGContextSetRGBFillColor(ctx, fr, fg, fb, fa);
     CGContextFillRect(ctx, dest);
@@ -549,6 +562,10 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
     for (uint32_t i = 0; i < lo->nruns; i++) {
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
+        uint32_t n = rn->glyph_count;
+        // Scratch bound (issue #388: zatex_gbuf/zatex_pos are 1024 now);
+        // over-cap runs skip exactly like zero-count runs above.
+        if (n > 1024) continue;
         double run_px = (double)font_px * (double)rn->size_units / 1000.0;
         if (run_px <= 0) continue;
         CTFontRef rf = CTFontCreateCopyWithAttributes(zatex_font, (CGFloat)(run_px * RASTER_SCALE), NULL, NULL);
@@ -585,7 +602,7 @@ static int zatex_rasterize(ZatexAtlasEntry *e, const ZatexLayout *lo, double s, 
             CGContextScaleCTM(g_atlas_ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), 1.0);
             base = 0.0;
         }
-        uint32_t n = rn->glyph_count;
+        // n already bounded to 1024 by the loop guard above.
         int64_t acc = 0;
         for (uint32_t k = 0; k < n; k++) {
             uint16_t gl = zatex_glyphs[rn->glyph_start + k];
@@ -672,6 +689,16 @@ static const char *zatex_nfc(const char *tex, int tex_len, int *n) {
 static uint32_t zatex_colors[ZATEX_RUNS_CAP];
 static int zatex_has_color = 0;
 
+// write(2) diagnostics, never fprintf (issue #391 __TEXT diet): the two
+// one-shot notices below are the only prints in this TU, and the format
+// call pulls stdio machinery into the binary. stderr is unbuffered, so
+// bytes hit the fd in order either way. Literal + one dynamic part.
+static void zatex_diag2(const char *a, const char *b) {
+    if (a) (void)write(2, a, strlen(a));
+    if (b) (void)write(2, b, strlen(b));
+    (void)write(2, "\n", 1);
+}
+
 static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLayout *out) {
     if (!tex || tex_len <= 0 || tex_len > ZATEX_INPUT_CAP) return ZATEX_FALLBACK;
     zatex_try_load();
@@ -750,8 +777,29 @@ static int zatex_layout_once(const char *tex, int tex_len, int display, ZatexLay
         // diagnostic per formula; the reader falls back literally.
         if (zatex_last_diag_key != zatex_err_key) {
             zatex_last_diag_key = zatex_err_key;
-            fprintf(stderr, "read: math over engine ceilings (status %d, need %u runs/%u rules) — literal fallback\n",
-                    rc, out->nruns, out->nrules);
+            // Status + needs are numeric: three short decimal parts, no
+            // format call. Message text unchanged.
+            char nbuf[72];
+            int n = 0;
+            unsigned vals[3];
+            vals[0] = (unsigned)rc;
+            vals[1] = out->nruns;
+            vals[2] = out->nrules;
+            const char *seps[3] = { "read: math over engine ceilings (status ", ", need ", " runs/" };
+            for (int k = 0; k < 3; k++) {
+                const char *s = seps[k];
+                while (*s && n < (int)sizeof(nbuf) - 24) nbuf[n++] = *s++;
+                unsigned v = vals[k];
+                char rev[12];
+                int rn = 0;
+                if (v == 0) rev[rn++] = '0';
+                while (v > 0 && rn < (int)sizeof(rev)) { rev[rn++] = (char)('0' + v % 10); v /= 10; }
+                while (rn > 0 && n < (int)sizeof(nbuf) - 24) nbuf[n++] = rev[--rn];
+            }
+            const char *tail = " rules) — literal fallback";
+            while (*tail && n < (int)sizeof(nbuf) - 2) nbuf[n++] = *tail++;
+            nbuf[n] = '\0';
+            zatex_diag2(nbuf, NULL);
         }
         return ZATEX_OVERFLOW;
     }
@@ -805,7 +853,7 @@ int platform_math_size(const char *tex, int tex_len, int display, float font_px,
         st = zatex_layout_once(tex, tex_len, display, &lo);
         if (st == ZATEX_UNAVAILABLE && !zatex_missing_noticed) {
             zatex_missing_noticed = 1;
-            fprintf(stderr, "read: libzatex.dylib unavailable — math renders as source text; install to /usr/local/lib (see docs/engine.md)\n");
+            zatex_diag2("read: libzatex.dylib unavailable — math renders as source text; install to /usr/local/lib (see docs/engine.md)", NULL);
         }
         if (st == ZATEX_OK) {
             double s = (double)font_px / 1000.0;
@@ -909,6 +957,10 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
     for (uint32_t i = 0; i < lo.nruns; i++) {
         ZatexRun *rn = &zatex_runs[i];
         if (rn->glyph_count == 0 || rn->glyph_start + rn->glyph_count > ZATEX_GLYPHS_CAP) continue;
+        uint32_t n = rn->glyph_count;
+        // Scratch bound (issue #388: 1024 now); over-cap runs skip, same
+        // rule as the atlas rasterizer above.
+        if (n > 1024) continue;
         if (zatex_has_color) {
             uint32_t c = zatex_colors[i];
             uint32_t want = c ? c : ambient_w;
@@ -944,7 +996,7 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         // always 1000).
         CGContextScaleCTM(ctx, (CGFloat)((double)zatex_xscale[i] / 1000.0), -1.0);
         CGContextSetTextPosition(ctx, 0, 0);
-        uint32_t n = rn->glyph_count;
+        // n already bounded to 1024 by the loop guard above.
         int64_t acc = 0;
         for (uint32_t k = 0; k < n; k++) {
             uint16_t g = zatex_glyphs[rn->glyph_start + k];
@@ -956,4 +1008,14 @@ void platform_draw_math(const char *tex, int tex_len, int display, float font_px
         CGContextRestoreGState(ctx);
         CFRelease(rf);
     }
+    // Leave the ambient fill behind (2026-10): painted runs switch the
+    // fill per run, and the #389 text batch keys its prime on color — a
+    // leaked run paint would recolor later same-group text until the next
+    // group change. Restoring ambient makes the leak self-healing (equal
+    // colors need no prime, different ones re-prime).
+    if (cur_w != ambient_w)
+        CGContextSetRGBFillColor(ctx, ((ambient_w >> 24) & 255) / 255.0,
+                                      ((ambient_w >> 16) & 255) / 255.0,
+                                      ((ambient_w >> 8) & 255) / 255.0,
+                                      (ambient_w & 255) / 255.0);
 }

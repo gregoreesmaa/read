@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const PlatformCallbacks = extern struct {
-    on_scroll: ?*const fn (delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void,
+    on_scroll: ?*const fn (delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int, event_ms: f64) callconv(.c) void,
     on_resize: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
     on_key: ?*const fn (key_code: c_int, hovered_block_id: c_int) callconv(.c) void,
     on_draw: ?*const fn (width: c_int, height: c_int) callconv(.c) void,
@@ -69,6 +69,10 @@ pub extern "c" fn platform_init(
 pub extern "c" fn platform_run_loop() void;
 pub extern "c" fn platform_request_redraw() void;
 pub extern "c" fn platform_request_redraw_rect(x: f32, y: f32, w: f32, h: f32) void;
+/// Scroll-blit request (#384): copy the overlapping region by the scroll
+/// delta, then invalidate only the exposed strip. View coords, flipped
+/// (origin top-left). Falls back to full when the delta covers the view.
+pub extern "c" fn platform_request_scroll(old_scroll_y: f32, new_scroll_y: f32) void;
 /// Returns 1 and fills out the dirty rect AppKit reported for this draw,
 /// or 0 when there is no pending damage (headless render, first draw).
 pub extern "c" fn platform_get_pending_damage(x: *f32, y: *f32, w: *f32, h: *f32) c_int;
@@ -114,6 +118,12 @@ pub extern "c" fn platform_draw_text(
     link_url: ?[*]const u8,
     link_url_len: c_int,
 ) void;
+
+/// Fill-color batch close (issue #389, GPU): idempotent; ends the primed
+/// group the text-run loop opens (same save/restore pairing the run loop
+/// owns). Called once per draw pass; partial passes that never drew text
+/// close a never-opened batch, which is a no-op.
+pub extern "c" fn platform_batch_end() void;
 
 /// Visited-link probe (issue #25): 1 when this URL was opened before.
 pub extern "c" fn platform_link_visited(url: ?[*]const u8, url_len: c_int) c_int;
@@ -226,6 +236,11 @@ pub extern "c" fn platform_math_engine_info(version: *u32, use_ex: *u32, conform
 pub extern "c" fn platform_set_test_damage(x: f32, y: f32, w: f32, h: f32, valid: c_int) void;
 pub extern "c" fn platform_text_record_count() c_int;
 pub extern "c" fn platform_set_test_selection(x1: f32, y1: f32, x2: f32, y2: f32, enable: c_int) void;
+pub extern "c" fn platform_set_test_scroll(scroll_y: f32) void;
+/// TEST_HOOKS reader for the platform scroll mirror (no-rerender fix):
+/// the value onTick/onScroll synced last. Same gate pattern as the
+/// neighboring test hooks -- only referenced under test_hooks.
+pub extern "c" fn platform_test_scroll_synced() f32;
 pub extern "c" fn platform_set_test_hover(x: f32, y: f32) void;
 pub extern "c" fn platform_test_button_damage(bx: f32, by: f32, bw: f32, bh: f32, ox: *f32, oy: *f32, ow: *f32, oh: *f32) void;
 pub extern "c" fn platform_images_pending() c_int;
@@ -350,3 +365,27 @@ pub extern "c" fn platform_render_to_png(
     height: c_int,
     render_fn: *const fn (width: c_int, height: c_int) callconv(.c) void,
 ) c_int;
+/// Repaint-idempotence probe: same frame twice on one bitmap (warm caches
+/// on pass two). Test-hooks builds only.
+pub extern "c" fn platform_render_repaint_png(
+    out_a: [*:0]const u8,
+    out_b: [*:0]const u8,
+    out_c: [*:0]const u8,
+    width: c_int,
+    height: c_int,
+    render_fn: *const fn (width: c_int, height: c_int) callconv(.c) void,
+) c_int;
+/// Tier-isolation bypasses (test binary only): force legacy direct paint.
+pub extern "c" fn platform_set_test_bypass(pill_direct: c_int, shape_direct: c_int) void;
+/// Scroll-copy plan query: copy/seam-band decision for dy,scale,view_h,
+/// overshoot. Test-hooks builds only.
+pub extern "c" fn platform_probe_scroll_plan(
+    dy: f32,
+    scale: f32,
+    view_h: f32,
+    overshoot: f32,
+    use_copy: *c_int,
+    copy_dy: *f32,
+    band_y: *f32,
+    band_h: *f32,
+) void;
