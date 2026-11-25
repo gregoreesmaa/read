@@ -1,0 +1,3 @@
+[submodule "third_party/zatex"]
+	path = third_party/zatex
+	url = https://github.com/gregoreesmaa/zatex

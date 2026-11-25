@@ -8,6 +8,13 @@
 # src/platform/macos_zatex.m. The double is scripted (fixed bytes, no
 # network), so the hermetic default is preserved.
 #
+# macOS-only (the double's .dylib spelling): Linux/Windows runners
+# build their own spellings but the host backends there resolve the
+# double through their own loaders — until a per-OS double step lands,
+# this script runs the suite against the double only on macOS and
+# skips elsewhere, so the strict gate keeps pinning engine-absent
+# skips there.
+#
 # Without a checkout (e.g. Read CI) it skips gracefully: the default
 # suite already covers the engine-absent skip and the live-dylib paths.
 #
@@ -24,12 +31,19 @@ if [ -z "$checkout" ] || [ ! -f "$checkout/packages/zatex/build.zig" ]; then
     echo "math_testdouble: no zatex checkout, skipping (hermetic default)"
     exit 0
 fi
+case "$(uname -s)" in
+    Darwin) ;;
+    *) echo "math_testdouble: non-macOS host, skipping (per-OS double step not landed)"; exit 0 ;;
+esac
 (cd "$checkout/packages/zatex" && zig build test-double)
 dylib="$checkout/packages/zatex/zig-out/test-double/libzatex_test.dylib"
 if [ ! -f "$dylib" ]; then
     echo "math_testdouble: double build produced no dylib, skipping"
     exit 0
 fi
+
 echo "math_testdouble: running suite against $dylib"
 cd "$root"
-ZATEX_TEST_DYLIB="$dylib" zig build test -Doptimize=ReleaseFast --summary all
+# The live engine stays out (same note as ci.yml): the double run pins
+# the scripted paths, not the real dylib behind READ_ZATEX_LIB.
+READ_ZATEX_LIB="" ZATEX_TEST_DYLIB="$dylib" zig build test -Doptimize=ReleaseFast --summary all
