@@ -2823,12 +2823,41 @@ static size_t png_write_rgba(const unsigned char* px, int w, int h,
 static int write_file_bytes(const char* path, const unsigned char* data, size_t n) {
     char npath[2048];
     if (normalize_path(path, (int)strlen(path), npath, (int)sizeof(npath)) != 0) return -1;
+    // Drive-rooted "/tmp/..." probe paths (the form Zig tests use)
+    // target the process drive's root (D:\tmp on CI runners).
+    // normalize_path already folds '/' to '\', so match the folded
+    // single-backslash root — never UNC ("\\server"). The root may
+    // not exist on bare runners (no shell step can create it across
+    // the MSYS volume split), so create the leaf directory here:
+    // writer and reader still agree on one path, creation is loud on
+    // failure, and ship behavior is untouched (ship never writes).
+    if (npath[0] == '\\' && npath[1] != '\\' && npath[1] != '\0') {
+        char dir[2048];
+        const char *sep = strrchr(npath, '\\');
+        if (sep && sep != npath) {
+            size_t dn = (size_t)(sep - npath);
+            if (dn < sizeof(dir)) {
+                memcpy(dir, npath, dn);
+                dir[dn] = '\0';
+                WCHAR wd[2048];
+                int wn2 = utf8_to_wide(dir, (int)dn, wd, 2047);
+                if (wn2 > 0) {
+                    wd[wn2] = 0;
+                    if (GetFileAttributesW(wd) == INVALID_FILE_ATTRIBUTES)
+                        CreateDirectoryW(wd, NULL);
+                }
+            }
+        }
+    }
     WCHAR w[2048];
     int wn = utf8_to_wide(npath, (int)strlen(npath), w, 2047);
     if (wn <= 0) return -1;
     w[wn] = 0;
     HANDLE fh = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (fh == INVALID_HANDLE_VALUE) return -1;
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "read: headless PNG create failed err=%lu path=%s\n", (unsigned long)GetLastError(), npath);
+        return -1;
+    }
     DWORD wr = 0;
     BOOL ok = WriteFile(fh, data, (DWORD)n, &wr, NULL);
     CloseHandle(fh);
