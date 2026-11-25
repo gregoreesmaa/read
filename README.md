@@ -4,13 +4,15 @@
 [![License: MIT](https://img.shields.io/github/license/gregoreesmaa/read)](LICENSE)
 [![Zig 0.16](https://img.shields.io/badge/zig-0.16-orange)](https://ziglang.org)
 
-**The Markdown reader that opens before you blink.** Pure Zig, zero dependencies, native macOS — mmap + SIMD, microsecond rendering, CoreText typography.
+**The Markdown reader that opens before you blink.** Pure Zig, zero dependencies, native on macOS, Linux and Windows — mmap + SIMD, microsecond rendering, CoreText typography.
 
 ![Reading view](screenshots/text_wrapping.png)
 
 ```bash
 zig build -Doptimize=ReleaseFast && ./zig-out/bin/read showcase.md
 ```
+
+Linux needs the X11/FreeType stack (`sudo apt-get install libx11-dev libxext-dev libfontconfig1-dev libfreetype6-dev libpng-dev`); Windows and macOS need nothing beyond Zig. Tagged releases ship artifacts for all three OSes: [docs/release.md](docs/release.md).
 
 `j`/`k` scroll · `Space` page · `t` theme · `q` quit · [all keys](docs/keys.md)
 

@@ -1,8 +1,10 @@
 name: Release
 
-# Versioned tags (v*) ship installable artifacts. The release honors the
-# same contract as a local build (AGENTS.md §1): strict tests green,
-# ship binary under 200 KiB, test tooling never in the artifact.
+# Versioned tags (v*) ship installable artifacts for macOS, Linux, and
+# Windows across CPU variations (issue #51, docs/release.md). The release
+# honors the same contract as a local build (AGENTS.md §1): strict tests
+# green, ship binary within the size budget, test tooling never in the
+# artifact. Runner-per-OS, never cross-compile (docs/cross-platform-rfc.md).
 on:
   push:
     tags:
@@ -15,9 +17,13 @@ on:
 permissions:
   contents: write
 
+env:
+  ZIG_VERSION: "0.16.0"
+
 jobs:
-  release-macos:
-    runs-on: macos-latest
+  # -- macOS arm64 (native) ---------------------------------------------
+  build-macos-arm64:
+    runs-on: macos-15
     # Defense in depth: tags-only trigger above plus this guard, so a
     # branch push can never execute (or publish) a release.
     if: startsWith(github.ref, 'refs/tags/')
@@ -34,21 +40,21 @@ jobs:
           fetch-tags: true
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
 
       - name: Release build (ship binary only ships)
         run: |
-          zig build -Doptimize=ReleaseFast
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}"
           ./scripts/size_gate.sh zig-out/bin/read
           ls -lh zig-out/bin/read
 
       - name: Reproducibility check (same tag, same bytes)
         run: |
-          zig build -Doptimize=ReleaseFast --prefix /tmp/repro-a
-          zig build -Doptimize=ReleaseFast --prefix /tmp/repro-b
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-a
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-b
           cmp /tmp/repro-a/bin/read /tmp/repro-b/bin/read
           cmp /tmp/repro-a/bin/read zig-out/bin/read
           echo "reproducible: identical bytes across rebuilds"
@@ -90,17 +96,371 @@ jobs:
           xcrun stapler staple zig-out/Read.app
           echo "notarized + stapled (binary and app bundle)"
 
-      - name: Package, checksum, changelog
+      - name: Ship/test separation (no hooks in ship binary, AGENTS.md §1)
+        run: sh scripts/ship_separation.sh ./zig-out/bin/read ./zig-out/bin/read-test showcase.md
+
+      - name: Package
         run: |
           DIST="read-$TAG-macos-arm64"
-          mkdir -p "dist/$DIST"
-          cp zig-out/bin/read LICENSE "dist/$DIST/"
+          sh scripts/make_dist.sh macos arm64 "${TAG#v}" zig-out/bin/read dist
           cp -R zig-out/Read.app "dist/$DIST/"
           tar -czf "dist/$DIST.tar.gz" -C dist "$DIST"
           (cd dist && shasum -a 256 "$DIST.tar.gz" > "$DIST.tar.gz.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-arm64
+          path: dist/read-*-macos-arm64.tar.gz*
+          retention-days: 14
+
+  # -- macOS x86_64 (native Intel runner) --------------------------------
+  build-macos-x64:
+    runs-on: macos-15-intel
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      TAG: ${{ github.ref_name }}
+      HAS_SIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY != '' }}
+      HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast --summary all
+
+      - name: Release build (ship binary only ships)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}"
+          ./scripts/size_gate.sh zig-out/bin/read
+          ls -lh zig-out/bin/read
+
+      - name: Reproducibility check (same tag, same bytes)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-a
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-b
+          cmp /tmp/repro-a/bin/read /tmp/repro-b/bin/read
+          cmp /tmp/repro-a/bin/read zig-out/bin/read
+          echo "reproducible: identical bytes across rebuilds"
+
+      - name: Assemble app bundle (icon + plist, issue #102)
+        run: |
+          sh scripts/make_app_bundle.sh zig-out/bin/read zig-out "${TAG#v}"
+          sh scripts/check_app_bundle.sh zig-out/Read.app
+
+      - name: Codesign (Developer ID, when secrets exist)
+        if: env.HAS_SIGN_IDENTITY == 'true'
+        run: |
+          codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
+            --options runtime --timestamp -v zig-out/bin/read
+          if [ -f zig-out/Read.app/Contents/Resources/libzatex.dylib ]; then
+            codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
+              --options runtime --timestamp -v zig-out/Read.app/Contents/Resources/libzatex.dylib
+          fi
+          codesign --sign "${{ secrets.APPLE_DEVELOPER_IDENTITY }}" \
+            --options runtime --timestamp -v zig-out/Read.app
+          codesign -vv zig-out/bin/read zig-out/Read.app
+
+      - name: Notarize (Apple notarytool, when secrets exist)
+        if: env.HAS_APPLE_ID == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent zig-out/bin/read /tmp/notarize-bin.zip
+          xcrun notarytool submit /tmp/notarize-bin.zip --wait \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          xcrun stapler staple zig-out/bin/read
+          ditto -c -k --keepParent zig-out/Read.app /tmp/notarize-app.zip
+          xcrun notarytool submit /tmp/notarize-app.zip --wait \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          xcrun stapler staple zig-out/Read.app
+          echo "notarized + stapled (binary and app bundle)"
+
+      - name: Ship/test separation (no hooks in ship binary, AGENTS.md §1)
+        run: sh scripts/ship_separation.sh ./zig-out/bin/read ./zig-out/bin/read-test showcase.md
+
+      - name: Package
+        run: |
+          DIST="read-$TAG-macos-x86_64"
+          sh scripts/make_dist.sh macos x86_64 "${TAG#v}" zig-out/bin/read dist
+          cp -R zig-out/Read.app "dist/$DIST/"
+          tar -czf "dist/$DIST.tar.gz" -C dist "$DIST"
+          (cd dist && shasum -a 256 "$DIST.tar.gz" > "$DIST.tar.gz.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-x86_64
+          path: dist/read-*-macos-x86_64.tar.gz*
+          retention-days: 14
+
+  # -- Linux x86_64 (musl-static libc, dynamic system GUI libs) ---------
+  build-linux-x64:
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install X11/FreeType/fontconfig/libpng dev packages
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libfontconfig1-dev libfreetype6-dev libpng-dev xvfb
+
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl --summary all
+
+      - name: Release build (ship binary only ships)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dversion="${TAG#v}"
+          ./scripts/size_gate.sh zig-out/bin/read
+          ls -lh zig-out/bin/read
+          ldd zig-out/bin/read 2>&1 | head -8 || true
+
+      - name: Reproducibility check (same tag, same bytes)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dversion="${TAG#v}" --prefix /tmp/repro-a
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dversion="${TAG#v}" --prefix /tmp/repro-b
+          cmp /tmp/repro-a/bin/read /tmp/repro-b/bin/read
+          cmp /tmp/repro-a/bin/read zig-out/bin/read
+          echo "reproducible: identical bytes across rebuilds"
+
+      - name: Floor check (runs on Ubuntu 22.04 / glibc 2.35 container)
+        run: |
+          docker run --rm -v "$PWD/zig-out/bin/read:/read:ro" ubuntu:22.04 /read --version
+
+      - name: Ship/test separation (no hooks in ship binary, AGENTS.md §1)
+        run: sh scripts/ship_separation.sh ./zig-out/bin/read ./zig-out/bin/read-test showcase.md
+
+      - name: Headless smoke (under Xvfb for fontconfig)
+        run: xvfb-run -a ./zig-out/bin/read-test --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
+
+      - name: Package
+        run: |
+          DIST="read-$TAG-linux-x86_64"
+          sh scripts/make_dist.sh linux x86_64 "${TAG#v}" zig-out/bin/read dist
+          tar -czf "dist/$DIST.tar.gz" -C dist "$DIST"
+          (cd dist && shasum -a 256 "$DIST.tar.gz" > "$DIST.tar.gz.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-x86_64
+          path: dist/read-*-linux-x86_64.tar.gz*
+          retention-days: 14
+
+  # -- Linux arm64 (musl-static libc) ------------------------------------
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install X11/FreeType/fontconfig/libpng dev packages
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libfontconfig1-dev libfreetype6-dev libpng-dev xvfb
+
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl --summary all
+
+      - name: Release build (ship binary only ships)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -Dversion="${TAG#v}"
+          ./scripts/size_gate.sh zig-out/bin/read
+          ls -lh zig-out/bin/read
+
+      - name: Reproducibility check (same tag, same bytes)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -Dversion="${TAG#v}" --prefix /tmp/repro-a
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -Dversion="${TAG#v}" --prefix /tmp/repro-b
+          cmp /tmp/repro-a/bin/read /tmp/repro-b/bin/read
+          cmp /tmp/repro-a/bin/read zig-out/bin/read
+          echo "reproducible: identical bytes across rebuilds"
+
+      - name: Ship/test separation (no hooks in ship binary, AGENTS.md §1)
+        run: sh scripts/ship_separation.sh ./zig-out/bin/read ./zig-out/bin/read-test showcase.md
+
+      - name: Headless smoke (under Xvfb for fontconfig)
+        run: xvfb-run -a ./zig-out/bin/read-test --screenshot /tmp/smoke.png showcase.md && ls -lh /tmp/smoke.png
+
+      - name: Package
+        run: |
+          DIST="read-$TAG-linux-arm64"
+          sh scripts/make_dist.sh linux arm64 "${TAG#v}" zig-out/bin/read dist
+          tar -czf "dist/$DIST.tar.gz" -C dist "$DIST"
+          (cd dist && shasum -a 256 "$DIST.tar.gz" > "$DIST.tar.gz.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-arm64
+          path: dist/read-*-linux-arm64.tar.gz*
+          retention-days: 14
+
+  # -- Windows x86_64 (native) -------------------------------------------
+  build-windows-x64:
+    runs-on: windows-2022
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      TAG: ${{ github.ref_name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast --summary all
+
+      - name: Build pesize helper (PE .text reader for the size gate)
+        run: zig build-exe scripts/pesize.zig -O ReleaseSmall -lc -femit-bin="$RUNNER_TEMP/pesize.exe"
+
+      - name: Release build (ship binary only ships)
+        env:
+          PESIZE: ${{ runner.temp }}/pesize.exe
+        run: |
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}"
+          ./scripts/size_gate.sh zig-out/bin/read.exe
+          ls -lh zig-out/bin/read.exe
+
+      - name: Reproducibility check (same tag, same bytes)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-a
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-b
+          cmp /tmp/repro-a/bin/read.exe /tmp/repro-b/bin/read.exe
+          cmp /tmp/repro-a/bin/read.exe zig-out/bin/read.exe
+          echo "reproducible: identical bytes across rebuilds"
+
+      - name: Headless smoke (ship carries no hooks; hooks binary renders)
+        run: ./zig-out/bin/read-test.exe --screenshot "$RUNNER_TEMP/smoke.png" showcase.md && ls -lh "$RUNNER_TEMP/smoke.png"
+
+      - name: Package (zip is the platform-native expectation)
+        run: |
+          DIST="read-$TAG-windows-x86_64"
+          sh scripts/make_dist.sh windows x86_64 "${TAG#v}" zig-out/bin/read.exe dist
+          (cd dist && /c/Windows/System32/tar.exe -a -c -f "$DIST.zip" "$DIST")
+          (cd dist && sha256sum "$DIST.zip" > "$DIST.zip.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-x86_64
+          path: dist/read-*-windows-x86_64.zip*
+          retention-days: 14
+
+  # -- Windows arm64 (native; non-blocking until proven) ------------------
+  build-windows-arm64:
+    runs-on: windows-11-arm
+    continue-on-error: true
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      TAG: ${{ github.ref_name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Strict gate (tests + microsecond benchmarks)
+        run: zig build test -Doptimize=ReleaseFast --summary all
+
+      - name: Build pesize helper (PE .text reader for the size gate)
+        run: zig build-exe scripts/pesize.zig -O ReleaseSmall -lc -femit-bin="$RUNNER_TEMP/pesize.exe"
+
+      - name: Release build (ship binary only ships)
+        env:
+          PESIZE: ${{ runner.temp }}/pesize.exe
+        run: |
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}"
+          ./scripts/size_gate.sh zig-out/bin/read.exe
+          ls -lh zig-out/bin/read.exe
+
+      - name: Reproducibility check (same tag, same bytes)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-a
+          zig build -Doptimize=ReleaseFast -Dversion="${TAG#v}" --prefix /tmp/repro-b
+          cmp /tmp/repro-a/bin/read.exe /tmp/repro-b/bin/read.exe
+          cmp /tmp/repro-a/bin/read.exe zig-out/bin/read.exe
+          echo "reproducible: identical bytes across rebuilds"
+
+      - name: Headless smoke (ship carries no hooks; hooks binary renders)
+        run: ./zig-out/bin/read-test.exe --screenshot "$RUNNER_TEMP/smoke.png" showcase.md && ls -lh "$RUNNER_TEMP/smoke.png"
+
+      - name: Package (zip is the platform-native expectation)
+        run: |
+          DIST="read-$TAG-windows-arm64"
+          sh scripts/make_dist.sh windows arm64 "${TAG#v}" zig-out/bin/read.exe dist
+          (cd dist && /c/Windows/System32/tar.exe -a -c -f "$DIST.zip" "$DIST")
+          (cd dist && sha256sum "$DIST.zip" > "$DIST.zip.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-arm64
+          path: dist/read-*-windows-arm64.zip*
+          retention-days: 14
+
+  # -- Publish (single GitHub release over all artifacts) -----------------
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-macos-arm64, build-macos-x64, build-linux-x64, build-linux-arm64, build-windows-x64]
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      TAG: ${{ github.ref_name }}
+      HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download all artifacts (plus win-arm64 best-effort)
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Unified checksums + changelog
+        run: |
+          ls -lh dist/
+          (cd dist && sha256sum read-*.tar.gz read-*.zip > SHA256SUMS 2>/dev/null || (cd dist && shasum -a 256 read-*.tar.gz read-*.zip > SHA256SUMS))
+          cat dist/SHA256SUMS
           PREV=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || true)
           {
             echo "Read $TAG"
+            echo
+            echo "Artifacts:"
+            echo
+            (cd dist && ls read-*.tar.gz read-*.zip 2>/dev/null | sed 's/^/- /')
             echo
             if [ -z "$PREV" ]; then
               echo "First versioned release."
@@ -111,26 +471,27 @@ jobs:
               echo
             fi
             echo
-            echo "Checksum (sha256):"
-            cat "dist/$DIST.tar.gz.sha256"
+            echo "Checksums (sha256, see SHA256SUMS):"
+            cat dist/SHA256SUMS
             if [ "$HAS_APPLE_ID" != 'true' ]; then
               echo
-              echo "Note: built without Apple signing secrets, so this artifact is"
-              echo "unsigned (Gatekeeper will block it on other Macs until a signed"
-              echo "release is cut). See docs/release.md."
+              echo "Note: macOS artifacts are unsigned (no Apple signing"
+              echo "secrets) — Gatekeeper will block them on other Macs until"
+              echo "a signed release is cut. See docs/release.md."
             fi
+            echo
+            echo "Note: Linux and Windows artifacts are unsigned — verify"
+            echo "SHA256SUMS before running. See docs/release.md."
           } > dist/NOTES.md
           cat dist/NOTES.md
 
-      - name: Homebrew formula bump gate (issue #369)
+      - name: Homebrew formula bump gate (issue #369, macOS arm64 tarball)
         run: |
-          DIST="read-$TAG-macos-arm64"
-          sh scripts/check_homebrew_formula.sh "$TAG" "dist/$DIST.tar.gz" "dist/$DIST.tar.gz.sha256"
+          sh scripts/check_homebrew_formula.sh "$TAG" "dist/read-$TAG-macos-arm64.tar.gz" "dist/read-$TAG-macos-arm64.tar.gz.sha256"
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          DIST="read-$TAG-macos-arm64"
           gh release create "$TAG" --title "$TAG" --notes-file dist/NOTES.md \
-            "dist/$DIST.tar.gz" "dist/$DIST.tar.gz.sha256"
+            dist/read-*.tar.gz dist/read-*.tar.gz.sha256 dist/read-*.zip dist/read-*.zip.sha256 dist/SHA256SUMS

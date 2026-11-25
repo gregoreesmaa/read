@@ -1,6 +1,9 @@
 # Cross-Platform Strategy (RFC — issue #53)
 
-Status: **proposed**. This doc declares the target matrix and the
+Status: **landed** (2026-10, `impl/51-release-matrix`): Linux X11 and
+Windows Win32 backends ship behind `src/platform/bridge.zig` /
+`src/platform/platform.h`; the seam contract (§6) below held throughout.
+This doc declares the target matrix and the
 abstraction contract *before* more AppKit-isms bake in. Everything
 below is additive: no core/layout behavior changes ship with this RFC.
 
@@ -52,9 +55,10 @@ FreeType and DirectWrite both consume them directly). No format change.
   Mono: JetBrains Mono. System fallbacks stay per-platform
   (today: Georgia/Menlo/system fonts in `macos.m`; Linux: DejaVu Serif /
   DejaVu Sans Mono via fontconfig; Windows: Georgia/Consolas).
-- **Licensing check (open):** all three families are SIL OFL, but the
-  OFL texts are *not* vendored under `assets/fonts/` today. Vendor them
-  before any release that redistributes binaries; no code change needed.
+- **Licensing check (landed):** all three families are SIL OFL, and the
+  OFL texts now ship under `assets/fonts/OFL-*.txt` (copyright lines from
+  each TTF's name table + the OFL 1.1 body). `scripts/make_dist.sh` fails
+  without them; no code change needed.
 
 ## Minimum OS versions / API floor
 
@@ -77,9 +81,10 @@ SDK. Proposed (settles the 10.12/10.14 question):
 | Target | Arch | CI | Status |
 | :--- | :--- | :--- | :--- |
 | macOS 12+ | arm64 | `test-macos` (full gate + screenshots) | shipping |
-| macOS 12+ | x86_64 | cross-compile check | best-effort |
-| Linux (Ubuntu 22.04+) | x86_64, arm64 | `test-linux` (core gate; X11 glue compile check when it lands) | next |
-| Windows 10+ | x86_64 | runner job when Win32 glue lands | later |
+| macOS 12+ | x86_64 | `test-macos` equivalent in release (`macos-15-intel`); cross-compile check | shipping |
+| Linux (Ubuntu 22.04+) | x86_64, arm64 | `test-linux` (full core gate + size gate + Xvfb smoke) | shipping (musl-static libc, X11/FreeType/fontconfig/libpng) |
+| Windows 10+ | x86_64 | `test-windows` (full core gate + size gate + smoke) | shipping (GDI + GDI+-flat decode) |
+| Windows 10+ | arm64 | release job, non-blocking until proven | beta |
 
 ## CI approach
 

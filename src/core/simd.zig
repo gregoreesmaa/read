@@ -55,9 +55,22 @@ pub const timing_gate_backoff_ns: u64 = 2_000_000;
 /// Backoff nap between uncleared timing-gate attempts (see above). Test-only
 /// measurement hygiene; never on a hot path.
 pub fn timingGateBackoff() void {
-    const req = std.posix.timespec{ .sec = 0, .nsec = @intCast(timing_gate_backoff_ns) };
-    _ = std.c.nanosleep(&req, null);
+    sleepNs(timing_gate_backoff_ns);
 }
+
+/// Nanosecond backoff sleep (Windows: Sleep, POSIX: nanosleep). Lives here
+/// in `hot` (not port_clock.zig) because both the `hot` and `read` modules
+/// contain this file's dependents and Zig forbids one file in two modules.
+fn sleepNs(ns: u64) void {
+    if (builtin.os.tag == .windows) {
+        Sleep(if (ns >= 1_000_000) @as(u32, @intCast(@min(ns / 1_000_000, std.math.maxInt(u32)))) else 1);
+    } else {
+        var req = std.posix.timespec{ .sec = @intCast(ns / 1_000_000_000), .nsec = @intCast(ns % 1_000_000_000) };
+        _ = std.c.nanosleep(&req, null);
+    }
+}
+
+extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 
 pub const BlockType = enum(u5) {
     paragraph = 0,
