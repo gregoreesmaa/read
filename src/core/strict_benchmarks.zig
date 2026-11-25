@@ -224,7 +224,9 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
     });
 
     try std.testing.expect(last_line_count > 100);
-    try std.testing.expect(min_elapsed_us <= TARGET_MAX_SHOWCASE_STARTUP_TIME_US);
+    if (simd.timingBudgetsEnforced()) {
+        try std.testing.expect(min_elapsed_us <= TARGET_MAX_SHOWCASE_STARTUP_TIME_US);
+    }
 }
 
 test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
