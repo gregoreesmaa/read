@@ -1648,6 +1648,13 @@ void platform_sync_scroll(float scroll_y) {
     g_scroll_y = scroll_y;
 }
 
+void platform_request_scroll(float old_scroll_y, float new_scroll_y) {
+    if (new_scroll_y != old_scroll_y) request_redraw();
+}
+#ifdef TEST_HOOKS
+float platform_test_scroll_synced(void) { return g_scroll_y; }
+#endif
+
 void platform_sync_overshoot(float overshoot) {
     g_overshoot = overshoot;
 }

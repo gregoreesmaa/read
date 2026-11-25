@@ -1122,6 +1122,13 @@ void platform_sync_scroll(float scroll_y) {
     if (scroll_y != g_scroll_y) g_hover_link_hash = 0;
     g_scroll_y = scroll_y;
 }
+void platform_request_scroll(float old_scroll_y, float new_scroll_y) {
+    if (new_scroll_y != old_scroll_y) platform_request_redraw();
+}
+#ifdef TEST_HOOKS
+float platform_test_scroll_synced(void) { return g_scroll_y; }
+#endif
+
 void platform_sync_overshoot(float overshoot) { g_overshoot = overshoot; }
 void platform_set_scroll_info(float scroll_y, float max_scroll_y, float view_h) {
     g_scroll_y = scroll_y;
