@@ -764,6 +764,7 @@ fn pluginMtimeSec(path_z: [*:0]const u8) ?i64 {
 /// probe for the shim hash-skip: a missing/unreadable file reads as
 /// different (rewrite path), never as equal.
 fn pluginFileContentMatches(path: []const u8, want: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) return false;
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
     defer _ = std.c.close(fd);
     if ((pluginFdSize(fd) orelse return false) != want.len) return false;
@@ -1011,6 +1012,7 @@ const PLUGIN_TIDY_DEL_MAX: usize = 32;
 /// Sweep one renderer's cache dir: drop stale probe sentinels, prune PNG
 /// overflow. `root` is the cache root (resolved once by the caller).
 fn pluginTidyCache(root: []const u8) void {
+    if (comptime builtin.os.tag == .windows) return;
     var r: usize = 0;
     while (r < PLUGIN_RENDERER_COUNT) : (r += 1) {
         const renderer: plugin_cache.Renderer = @enumFromInt(r);
