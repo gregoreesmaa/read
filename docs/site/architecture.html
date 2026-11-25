@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it stays fast — Read docs</title>
+<meta name="description" content="The four mechanisms behind Read's microsecond rendering.">
+<style>
+:root { color-scheme: dark light; --bg: #121212; --fg: #E0E0E0; --muted: #9a9a9a; --card: #1b1b1b; --accent: #7cc4ff; }
+@media (prefers-color-scheme: light) { :root { --bg: #FAFAFA; --fg: #1E2022; --muted: #666; --card: #fff; --accent: #0b5fff; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.75 Georgia, "IBM Plex Serif", serif; }
+.wrap { max-width: 680px; margin: 0 auto; padding: 48px 24px 96px; }
+h1, h2 { font-family: "Space Grotesk", system-ui, sans-serif; }
+a { color: var(--accent); }
+nav { font-family: system-ui, sans-serif; font-size: 15px; margin-bottom: 32px; }
+.step { background: var(--card); border-radius: 12px; padding: 18px 20px; margin: 14px 0; }
+.step h2 { margin: 0 0 6px; font-size: 20px; }
+.step p { margin: 0; font-size: 15px; color: var(--muted); font-family: system-ui, sans-serif; }
+code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .88em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav><a href="index.html">&larr; Read docs</a></nav>
+<h1>How it stays fast</h1>
+<p>One job: open and render Markdown faster than the eye can perceive, using the absolute minimum of computer resources.</p>
+<div class="step"><h2>1. Zero-copy memory mapping</h2><p>Documents map straight into virtual address space (<code>src/core/mmap.zig</code>) — text demand-pages from the OS cache, no read() copy.</p></div>
+<div class="step"><h2>2. Branchless SIMD line scan</h2><p>Wide vector compares find line breaks; a branch-light pass classifies headings, fences, quotes, lists, tables, and rules into a packed 8-byte <code>Line</code> index (<code>src/core/simd.zig</code>).</p></div>
+<div class="step"><h2>3. Virtualized viewport</h2><p>Off-screen elements are culled — only intersecting tokens are parsed and laid out, with zero heap allocations on the hot path (<code>src/layout/viewport.zig</code>, <code>src/core/parser.zig</code>).</p></div>
+<div class="step"><h2>4. Native Cocoa / CoreText</h2><p>Borderless window, CoreGraphics clipping, CoreText rasterization — no Electron, no WebKit, no toolkit (<code>src/platform/</code>). A headless screenshot engine renders to PNG for visual regression in CI.</p></div>
+<h2>Lean ship binary</h2>
+<p>The <code>read</code> binary contains only what reading needs (&lt; 200 KiB). All test and debug tooling lives in a separate <code>read-test</code> binary behind compile-time gates — never runtime flags. Full mechanism: <a href="https://github.com/gregoreesmaa/read/blob/main/docs/architecture.md">architecture.md</a>.</p>
+</div>
+</body>
+</html>

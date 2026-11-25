@@ -2,7 +2,7 @@ const std = @import("std");
 const simd = @import("hot");
 const portfs = @import("port_fs.zig");
 
-/// Flat SoA block-index store (see todo/ideas2.txt:3-7).
+/// Flat SoA block-index store (see docs/design-notes/ideas2.txt:3-7).
 ///
 /// Zero-copy: a Block holds only integer anchors (`start`/`len`) into the
 /// mmap buffer plus u32 relationship indices. No heap strings, no pointers.

@@ -682,7 +682,7 @@ test "findOffsetY lands on the match block (#42)" {
     var fence: simd.FenceState = .{};
     const n = simd.scanLines(doc, &line_buf, &fence);
     const lines = line_buf[0..n];
-    const cfg = ViewportConfig{
+    var cfg = ViewportConfig{
         .window_width = 1200,
         .window_height = 900,
         .scroll_y = 0,
@@ -692,13 +692,61 @@ test "findOffsetY lands on the match block (#42)" {
     };
     // Block-exact (not row-exact): offset 0 lands the top margin, and a
     // later block lands strictly below on its own top.
-    try t.expectEqual(@as(f32, 50.0), findOffsetY(doc, lines, cfg, 0).?);
+    try t.expectEqual(@as(f32, 50.0), findOffsetY(doc, lines, &cfg, 0).?);
     const second_off = std.mem.indexOf(u8, doc, "Second").?;
-    const y2 = findOffsetY(doc, lines, cfg, second_off).?;
+    const y2 = findOffsetY(doc, lines, &cfg, second_off).?;
     try t.expect(y2 > 50.0);
     // Past-the-end clamps to the last block instead of null.
-    try t.expect(findOffsetY(doc, lines, cfg, doc.len + 100).? >= y2);
-    try t.expect(findOffsetY(doc, lines[0..0], cfg, 0) == null);
+    try t.expect(findOffsetY(doc, lines, &cfg, doc.len + 100).? >= y2);
+    try t.expect(findOffsetY(doc, lines[0..0], &cfg, 0) == null);
+}
+
+test "findRowOffsetY lands row-exact inside wrapped paras (#386)" {
+    const t = std.testing;
+    const doc = "# Title\n\nFirst para here.\n\nSecond para here.\n";
+    var line_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &line_buf, &fence);
+    const lines = line_buf[0..n];
+    const cfg = ViewportConfig{
+        .window_width = 1200,
+        .window_height = 900,
+        .scroll_y = 0,
+        .base_font_size = 17,
+        .line_height = 29.75,
+        .is_dark_theme = true,
+    };
+    // Single-row paragraph: row-exact == block top.
+    const off = std.mem.indexOf(u8, doc, "First").?;
+    const top = findOffsetY(doc, lines, &cfg, off).?;
+    var unit: usize = 0;
+    while (unit < lines.len and lines[unit].offset + lines[unit].len <= off) : (unit += 1) {}
+    unit = snapWindowStart(doc, lines, unit);
+    try t.expectEqual(top, findRowOffsetY(doc, lines, cfg, unit, top, off));
+    // Narrow column wraps the run: an offset on the second visual row
+    // lands exactly one line height below the block top.
+    const doc2 = "aaa bbb ccc ddd eee fff ggg hhh\n";
+    var lb2: [8]simd.Line = undefined;
+    var f2: simd.FenceState = .{};
+    const n2 = simd.scanLines(doc2, &lb2, &f2);
+    const w1 = measureTextEx("aaa", 17.0, false, false, false, false);
+    const sp = measureCharEx(' ', 17.0, false, false, false, false);
+    // Force wrap after the first word by sizing the column just past it.
+    var cfg2 = ViewportConfig{
+        .window_width = 64.0 + w1 + sp + 2.0,
+        .window_height = 900,
+        .scroll_y = 0,
+        .base_font_size = 17,
+        .line_height = 29.75,
+        .is_dark_theme = true,
+    };
+    const top2 = findOffsetY(doc2, lb2[0..n2], &cfg2, 0).?;
+    const late = std.mem.indexOf(u8, doc2, "hhh").?;
+    const y_late = findRowOffsetY(doc2, lb2[0..n2], cfg2, 0, top2, late);
+    try t.expect(y_late > top2);
+    // Row-exact never lands above the block top nor past its refined bottom.
+    const u = refineLineHeight(doc2, lb2[0..n2], 0, &cfg2, contentWidthOf(&cfg2), contentXOf(&cfg2));
+    try t.expect(y_late <= top2 + u.height + 0.001);
 }
 
 pub const DrawCommandKind = enum {
@@ -882,7 +930,7 @@ pub fn codeClassColor(theme: Theme, class: highlight.Class) Color {
     return table[@intFromEnum(class)];
 }
 
-pub const MAX_SCROLLABLE_BLOCKS = 128;
+pub const MAX_SCROLLABLE_BLOCKS: usize = 128;
 
 /// Ambient scrollbar geometry shared by the Zig filament and the platform
 /// drag handling (macos.m mirrors this formula; tests pin it here).
@@ -925,7 +973,11 @@ pub const ViewportConfig = struct {
     window_width: f32,
     window_height: f32,
     scroll_y: f32,
-    block_scroll_x: [MAX_SCROLLABLE_BLOCKS]f32 = [_]f32{0.0} ** MAX_SCROLLABLE_BLOCKS,
+    // Horizontal offsets for hover-scrollable code/table blocks, borrowed
+    // from the caller (issue #388: was a 512 B inline array copied with
+    // every config — now a 16-byte slice over the app's live table, which
+    // is also the only writer, so no copy can go stale).
+    block_scroll_x: []const f32 = &.{},
     content_max_width: f32 = 600.0,
     base_font_size: f32 = 17.0,
     line_height: f32 = 29.75,
@@ -971,14 +1023,27 @@ pub const ViewportConfig = struct {
     /// Null keeps fallbacks byte-identical; set beside math_size_fn on the
     /// live ship path.
     math_error_fn: ?MathErrorFn = null,
+    /// Caller-owned memo tables (issue #385): math boxes keyed by tex
+    /// slice and code-line segments keyed by (lang, line slice). Null
+    /// keeps the old direct calls bit-for-bit; main.zig threads live
+    /// tables on the render path. Measurement contexts leave them null
+    /// (their math matches rendering exactly via the shared query path).
+    math_box_cache: ?*MathBoxCache = null,
+    token_cache: ?*TokenCache = null,
 };
 
 /// One layout-facing plugin row: the fence anchor plus what the fence
 /// decision and the ready-image link need. Built by main.zig at open from
 /// the job table and the per-slot path buffers; layout never writes it.
+/// `fence_end` closes the region (matching `code_fence_end` scan index,
+/// lines.len when unclosed): callers skip re-scanning the fence body.
 pub const PluginEntry = struct {
     job: plugin_cache.PluginJob,
     path: []const u8,
+    /// `fence_end == 0` means UNSTAMPED (open-time stamping never ran):
+    /// every real fence end is `> fence_line >= 0`, so 0 can never be a
+    /// valid stamped value. Unstamped rows fall back to the inline scan.
+    fence_end: usize = 0,
 };
 
 /// Cross-line reference joint scratch length: two source lines plus a space.
@@ -1116,6 +1181,15 @@ pub const SmoothScroll = struct {
         }
         return self.current == self.target;
     }
+
+    /// Quantize a scroll offset to whole device pixels at the given backing
+    /// scale (#384: coalesced vsync deltas + sub-pixel jitter converge to
+    /// the same physical pixel, so the compositor moves rows in whole-pixel
+    /// steps and scroll-blits stay pixel-exact). Scale <= 0 is a no-op.
+    pub fn quantize(v: f32, backing_scale: f32) f32 {
+        if (!(backing_scale > 0.0)) return v;
+        return @round(v * backing_scale) / backing_scale;
+    }
 };
 
 /// Display text scaling from the system size class (issue #315 removed
@@ -1244,6 +1318,226 @@ pub const EdgeSpring = struct {
     }
 };
 
+/// Cached scroll frame (#384): the live document-space layout result one
+/// scroll frame produced, so a pure `scroll_y` shift reuses it instead of
+/// re-running the full pipeline at 120 Hz. Layout y-offsets it (zero
+/// re-measure); anything else (content identity, geometry, theme, h-scroll,
+/// plugin/image/math state) invalidates. Fixed-size, zero heap, caller-owned
+/// ring rental like `g_commands_buffer`: hit = in-place caller-buffer shift,
+/// miss = full `layoutViewport` + snapshot.
+///
+/// Scope guard: covers only the same-scroll fast path (damage-only
+/// repaints: selection, GIF ticks, hover). Registration-only records
+/// (`register_scrollable_block`, clips, anchors) replay verbatim — state
+/// rebuild stays bit-identical. Scroll changes MUST miss (see `reuse`):
+/// the snapshot holds viewport-window rows only, and a shifted replay
+/// would serve stale rows past the fold. Callers must route any
+/// content/config change through `invalidate` first.
+pub const ScrollFrameCache = struct {
+    valid: bool = false,
+    count: usize = 0,
+    scroll_y: f32 = 0.0,
+    window_width: f32 = 0.0,
+    window_height: f32 = 0.0,
+    base_font_size: f32 = 0.0,
+    line_height: f32 = 0.0,
+    content_max_width: f32 = 0.0,
+    is_dark_theme: bool = false,
+    backing_scale: f32 = 0.0,
+    content_id: usize = 0,
+    hover_epoch: usize = 0,
+
+    pub fn invalidate(self: *ScrollFrameCache) void {
+        self.valid = false;
+        self.count = 0;
+    }
+
+    pub fn snapshot(
+        self: *ScrollFrameCache,
+        cmds: []const DrawCommand,
+        count: usize,
+        cfg: ViewportConfig,
+        content_id: usize,
+        hover_epoch: usize,
+        backing_scale: f32,
+    ) void {
+        self.valid = true;
+        self.count = count;
+        self.scroll_y = cfg.scroll_y;
+        self.window_width = cfg.window_width;
+        self.window_height = cfg.window_height;
+        self.base_font_size = cfg.base_font_size;
+        self.line_height = cfg.line_height;
+        self.content_max_width = cfg.content_max_width;
+        self.is_dark_theme = cfg.is_dark_theme;
+        self.backing_scale = backing_scale;
+        self.content_id = content_id;
+        self.hover_epoch = hover_epoch;
+        _ = cmds;
+    }
+
+    fn configMatches(self: *const ScrollFrameCache, cfg: ViewportConfig, content_id: usize, hover_epoch: usize) bool {
+        return self.window_width == cfg.window_width and
+            self.window_height == cfg.window_height and
+            self.base_font_size == cfg.base_font_size and
+            self.line_height == cfg.line_height and
+            self.content_max_width == cfg.content_max_width and
+            self.is_dark_theme == cfg.is_dark_theme and
+            self.content_id == content_id and
+            self.hover_epoch == hover_epoch;
+    }
+
+    /// Same-scroll reuse: replay the cached frame verbatim into the caller
+    /// buffer (same buffer the full path rents). Registration, clip, and
+    /// fill records replay unchanged. Scroll changes MUST miss: the cache
+    /// holds viewport-window rows only (`renderViewportCore` stops at the
+    /// viewport bottom), so a y-shifted replay would serve stale rows —
+    /// the expose strip's fresh rows are never in the stream, `keeps()`
+    /// culls the shifted rows out of the strip, and live scrolling shows
+    /// sliding stale pixels with blank strips below the fold. Fresh layout
+    /// per scroll step is microseconds (strict layout budgets), so no fast
+    /// path is lost that correctness needs. Returns the count on a hit,
+    /// null on any mismatch (caller runs full layout instead).
+    pub fn reuse(
+        self: *const ScrollFrameCache,
+        cached: []const DrawCommand,
+        out: []DrawCommand,
+        cfg: ViewportConfig,
+        content_id: usize,
+        hover_epoch: usize,
+    ) ?usize {
+        if (!self.valid) return null;
+        if (!self.configMatches(cfg, content_id, hover_epoch)) return null;
+        // Scroll moved: miss so the caller lays out fresh rows. Damage-only
+        // frames (same scroll) replay verbatim and skip layout.
+        if (cfg.scroll_y != self.scroll_y) return null;
+        if (self.count > out.len) return null;
+        if (cached.len < self.count) return null;
+        @memcpy(out[0..self.count], cached[0..self.count]);
+        return self.count;
+    }
+};
+
+test "scroll cache: same-scroll repaints reuse verbatim, scroll changes miss" {
+    const cmds = [_]DrawCommand{
+        .{ .kind = .fill_rect, .rect = .{ .x = 0, .y = 0, .w = 800, .h = 600 } },
+        .{ .kind = .text_run, .rect = .{ .x = 100, .y = 120, .w = 200, .h = 24 }, .text = "row" },
+        .{ .kind = .register_scrollable_block, .rect = .{ .x = 100, .y = 200, .w = 400, .h = 80 } },
+    };
+    const base = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
+    var cache = ScrollFrameCache{};
+    try std.testing.expect(cache.reuse(&cmds, emptyCmds(), base, 7, 0) == null);
+    cache.snapshot(&cmds, cmds.len, base, 7, 0, 2.0);
+    var out: [8]DrawCommand = undefined;
+    // Same scroll (damage-only repaint): verbatim replay, layout skipped.
+    const n = cache.reuse(&cmds, &out, base, 7, 0).?;
+    try std.testing.expectEqual(cmds.len, n);
+    try std.testing.expectEqual(@as(f32, 0.0), out[0].rect.y);
+    try std.testing.expectEqual(@as(f32, 120.0), out[1].rect.y);
+    try std.testing.expectEqual(@as(f32, 200.0), out[2].rect.y);
+    // Any scroll change misses: the snapshot holds viewport-window rows
+    // only, so a shifted replay would serve stale rows past the fold
+    // (live scroll showed sliding stale pixels with blank expose strips).
+    const moved_cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 40.0 };
+    try std.testing.expect(cache.reuse(&cmds, &out, moved_cfg, 7, 0) == null);
+    try std.testing.expect(cache.reuse(&cmds, &out, moved_cfg, 8, 0) == null);
+    var theme_cfg = moved_cfg;
+    theme_cfg.is_dark_theme = !base.is_dark_theme;
+    try std.testing.expect(cache.reuse(&cmds, &out, theme_cfg, 7, 0) == null);
+    var wide_cfg = moved_cfg;
+    wide_cfg.window_width = 801.0;
+    try std.testing.expect(cache.reuse(&cmds, &out, wide_cfg, 7, 0) == null);
+    try std.testing.expect(cache.reuse(&cmds, &out, moved_cfg, 7, 1) == null);
+}
+
+fn emptyCmds() []DrawCommand {
+    var buf: [1]DrawCommand = undefined;
+    return buf[0..0];
+}
+
+test "scroll cache: scrolled frames never reuse stale rows (live blank strips)" {
+    // End-to-end over real layout: frame 1 at scroll 0 snapshots the
+    // initial viewport; a scrolled frame MUST miss (fresh layout lays out
+    // the rows the snapshot never held), otherwise the expose strip paints
+    // nothing: reuse would shift stale rows out of the strip and keeps()
+    // culls the rest. Live this read as sliding stale pixels with blank
+    // strips below the fold.
+    const doc =
+        \\# Title
+        \\
+        \\Alpha line one two three.
+        \\Bravo line one two three.
+        \\Charlie line one two three.
+        \\Delta line one two three.
+        \\Echo line one two three.
+        \\Foxtrot line one two three.
+        \\Golf line one two three.
+        \\Hotel line one two three.
+        \\India line one two three.
+        \\Juliet line one two three.
+        \\Kilo line one two three.
+        \\Lima line one two three.
+        \\Mike line one two three.
+        \\November line one two three.
+        \\Oscar line one two three.
+        \\Papa line one two three.
+        \\Quebec line one two three.
+        \\Romeo line one two three.
+        \\Sierra line one two three.
+        \\Tango line one two three.
+        \\Uniform line one two three.
+        \\Victor line one two three.
+        \\Whiskey line one two three.
+        \\Xray line one two three.
+        \\Yankee line one two three.
+        \\Zulu line one two three.
+    ;
+    var lines_buf: [64]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    try std.testing.expect(n > 0);
+
+    var cmds0: [256]DrawCommand = undefined;
+    var cfg0 = ViewportConfig{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    };
+    const n0 = layoutViewport(doc, lines_buf[0..n], &cfg0, &cmds0);
+    try std.testing.expect(n0 > 0);
+
+    var cache = ScrollFrameCache{};
+    cache.snapshot(cmds0[0..n0], n0, cfg0, 7, 0, 1.0);
+    var out: [256]DrawCommand = undefined;
+    // Same scroll still replays (damage-only frames skip layout).
+    try std.testing.expectEqual(n0, cache.reuse(cmds0[0..n0], &out, cfg0, 7, 0).?);
+    // Scrolled frame misses: fresh layout must provide the new rows.
+    var cfg1 = cfg0;
+    cfg1.scroll_y = 400.0;
+    try std.testing.expect(cache.reuse(cmds0[0..n0], &out, cfg1, 7, 0) == null);
+    var cmds1: [256]DrawCommand = undefined;
+    const n1 = layoutViewport(doc, lines_buf[0..n], &cfg1, &cmds1);
+    try std.testing.expect(n1 > 0);
+    // The fresh frame covers the viewport with rows the snapshot never
+    // held: at least one text run sits inside [0, window_height).
+    var covered = false;
+    for (cmds1[0..n1]) |c| {
+        if (c.kind == .text_run and c.rect.y + c.rect.h > 0.0 and c.rect.y < cfg1.window_height) {
+            covered = true;
+            break;
+        }
+    }
+    try std.testing.expect(covered);
+}
+
+test "scroll quantize: whole device pixels, passthrough on bad scale" {
+    try std.testing.expectEqual(@as(f32, 40.0), SmoothScroll.quantize(40.0, 2.0));
+    try std.testing.expectEqual(@as(f32, 40.0), SmoothScroll.quantize(40.24, 2.0));
+    try std.testing.expectEqual(@as(f32, 40.5), SmoothScroll.quantize(40.26, 2.0));
+    try std.testing.expectEqual(@as(f32, 41.0), SmoothScroll.quantize(40.9, 1.0));
+    try std.testing.expectEqual(@as(f32, 12.125), SmoothScroll.quantize(12.125, 0.0));
+}
+
 /// Renders a series of inline spans with automatic word wrapping and exact typography.
 /// `rtl` right-anchors the pen (issue #50): false preserves history exactly.
 pub fn layoutWrappedSpans(
@@ -1343,6 +1637,13 @@ pub const FlowCtx = struct {
     /// keeps fallbacks byte-identical). Names the failure byte for the
     /// accent mark; geometry never depends on it.
     math_error_fn: ?MathErrorFn = null,
+    /// Caller-owned memo tables (issue #385): math boxes keyed by tex
+    /// slice and code-line segments keyed by (lang, line slice). Null
+    /// keeps the old direct calls bit-for-bit; main.zig threads live
+    /// tables on the render path. Measurement contexts leave them null
+    /// (their math matches rendering exactly via the shared query path).
+    math_box_cache: ?*MathBoxCache = null,
+    token_cache: ?*TokenCache = null,
     /// RTL paragraph flow (issue #50): the pen tracks the RIGHT edge and
     /// words lay right-to-left. Defaults false: the LTR path below is
     /// byte-identical to the historical layout.
@@ -1497,6 +1798,19 @@ pub fn flowSpace(pen: *FlowPen, space_w: f32, rtl: bool) void {
     }
 }
 
+/// Alt text of a linked image `[![alt](src)](href)` when `text` is exactly
+/// one complete image. Null unless the shape is exact -- on doubt the caller
+/// keeps the raw text (today's behavior).
+fn linkedImageAlt(text: []const u8) ?[]const u8 {
+    if (text.len < 7 or text[0] != '!' or text[1] != '[') return null;
+    var j: usize = 2;
+    while (j < text.len and text[j] != ']') : (j += 1) {}
+    if (j + 1 >= text.len or text[j + 1] != '(') return null;
+    if (text[text.len - 1] != ')') return null;
+    if (std.mem.indexOf(u8, text[2..j], "![") != null) return null;
+    return text[2..j];
+}
+
 /// Flows words and spaces of one span-text at the pen. Inline code spans
 /// (never block code: `is_block_code`) flow atomically through
 /// `flowCodeSpan` — one pill, no mid-span wrap. Pen advancement is
@@ -1510,6 +1824,14 @@ pub fn flowSpans(
     ctx: FlowCtx,
     is_block_code: bool,
 ) void {
+    // Linked image `[![alt](src)](href)`: flow the alt text (keeps the
+    // link target), never the raw inner markup. Inline spans carry raw
+    // link text for the spec harness's re-parse; the app has no re-parse
+    // pass, so raw markup would paint literally (README badge row).
+    var text = span_text;
+    if (style.link and !style.code and link_target != null) {
+        if (linkedImageAlt(span_text)) |alt| text = alt;
+    }
     // Issue #40 <br>: forced line break. Measure and render share this
     // path, so wrapped heights match bit-for-bit.
     if (style.line_break) {
@@ -1520,20 +1842,20 @@ pub fn flowSpans(
     // Out-of-subset tags stay pill-free muted mono (issue #40 fallback):
     // only true inline code takes the pill path.
     if (style.code and !is_block_code and !style.html_tag) {
-        flowCodeSpan(span_text, style, link_target, pen, ctx);
+        flowCodeSpan(text, style, link_target, pen, ctx);
         return;
     }
     const space_w = measureCharEx(' ', ctx.font_size, false, false, false, style.heading);
     var i: usize = 0;
-    while (i < span_text.len) {
-        if (span_text[i] == ' ') {
+    while (i < text.len) {
+        if (text[i] == ' ') {
             flowSpace(pen, space_w, ctx.rtl);
             i += 1;
             continue;
         }
         const w_start = i;
-        while (i < span_text.len and span_text[i] != ' ') : (i += 1) {}
-        flowWord(span_text[w_start..i], style, link_target, pen, ctx);
+        while (i < text.len and text[i] != ' ') : (i += 1) {}
+        flowWord(text[w_start..i], style, link_target, pen, ctx);
     }
 }
 
@@ -1735,7 +2057,7 @@ test "design #23: inline code pill geometry + atomic wrap" {
 /// unavailable (null size fn, twin builds) or refuses the formula: the
 /// caller falls back to literal source rendering, byte-identical to the
 /// pre-math reader. `font_px` is the ambient size; dims scale linearly.
-const MathBox = struct {
+pub const MathBox = struct {
     w: f32,
     above: f32,
     below: f32,
@@ -1743,10 +2065,86 @@ const MathBox = struct {
     display: bool,
 };
 
+/// Per-frame math-box memo (issue #385): scroll frames re-derive the same
+/// boxes through the FFI size query, which is pure in its inputs (tex
+/// bytes, display flag, font px). Key is the tex slice identity (ptr +
+/// len) plus display/px; the boxed args cross the FFI by value, so hits
+/// skip the query with a bitwise-identical box. Small direct-mapped
+/// table (8 entries, caller-agnostic BSS-free: callers thread their own
+/// table so measurement passes stay independent): ptr/len/px/flag hits
+/// are exact for stable document slices (the same fence re-renders from
+/// the same mmap bytes every frame); a same-slot eviction simply
+/// re-queries (never aliases: the loser re-fills the slot). Miss path is
+/// byte-identical to the old direct call — the table only skips repeated
+/// queries.
+pub const MATH_BOX_CACHE_LEN: usize = 8;
+pub const MathBoxCacheEntry = struct {
+    tex_ptr: usize = 0,
+    tex_len: usize = 0,
+    font_px: f32 = 0,
+    display: bool = false,
+    // Refusals latch as the zero-area box mathBoxQuery never emits (it
+    // nulls w <= 0 or above + below <= 0), so no separate fail bit: a hit
+    // with a zero-area box is a latched refusal. `hit` doubles as the
+    // valid flag; reset clears it.
+    box: MathBox = .{ .w = 0, .above = 0, .below = 0, .font_px = 0, .display = false },
+    hit: bool = false,
+};
+pub const MathBoxCache = [MATH_BOX_CACHE_LEN]MathBoxCacheEntry;
+
+/// Zero the table (document open / font change): stale entries would pin
+/// a previous document's slices.
+pub fn mathBoxCacheReset(cache: *MathBoxCache) void {
+    for (cache) |*e| e.* = .{};
+}
+
 fn mathBox(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSizeFn) ?MathBox {
+    return mathBoxCached(tex, display, font_px, size_fn, null);
+}
+
+/// Cache-threaded math-box query (issue #385): same pure query as
+/// mathBox, but consults a small caller-owned memo first. Null cache
+/// keeps the old direct call bit-for-bit (measurement contexts and
+/// existing callers pass null during the rollout); a live cache skips
+/// repeated FFI queries with bitwise-identical boxes. The memo key is
+/// the tex slice identity (ptr + len) plus display/px: stable document
+/// slices hit exactly, and a same-slot eviction re-queries rather than
+/// aliasing (the loser re-fills the slot).
+/// Misses (and refused formulas) call through exactly once and fill the
+/// direct-mapped slot — refusals latch as the zero-area box below, so a
+/// repeatedly refused formula pays one FFI refusal per table cycle, not
+/// per frame.
+fn mathBoxCached(tex: []const u8, display: bool, font_px: f32, size_fn: ?MathSizeFn, cache: ?*MathBoxCache) ?MathBox {
     const q = size_fn orelse return null;
     if (comptime math_stub) return null;
     if (tex.len == 0 or tex.len > 65536 or font_px <= 0) return null;
+    const tab = cache orelse return mathBoxQuery(tex, display, font_px, q);
+    const key = @intFromPtr(tex.ptr);
+    // Direct-mapped by slice identity: cheap hash over ptr/len/px/flag.
+    var h: usize = key ^ (tex.len *% 0x9E3779B97F4A7C15) ^ @as(usize, @as(u32, @bitCast(font_px)));
+    if (display) h ^= 0xA24BAED4963EE407;
+    const slot = tab[@as(usize, h) % MATH_BOX_CACHE_LEN];
+    if (slot.hit and slot.tex_ptr == key and slot.tex_len == tex.len and slot.font_px == font_px and slot.display == display) {
+        // Zero-area box is the latched refusal (mathBoxQuery never emits
+        // one); nonzero boxes replay bitwise-identically.
+        if (slot.box.w <= 0 or slot.box.above + slot.box.below <= 0) return null;
+        return slot.box;
+    }
+    const got = mathBoxQuery(tex, display, font_px, q);
+    tab[@as(usize, h) % MATH_BOX_CACHE_LEN] = .{
+        .tex_ptr = key,
+        .tex_len = tex.len,
+        .font_px = font_px,
+        .display = display,
+        .box = got orelse .{ .w = 0, .above = 0, .below = 0, .font_px = 0, .display = false },
+        .hit = true,
+    };
+    return got;
+}
+
+/// One raw FFI math-box query: the old mathBox body, uncached. Shared by
+/// the null-cache path (bit-for-bit the old call) and cache misses.
+fn mathBoxQuery(tex: []const u8, display: bool, font_px: f32, q: MathSizeFn) ?MathBox {
     var w: f32 = 0;
     var above: f32 = 0;
     var below: f32 = 0;
@@ -1786,7 +2184,7 @@ fn flowMathSpan(island: []const u8, display: bool, pen: *FlowPen, ctx: FlowCtx) 
         flowSpans(island, .{}, null, pen, ctx, false);
         return;
     };
-    const box = mathBox(tex, display, ctx.font_size, ctx.math_size_fn) orelse {
+    const box = mathBoxCached(tex, display, ctx.font_size, ctx.math_size_fn, ctx.math_box_cache) orelse {
         // Typed-error mark (issue #377): the accent byte names the failure
         // position; untyped failures flow plainly as before.
         if (comptime !math_stub) {
@@ -1896,7 +2294,7 @@ fn mathBlockGeom(ux: *UnitCx, i: usize, base_x: f32, bw: f32) ?MathBlockGeom {
     if (ux.config.math_size_fn == null) return null;
     if (i >= ux.lines.len or ux.lines[i].block_type != .paragraph) return null;
     const blk = math_detect.displayBlock(ux.bytes, ux.lines, i) orelse return null;
-    const box = mathBox(blk.tex, true, ux.config.base_font_size, ux.config.math_size_fn) orelse return null;
+    const box = mathBoxCached(blk.tex, true, ux.config.base_font_size, ux.config.math_size_fn, ux.config.math_box_cache) orelse return null;
     const fit = fitMathBox(box, bw);
     // Centered: the RTL mirror is identical (symmetric about the middle).
     return .{ .tex = blk.tex, .box = fit, .x = base_x + (bw - fit.w) / 2.0, .consumed = blk.close_idx - i + 1 };
@@ -1908,7 +2306,7 @@ fn mathBlockGeom(ux: *UnitCx, i: usize, base_x: f32, bw: f32) ?MathBlockGeom {
 /// break, so mid-paragraph display lines just work. Mid-line islands never
 /// reach this path: they stay in the text flow via flowMathSpan.
 fn flowMathDisplay(tex: []const u8, pen: *FlowPen, ctx: FlowCtx) bool {
-    const box = mathBox(tex, true, ctx.font_size, ctx.math_size_fn) orelse return false;
+    const box = mathBoxCached(tex, true, ctx.font_size, ctx.math_size_fn, ctx.math_box_cache) orelse return false;
     if (pen.x > ctx.start_x or (ctx.rtl and pen.x < ctx.start_x + ctx.max_w)) {
         advanceRow(pen, ctx.line_h);
         pen.x = if (ctx.rtl) ctx.start_x + ctx.max_w else ctx.start_x;
@@ -2289,7 +2687,7 @@ fn skipSpaces(s: []const u8) usize {
 /// Parses heading text with reference-link resolution, forces heading style,
 /// and decodes entities through the frame store. Shared by render, height,
 /// and refine so all three agree bit-for-bit.
-fn resolveHeadingSpans(config: ViewportConfig, h_text: []const u8, span_buf: []parser.InlineSpan) usize {
+fn resolveHeadingSpans(config: *const ViewportConfig, h_text: []const u8, span_buf: []parser.InlineSpan) usize {
     const n = parser.parseInlinesWithDefs(h_text, span_buf, config.ref_defs);
     for (span_buf[0..n]) |*s| {
         s.style.bold = true;
@@ -2699,7 +3097,7 @@ pub fn headingScale(level: u8) f32 {
     };
 }
 
-fn atxMetrics(config: ViewportConfig, level: u8) HeadingMetrics {
+fn atxMetrics(config: *const ViewportConfig, level: u8) HeadingMetrics {
     const font_size = config.base_font_size * headingScale(level);
     return .{
         .font_size = font_size,
@@ -2709,7 +3107,7 @@ fn atxMetrics(config: ViewportConfig, level: u8) HeadingMetrics {
     };
 }
 
-fn setextMetrics(config: ViewportConfig, level: u8) HeadingMetrics {
+fn setextMetrics(config: *const ViewportConfig, level: u8) HeadingMetrics {
     const font_size = config.base_font_size * headingScale(level);
     return .{
         .font_size = font_size,
@@ -2728,17 +3126,17 @@ test "design #22: H1/H2/H3 scale 2.0/1.5/1.2 with 2.5/0.5em rhythm" {
     while (l < 6) : (l += 1) {
         try std.testing.expect(headingScale(l) > headingScale(l + 1));
     }
-    const cfg = ViewportConfig{ .window_width = 800, .window_height = 600, .scroll_y = 0 };
+    var cfg = ViewportConfig{ .window_width = 800, .window_height = 600, .scroll_y = 0 };
     // 2.5em top / 0.5em bottom margins on the 1.75 baseline grid, ATX + setext.
     try std.testing.expectApproxEqAbs(cfg.line_height, cfg.base_font_size * 1.75, 0.01);
-    const m1 = atxMetrics(cfg, 1);
+    const m1 = atxMetrics(&cfg, 1);
     try std.testing.expectApproxEqAbs(m1.font_size, cfg.base_font_size * 2.0, 0.01);
     try std.testing.expectApproxEqAbs(m1.margin_top, m1.font_size * 2.5, 0.01);
     try std.testing.expectApproxEqAbs(m1.margin_bottom, m1.font_size * 0.5, 0.01);
-    const s1 = setextMetrics(cfg, 1);
+    const s1 = setextMetrics(&cfg, 1);
     try std.testing.expectApproxEqAbs(s1.font_size, cfg.base_font_size * 2.0, 0.01);
     try std.testing.expectApproxEqAbs(s1.margin_top, s1.font_size * 2.5, 0.01);
-    const s2 = setextMetrics(cfg, 2);
+    const s2 = setextMetrics(&cfg, 2);
     try std.testing.expectApproxEqAbs(s2.font_size, cfg.base_font_size * 1.5, 0.01);
     try std.testing.expectApproxEqAbs(s2.margin_top, s2.font_size * 2.5, 0.01);
 }
@@ -2749,7 +3147,10 @@ test "design #22: H1/H2/H3 scale 2.0/1.5/1.2 with 2.5/0.5em rhythm" {
 const UnitCx = struct {
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    // Borrowed (issue #388): was a by-value copy of the whole config per
+    // unit context — now one pointer, set at each renderViewportCore /
+    // computeDocumentHeightEx entry from the caller's live config.
+    config: *const ViewportConfig,
     content_x: f32,
     content_width: f32,
     theme: Theme,
@@ -2795,6 +3196,8 @@ fn flowCtxFor(ux: *UnitCx, tx: f32, tw: f32, font_size: f32, line_h: f32, color:
         .entities = ux.config.entities,
         .math_size_fn = ux.config.math_size_fn,
         .math_error_fn = ux.config.math_error_fn,
+        .math_box_cache = ux.config.math_box_cache,
+        .token_cache = ux.config.token_cache,
     };
 }
 
@@ -3754,8 +4157,8 @@ test "list hanging indent: continuation rows share the lead row x" {
     const n = simd.scanLines(doc, &lines_buf, &fence);
     const lines = lines_buf[0..n];
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
-    const count = layoutViewport(doc, lines, config, &cmds);
+    var config = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
+    const count = layoutViewport(doc, lines, &config, &cmds);
     var lead_x: ?f32 = null;
     var cont_x: ?f32 = null;
     for (cmds[0..count]) |c| {
@@ -3807,8 +4210,8 @@ test "list hanging indent: in-item fence card indents with its text" {
     // -> content_x 100: top card at 100 with code at 112; in-item card at
     // the ordered item's text column 130 with code at 142.
     var cmds: [512]DrawCommand = undefined;
-    const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
-    const count = layoutViewport(doc, lines, config, &cmds);
+    var config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
+    const count = layoutViewport(doc, lines, &config, &cmds);
     var top_bg: ?f32 = null;
     var item_bg: ?f32 = null;
     var code_x: ?f32 = null;
@@ -3860,8 +4263,8 @@ test "list bullets: centered dots with equal side spacing; card flush with text"
     const n = simd.scanLines(doc, &lines_buf, &fence);
     const lines = lines_buf[0..n];
     var cmds: [512]DrawCommand = undefined;
-    const config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
-    const count = layoutViewport(doc, lines, config, &cmds);
+    var config = ViewportConfig{ .window_width = 800.0, .window_height = 1200.0, .scroll_y = 0.0 };
+    const count = layoutViewport(doc, lines, &config, &cmds);
     var dots: [4]f32 = undefined;
     var ndot: usize = 0;
     var lead_x: ?f32 = null;
@@ -3903,7 +4306,7 @@ test "list bullets: centered dots with equal side spacing; card flush with text"
 fn measureCx(
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     content_width: f32,
     content_x: f32,
     dummy: *usize,
@@ -4068,7 +4471,8 @@ fn layoutQuoteLine(ux: *UnitCx, i: usize, base_x: f32, start_y: f32) UnitOut {
         },
         .ordered => {
             const num = quotedNumber(ux, i, body.number, sq.depth);
-            const marker = orderedMarkerText(ux, num, body.delim, sq.body[0..@min(body.prefix_len, sq.body.len)]);
+            const marker_vis = y + ux.config.line_height >= 0 and y <= ux.vp_bottom;
+            const marker = if (marker_vis) orderedMarkerText(ux, num, body.delim, sq.body[0..@min(body.prefix_len, sq.body.len)]) else sq.body[0..@min(body.prefix_len, sq.body.len)];
             const op = @min(body.prefix_len, sq.body.len);
             const item_text = sq.body[op + skipSpaces(sq.body[op..]) ..];
             quote_rtl = bidi.baseDirection(item_text) == .rtl;
@@ -4201,7 +4605,8 @@ fn layoutListUnit(ux: *UnitCx, i: usize, start_y: f32) UnitOut {
         const own = parseListNumber(text_slice[0..d]);
         const delim: u8 = if (d < text_slice.len and text_slice[d] == ')') ')' else '.';
         const num = orderedNumber(ux, i, own, info.indent);
-        const marker = orderedMarkerText(ux, num, delim, text_slice[0..@min(prefix_len, text_slice.len)]);
+        const marker_vis = y + ux.config.line_height >= 0 and y <= ux.vp_bottom;
+        const marker = if (marker_vis) orderedMarkerText(ux, num, delim, text_slice[0..@min(prefix_len, text_slice.len)]) else text_slice[0..@min(prefix_len, text_slice.len)];
         const rtl = leadParaDirection(ux, item_text, i + 1);
         if (y + ux.config.line_height >= 0 and y <= ux.vp_bottom) {
             emitCmd(ux, .{
@@ -4331,22 +4736,26 @@ fn flowParaLineJoint(ux: *UnitCx, pen: *FlowPen, ctx: FlowCtx, k: usize, strip: 
 /// Scans the same continuation lines the unit consumes below, so the
 /// decision — and therefore every wrap — is identical across the render,
 /// measure, and refine passes. False (LTR) preserves history exactly.
-noinline fn paragraphDirection(ux: *UnitCx, i: usize) bool {
-    const lb0 = ux.bytes[ux.lines[i].offset..][0..ux.lines[i].len];
+fn unitRtl(bytes: []const u8, lines: []const simd.Line, i: usize) bool {
+    const lb0 = bytes[lines[i].offset..][0..lines[i].len];
     if (bidi.firstStrong(lb0)) |s| return s == .r;
     // Setext pairs decide on the text line alone: the underline is neutral
     // but must not leak the scan into the following paragraph.
-    if (setextLevel(ux.bytes, ux.lines, i) != null) return false;
+    if (setextLevel(bytes, lines, i) != null) return false;
     var j = i + 1;
-    while (j < ux.lines.len and
-        ((ux.lines[j].block_type == .paragraph and
-            setextLevel(ux.bytes, ux.lines, j) == null) or
-            ((listContinuationStart(ux.bytes, ux.lines, j) orelse (j + 1)) == i))) : (j += 1)
+    while (j < lines.len and
+        ((lines[j].block_type == .paragraph and
+            setextLevel(bytes, lines, j) == null) or
+            ((listContinuationStart(bytes, lines, j) orelse (j + 1)) == i))) : (j += 1)
     {
-        const lb = ux.bytes[ux.lines[j].offset..][0..ux.lines[j].len];
+        const lb = bytes[lines[j].offset..][0..lines[j].len];
         if (bidi.firstStrong(lb)) |s| return s == .r;
     }
     return false;
+}
+
+noinline fn paragraphDirection(ux: *UnitCx, i: usize) bool {
+    return unitRtl(ux.bytes, ux.lines, i);
 }
 
 /// Lays out a paragraph unit: setext pair (consumes 2) or a flowed run of
@@ -4655,9 +5064,38 @@ fn pluginFenceGeom(entries: ?[]const PluginEntry, i: usize) PluginFenceGeom {
                 const path: ?[]const u8 = if (rows[s].path.len > 0) rows[s].path else null;
                 return .{ .state = rows[s].job.state, .path = path };
             }
+            // Rows arrive in fence_line order (Task 5 builds from the
+            // fence-ordered scan; tests pin it): stop at the first row
+            // past the query instead of scanning the tail.
+            if (rows[s].job.fence_line > i) break;
         }
     }
     return .{};
+}
+
+/// Fence-body end shared by the three code-fence passes (issue #385):
+/// the matching `code_fence_end` scan index, or lines.len when unclosed.
+/// Null-entry/foreign-index/unstamped rows still scan inline (bit-identical
+/// fallback); stamped plugin rows short-circuit through their precomputed
+/// `fence_end`, so ready/queued fences pay no per-frame body walk. Pub for
+/// the main.zig stamping test.
+pub fn codeFenceEnd(entries: ?[]const PluginEntry, lines: []const simd.Line, i: usize) usize {
+    if (entries) |rows| {
+        var s: usize = 0;
+        while (s < rows.len) : (s += 1) {
+            if (rows[s].job.fence_line == i) {
+                // Stamped ends only: 0 means the row predates stamping
+                // (hand-built tables, new jobs) and any end at/below the
+                // open is a stale close — fall through to the inline scan.
+                if (rows[s].fence_end > i) return @min(rows[s].fence_end, lines.len);
+                break;
+            }
+            if (rows[s].job.fence_line > i) break;
+        }
+    }
+    var j: usize = i + 1;
+    while (j < lines.len and lines[j].block_type != .code_fence_end) : (j += 1) {}
+    return j;
 }
 
 /// ZaTeX math-fence geometry (```math|tex|latex|katex): the synchronous
@@ -4676,7 +5114,7 @@ fn mathFenceGeom(
     bytes: []const u8,
     lines: []const simd.Line,
     i: usize,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     content_x: f32,
     content_width: f32,
 ) ?MathFenceGeom {
@@ -4687,9 +5125,75 @@ fn mathFenceGeom(
     if (!math_detect.isMathFenceToken(tok)) return null;
     // No empty-source guard: mathBox nulls it below.
     const tex = plugin_cache.fenceSource(bytes, lines, i);
-    const box = mathBox(tex, true, config.base_font_size, config.math_size_fn) orelse return null;
+    const box = mathBoxCached(tex, true, config.base_font_size, config.math_size_fn, config.math_box_cache) orelse return null;
     const fit = fitMathBox(box, content_width);
     return .{ .tex = tex, .box = fit, .x = content_x + (content_width - fit.w) / 2.0 };
+}
+
+/// Per-frame code-line tokenization memo (issue #385): tokenize is pure
+/// in `(lang, line bytes)` but costs a full scan per visible line per
+/// tick. Small direct-mapped table over caller-owned segment storage:
+/// the hit path copies the latched segments into the caller's buffer
+/// (same bytes the direct call would have written) and returns the
+/// prefix; the miss path tokenizes once and latches the outcome —
+/// including the null (plain-run) outcome, so untokenizable lines pay
+/// one scan per table cycle, not per frame. Key is the line slice
+/// identity (ptr + len) plus lang; segments are small values, and the
+/// caller-visible `out` buffer always carries the returned runs, so a
+/// same-slot eviction re-tokenizes (never aliases). Callers pass their
+/// per-iteration stack buffer through; the memo owns no memory.
+pub const TOKEN_CACHE_LEN: usize = 16;
+pub const TokenCacheEntry = struct {
+    line_ptr: usize = 0,
+    line_len: usize = 0,
+    lang: highlight.Lang = .none,
+    seg_count: u8 = 0,
+    // Null (untokenizable-line) outcomes latch as seg_count == 0 with hit
+    // set — tokenize never emits an empty non-null prefix for a nonempty
+    // line (empty lines bypass the table above), so 0 unambiguously means
+    // null. No separate is_null bit.
+    segs: [highlight.MAX_SEGMENTS]highlight.Segment = undefined,
+    hit: bool = false,
+};
+pub const TokenCache = [TOKEN_CACHE_LEN]TokenCacheEntry;
+
+/// Zero the table (document open): stale entries would pin a previous
+/// document's slices.
+pub fn tokenCacheReset(cache: *TokenCache) void {
+    for (cache) |*e| e.* = .{};
+}
+
+/// Memoized tokenize: bitwise-identical segments to the direct call.
+/// `out` is the caller's segment buffer (same contract as tokenize);
+/// `cache` may be null (direct call, bit-for-bit the old path).
+pub fn tokenizeCached(lang: highlight.Lang, line: []const u8, out: []highlight.Segment, cache: ?*TokenCache) ?[]highlight.Segment {
+    const tab = cache orelse return highlight.tokenize(lang, line, out);
+    if (line.len == 0) return highlight.tokenize(lang, line, out);
+    if (out.len < highlight.MAX_SEGMENTS) return highlight.tokenize(lang, line, out);
+    const key = @intFromPtr(line.ptr);
+    const h: usize = key ^ (line.len *% 0x9E3779B97F4A7C15) ^ @as(usize, @intFromEnum(lang));
+    const idx = h % TOKEN_CACHE_LEN;
+    const slot = &tab[idx];
+    if (slot.hit and slot.line_ptr == key and slot.line_len == line.len and slot.lang == lang) {
+        // seg_count == 0 is the latched null (see the entry comment); the
+        // hit path copies the latched segments into the caller's buffer.
+        if (slot.seg_count == 0) return null;
+        const n = @min(@as(usize, slot.seg_count), out.len);
+        @memcpy(out[0..n], slot.segs[0..n]);
+        return out[0..n];
+    }
+    const got = highlight.tokenize(lang, line, out);
+    slot.line_ptr = key;
+    slot.line_len = line.len;
+    slot.lang = lang;
+    slot.hit = true;
+    if (got) |runs| {
+        slot.seg_count = @intCast(@min(runs.len, slot.segs.len));
+        @memcpy(slot.segs[0..slot.seg_count], runs[0..slot.seg_count]);
+    } else {
+        slot.seg_count = 0;
+    }
+    return got;
 }
 
 /// One monospace slice of a fenced-code row: the fence card's typed-error
@@ -4732,7 +5236,7 @@ fn emitMonoSlice(
 pub fn renderViewportCore(
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     start_line: usize,
     origin_y: f32,
     start_block_id: usize,
@@ -4787,6 +5291,29 @@ pub fn renderViewportCore(
 
         const line_info = lines[i];
 
+        // Scroll-invariant scratch stores: a unit that emits no text_run
+        // borrows no marker/entity slot text, so its slot use rolls back
+        // exactly. Prefix units above the viewport then consume nothing in
+        // either walk, and visible units consume identically with and
+        // without checkpoints. (Marker pushes are additionally gated at
+        // their sites; this covers every store uniformly.)
+        const rb_m: usize = if (unit_cx.config.ordered_markers) |st| st.count else 0;
+        const rb_e: usize = if (unit_cx.config.entities) |st| st.count else 0;
+        const rb_c: usize = cmd_count;
+        defer {
+            var rb_text: bool = false;
+            var rb_k: usize = rb_c;
+            while (rb_k < cmd_count) : (rb_k += 1) {
+                if (commands_out[rb_k].kind == .text_run) {
+                    rb_text = true;
+                    break;
+                }
+            }
+            if (!rb_text) {
+                if (unit_cx.config.ordered_markers) |st| st.count = rb_m;
+                if (unit_cx.config.entities) |st| st.count = rb_e;
+            }
+        }
         // Early exit if past bottom of viewport
         if (cur_y > vp_bottom) break;
 
@@ -4819,11 +5346,11 @@ pub fn renderViewportCore(
         // Handle Code Blocks: ```start ... lines ... ```end
         // ----------------------------------------------------
         if (line_info.block_type == .code_fence_start) {
-            var code_line_count: usize = 0;
-            var scan_i = i + 1;
-            while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
-                code_line_count += 1;
-            }
+            // Precomputed fence end (issue #385): plugin rows stamp the
+            // matching close at open; other fences scan inline exactly as
+            // before (same first-`code_fence_end`-wins rule).
+            const scan_i = codeFenceEnd(unit_cx.plugins, lines, i);
+            const code_line_count: usize = if (scan_i > i + 1) scan_i - i - 1 else 0;
 
             // ZaTeX math fence (```math|tex|latex|katex): synchronous
             // native block, centered with image margins. Engine off or
@@ -4936,7 +5463,7 @@ pub fn renderViewportCore(
 
                 // Maximum horizontal scroll: right side aligned with right end of text line
                 const max_scroll_x = @max(0.0, max_code_line_w - content_width + 16.0);
-                const cur_scroll_x = if (block_id < MAX_SCROLLABLE_BLOCKS)
+                const cur_scroll_x = if (block_id < config.block_scroll_x.len)
                     std.math.clamp(config.block_scroll_x[block_id], 0.0, max_scroll_x)
                 else
                     0.0;
@@ -5071,7 +5598,11 @@ pub fn renderViewportCore(
                         var seg_buf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
                         // Null (untokenizable) and empty runs share the one
                         // plain run below — identical pixels, one literal.
-                        const runs: []highlight.Segment = if (highlight.tokenize(fence_lang, c_bytes, &seg_buf)) |r| r else &.{};
+                        // Memoized per (lang, line) per frame-set (issue
+                        // #385): repeat scroll frames hit the caller-owned
+                        // table instead of re-scanning; null cache (tests,
+                        // metrics) takes the old direct call bit-for-bit.
+                        const runs: []highlight.Segment = if (tokenizeCached(fence_lang, c_bytes, &seg_buf, config.token_cache)) |r| r else &.{};
                         // Failed ```math row with a typed error (issue
                         // #377): plain/accent/plain at the error column
                         // instead of the tinted runs (error case only).
@@ -5223,7 +5754,7 @@ pub fn renderViewportCore(
                 }
 
                 const max_scroll_x = @max(0.0, total_measured_w - content_width);
-                const cur_scroll_x = if (block_id < MAX_SCROLLABLE_BLOCKS)
+                const cur_scroll_x = if (block_id < config.block_scroll_x.len)
                     std.math.clamp(config.block_scroll_x[block_id], 0.0, max_scroll_x)
                 else
                     0.0;
@@ -5623,7 +6154,7 @@ pub fn renderViewportCore(
 pub fn layoutViewport(
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     commands_out: []DrawCommand,
 ) usize {
     if (commands_out.len == 0 or lines.len == 0) return 0;
@@ -5659,12 +6190,17 @@ pub fn layoutViewport(
             var y_skip: f32 = 0.0;
             var id_skip: usize = 0;
             var k = s0;
+            // The re-walk measures only (its units sit above the viewport),
+            // so its entity slot use is discarded: the render walk below
+            // must start from the same store state as the exact walk.
+            const rw_e: usize = if (config.entities) |st| st.count else 0;
             while (k < cp.line_idx and k < lines.len) {
                 const u = refineLineHeight(bytes, lines, k, config, cw, cx);
                 y_skip += u.height;
                 id_skip += countScrollableBlocks(lines, k, @min(k + @max(u.consumed, 1), lines.len));
                 k += @max(u.consumed, 1);
             }
+            if (config.entities) |st| st.count = rw_e;
             i = s0;
             cur_y = cp.y - y_skip - config.scroll_y;
             next_block_id = cp.next_block_id -| @min(id_skip, cp.next_block_id);
@@ -5680,7 +6216,7 @@ pub fn layoutViewport(
 pub fn computeDocumentHeightEx(
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     checkpoints_out: ?[]Checkpoint,
     checkpoint_count_out: ?*usize,
 ) f32 {
@@ -5757,11 +6293,8 @@ pub fn computeDocumentHeightEx(
 
         // 1. Code blocks
         if (line_info.block_type == .code_fence_start) {
-            var code_line_count: usize = 0;
-            var scan_i = i + 1;
-            while (scan_i < lines.len and lines[scan_i].block_type != .code_fence_end) : (scan_i += 1) {
-                code_line_count += 1;
-            }
+            const scan_i = codeFenceEnd(unit_cx.plugins, lines, i);
+            const code_line_count: usize = if (scan_i > i + 1) scan_i - i - 1 else 0;
             // ZaTeX math fence mirror: the same mathFenceGeom decision
             // the render branch draws, so the document height tracks
             // native math blocks exactly. Falls through to the card.
@@ -6009,19 +6542,19 @@ test "strict scroll smoothness across enumerations, lists, headings, and mixed b
     for (step_sizes) |delta_s| {
         var s: f32 = 0.0;
         while (s < 1200.0) : (s += delta_s) {
-            const config_a = ViewportConfig{
+            var config_a = ViewportConfig{
                 .window_width = 800.0,
                 .window_height = 600.0,
                 .scroll_y = s,
             };
-            const count_a = layoutViewport(test_doc, lines, config_a, &cmds_a);
+            const count_a = layoutViewport(test_doc, lines, &config_a, &cmds_a);
 
-            const config_b = ViewportConfig{
+            var config_b = ViewportConfig{
                 .window_width = 800.0,
                 .window_height = 600.0,
                 .scroll_y = s + delta_s,
             };
-            const count_b = layoutViewport(test_doc, lines, config_b, &cmds_b);
+            const count_b = layoutViewport(test_doc, lines, &config_b, &cmds_b);
 
             // Verify that all distinct anchor words across lists, enumerations, headings, and quotes
             // scroll with mathematical smoothness (diff == delta_s exactly within 0.01 px)
@@ -6185,12 +6718,12 @@ test "strict cross-element copying across headings, paragraphs, lists, tables, a
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     var text_buf: [1024]u8 = undefined;
 
@@ -6271,12 +6804,12 @@ test "syntax highlight: zig fence tints keyword/string/comment/number, unknown f
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     var saw_keyword = false;
     var saw_string = false;
@@ -6338,13 +6871,13 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
     };
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
         .plugins = entries[0..],
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     // Ready: exactly one .image whose link_target ends with ".png".
     var images: usize = 0;
@@ -6359,7 +6892,7 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
     // Rendering: today's code card + a muted "rendering" run, no .image.
     entries[0].job.state = .rendering;
     var cmds2: [256]DrawCommand = undefined;
-    const count2 = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds2);
+    const count2 = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds2);
     var images2: usize = 0;
     var saw_card = false;
     var saw_rendering = false;
@@ -6380,7 +6913,7 @@ test "plugin fence: ready job emits image box, rendering shows indicator (#323 P
     for ([_]plugin_cache.JobState{ .queued, .naive, .failed }) |st| {
         entries[0].job.state = st;
         var cmds_n: [256]DrawCommand = undefined;
-        const count_n = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds_n);
+        const count_n = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds_n);
         var images_n: usize = 0;
         var card_n = false;
         var ind_n = false;
@@ -6421,16 +6954,16 @@ test "plugin fence: ready job grows document height by the image box (#323 PR-1 
             out_h.* = 400.0;
         }
     };
-    const base = ViewportConfig{
+    var base = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
         .image_size_fn = S.size800x400,
     };
-    const plain_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], base, null, null);
+    const plain_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], &base, null, null);
     var ready_cfg = base;
     ready_cfg.plugins = entries[0..];
-    const ready_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], ready_cfg, null, null);
+    const ready_h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], &ready_cfg, null, null);
     // 1-line card: 1*29.75*0.88 + 24 + 16; ready image box: 36 + 300
     // (800x400 natural in the 600px column keeps aspect: 400*600/800).
     const card_h: f32 = 1.0 * 29.75 * 0.88 + 24.0 + 16.0;
@@ -6441,15 +6974,15 @@ test "plugin fence: ready job grows document height by the image box (#323 PR-1 
 
     // Refine agrees bit-for-bit: ready refines to the image box, pending
     // to the card plus one header row, naive to today's card.
-    const cw = contentWidthOf(ready_cfg);
-    const ready_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
+    const cw = contentWidthOf(&ready_cfg);
+    const ready_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, &ready_cfg, cw, 0.0);
     try std.testing.expectApproxEqAbs(36.0 + img_h, ready_unit.height, 0.01);
     try std.testing.expectEqual(@as(usize, 3), ready_unit.consumed);
     entries[0].job.state = .queued;
-    const pending_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
+    const pending_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, &ready_cfg, cw, 0.0);
     try std.testing.expectApproxEqAbs(card_h + 29.75 * 0.88, pending_unit.height, 0.01);
     entries[0].job.state = .naive;
-    const naive_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, ready_cfg, cw, 0.0);
+    const naive_unit = refineLineHeight(test_doc, lines_buf[0..line_count], 0, &ready_cfg, cw, 0.0);
     try std.testing.expectApproxEqAbs(card_h, naive_unit.height, 0.01);
 }
 
@@ -6474,12 +7007,12 @@ test "html subset: break/kbd/mark/sub/sup/del render, fallback muted, details hi
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [512]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1400.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     var y_first: ?f32 = null;
     var y_second: ?f32 = null;
@@ -6548,12 +7081,12 @@ test "admonition alert: marker becomes tinted label, bar takes alert color" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     const note_color = alertColor(.note, config.is_dark_theme);
     const plain_bar = if (config.is_dark_theme) Theme.dark.quote_bar else Theme.light.quote_bar;
@@ -6598,12 +7131,12 @@ test "admonition alert: label carries half-line above, quarter-line below" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     const note_color = alertColor(.note, config.is_dark_theme);
     const lh = config.line_height;
@@ -6640,7 +7173,7 @@ test "admonition alert: label carries half-line above, quarter-line below" {
     var same_fence: simd.FenceState = .{};
     const same_n = simd.scanLines(same_doc, &same_buf, &same_fence);
     var same_cmds: [256]DrawCommand = undefined;
-    const same_count = layoutViewport(same_doc, same_buf[0..same_n], config, &same_cmds);
+    const same_count = layoutViewport(same_doc, same_buf[0..same_n], &config, &same_cmds);
     var same_label_y: ?f32 = null;
     var same_body_y: ?f32 = null;
     for (same_cmds[0..same_count]) |c| {
@@ -6670,12 +7203,12 @@ test "frontmatter hides at layout: metadata emits no commands" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [128]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     var saw_visible = false;
     for (cmds[0..count]) |c| {
@@ -6716,12 +7249,12 @@ test "scroll shadows: overflowing code block shows right-edge fade when unscroll
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var shadow_config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &shadow_config, &cmds);
 
     var max_scroll: f32 = 0.0;
     for (cmds[0..count]) |c| {
@@ -6767,8 +7300,9 @@ test "scroll shadows: scrolled-right code block shows left-edge fade, no right f
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    config.block_scroll_x[0] = 1e9; // clamped to max inside layout
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    var wide_scroll = [_]f32{1e9} ** 1;
+    config.block_scroll_x = &wide_scroll; // clamped to max inside layout
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
 
     try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 100.0, true, 255));
     try std.testing.expectEqual(@as(usize, 0), countShadowStrips(cmds[0..count], 700.0, false, 255));
@@ -6787,12 +7321,12 @@ test "scroll shadows: fitting code block shows no fade" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var fit_config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &fit_config, &cmds);
 
     var max_scroll: f32 = 0.0;
     var strips: usize = 0;
@@ -6818,12 +7352,12 @@ test "scroll shadows: overflowing table shows right-edge fade" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [512]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var table_config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &table_config, &cmds);
 
     var max_scroll: f32 = 0.0;
     for (cmds[0..count]) |c| {
@@ -6848,13 +7382,13 @@ test "scroll shadows: light theme uses a dark overlay" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
 
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var light_config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
         .is_dark_theme = false,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &light_config, &cmds);
 
     // Dark strips at the right edge, no light strips anywhere near the block.
     try std.testing.expectEqual(@as(usize, scroll_shadow_strips), countShadowStrips(cmds[0..count], 700.0, false, 0));
@@ -6900,7 +7434,7 @@ test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
     _ = computeDocumentHeightEx(
         mem,
         lines_buf[0..line_count],
-        vp_config_base,
+        &vp_config_base,
         &checkpoints,
         &cp_count,
     );
@@ -6924,8 +7458,8 @@ test "STRICT FOOTPRINT: 64-bit packed Line struct and sparse checkpoint seek" {
     var cmds_no_cp: [512]DrawCommand = undefined;
     var cmds_with_cp: [512]DrawCommand = undefined;
 
-    const count_no_cp = layoutViewport(mem, lines_buf[0..line_count], config_no_cp, &cmds_no_cp);
-    const count_with_cp = layoutViewport(mem, lines_buf[0..line_count], config_with_cp, &cmds_with_cp);
+    const count_no_cp = layoutViewport(mem, lines_buf[0..line_count], &config_no_cp, &cmds_no_cp);
+    const count_with_cp = layoutViewport(mem, lines_buf[0..line_count], &config_with_cp, &cmds_with_cp);
 
     // Must generate the exact same visible draw commands
     try std.testing.expectEqual(count_no_cp, count_with_cp);
@@ -6997,7 +7531,8 @@ test "scroll: preallocated ring reused across frames, output is pure (issue #13)
         .window_height = 600.0,
         .scroll_y = 0.0,
     };
-    const n0 = layoutViewport(doc, lines, frame_cfg, &ring);
+    var frame_cfg_mut = frame_cfg;
+    const n0 = layoutViewport(doc, lines, &frame_cfg_mut, &ring);
     try std.testing.expect(n0 > 0);
     var first: [512]DrawCommand = undefined;
     @memcpy(first[0..n0], ring[0..n0]);
@@ -7007,21 +7542,21 @@ test "scroll: preallocated ring reused across frames, output is pure (issue #13)
     // (guards a vacuous all-clamped session).
     var f: usize = 1;
     while (f <= 30) : (f += 1) {
-        const cfg = ViewportConfig{
+        var cfg = ViewportConfig{
             .window_width = 800.0,
             .window_height = 600.0,
             .scroll_y = @as(f32, @floatFromInt(f)) * 40.0,
         };
-        const n = layoutViewport(doc, lines, cfg, &ring);
+        const n = layoutViewport(doc, lines, &cfg, &ring);
         try std.testing.expect(n > 0);
     }
-    const mid_cfg = ViewportConfig{
+    var mid_cfg = ViewportConfig{
         .window_width = 800.0,
         .window_height = 600.0,
         .scroll_y = 400.0,
     };
     var mid_ring: [512]DrawCommand = undefined;
-    const n_mid = layoutViewport(doc, lines, mid_cfg, &mid_ring);
+    const n_mid = layoutViewport(doc, lines, &mid_cfg, &mid_ring);
     try std.testing.expect(n_mid > 0);
     var moved = false;
     const probe_n = @min(n0, n_mid);
@@ -7034,7 +7569,7 @@ test "scroll: preallocated ring reused across frames, output is pure (issue #13)
     }
     try std.testing.expect(moved);
     // Scroll back: frame at 0 must equal the first frame bit-for-bit.
-    const n_back = layoutViewport(doc, lines, frame_cfg, &ring);
+    const n_back = layoutViewport(doc, lines, &frame_cfg_mut, &ring);
     try std.testing.expectEqual(n0, n_back);
     for (first[0..n0], 0..) |cmd_a, idx| {
         const cmd_b = ring[idx];
@@ -7044,6 +7579,424 @@ test "scroll: preallocated ring reused across frames, output is pure (issue #13)
         try std.testing.expectEqual(cmd_a.rect.w, cmd_b.rect.w);
         try std.testing.expectEqual(cmd_a.rect.h, cmd_b.rect.h);
         try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+    }
+}
+
+test "scroll: checkpoint deep seeks match exact layout across all block types" {
+    // A deep scroll must render exactly what the exact top-down walk renders:
+    // the checkpoint fast path only skips already-measured prefix lines, so
+    // every scrolled frame has to be command-identical with and without it.
+    // Any height/refine mismatch blanks or shifts the viewport once scrolling
+    // passes the 800px seek threshold (the live "nothing renders after I
+    // scroll" shape). Sweep every block type past that threshold.
+    const allocator = std.testing.allocator;
+
+    const chunk =
+        \\# Chapter Heading One
+        \\Paragraph line one of text with some **bold** and *italic* words.
+        \\Paragraph line two carrying a [link](https://example.com) and `code`.
+        \\Entity check: fish &amp; chips &lt;tag&gt; in flowing text here.
+        \\## Sub Heading Two
+        \\### Sub Sub Heading Three
+        \\- Bullet list item alpha with enough words to wrap a little bit
+        \\- Bullet list item beta
+        \\1. Ordered item one
+        \\2. Ordered item two
+        \\- [ ] Task open item
+        \\- [x] Task done item
+        \\> A quoted line to vary the command stream.
+        \\>> A nested quoted line deeper still.
+        \\```zig
+        \\const x: u32 = 1;
+        \\// fenced code stays mono
+        \\```
+        \\    indented code line one
+        \\    indented code line two
+        \\| cell a | cell b |
+        \\| --- | --- |
+        \\| cell c | cell d |
+        \\![alt text](image.png)
+        \\---
+        \\Setext Title Line
+        \\===
+        \\[ref]: https://example.com
+        \\```math
+        \\E = mc^2
+        \\Entity row alpha &amp; beta &lt;gamma&gt; here.
+        \\Entity row delta &quot;quoted&quot; &apos;apos&apos; there.
+        \\```
+        \\```mermaid
+        \\graph TD
+        \\    A-->B
+        \\```
+        \\```
+        \\```
+        \\نص عربي مختلط with English words here
+        \\1.  Deeply nested one
+        \\    1.  nested two
+        \\        1.  nested three
+        \\            1.  nested four
+        \\> quote
+        \\> > nested quote
+        \\> > > deep quote
+        \\| w1 | w2 | w3 | w4 | w5 | w6 | w7 | w8 |
+        \\| --- | --- | --- | --- | --- | --- | --- | --- |
+        \\| c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 |
+        \\
+    ;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var rep: usize = 0;
+    while (rep < 24) : (rep += 1) {
+        try buffer.appendSlice(allocator, chunk);
+    }
+    const mem = buffer.items;
+
+    var lines_buf: [2048]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
+    try std.testing.expect(line_count > 400);
+    const lines = lines_buf[0..line_count];
+
+    var checkpoints: [128]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    var markers = OrderedMarkerStore{};
+    var entities = EntityStore{};
+    var join_buf: [JOIN_BUF_LEN]u8 = undefined;
+    const base_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base_cfg, &checkpoints, &cp_count);
+    try std.testing.expect(cp_count > 0);
+    try std.testing.expect(doc_h > 3000.0);
+
+    var cmds_plain: [2048]DrawCommand = undefined;
+    var cmds_seek: [2048]DrawCommand = undefined;
+    var off: f32 = 0.0;
+    while (off <= doc_h) : (off += 53.0) {
+        markers.reset();
+        entities.reset();
+        const n_plain = layoutViewport(mem, lines, &.{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = off,
+            .ordered_markers = &markers,
+            .entities = &entities,
+            .join_buf = &join_buf,
+        }, &cmds_plain);
+        markers.reset();
+        entities.reset();
+        const n_seek = layoutViewport(mem, lines, &.{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = off,
+            .ordered_markers = &markers,
+            .entities = &entities,
+            .join_buf = &join_buf,
+            .checkpoints = checkpoints[0..cp_count],
+        }, &cmds_seek);
+        if (n_plain != n_seek) {
+            std.debug.print("\nscroll mismatch at off={d}: plain={d} seek={d}\n", .{ off, n_plain, n_seek });
+        }
+        try std.testing.expectEqual(n_plain, n_seek);
+        // Content must actually paint while a screen of document remains:
+        // background-only frames here mean a blank viewport after scrolling.
+        if (off + 750.0 <= doc_h) {
+            if (n_plain <= 1) {
+                std.debug.print("\nblank viewport at off={d} (doc_h={d})\n", .{ off, doc_h });
+            }
+            try std.testing.expect(n_plain > 1);
+        }
+        for (cmds_plain[0..n_plain], 0..) |cmd_a, idx| {
+            const cmd_b = cmds_seek[idx];
+            if (cmd_a.kind != cmd_b.kind) {
+                std.debug.print("\nkind mismatch at off={d} idx={d}: {s} vs {s}\n", .{ off, idx, @tagName(cmd_a.kind), @tagName(cmd_b.kind) });
+            }
+            try std.testing.expectEqual(cmd_a.kind, cmd_b.kind);
+            {
+                const d = @abs(cmd_a.rect.x - cmd_b.rect.x);
+                if (d > 0.01) std.debug.print("\nrect.x mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.x, cmd_b.rect.x });
+                try std.testing.expect(d <= 0.01);
+            }
+            {
+                const d = @abs(cmd_a.rect.y - cmd_b.rect.y);
+                if (d > 0.01) std.debug.print("\nrect.y mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.y, cmd_b.rect.y });
+                try std.testing.expect(d <= 0.01);
+            }
+            {
+                const d = @abs(cmd_a.rect.w - cmd_b.rect.w);
+                if (d > 0.01) std.debug.print("\nrect.w mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.w, cmd_b.rect.w });
+                try std.testing.expect(d <= 0.01);
+            }
+            {
+                const d = @abs(cmd_a.rect.h - cmd_b.rect.h);
+                if (d > 0.01) std.debug.print("\nrect.h mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.rect.h, cmd_b.rect.h });
+                try std.testing.expect(d <= 0.01);
+            }
+            try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+            try std.testing.expectEqual(cmd_a.scrollable_id, cmd_b.scrollable_id);
+            // ABSOLUTE scroll truth (not just seek-vs-plain consistency):
+            // every scrolled text run must sit at the same document height
+            // as in the exact scroll-zero full-document layout. A layout
+            // that misplaces content once scrolled shows the user the wrong
+            // (or no) pixels after scrolling, even when both paths agree.
+            // (Checked below against the full-document frame.)
+            {
+                const d = @abs(cmd_a.max_scroll_x - cmd_b.max_scroll_x);
+                if (d > 0.01) std.debug.print("\nmax_scroll_x mismatch at off={d} idx={d}/{d} kind={s} text='{s}': {d} vs {d}\n", .{ off, idx, n_plain, @tagName(cmd_a.kind), cmd_a.text, cmd_a.max_scroll_x, cmd_b.max_scroll_x });
+                try std.testing.expect(d <= 0.01);
+            }
+        }
+    }
+}
+
+test "scroll: scrolled frames land on exact document positions (absolute)" {
+    // Absolute scroll truth: a scrolled frame must show the same bytes at
+    // the same document heights as the exact scroll-zero full-document
+    // layout. Seek-vs-plain agreement alone cannot catch a placement bug
+    // shared by both walks; this pins placement against document truth,
+    // the user-visible "the right content is painted after scrolling".
+    const allocator = std.testing.allocator;
+
+    const chunk =
+        \\# Chapter Heading One
+        \\Paragraph line one of text with some **bold** and *italic* words.
+        \\Paragraph line two carrying a [link](https://example.com) and `code`.
+        \\Entity check: fish &amp; chips &lt;tag&gt; in flowing text here.
+        \\## Sub Heading Two
+        \\- Bullet list item alpha with enough words to wrap a little bit
+        \\- Bullet list item beta
+        \\1. Ordered item one
+        \\2. Ordered item two
+        \\- [ ] Task open item
+        \\- [x] Task done item
+        \\> A quoted line to vary the command stream.
+        \\```zig
+        \\const x: u32 = 1;
+        \\```
+        \\    indented code line one
+        \\    indented code line two
+        \\| cell a | cell b |
+        \\| --- | --- |
+        \\| cell c | cell d |
+        \\![alt text](image.png)
+        \\---
+        \\
+    ;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var rep: usize = 0;
+    while (rep < 12) : (rep += 1) {
+        try buffer.appendSlice(allocator, chunk);
+    }
+    const mem = buffer.items;
+
+    var lines_buf: [1024]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
+    try std.testing.expect(line_count > 200);
+    const lines = lines_buf[0..line_count];
+
+    var checkpoints: [64]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    var markers = OrderedMarkerStore{};
+    var entities = EntityStore{};
+    var join_buf: [JOIN_BUF_LEN]u8 = undefined;
+    const base_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base_cfg, &checkpoints, &cp_count);
+    try std.testing.expect(doc_h > 3000.0);
+
+    // Exact scroll-zero frame of the whole document (tall window, no cull).
+    var full_cmds: [8192]DrawCommand = undefined;
+    markers.reset();
+    entities.reset();
+    const full_n = layoutViewport(mem, lines, &.{
+        .window_width = 1000.0,
+        .window_height = doc_h + 200.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    }, &full_cmds);
+    try std.testing.expect(full_n > 10);
+    try std.testing.expect(full_n < full_cmds.len - 16);
+
+    // Snapshot document truth with owned text: later scrolled layouts
+    // reuse (and overwrite) the entity/marker stores the full frame
+    // borrowed from, so comparisons must own their strings.
+    const Snap = struct {
+        kind: DrawCommandKind,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        text: []const u8,
+    };
+    var snaps: [8192]Snap = undefined;
+    var snap_n: usize = 0;
+    for (full_cmds[0..full_n]) |c| {
+        if (c.kind != .text_run) continue;
+        const owned = if (c.text.len > 0) try allocator.dupe(u8, c.text) else @as([]const u8, "");
+        snaps[snap_n] = .{ .kind = c.kind, .x = c.rect.x, .y = c.rect.y, .w = c.rect.w, .h = c.rect.h, .text = owned };
+        snap_n += 1;
+    }
+    defer {
+        for (snaps[0..snap_n]) |s| {
+            if (s.text.len > 0) allocator.free(s.text);
+        }
+    }
+    try std.testing.expect(snap_n > 10);
+
+    // Twelve frames from top to bottom (checkpoint seeks engage past 800).
+    var cmds: [2048]DrawCommand = undefined;
+    var oi: usize = 0;
+    while (oi < 12) : (oi += 1) {
+        const off = doc_h * @as(f32, @floatFromInt(oi)) / 11.0;
+        markers.reset();
+        entities.reset();
+        const n = layoutViewport(mem, lines, &.{
+            .window_width = 1000.0,
+            .window_height = 750.0,
+            .scroll_y = off,
+            .ordered_markers = &markers,
+            .entities = &entities,
+            .join_buf = &join_buf,
+            .checkpoints = checkpoints[0..cp_count],
+        }, &cmds);
+        if (off + 750.0 <= doc_h) {
+            try std.testing.expect(n > 1);
+        }
+        for (cmds[0..n]) |c| {
+            if (c.kind != .text_run) continue;
+            const want_y = c.rect.y + off;
+            var found = false;
+            for (snaps[0..snap_n]) |s| {
+                if (!std.mem.eql(u8, s.text, c.text)) continue;
+                if (@abs(s.y - want_y) > 0.5) continue;
+                if (@abs(s.x - c.rect.x) > 0.01) continue;
+                if (@abs(s.w - c.rect.w) > 0.01) continue;
+                if (@abs(s.h - c.rect.h) > 0.01) continue;
+                found = true;
+                break;
+            }
+            if (!found) {
+                std.debug.print("\nmisplaced run at off={d}: text='{s}' view_y={d} want_doc_y={d}\n", .{ off, c.text, c.rect.y, want_y });
+            }
+            try std.testing.expect(found);
+        }
+    }
+}
+
+test "scroll: entity-dense deep seeks match exact layout" {
+    // 400 ordered items with one entity each: many units, many
+    // checkpoints, real seeks. Prefix decodes (400+) overflow the 32-slot
+    // entity store, while the seek window (~25 units) fits. Without the
+    // per-unit rollback the exact walk starves (visible raw "&amp;")
+    // while the seek walk decodes (visible "&") and the frames diverge.
+    // Ordered markers ride along, so marker gating is covered at scale.
+    const allocator = std.testing.allocator;
+    const chunk =
+        \\1. Fish &amp; chips here now.
+        \\
+    ;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    var rep: usize = 0;
+    while (rep < 400) : (rep += 1) {
+        try buffer.appendSlice(allocator, chunk);
+    }
+    const mem = buffer.items;
+    var lines_buf: [512]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(mem, &lines_buf, &in_fence);
+    std.debug.print("\nprobe setup: lines={d}\n", .{line_count});
+    try std.testing.expect(line_count > 300);
+    const lines = lines_buf[0..line_count];
+    var checkpoints: [24]Checkpoint = undefined;
+    var cp_count: usize = 0;
+    var markers = OrderedMarkerStore{};
+    var entities = EntityStore{};
+    var join_buf: [JOIN_BUF_LEN]u8 = undefined;
+    const base_cfg = ViewportConfig{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = 0.0,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base_cfg, &checkpoints, &cp_count);
+    std.debug.print("\nprobe lines={d} doc_h={d} cps={d}\n", .{ line_count, doc_h, cp_count });
+    try std.testing.expect(doc_h > 5000.0);
+    try std.testing.expect(cp_count > 2);
+    var cmds_plain: [2048]DrawCommand = undefined;
+    var cmds_seek: [2048]DrawCommand = undefined;
+    const off: f32 = doc_h * 0.75;
+    markers.reset();
+    entities.reset();
+    const n_plain = layoutViewport(mem, lines, &.{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = off,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+    }, &cmds_plain);
+    markers.reset();
+    entities.reset();
+    const n_seek = layoutViewport(mem, lines, &.{
+        .window_width = 1000.0,
+        .window_height = 750.0,
+        .scroll_y = off,
+        .ordered_markers = &markers,
+        .entities = &entities,
+        .join_buf = &join_buf,
+        .checkpoints = checkpoints[0..cp_count],
+    }, &cmds_seek);
+    if (n_plain != n_seek) {
+        std.debug.print("\nprobe count mismatch at off={d}: plain={d} seek={d}\n", .{ off, n_plain, n_seek });
+    }
+    try std.testing.expectEqual(n_plain, n_seek);
+    for (cmds_plain[0..n_plain], 0..) |cmd_a, idx| {
+        const cmd_b = cmds_seek[idx];
+        if (cmd_a.kind != cmd_b.kind) {
+            std.debug.print("\nprobe kind mismatch at off={d} idx={d}: {s} vs {s}\n", .{ off, idx, @tagName(cmd_a.kind), @tagName(cmd_b.kind) });
+        }
+        try std.testing.expectEqual(cmd_a.kind, cmd_b.kind);
+        if (!std.mem.eql(u8, cmd_a.text, cmd_b.text)) {
+            std.debug.print("\nprobe text mismatch at off={d} idx={d} kind={s} rect=({d},{d},{d},{d}): [{s}] vs [{s}]\n", .{ off, idx, @tagName(cmd_a.kind), cmd_a.rect.x, cmd_a.rect.y, cmd_a.rect.w, cmd_a.rect.h, cmd_a.text, cmd_b.text });
+        }
+        try std.testing.expectEqualStrings(cmd_a.text, cmd_b.text);
+    }
+    // Absolute: the visible window (~25 units) fits the 32-slot store,
+    // so its entities must render decoded. Without the per-unit
+    // rollback, prefix units (400+) exhaust the slots and the visible
+    // rows show raw "&amp;" in the exact walk while the seek walk (fewer
+    // prefix units) decodes them: same-document scroll divergence.
+    for ([2][]DrawCommand{ cmds_plain[0..n_plain], cmds_seek[0..n_seek] }) |cmds| {
+        var seen_amp: bool = false;
+        for (cmds) |cmd| {
+            if (cmd.kind == .text_run and cmd.text.len == 1 and cmd.text[0] == '&') {
+                seen_amp = true;
+                break;
+            }
+        }
+        if (!seen_amp) {
+            std.debug.print("\nprobe: no decoded & run at off={d} (e={d})\n", .{ off, entities.count });
+        }
+        try std.testing.expect(seen_amp);
     }
 }
 
@@ -7081,7 +8034,7 @@ test "checkpoints: sparse grid density, kilobyte RAM, deterministic deep seek (i
 
     var checkpoints: [2048]Checkpoint = undefined;
     var cp_count: usize = 0;
-    const base_cfg = ViewportConfig{
+    var base_cfg = ViewportConfig{
         .window_width = 1000.0,
         .window_height = 800.0,
         .scroll_y = 0.0,
@@ -7089,7 +8042,7 @@ test "checkpoints: sparse grid density, kilobyte RAM, deterministic deep seek (i
     const doc_h = computeDocumentHeightEx(
         mem,
         line_entries[0..line_count],
-        base_cfg,
+        &base_cfg,
         &checkpoints,
         &cp_count,
     );
@@ -7113,7 +8066,7 @@ test "checkpoints: sparse grid density, kilobyte RAM, deterministic deep seek (i
     try std.testing.expect(cp_count * @sizeOf(Checkpoint) <= 64 * 1024);
 
     // Deterministic deep seek: same 45k+ scroll twice, bit-identical output.
-    const deep_cfg = ViewportConfig{
+    var deep_cfg = ViewportConfig{
         .window_width = 1000.0,
         .window_height = 800.0,
         .scroll_y = doc_h * 0.90,
@@ -7121,8 +8074,8 @@ test "checkpoints: sparse grid density, kilobyte RAM, deterministic deep seek (i
     };
     var cmds_a: [1024]DrawCommand = undefined;
     var cmds_b: [1024]DrawCommand = undefined;
-    const n_a = layoutViewport(mem, line_entries[0..line_count], deep_cfg, &cmds_a);
-    const n_b = layoutViewport(mem, line_entries[0..line_count], deep_cfg, &cmds_b);
+    const n_a = layoutViewport(mem, line_entries[0..line_count], &deep_cfg, &cmds_a);
+    const n_b = layoutViewport(mem, line_entries[0..line_count], &deep_cfg, &cmds_b);
     try std.testing.expect(n_a > 0);
     try std.testing.expectEqual(n_a, n_b);
     for (cmds_a[0..n_a], 0..) |cmd_a, idx| {
@@ -7167,7 +8120,7 @@ test "design #21: heading tracking in -0.02..-0.01em, word space ~0.22em" {
 // Virtualized lazy layout: time-sliced amortized layout + Goldilocks buffer
 // + estimated heights with just-in-time refinement.
 //
-// Ideas implemented (todo/ideas.txt 9-11, todo/ideas2.txt 17-22):
+// Ideas implemented (docs/design-notes/ideas.txt 9-11, docs/design-notes/ideas2.txt 17-22):
 //   * Estimated heights: every off-screen block gets a cheap byte-length
 //     heuristic height; the sum drives the scrollbar without exact layout.
 //   * Goldilocks buffer: a sliding window of viewport + exactly 1 screen
@@ -7219,14 +8172,14 @@ test "images clamp to the content column preserving aspect (#45)" {
     try t.expectEqual(@as(f32, 240.0), laidOutImageHeight(800.0, 0.0, 600.0));
 }
 
-pub fn contentWidthOf(config: ViewportConfig) f32 {
+pub fn contentWidthOf(config: *const ViewportConfig) f32 {
     return if (config.window_width > config.content_max_width)
         config.content_max_width
     else
         @max(config.window_width - 64.0, 100.0);
 }
 
-fn contentXOf(config: ViewportConfig) f32 {
+fn contentXOf(config: *const ViewportConfig) f32 {
     return if (config.window_width > config.content_max_width)
         (config.window_width - config.content_max_width) * 0.5
     else
@@ -7239,7 +8192,7 @@ fn contentXOf(config: ViewportConfig) f32 {
 /// from `byte_len * font_size * 0.5 / content_width`. Multi-line units
 /// (fences, tables, setext) are estimated per line here and corrected to
 /// exact heights by JIT refinement when they enter the Goldilocks window.
-pub fn estimateBlockHeight(line: simd.Line, config: ViewportConfig, content_width: f32) f32 {
+pub fn estimateBlockHeight(line: simd.Line, config: *const ViewportConfig, content_width: f32) f32 {
     const lh = config.line_height;
     const bt = line.block_type;
     if (bt == .blank) return lh * 0.75;
@@ -7279,7 +8232,7 @@ pub fn estimateBlockHeight(line: simd.Line, config: ViewportConfig, content_widt
 /// Heuristic total document height for the scrollbar: one O(n) pass of
 /// `estimateBlockHeight`, no parsing, zero allocations. Converges to the
 /// exact height as `LayoutJob` refines blocks in the background.
-pub fn estimateDocumentHeight(lines: []const simd.Line, config: ViewportConfig) f32 {
+pub fn estimateDocumentHeight(lines: []const simd.Line, config: *const ViewportConfig) f32 {
     if (lines.len == 0) return 0.0;
     const cw = contentWidthOf(config);
     var total: f32 = 50.0;
@@ -7332,7 +8285,7 @@ pub fn refineLineHeight(
     bytes: []const u8,
     lines: []const simd.Line,
     idx: usize,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     content_width: f32,
     content_x: f32,
 ) RefinedUnit {
@@ -7371,12 +8324,8 @@ pub fn refineLineHeight(
         .code_line => return .{ .height = lh * 0.88, .consumed = 1 },
         .code_fence_end => return .{ .height = 0.0, .consumed = 1 },
         .code_fence_start => {
-            var n: usize = 0;
-            var j = idx + 1;
-            while (j < lines.len and lines[j].block_type != .code_fence_end) : ({
-                j += 1;
-                n += 1;
-            }) {}
+            const j = codeFenceEnd(config.plugins, lines, idx);
+            const n: usize = if (j > idx + 1) j - idx - 1 else 0;
             // Plugin fence mirror (issue #323, PR-1 Task 5 F1): same
             // pluginFenceGeom decision as render/height so JIT refine
             // converges to the drawn box, never the stale card.
@@ -7682,14 +8631,14 @@ pub const VirtualCache = struct {
         self.warm = false;
     }
 
-    fn geometryMatches(self: *const VirtualCache, config: ViewportConfig) bool {
+    fn geometryMatches(self: *const VirtualCache, config: *const ViewportConfig) bool {
         return self.window_width == config.window_width and
             self.content_max_width == config.content_max_width and
             self.base_font_size == config.base_font_size and
             self.line_height == config.line_height;
     }
 
-    fn storeGeometry(self: *VirtualCache, config: ViewportConfig) void {
+    fn storeGeometry(self: *VirtualCache, config: *const ViewportConfig) void {
         self.window_width = config.window_width;
         self.content_max_width = config.content_max_width;
         self.base_font_size = config.base_font_size;
@@ -7720,7 +8669,7 @@ pub const VirtualCache = struct {
     /// Steady small scrolls shift incrementally (evict one edge, parse in
     /// the other); jumps and geometry/doc changes recompute. Static frames
     /// return immediately with zero work.
-    pub fn update(self: *VirtualCache, bytes: []const u8, lines: []const simd.Line, config: ViewportConfig) void {
+    fn update(self: *VirtualCache, bytes: []const u8, lines: []const simd.Line, config: *const ViewportConfig) void {
         if (lines.len == 0) {
             self.reset();
             return;
@@ -7761,7 +8710,7 @@ pub const VirtualCache = struct {
         self: *VirtualCache,
         bytes: []const u8,
         lines: []const simd.Line,
-        config: ViewportConfig,
+        config: *const ViewportConfig,
         cw: f32,
         cx: f32,
         lo_target: f32,
@@ -7796,7 +8745,7 @@ pub const VirtualCache = struct {
     fn estimateRange(
         self: *const VirtualCache,
         lines: []const simd.Line,
-        config: ViewportConfig,
+        config: *const ViewportConfig,
         start: usize,
         end: usize,
     ) f32 {
@@ -7837,7 +8786,7 @@ pub const VirtualCache = struct {
         self: *VirtualCache,
         bytes: []const u8,
         lines: []const simd.Line,
-        config: ViewportConfig,
+        config: *const ViewportConfig,
         cw: f32,
         cx: f32,
         lo_target: f32,
@@ -7894,7 +8843,7 @@ pub const VirtualCache = struct {
         self: *VirtualCache,
         bytes: []const u8,
         lines: []const simd.Line,
-        config: ViewportConfig,
+        config: *const ViewportConfig,
         cw: f32,
         cx: f32,
         hi_target: f32,
@@ -7909,7 +8858,7 @@ pub const VirtualCache = struct {
         self: *VirtualCache,
         bytes: []const u8,
         lines: []const simd.Line,
-        config: ViewportConfig,
+        config: *const ViewportConfig,
         cw: f32,
         cx: f32,
         j0: usize,
@@ -8048,7 +8997,7 @@ pub const LayoutJob = struct {
         self: *LayoutJob,
         bytes: []const u8,
         lines: []const simd.Line,
-        config: ViewportConfig,
+        config: *const ViewportConfig,
         heights: []f32,
         budget_ns: u64,
     ) JobStatus {
@@ -8106,7 +9055,7 @@ pub const LayoutJob = struct {
         return .done;
     }
 
-    fn jobGeometryMatches(self: *const LayoutJob, config: ViewportConfig) bool {
+    fn jobGeometryMatches(self: *const LayoutJob, config: *const ViewportConfig) bool {
         return self.window_width == config.window_width and
             self.content_max_width == config.content_max_width and
             self.base_font_size == config.base_font_size and
@@ -8130,7 +9079,7 @@ fn budgetExceeded(ts0: u64, budget_ns: u64) bool {
 pub fn layoutViewportJIT(
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     cache: *VirtualCache,
     commands_out: []DrawCommand,
 ) usize {
@@ -8398,7 +9347,7 @@ pub const OUTLINE_TEXT_MAX: usize = 160;
 pub fn collectHeadings(
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     arena: []u8,
     out: []HeadingMark,
 ) usize {
@@ -8449,7 +9398,7 @@ pub fn collectHeadings(
 pub fn findOffsetY(
     bytes: []const u8,
     lines: []const simd.Line,
-    config: ViewportConfig,
+    config: *const ViewportConfig,
     target: usize,
 ) ?f32 {
     if (lines.len == 0) return null;
@@ -8468,10 +9417,72 @@ pub fn findOffsetY(
     return y;
 }
 
-pub fn anchorScrollY(
+/// Exact document y of a byte offset inside the unit starting at
+/// `unit_start` with document top `unit_top_y` (issue #386: one-snap find
+/// landing, no chase steps). Paragraph units refine to the wrapped visual
+/// row holding the offset via `countRowsBefore` over the unit's joined
+/// source text; every other unit type lands on the unit top exactly like
+/// `findOffsetY` (its intra-block geometry is not row-addressable). Cold
+/// path (per find cycle only); zero heap.
+pub fn findRowOffsetY(
     bytes: []const u8,
     lines: []const simd.Line,
     config: ViewportConfig,
+    unit_start: usize,
+    unit_top_y: f32,
+    target: usize,
+) f32 {
+    if (unit_start >= lines.len) return unit_top_y;
+    if (lines[unit_start].block_type != .paragraph) return unit_top_y;
+    // Plain-LTR body runs only (see countRowsBefore): inline markup
+    // (code, emphasis, links, math, tags, entities, escapes, bare URLs —
+    // every opener the parser honors, per hasInlineMarkup's doc comment),
+    // RTL paragraphs, and multi-line or owned units (quotes, lists,
+    // setext pairs, continuations, indented code rows) fall back to the
+    // unit top — the same offset the chase's first step landed on — so
+    // the final scroll is never worse than before, only sometimes
+    // row-exact.
+    {
+        const lb0 = bytes[lines[unit_start].offset..][0..lines[unit_start].len];
+        var t0 = lb0;
+        while (t0.len > 0 and (t0[0] == ' ' or t0[0] == '\t')) : (t0 = t0[1..]) {}
+        if (hasInlineMarkup(t0)) return unit_top_y;
+        if (unitRtl(bytes, lines, unit_start)) return unit_top_y;
+        if (setextLevel(bytes, lines, unit_start) != null) return unit_top_y;
+        if (enclosingListMarker(bytes, lines, unit_start) != null) return unit_top_y;
+        if (quoteLeader(bytes, lines, unit_start) != null) return unit_top_y;
+        if (indentedCodeLeader(bytes, lines, unit_start) != null) return unit_top_y;
+        if (inItemCodeRow(bytes, lines, unit_start)) return unit_top_y;
+        if (unit_start + 1 < lines.len) {
+            const nl = lines[unit_start + 1];
+            if (nl.block_type == .paragraph and quoteLeader(bytes, lines, unit_start + 1) == null) return unit_top_y;
+        }
+    }
+    // The unit's first flowed row mirrors the render join's head line:
+    // followers append with one soft space (see layoutParagraphUnit via
+    // flowParaLineJoint). Single-line units only (multi-line gated above),
+    // stripped of edge indent exactly like flowSourceLine. Tail offsets
+    // past the joined text clamp to its last row, never past the block.
+    var joined: [512]u8 = undefined;
+    var jlen: usize = 0;
+    {
+        const lb = bytes[lines[unit_start].offset..][0..lines[unit_start].len];
+        var s = lb;
+        while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) : (s = s[1..]) {}
+        while (s.len > 0 and (s[s.len - 1] == ' ' or s[s.len - 1] == '\t')) : (s = s[0 .. s.len - 1]) {}
+        jlen = @min(s.len, joined.len);
+        @memcpy(joined[0..jlen], s[0..jlen]);
+    }
+    const start_off = lines[unit_start].offset;
+    const rel = if (target > start_off) @min(target - start_off, jlen) else 0;
+    const rows = countRowsBefore(joined[0..jlen], rel, contentXOf(&config), contentWidthOf(&config), config.base_font_size);
+    return findRowY(unit_top_y, rows, config.line_height);
+}
+
+pub fn anchorScrollY(
+    bytes: []const u8,
+    lines: []const simd.Line,
+    config: *const ViewportConfig,
     fragment: []const u8,
 ) ?f32 {
     if (fragment.len == 0) return 0.0;
@@ -8583,25 +9594,25 @@ test "anchor jump: GitHub slug edge cases (dupes, unicode, punctuation)" {
     const cfg = ViewportConfig{ .window_width = 1200, .window_height = 900, .scroll_y = 0 };
 
     // First "Heading" wins the bare slug; `-1` addresses the duplicate.
-    const yf = anchorScrollY(doc, lines, cfg, "heading").?;
-    const ys = anchorScrollY(doc, lines, cfg, "heading-1").?;
+    const yf = anchorScrollY(doc, lines, &cfg, "heading").?;
+    const ys = anchorScrollY(doc, lines, &cfg, "heading-1").?;
     try t.expect(ys > yf);
     // Exact singleton ending in -1 beats the dupe reading (2nd "Heading").
-    const y_ch1 = anchorScrollY(doc, lines, cfg, "chapter-1").?;
+    const y_ch1 = anchorScrollY(doc, lines, &cfg, "chapter-1").?;
     try t.expectEqual(@as(f32, 50.0), y_ch1);
     try t.expect(y_ch1 < yf);
     // Punctuation dropped, spaces hyphenated, ASCII lowercased.
-    const y_hw = anchorScrollY(doc, lines, cfg, "hello-world").?;
+    const y_hw = anchorScrollY(doc, lines, &cfg, "hello-world").?;
     try t.expect(y_hw > ys);
     // Unicode passes through the slugger on both sides.
-    const y_uni = anchorScrollY(doc, lines, cfg, "日本語の見出し").?;
+    const y_uni = anchorScrollY(doc, lines, &cfg, "日本語の見出し").?;
     try t.expect(y_uni > y_hw);
     // Missing anchor: the no-op signal (callers must not error). Note the
     // anchor must clear every legacy fuzzy tier too (affix/subsequence):
     // "zzz-quux-qqq" shares no letter run with any slug above.
-    try t.expect(anchorScrollY(doc, lines, cfg, "zzz-quux-qqq") == null);
+    try t.expect(anchorScrollY(doc, lines, &cfg, "zzz-quux-qqq") == null);
     // Empty fragment: document top.
-    try t.expectEqual(@as(?f32, 0.0), anchorScrollY(doc, lines, cfg, ""));
+    try t.expectEqual(@as(?f32, 0.0), anchorScrollY(doc, lines, &cfg, ""));
 }
 
 test "outline picker: headings enumerate top-to-bottom with levels (#48)" {
@@ -8627,7 +9638,7 @@ test "outline picker: headings enumerate top-to-bottom with levels (#48)" {
     const cfg = ViewportConfig{ .window_width = 1200, .window_height = 900, .scroll_y = 0 };
     var arena: [8 * OUTLINE_TEXT_MAX]u8 = undefined;
     var marks: [8]HeadingMark = undefined;
-    const count = collectHeadings(doc, lines_buf[0..n], cfg, &arena, &marks);
+    const count = collectHeadings(doc, lines_buf[0..n], &cfg, &arena, &marks);
     try t.expectEqual(@as(usize, 5), count);
     // Levels in document order (ATX 1/2/3, setext === is 1, dupe H1 again).
     try t.expectEqual(@as(u8, 1), marks[0].level);
@@ -8649,7 +9660,7 @@ test "outline picker: headings enumerate top-to-bottom with levels (#48)" {
     try t.expectEqual(@as(f32, 50.0), marks[0].y);
     // Small output caps enumeration (picker shows a prefix, never overflows).
     var tiny: [2]HeadingMark = undefined;
-    try t.expectEqual(@as(usize, 2), collectHeadings(doc, lines_buf[0..n], cfg, &arena, &tiny));
+    try t.expectEqual(@as(usize, 2), collectHeadings(doc, lines_buf[0..n], &cfg, &arena, &tiny));
 }
 
 const virtual_test_doc =
@@ -8683,15 +9694,16 @@ test "virtualized: estimated heights track exact refined heights" {
     const lines = lines_buf[0..line_count];
 
     const config = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
-    const cw = contentWidthOf(config);
-    const cx = contentXOf(config);
+    var config_mut = config;
+    const cw = contentWidthOf(&config_mut);
+    const cx = contentXOf(&config_mut);
 
     var i: usize = 0;
     while (i < lines.len) {
-        const u = refineLineHeight(virtual_test_doc, lines, i, config, cw, cx);
+        const u = refineLineHeight(virtual_test_doc, lines, i, &config_mut, cw, cx);
         var est_sum: f32 = 0.0;
         var k: usize = 0;
-        while (k < u.consumed) : (k += 1) est_sum += estimateBlockHeight(lines[i + k], config, cw);
+        while (k < u.consumed) : (k += 1) est_sum += estimateBlockHeight(lines[i + k], &config_mut, cw);
         if (u.height > 0.5) {
             const ratio = est_sum / u.height;
             try std.testing.expect(ratio >= 0.2 and ratio <= 5.0);
@@ -8704,8 +9716,8 @@ test "virtualized: estimated heights track exact refined heights" {
         i += @max(u.consumed, 1);
     }
 
-    const est_total = estimateDocumentHeight(lines, config);
-    const exact_total = computeDocumentHeightEx(virtual_test_doc, lines, config, null, null);
+    const est_total = estimateDocumentHeight(lines, &config_mut);
+    const exact_total = computeDocumentHeightEx(virtual_test_doc, lines, &config_mut, null, null);
     const total_ratio = est_total / exact_total;
     try std.testing.expect(total_ratio >= 0.5 and total_ratio <= 2.0);
 }
@@ -8725,10 +9737,10 @@ test "virtualized: Goldilocks window spans viewport plus exactly one screen each
 
     const vh: f32 = 800.0;
     const scroll: f32 = 8000.0;
-    const config = ViewportConfig{ .window_width = 800.0, .window_height = vh, .scroll_y = scroll };
+    var config = ViewportConfig{ .window_width = 800.0, .window_height = vh, .scroll_y = scroll };
 
     var cache = VirtualCache{};
-    cache.update(mem, lines, config);
+    cache.update(mem, lines, &config);
 
     try std.testing.expect(cache.covers(scroll, vh, lines.len));
     // Top buffer is exactly one screen (snapped back by at most one unit).
@@ -8760,14 +9772,14 @@ test "virtualized: incremental scroll parses in entering lines, frees evicted ed
     const vh: f32 = 800.0;
     var cache = VirtualCache{};
     var cfg = ViewportConfig{ .window_width = 800.0, .window_height = vh, .scroll_y = 2000.0 };
-    cache.update(mem, lines, cfg);
+    cache.update(mem, lines, &cfg);
     const old_start = cache.win_start;
     const old_end = cache.winEnd();
     var old_heights: [MAX_WINDOW_LINES]f32 = undefined;
     @memcpy(old_heights[0..cache.win_len], cache.heights[0..cache.win_len]);
 
     cfg.scroll_y = 2060.0;
-    cache.update(mem, lines, cfg);
+    cache.update(mem, lines, &cfg);
     try std.testing.expect(cache.covers(2060.0, vh, lines.len));
     // Evicted edge advanced past fully buffered-out units.
     try std.testing.expect(cache.win_start >= old_start);
@@ -8782,7 +9794,7 @@ test "virtualized: incremental scroll parses in entering lines, frees evicted ed
 
     // Scroll back up: window follows, still covering.
     cfg.scroll_y = 2000.0;
-    cache.update(mem, lines, cfg);
+    cache.update(mem, lines, &cfg);
     try std.testing.expect(cache.covers(2000.0, vh, lines.len));
     try std.testing.expect(cache.win_start <= old_start);
 }
@@ -8806,13 +9818,13 @@ test "virtualized: JIT output identical to exact layout after incremental scroll
     var s: f32 = 0.0;
     var jit_count: usize = 0;
     while (s <= 600.0) : (s += 60.0) {
-        const cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = s };
-        jit_count = layoutViewportJIT(mem, lines, cfg, &cache, &cmds_jit);
+        var cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = s };
+        jit_count = layoutViewportJIT(mem, lines, &cfg, &cache, &cmds_jit);
     }
 
-    const target = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 600.0 };
+    var target = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 600.0 };
     var cmds_exact: [1024]DrawCommand = undefined;
-    const exact_count = layoutViewport(mem, lines, target, &cmds_exact);
+    const exact_count = layoutViewport(mem, lines, &target, &cmds_exact);
 
     try std.testing.expectEqual(exact_count, jit_count);
     for (cmds_exact[0..exact_count], 0..) |cmd_a, idx| {
@@ -8842,19 +9854,19 @@ test "virtualized: jumped-to window anchors to exact layout" {
 
     const scroll: f32 = 2000.0;
     const vh: f32 = 600.0;
-    const jump_cfg = ViewportConfig{ .window_width = 800.0, .window_height = vh, .scroll_y = scroll };
+    var jump_cfg = ViewportConfig{ .window_width = 800.0, .window_height = vh, .scroll_y = scroll };
     var cache = VirtualCache{};
-    cache.update(mem, lines, jump_cfg);
+    cache.update(mem, lines, &jump_cfg);
     try std.testing.expect(cache.covers(scroll, vh, lines.len));
     const s0 = cache.win_start;
 
     // Exact prefix height above the window (unit-stepped refinement).
-    const cw = contentWidthOf(jump_cfg);
-    const cx = contentXOf(jump_cfg);
+    const cw = contentWidthOf(&jump_cfg);
+    const cx = contentXOf(&jump_cfg);
     var exact_prefix: f32 = 50.0;
     var j: usize = 0;
     while (j < s0) {
-        const u = refineLineHeight(mem, lines, j, jump_cfg, cw, cx);
+        const u = refineLineHeight(mem, lines, j, &jump_cfg, cw, cx);
         exact_prefix += u.height;
         j += @max(u.consumed, 1);
     }
@@ -8871,11 +9883,11 @@ test "virtualized: jumped-to window anchors to exact layout" {
     // JIT render on the estimate basis at `scroll` must be fully identical
     // to the exact render at the anchored offset: same lines, same pixels.
     var cmds_jit: [1024]DrawCommand = undefined;
-    const jit_count = layoutViewportJIT(mem, lines, jump_cfg, &cache, &cmds_jit);
+    const jit_count = layoutViewportJIT(mem, lines, &jump_cfg, &cache, &cmds_jit);
 
-    const anchored_cfg = ViewportConfig{ .window_width = 800.0, .window_height = vh, .scroll_y = anchored };
+    var anchored_cfg = ViewportConfig{ .window_width = 800.0, .window_height = vh, .scroll_y = anchored };
     var cmds_exact: [1024]DrawCommand = undefined;
-    const exact_count = layoutViewport(mem, lines, anchored_cfg, &cmds_exact);
+    const exact_count = layoutViewport(mem, lines, &anchored_cfg, &cmds_exact);
 
     try std.testing.expectEqual(exact_count, jit_count);
     for (cmds_exact[0..exact_count], 0..) |cmd_a, idx| {
@@ -8918,22 +9930,23 @@ test "virtualized: time-sliced job yields on budget and converges to exact heigh
     defer allocator.free(heights);
 
     const config = ViewportConfig{ .window_width = 1000.0, .window_height = 800.0, .scroll_y = 0.0 };
+    var config_mut = config;
 
     // A ~zero budget must yield (never block the UI) while making progress.
     var job = LayoutJob{};
-    const first = job.step(mem, lines, config, heights, 1);
+    const first = job.step(mem, lines, &config_mut, heights, 1);
     try std.testing.expectEqual(JobStatus.yielded, first);
     try std.testing.expect(job.next_line > 0 or job.refine_line > 0);
 
     // Full convergence under the strict ~2ms frame budget.
     var slices: usize = 1;
     while (slices < 100_000) : (slices += 1) {
-        if (job.step(mem, lines, config, heights, FRAME_BUDGET_NS) == .done) break;
+        if (job.step(mem, lines, &config_mut, heights, FRAME_BUDGET_NS) == .done) break;
     }
     try std.testing.expectEqual(JobPhase.done, job.phase);
     try std.testing.expectEqual(lines.len, job.refinedUpTo());
 
-    const exact = computeDocumentHeightEx(mem, lines, config, null, null);
+    const exact = computeDocumentHeightEx(mem, lines, &config_mut, null, null);
     std.debug.print("\n[VIRTUALIZED] job converged in {d} slices; total {d:.1} px (exact {d:.1} px)\n", .{
         slices + 1,
         job.totalHeight(),
@@ -8942,7 +9955,7 @@ test "virtualized: time-sliced job yields on budget and converges to exact heigh
     // Per-line heights are bitwise exact (same computation, no accumulation).
     var q: usize = 0;
     while (q < lines.len) {
-        const u = refineLineHeight(mem, lines, q, config, contentWidthOf(config), contentXOf(config));
+        const u = refineLineHeight(mem, lines, q, &config_mut, contentWidthOf(&config_mut), contentXOf(&config_mut));
         try std.testing.expectEqual(u.height, heights[q]);
         var f: usize = 1;
         while (f < u.consumed and q + f < lines.len) : (f += 1) {
@@ -8955,7 +9968,7 @@ test "virtualized: time-sliced job yields on budget and converges to exact heigh
     try std.testing.expectApproxEqAbs(job.totalHeight(), exact, @max(1.0, exact * 0.0002));
 
     // Scrollbar estimate from byte lengths alone lands in a sane band.
-    const est = estimateDocumentHeight(lines, config);
+    const est = estimateDocumentHeight(lines, &config_mut);
     try std.testing.expect(est / exact >= 0.5 and est / exact <= 2.0);
 }
 
@@ -8981,14 +9994,14 @@ test "virtualized: warm JIT viewport layout under 12us" {
     const line_count = simd.scanLines(mem, line_entries, &fence);
     const lines = line_entries[0..line_count];
 
-    const base_cfg = ViewportConfig{ .window_width = 1000.0, .window_height = 800.0, .scroll_y = 0.0 };
-    const doc_h = computeDocumentHeightEx(mem, lines, base_cfg, null, null);
-    const deep_cfg = ViewportConfig{ .window_width = 1000.0, .window_height = 800.0, .scroll_y = doc_h * 0.90 };
+    var base_cfg = ViewportConfig{ .window_width = 1000.0, .window_height = 800.0, .scroll_y = 0.0 };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base_cfg, null, null);
+    var deep_cfg = ViewportConfig{ .window_width = 1000.0, .window_height = 800.0, .scroll_y = doc_h * 0.90 };
 
     var cache = VirtualCache{};
     var commands: [1024]DrawCommand = undefined;
     // Warm outside the timed region (one cold jump, then static frames).
-    _ = layoutViewportJIT(mem, lines, deep_cfg, &cache, &commands);
+    _ = layoutViewportJIT(mem, lines, &deep_cfg, &cache, &commands);
     try std.testing.expect(cache.covers(deep_cfg.scroll_y, 800.0, lines.len));
 
     // Adaptive sampling (simd.timing_gate_*): repeat until one sample
@@ -9000,7 +10013,7 @@ test "virtualized: warm JIT viewport layout under 12us" {
     while (attempts < simd.timing_gate_max_attempts) {
         if (attempts > 0) simd.timingGateBackoff();
         const start_ns: i128 = port_clock.nowNsI128();
-        last_cmd_count = layoutViewportJIT(mem, lines, deep_cfg, &cache, &commands);
+        last_cmd_count = layoutViewportJIT(mem, lines, &deep_cfg, &cache, &commands);
         const end_ns: i128 = port_clock.nowNsI128();
         const elapsed_us = @divTrunc(end_ns - start_ns, 1_000);
         attempts += 1;
@@ -9020,7 +10033,7 @@ test "virtualized: warm JIT viewport layout under 12us" {
 
 // ============================================================================
 // Scroll-illusion masking: heuristic estimate + indexed block map + anchoring.
-// (todo/ideas.txt lines 13-24.) The scrollbar is decoupled from pixel-perfect
+// (docs/design-notes/ideas.txt lines 13-24.) The scrollbar is decoupled from pixel-perfect
 // layout: at file-open a SIMD `\n` census times line-height yields an
 // estimated total height; a u32 offset index over `\n\n` gives O(1)
 // fraction jumps + O(log N) line resolution; scroll anchoring absorbs
@@ -9029,6 +10042,120 @@ test "virtualized: warm JIT viewport layout under 12us" {
 // on the layoutViewport hot path: estimate/map build run once at open,
 // per-frame cost is one index multiply plus checkpoint binary search.
 // ============================================================================
+
+/// Coalesced document re-measure state (issue #386): arrivals (async image
+/// sizes, plugin render completions) batch into one metrics walk per frame
+/// instead of one walk per arrival. Zig accumulates the above-viewport
+/// height delta; the platform's per-arrival repaint requests coalesce
+/// through the native view's invalidation (already idempotent). Pure, zero
+/// heap, test-pinned below.
+pub const MetricsCoalescer = struct {
+    pending: bool = false,
+    delta_above: f32 = 0.0,
+
+    pub fn noteArrival(self: *MetricsCoalescer, delta_above: f32) void {
+        self.pending = true;
+        self.delta_above += delta_above;
+    }
+
+    /// Drain one frame's batch: exactly one metrics walk, then the summed
+    /// above-viewport shift as a single scroll snap. True when a walk ran
+    /// (caller repaints once); false when nothing arrived (zero walks).
+    pub fn drain(self: *MetricsCoalescer) bool {
+        if (!self.pending) return false;
+        self.pending = false;
+        return true;
+    }
+
+    /// Consume the accumulated delta after the walk (same absorbHeightDelta
+    /// anchor math the platform path uses: top-visible pixel stays put).
+    pub fn takeDelta(self: *MetricsCoalescer) f32 {
+        const d = self.delta_above;
+        self.delta_above = 0.0;
+        return d;
+    }
+};
+
+/// Exact find landing (issue #386): intra-block row for a byte offset
+/// inside a wrapped paragraph run. `block_top_y` is the unit top from
+/// findOffsetY's walk (document coords); `line_h` the block's visual row
+/// height; `rows_before` the count of wrapped visual rows strictly above
+/// the offset's row. Landing = block_top + rows_before * line_h, so find
+/// cycles land on the match row in one snap — no chase steps, no extra
+/// fullscreen redraws. Pure geometry, zero allocations.
+pub fn findRowY(block_top_y: f32, rows_before: usize, line_h: f32) f32 {
+    return block_top_y + @as(f32, @floatFromInt(rows_before)) * line_h;
+}
+
+/// Count wrapped visual rows strictly above `target` within the flowed
+/// source line `text` at `(start_x, max_w, font_size)`. Rows break at the
+/// same word boundaries the renderer uses: a word that overflows the row
+/// moves down exactly when the renderer wraps it (`flowWord`: overflow and
+/// not already at the row start). Per-word widths use whole-run
+/// `measureTextEx` (kern pairs apply within the run, as drawn) — callers
+/// must therefore pass whole flowed runs, never re-sliced words. Inline
+/// code pills, bold/italic/marks, and RTL runs use different widths or
+/// directions, so callers restrict this to plain LTR body runs; anything
+/// else lands on the block top via `findRowOffsetY`'s paragraph gate.
+/// Zero heap.
+pub fn countRowsBefore(text: []const u8, target: usize, start_x: f32, max_w: f32, font_size: f32) usize {
+    const space_w = measureCharEx(' ', font_size, false, false, false, false);
+    var pen_x: f32 = start_x;
+    var rows: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i > target) break;
+        if (text[i] == ' ') {
+            pen_x += space_w;
+            i += 1;
+            continue;
+        }
+        const w_start = i;
+        while (i < text.len and text[i] != ' ') : (i += 1) {}
+        const w_end = @min(i, text.len);
+        // The word holding `target` (w_start == target) still wraps exactly
+        // like the renderer: its wrap decides the offset's own row.
+        if (w_start > target) break;
+        const w = measureTextEx(text[w_start..w_end], font_size, false, false, false, false);
+        if (pen_x + w > start_x + max_w and pen_x > start_x) {
+            pen_x = start_x;
+            rows += 1;
+        }
+        pen_x += w;
+        if (i >= target) break;
+    }
+    return rows;
+}
+
+test "metrics coalescer batches arrivals into one walk (#386)" {
+    var m = MetricsCoalescer{};
+    try std.testing.expect(!m.drain());
+    m.noteArrival(10.0);
+    m.noteArrival(-4.0);
+    m.noteArrival(0.0);
+    try std.testing.expect(m.drain());
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), m.takeDelta(), 0.001);
+    try std.testing.expect(!m.drain());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), m.takeDelta(), 0.001);
+}
+
+test "find row landing matches wrapped flow rows (#386)" {
+    const t = std.testing;
+    const lh: f32 = 29.75;
+    // Single short line: no wrap, row 0.
+    try t.expectEqual(@as(usize, 0), countRowsBefore("foo bar", 4, 0.0, 600.0, 17.0));
+    try t.expectEqual(@as(f32, 50.0), findRowY(50.0, 0, lh));
+    // Narrow row forces a wrap: the second word sits one row down and the
+    // landing tracks it exactly.
+    const w1 = measureTextEx("aaa", 17.0, false, false, false, false);
+    const w2 = measureTextEx("bbb", 17.0, false, false, false, false);
+    const sp = measureCharEx(' ', 17.0, false, false, false, false);
+    const narrow = w1 + sp + w2 - 1.0;
+    try t.expect(w1 + sp + w2 > narrow);
+    try t.expectEqual(@as(usize, 0), countRowsBefore("aaa bbb", 0, 0.0, narrow, 17.0));
+    try t.expectEqual(@as(usize, 1), countRowsBefore("aaa bbb", 4, 0.0, narrow, 17.0));
+    try t.expectEqual(50.0 + lh, findRowY(50.0, 1, lh));
+}
 
 pub const SCROLL_CHROME_PAD: f32 = 100.0; // 50 top + 50 bottom, mirrors layoutViewport/computeDocumentHeightEx
 
@@ -9141,10 +10268,10 @@ test "scroll illusion: estimate is O(1) sane vs accurate height" {
     var lines_buf: [32]simd.Line = undefined;
     var fence: simd.FenceState = .{};
     const lc = simd.scanLines(doc, &lines_buf, &fence);
-    const cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
+    var cfg = ViewportConfig{ .window_width = 800.0, .window_height = 600.0, .scroll_y = 0.0 };
     const nl = simd.countNewlines(doc);
     const est = estimateTotalHeightFromNewlines(nl, cfg.line_height);
-    const acc = computeDocumentHeightEx(doc, lines_buf[0..lc], cfg, null, null);
+    const acc = computeDocumentHeightEx(doc, lines_buf[0..lc], &cfg, null, null);
     // Heuristic must be positive and within an order of magnitude of truth
     // (headings/margins inflate real height; plain lines match closely).
     try std.testing.expect(est > 0.0 and acc > 0.0);
@@ -9237,16 +10364,17 @@ test "scroll illusion: O(1) fraction jump resolves inside deep-scroll budget" {
     // The jumped-to region actually renders: viewport at that line's height.
     var cps: [64]Checkpoint = undefined;
     var cp_count: usize = 0;
-    const base = ViewportConfig{ .window_width = 1000.0, .window_height = 800.0, .scroll_y = 0.0 };
-    const doc_h = computeDocumentHeightEx(mem, lines, base, &cps, &cp_count);
+    var base = ViewportConfig{ .window_width = 1000.0, .window_height = 800.0, .scroll_y = 0.0 };
+    const doc_h = computeDocumentHeightEx(mem, lines, &base, &cps, &cp_count);
     const deep_y = @min(doc_h - 800.0, @as(f32, @floatFromInt(j75)) * base.line_height);
     var cmds: [256]DrawCommand = undefined;
-    const n_cmds = layoutViewport(mem, lines, .{
+    var jump_cfg = ViewportConfig{
         .window_width = 1000.0,
         .window_height = 800.0,
         .scroll_y = deep_y,
         .checkpoints = cps[0..cp_count],
-    }, &cmds);
+    };
+    const n_cmds = layoutViewport(mem, lines, &jump_cfg, &cmds);
     try std.testing.expect(n_cmds > 0);
 }
 
@@ -9398,7 +10526,7 @@ test "math: multiline display block centers one box, height agrees (issue #373)"
     var fence: simd.FenceState = .{};
     const lc = simd.scanLines(doc, &lines_buf, &fence);
     const lines = lines_buf[0..lc];
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
@@ -9406,7 +10534,7 @@ test "math: multiline display block centers one box, height agrees (issue #373)"
     };
     // Render: one centered math command over the borrowed TeX.
     var cmds: [256]DrawCommand = undefined;
-    const count = layoutViewport(doc, lines, config, &cmds);
+    const count = layoutViewport(doc, lines, &config, &cmds);
     var nmath: usize = 0;
     var math_h: f32 = 0;
     for (cmds[0..count]) |c| {
@@ -9420,7 +10548,7 @@ test "math: multiline display block centers one box, height agrees (issue #373)"
     try std.testing.expect(math_h > 0);
     // Height: the shared paragraph unit reports the same box the render
     // drew, so the document height tracks native blocks exactly.
-    const h = computeDocumentHeightEx(doc, lines, config, null, null);
+    const h = computeDocumentHeightEx(doc, lines, &config, null, null);
     try std.testing.expect(h > 50.0 + math_h);
 }
 
@@ -9441,14 +10569,14 @@ test "math: unclosed multiline opener stays literal (issue #373)" {
     var lines_buf: [8]simd.Line = undefined;
     var fence: simd.FenceState = .{};
     const lc = simd.scanLines(doc, &lines_buf, &fence);
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
         .math_size_fn = Stub.size,
     };
     var cmds: [256]DrawCommand = undefined;
-    const count = layoutViewport(doc, lines_buf[0..lc], config, &cmds);
+    const count = layoutViewport(doc, lines_buf[0..lc], &config, &cmds);
     for (cmds[0..count]) |c| try std.testing.expect(c.kind != .math);
 }
 
@@ -9558,7 +10686,7 @@ test "math: failed math fence marks the error byte in its card (issue #377)" {
     var lines_buf: [8]simd.Line = undefined;
     var fence: simd.FenceState = .{};
     const lc = simd.scanLines(doc, &lines_buf, &fence);
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
@@ -9566,7 +10694,7 @@ test "math: failed math fence marks the error byte in its card (issue #377)" {
         .math_error_fn = ErrStub.query,
     };
     var cmds: [256]DrawCommand = undefined;
-    const count = layoutViewport(doc, lines_buf[0..lc], config, &cmds);
+    const count = layoutViewport(doc, lines_buf[0..lc], &config, &cmds);
     // The card still draws its code rows, with the error byte accented.
     var saw_card = false;
     var saw_mark = false;
@@ -9755,13 +10883,13 @@ test "math: fence renders native block with stub engine, card without" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
     try std.testing.expectEqual(@as(usize, 3), line_count);
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
         .math_size_fn = Stub.size,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
     var found: ?DrawCommand = null;
     for (cmds[0..count]) |c| {
         if (c.kind == .math) {
@@ -9778,16 +10906,16 @@ test "math: fence renders native block with stub engine, card without" {
     try std.testing.expectApproxEqAbs(@as(f32, 68.0), m.rect.y, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 18.7), m.rect.h, 0.01);
     // Height pass agrees with render (50px top pad + block + 50px bottom).
-    const h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], config, null, null);
+    const h = computeDocumentHeightEx(test_doc, lines_buf[0..line_count], &config, null, null);
     try std.testing.expectApproxEqAbs(@as(f32, 50.0 + 18.0 + 18.7 + 18.0 + 50.0), h, 0.05);
     // Without the engine the same fence is today's code card: no math.
     var cmds2: [256]DrawCommand = undefined;
-    const config2 = ViewportConfig{
+    var config2 = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
     };
-    const count2 = layoutViewport(test_doc, lines_buf[0..line_count], config2, &cmds2);
+    const count2 = layoutViewport(test_doc, lines_buf[0..line_count], &config2, &cmds2);
     for (cmds2[0..count2]) |c| try std.testing.expect(c.kind != .math);
 }
 
@@ -9813,14 +10941,206 @@ test "math: tex/latex/katex fences stay highlighted code, never math" {
     const line_count = simd.scanLines(test_doc, &lines_buf, &fence);
     try std.testing.expectEqual(@as(usize, 3), line_count);
     var cmds: [256]DrawCommand = undefined;
-    const config = ViewportConfig{
+    var config = ViewportConfig{
         .window_width = 800.0,
         .window_height = 1000.0,
         .scroll_y = 0.0,
         .math_size_fn = Stub.size,
     };
-    const count = layoutViewport(test_doc, lines_buf[0..line_count], config, &cmds);
+    const count = layoutViewport(test_doc, lines_buf[0..line_count], &config, &cmds);
     // Even with a live engine: highlighted code card, zero math commands.
     try std.testing.expect(count > 0);
     for (cmds[0..count]) |c| try std.testing.expect(c.kind != .math);
+}
+
+test "energy #385: math-box memo matches direct query, skips repeat FFI" {
+    if (comptime core_options.plugin_stub) return;
+    const Calls = struct {
+        var n: u32 = 0;
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            n += 1;
+            w.* = px * 2.0;
+            ab.* = px * 0.8;
+            bl.* = px * 0.3;
+            return 0;
+        }
+    };
+    const tex = "x+y";
+    var cache: MathBoxCache = undefined;
+    mathBoxCacheReset(&cache);
+    Calls.n = 0;
+    const a = mathBoxCached(tex, true, 17.0, Calls.size, &cache) orelse return error.MissExpected;
+    try std.testing.expectEqual(@as(u32, 1), Calls.n);
+    const b = mathBoxCached(tex, true, 17.0, Calls.size, &cache) orelse return error.MissExpected;
+    // Hit: no second FFI call, bitwise-identical box.
+    try std.testing.expectEqual(@as(u32, 1), Calls.n);
+    try std.testing.expectEqual(a.w, b.w);
+    try std.testing.expectEqual(a.above, b.above);
+    try std.testing.expectEqual(a.below, b.below);
+    // Direct call agrees with the memoized box.
+    const d = mathBox(tex, true, 17.0, Calls.size) orelse return error.MissExpected;
+    try std.testing.expectEqual(a.w, d.w);
+    try std.testing.expectEqual(a.above, d.above);
+    try std.testing.expectEqual(a.below, d.below);
+    // Different px re-queries (key includes font size).
+    _ = mathBoxCached(tex, true, 20.0, Calls.size, &cache);
+    try std.testing.expectEqual(@as(u32, 3), Calls.n);
+    // Null cache is the old direct path.
+    Calls.n = 0;
+    _ = mathBoxCached(tex, true, 17.0, Calls.size, null);
+    _ = mathBoxCached(tex, true, 17.0, Calls.size, null);
+    try std.testing.expectEqual(@as(u32, 2), Calls.n);
+}
+
+test "energy #385: math-box memo latches refusals" {
+    if (comptime core_options.plugin_stub) return;
+    const Calls = struct {
+        var n: u32 = 0;
+        fn size(tex: [*]const u8, len: c_int, display: c_int, px: f32, w: *f32, ab: *f32, bl: *f32) callconv(.c) c_int {
+            _ = tex;
+            _ = len;
+            _ = display;
+            _ = px;
+            _ = w;
+            _ = ab;
+            _ = bl;
+            n += 1;
+            return 2;
+        }
+    };
+    var cache: MathBoxCache = undefined;
+    mathBoxCacheReset(&cache);
+    Calls.n = 0;
+    try std.testing.expect(mathBoxCached("bad", true, 17.0, Calls.size, &cache) == null);
+    try std.testing.expect(mathBoxCached("bad", true, 17.0, Calls.size, &cache) == null);
+    try std.testing.expectEqual(@as(u32, 1), Calls.n);
+}
+
+test "energy #385: tokenize memo matches direct call incl. null" {
+    var cache: TokenCache = undefined;
+    tokenCacheReset(&cache);
+    const line = "const x = 42; // hi";
+    var buf1: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    var buf2: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    const want = highlight.tokenize(.zig, line, &buf1);
+    const got = tokenizeCached(.zig, line, &buf2, &cache);
+    if (want == null) {
+        try std.testing.expect(got == null);
+    } else {
+        try std.testing.expect(got != null);
+        try std.testing.expectEqual(want.?.len, got.?.len);
+        for (want.?, 0..) |s, k| try std.testing.expectEqual(s, got.?[k]);
+    }
+    // Second call hits the memo with a fresh buffer: same runs.
+    var buf3: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    const got2 = tokenizeCached(.zig, line, &buf3, &cache);
+    if (want == null) {
+        try std.testing.expect(got2 == null);
+    } else {
+        try std.testing.expect(got2 != null);
+        try std.testing.expectEqual(want.?.len, got2.?.len);
+        for (want.?, 0..) |s, k| try std.testing.expectEqual(s, got2.?[k]);
+    }
+    // Untokenizable lines latch null (tab content).
+    const bad = "a\tb";
+    var bbuf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    try std.testing.expect(tokenizeCached(.zig, bad, &bbuf, &cache) == null);
+    var bbuf2: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    try std.testing.expect(tokenizeCached(.zig, bad, &bbuf2, &cache) == null);
+    // Null cache is the old direct path.
+    var nbuf: [highlight.MAX_SEGMENTS]highlight.Segment = undefined;
+    const direct = highlight.tokenize(.zig, line, &nbuf);
+    if (want == null) {
+        try std.testing.expect(direct == null);
+    } else {
+        try std.testing.expect(direct != null);
+        try std.testing.expectEqual(want.?.len, direct.?.len);
+    }
+}
+
+test "energy #385: codeFenceEnd matches inline scan, honors precomputed ends" {
+    const doc =
+        "```zig\n" ++
+        "const x = 1;\n" ++
+        "```\n" ++
+        "text\n" ++
+        "```mermaid\n" ++
+        "A-->B\n" ++
+        "```\n";
+    var lines_buf: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines_buf, &fence);
+    const lines = lines_buf[0..n];
+    // Null table: same first-close-wins scan as the old inline loops.
+    try std.testing.expectEqual(@as(usize, 2), codeFenceEnd(null, lines, 0));
+    try std.testing.expectEqual(@as(usize, 6), codeFenceEnd(null, lines, 4));
+    // Precomputed row short-circuits (ready plugin fence at 4).
+    const rows = [_]PluginEntry{.{
+        .job = .{ .fence_line = 4, .hash = 0, .renderer = .mermaid, .state = .ready },
+        .path = "p",
+        .fence_end = 6,
+    }};
+    try std.testing.expectEqual(@as(usize, 6), codeFenceEnd(rows[0..], lines, 4));
+    // Foreign index still scans inline.
+    try std.testing.expectEqual(@as(usize, 2), codeFenceEnd(rows[0..], lines, 0));
+    // Unclosed fence runs to lines.len.
+    const doc2 = "```zig\nconst x = 1;\n";
+    var lb2: [8]simd.Line = undefined;
+    var f2: simd.FenceState = .{};
+    const n2 = simd.scanLines(doc2, &lb2, &f2);
+    try std.testing.expectEqual(n2, codeFenceEnd(null, lb2[0..n2], 0));
+}
+
+test "energy #385: plugin lookup stops at first row past the query" {
+    const rows = [_]PluginEntry{
+        .{ .job = .{ .fence_line = 0, .hash = 1, .renderer = .mermaid, .state = .ready }, .path = "a", .fence_end = 2 },
+        .{ .job = .{ .fence_line = 5, .hash = 2, .renderer = .d2, .state = .queued }, .path = "", .fence_end = 7 },
+    };
+    const g0 = pluginFenceGeom(rows[0..], 0);
+    try std.testing.expect(g0.state.? == .ready);
+    try std.testing.expectEqualStrings("a", g0.path.?);
+    const g5 = pluginFenceGeom(rows[0..], 5);
+    try std.testing.expect(g5.state.? == .queued);
+    try std.testing.expect(g5.path == null);
+    // Miss between/after rows: null state, same as before.
+    try std.testing.expect(pluginFenceGeom(rows[0..], 3).state == null);
+    try std.testing.expect(pluginFenceGeom(rows[0..], 9).state == null);
+    try std.testing.expect(pluginFenceGeom(null, 0).state == null);
+}
+
+
+
+test "inline: linked image flows alt text, never raw markup" {
+    // `[![alt](src)](href)` must flow the alt text as a link run. Before
+    // the linkedImageAlt rewrite the outer link span carried the raw inner
+    // markup (`![CI](...)`) painted in link blue (README badge row).
+    const doc = "See [![CI](https://example.com/badge.svg)](https://example.com) here.\n";
+    var lines_buf: [8]simd.Line = undefined;
+    var in_fence: simd.FenceState = .{};
+    const line_count = simd.scanLines(doc, &lines_buf, &in_fence);
+    try std.testing.expect(line_count > 0);
+    var cmds: [128]DrawCommand = undefined;
+    const n = layoutViewport(doc, lines_buf[0..line_count], &.{
+        .window_width = 800.0,
+        .window_height = 600.0,
+        .scroll_y = 0.0,
+    }, &cmds);
+    try std.testing.expect(n > 0);
+    var saw_alt_link = false;
+    for (cmds[0..n]) |cmd| {
+        if (cmd.kind != .text_run) continue;
+        if (std.mem.indexOf(u8, cmd.text, "![") != null) {
+            std.debug.print("raw markup run: [{s}]\n", .{cmd.text});
+        }
+        try std.testing.expect(std.mem.indexOf(u8, cmd.text, "![") == null);
+        if (cmd.style.link and std.mem.eql(u8, cmd.text, "CI")) {
+            saw_alt_link = true;
+            try std.testing.expect(cmd.link_target != null);
+            try std.testing.expectEqualStrings("https://example.com", cmd.link_target.?);
+        }
+    }
+    try std.testing.expect(saw_alt_link);
 }

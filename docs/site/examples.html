@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Examples — Read docs</title>
+<meta name="description" content="Documents that show off what Read renders.">
+<style>
+:root { color-scheme: dark light; --bg: #121212; --fg: #E0E0E0; --muted: #9a9a9a; --card: #1b1b1b; --accent: #7cc4ff; }
+@media (prefers-color-scheme: light) { :root { --bg: #FAFAFA; --fg: #1E2022; --muted: #666; --card: #fff; --accent: #0b5fff; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.75 Georgia, "IBM Plex Serif", serif; }
+.wrap { max-width: 680px; margin: 0 auto; padding: 48px 24px 96px; }
+h1, h2 { font-family: "Space Grotesk", system-ui, sans-serif; }
+a { color: var(--accent); }
+nav { font-family: system-ui, sans-serif; font-size: 15px; margin-bottom: 32px; }
+.card { background: var(--card); border-radius: 12px; padding: 18px 20px; margin: 14px 0; }
+.card h2 { margin: 0 0 4px; font-size: 20px; }
+.card p { margin: 4px 0 10px; color: var(--muted); font-size: 15px; font-family: system-ui, sans-serif; }
+code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .88em; }
+img { width: 100%; border-radius: 8px; margin-top: 10px; }
+.shot { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 560px) { .shot { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav><a href="index.html">&larr; Read docs</a></nav>
+<h1>Examples</h1>
+<p>Every file below ships in the repo — open it in Read to see it live.</p>
+
+<div class="card">
+<h2>Showcase</h2>
+<p>The one-page tour: typography, headings, quotes, lists, code, tables, images, math.</p>
+<code>./zig-out/bin/read showcase.md</code>
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/text_wrapping.png" alt="Showcase rendering">
+</div>
+
+<div class="card">
+<h2>Code &amp; task lists</h2>
+<p>Zig fences, task checkboxes, horizontal scroll on hover.</p>
+<code>./zig-out/bin/read test_cases/code_and_tasks.md</code>
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/code_and_tasks.png" alt="Code blocks and task lists">
+</div>
+
+<div class="card">
+<h2>Tables</h2>
+<p>Column measurement, alignment, dividers, hover-scroll.</p>
+<code>./zig-out/bin/read test_cases/tables_formatting.md</code>
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/tables_formatting.png" alt="Tables">
+</div>
+
+<div class="card">
+<h2>Math gallery</h2>
+<p>Inline, display, and fenced formulae via the ZaTeX engine (falls back to source text without it).</p>
+<code>./zig-out/bin/read test_cases/math_gallery.md</code>
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/math_gallery.png" alt="Math rendering">
+<div class="shot">
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/math.png" alt="Math basics">
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/math_gallery_bottom.png" alt="Math display blocks">
+</div>
+<p>More: <code>examples/latex-example.md</code> · engine setup <a href="engine.html">here</a>.</p>
+</div>
+
+<div class="card">
+<h2>Syntax highlighting</h2>
+<p>20 languages, one frame each.</p>
+<code>./zig-out/bin/read test_cases/highlight.md</code>
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/highlight_zig.png" alt="Zig highlighting">
+<div class="shot">
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/highlight_python.png" alt="Python highlighting">
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/highlight_rust.png" alt="Rust highlighting">
+</div>
+</div>
+
+<div class="card">
+<h2>Diagrams</h2>
+<p>Mermaid, d2, Graphviz, PlantUML — cached async render, plain-code fallback.</p>
+<code>./zig-out/bin/read test_cases/plugin_mermaid.md</code>
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/plugin_mermaid.png" alt="Mermaid diagram">
+<div class="shot">
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/plugin_graphviz.png" alt="Graphviz diagram">
+<img src="https://github.com/gregoreesmaa/read/raw/main/screenshots/plugin_d2.png" alt="D2 diagram">
+</div>
+</div>
+
+<div class="card">
+<h2>Classic reference</h2>
+<p>The original Markdown syntax doc and the MarkdownTest 1.0 suite.</p>
+<code>./zig-out/bin/read examples/markdown-testfile.md</code>
+</div>
+</div>
+</body>
+</html>

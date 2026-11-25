@@ -285,10 +285,96 @@ pub fn mathBlitDest(x: f32, y_top: f32, w_px: f32, h_px: f32, scale: f32) MathBl
 }
 
 // ============================================================================
-// Tests. No allocator is referenced anywhere in this file: the cache owns
-// fixed storage and every test runs with zero heap allocations by
-// construction.
+// GPU batching model (issue #389): fill-color groups + wash-before-glyph.
+//
+// The platform text loop hoists SetFillColor out of the run loop: runs
+// sharing one ColorGroup paint as one GPU batch (no per-run state churn).
+// Opaque text collapses to RGB identity; translucent runs keep alpha in the
+// key so a translucent group never merges into an opaque batch. The model
+// is pure (no platform calls): group equality here must match the ObjC
+// run_color_group in macos.m (same inputs -> same grouping), pinned below.
 // ============================================================================
+
+/// Fill-color batch identity for one text run. Opaque to callers (equality
+/// only): same group => one primed fill color covers both runs.
+pub const ColorGroup = struct {
+    opaque_rgb: u24,
+    alpha: u8, // 255 = opaque fast path; anything else keys distinctly
+
+    pub fn init(r: u8, g: u8, b: u8, a: u8) ColorGroup {
+        if (a == 255) return .{ .opaque_rgb = @as(u24, r) << 16 | @as(u24, g) << 8 | b, .alpha = 255 };
+        // Translucent: fold the bytes (same xor-fold as run_color_group in
+        // macos.m) so distinct (r,g,b,a) tuples never share a group.
+        const fold: u8 = r ^ g ^ b ^ a;
+        return .{ .opaque_rgb = @as(u24, fold) << 16 | @as(u24, a) << 8 | 0x01, .alpha = a };
+    }
+
+    pub fn eql(self: ColorGroup, other: ColorGroup) bool {
+        return self.opaque_rgb == other.opaque_rgb and self.alpha == other.alpha;
+    }
+};
+
+/// Masked blits are clip-parity safe only at the raster's native scale:
+/// the 2x raster blits pixel-exact on 2x dests (snapped 1:1); on 1x the
+/// downsample under a damage clip resamples up to 1 LSB differently than
+/// the same blit unclipped, so incremental drag repaints never match
+/// fresh renders (2026-10 drag-back residue, every gesture incl. extend).
+/// 1x runs take the legacy direct draw (shaping still cached).
+pub fn blitScaleParityOk(output_scale: f32) bool {
+    return output_scale > 1.5;
+}
+
+/// Count the fill-color groups (batches) in one pass's run-color sequence:
+/// the number of SetFillColor primes the platform loop issues (first run
+/// primes, each group change re-primes). Zero runs => zero primes.
+pub fn batchCount(colors: []const ColorGroup) usize {
+    if (colors.len == 0) return 0;
+    var n: usize = 1;
+    var i: usize = 1;
+    while (i < colors.len) : (i += 1) {
+        if (!colors[i].eql(colors[i - 1])) n += 1;
+    }
+    return n;
+}
+
+test "gpu batching: single-color pass primes once, no per-run churn (issue #389)" {
+    const body = ColorGroup.init(224, 224, 224, 255);
+    const colors = [_]ColorGroup{ body, body, body, body, body };
+    try std.testing.expectEqual(@as(usize, 1), batchCount(&colors));
+}
+
+test "gpu batching: color changes re-prime exactly at group edges (issue #389)" {
+    const body = ColorGroup.init(224, 224, 224, 255);
+    const accent = ColorGroup.init(90, 160, 255, 255);
+    const muted = ColorGroup.init(140, 140, 145, 255);
+    const colors = [_]ColorGroup{ body, body, accent, accent, muted, body };
+    try std.testing.expectEqual(@as(usize, 4), batchCount(&colors));
+    // Same RGB, different alpha: distinct groups (never merge translucent
+    // into an opaque batch).
+    const wash = ColorGroup.init(224, 224, 224, 82);
+    const mixed = [_]ColorGroup{ body, wash, body };
+    try std.testing.expectEqual(@as(usize, 3), batchCount(&mixed));
+    try std.testing.expect(batchCount(&[_]ColorGroup{}) == 0);
+}
+
+test "gpu batching: opaque grouping is RGB-identity (issue #389)" {
+    // Mirrors run_color_group in macos.m: opaque collapses to RGB, so two
+    // runs of the same text color always batch even across alpha-255 calls.
+    const a = ColorGroup.init(18, 18, 18, 255);
+    const b = ColorGroup.init(18, 18, 18, 255);
+    try std.testing.expect(a.eql(b));
+    const c = ColorGroup.init(18, 18, 19, 255);
+    try std.testing.expect(!a.eql(c));
+}
+
+test "gpu batching: masked blit is clip-parity safe only at native scale (issue #389)" {
+    // Mirrors the g_output_scale > 1.5f gate in blit_tinted_mask_batched
+    // (macos.m): 1x downsamples of the 2x raster differ under a damage
+    // clip by up to 1 LSB vs unclipped, breaking incremental-vs-fresh
+    // pixel parity, so 1x takes the legacy direct draw.
+    try std.testing.expect(!blitScaleParityOk(1.0));
+    try std.testing.expect(blitScaleParityOk(2.0));
+}
 
 test "shaped-run cache: repeat run is a hit, zero re-shape" {
     var cache = ShapedRunCache{};

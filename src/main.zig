@@ -6,6 +6,7 @@ const simd = @import("hot");
 const parser = @import("core/parser.zig");
 const layout = @import("layout/viewport.zig");
 const damage = @import("layout/damage.zig");
+const idle = @import("platform/idle.zig");
 const help_overlay = @import("layout/help_overlay.zig");
 const math_detect = @import("core/math_detect.zig");
 const remote_policy = @import("core/remote_policy.zig");
@@ -18,10 +19,6 @@ const DEFAULT_DOC =
     \\# Read
     \\
     \\An ultra-minimalist, zero-dependency, microsecond-grade Markdown reader.
-    \\
-    \\## The Philosophy of Speed
-    \\
-    \\Computers are exceptionally fast, but modern document readers often hide layers of virtual DOMs, heavy JavaScript bundles, garbage collectors, and complex AST allocations.
     \\
     \\**Read** takes the opposite approach:
     \\
@@ -121,11 +118,99 @@ fn gatedImageSize(url: [*]const u8, url_len: c_int, out_w: *f32, out_h: *f32) ca
     const slice = url[0..@as(usize, @intCast(url_len))];
     if (remote_policy.isRemoteUrl(slice)) g_remote_seen = true;
     if (remote_policy.blockedByPolicy(slice, g_app.remote_images)) return;
+    // Per-document image-size memo (issue #385): metrics + draw used to
+    // re-query every image every pass through the platform FFI. Hits
+    // return the latched dims with no FFI round-trip; misses call
+    // through once and latch — including the 0x0 (still loading/blocked
+    // platform-side) outcome, so a loading image pays one query per
+    // table cycle, not per pass. Keyed by URL bytes: the table is
+    // reset on every document open (stale URLs must never pin), and a
+    // byte compare guards wrap-around eviction.
+    const key = @intFromPtr(url);
+    var h: usize = key ^ (@as(usize, @intCast(url_len)) *% 0x9E3779B97F4A7C15);
+    for (slice) |c| h = (h ^ c) *% 0x100000001B3;
+    const idx = h % IMAGE_SIZE_CACHE_LEN;
+    const slot = &g_image_size_cache[idx];
+    if (slot.hit and slot.url_ptr == key and slot.url_len == slice.len and std.mem.eql(u8, slot.url_buf[0..slot.url_len], slice)) {
+        out_w.* = slot.w;
+        out_h.* = slot.h;
+        return;
+    }
     bridge.platform_get_image_size(url, url_len, out_w, out_h);
+    slot.url_ptr = key;
+    const take = @min(slice.len, slot.url_buf.len);
+    @memcpy(slot.url_buf[0..take], slice[0..take]);
+    slot.url_len = take;
+    slot.w = out_w.*;
+    slot.h = out_h.*;
+    slot.hit = true;
+}
+
+/// Per-document image-size memo entry (issue #385): URL bytes plus the
+/// last platform answer. 16 entries x ~272B in BSS; zero hot-path
+/// allocations, zero ship-file cost (BSS).
+const IMAGE_SIZE_CACHE_LEN: usize = 16;
+const ImageSizeCacheEntry = struct {
+    url_ptr: usize = 0,
+    url_len: usize = 0,
+    url_buf: [256]u8 = [_]u8{0} ** 256,
+    w: f32 = 0,
+    h: f32 = 0,
+    hit: bool = false,
+};
+var g_image_size_cache: [IMAGE_SIZE_CACHE_LEN]ImageSizeCacheEntry = undefined;
+
+/// Zero the image-size memo (document open): stale URLs must never pin.
+fn imageSizeCacheReset() void {
+    for (&g_image_size_cache) |*e| e.* = .{};
 }
 
 var g_lines_buffer: [MAX_LINES]simd.Line = undefined;
 var g_commands_buffer: [MAX_COMMANDS]layout.DrawCommand = undefined;
+// Scroll fast path (#384): the live document-space layout result one
+// scroll frame produced, rented from the same static buffer as the full
+// path (no second ring). Same-scroll damage repaints reuse it instead of
+// re-running layout; scroll changes always re-lay out (the cache holds
+// viewport-window rows only). Any content/config change invalidates via
+// invalidateScrollCache below; the reuse check itself pins the full key.
+var g_scroll_cache: layout.ScrollFrameCache = .{};
+var g_scroll_cached_cmds: [MAX_COMMANDS]layout.DrawCommand = undefined;
+// Scroll coalescing (#384): superseded precise deltas collapse per vsync.
+// The platform already queues one draw per runloop pass; folding N raw
+// deltas into one quantized target per tick keeps the displayed offset on
+// whole device pixels without touching 1:1 feel (precise still snaps from
+// the displayed offset, wheel still retargets the glide).
+var g_pending_dy: f32 = 0.0;
+var g_pending_precise: bool = false;
+var g_pending_scroll: bool = false;
+// Last invalidation key the platform saw: skip setNeedsDisplay when neither
+// scroll/overshoot nor the frame counter moved (static screen, more==0).
+var g_last_drawn_scroll: f32 = 0.0;
+var g_last_drawn_overshoot: f32 = 0.0;
+
+/// Scroll-cache content identity: pointer + length + first/last bytes.
+/// Cheap (no hash walk); any edit, reload, or swap trips at least one leg.
+fn scrollContentId() usize {
+    var id: usize = @intFromPtr(g_app.bytes.ptr);
+    id ^= g_app.bytes.len *% 0x9e3779b97f4a7c15;
+    if (g_app.bytes.len > 0) {
+        id ^= @as(usize, g_app.bytes[0]) *% 0xbf58476d1ce4e5b9;
+        id ^= @as(usize, g_app.bytes[g_app.bytes.len - 1]) *% 0x94d049bb133111eb;
+    }
+    id ^= @as(usize, g_app.line_count) *% 0xda942042e4dd58b5;
+    return id;
+}
+
+fn invalidateScrollCache() void {
+    g_scroll_cache.invalidate();
+}
+// Per-frame layout memo tables (issue #385): math boxes keyed by tex
+// slice, code-line segments keyed by (lang, line slice). Threaded into
+// the render config in onDraw; metrics passes leave the config nulls so
+// heights track rendering exactly through the shared query path. BSS,
+// zero hot-path allocations, zero ship-file cost.
+var g_math_box_cache: layout.MathBoxCache = undefined;
+var g_token_cache: layout.TokenCache = undefined;
 // Content-driven async plugin renders (issue #323, PR-1 Task 5). Per-doc
 // job table plus the parallel path buffers Task 4's borrow side reads
 // (slot index == job index; paths NUL-terminated in place for the outcome
@@ -140,6 +225,10 @@ var g_plugin_count: usize = 0;
 var g_plugin_entries: [plugin_cache.MAX_PLUGIN_JOBS]layout.PluginEntry = undefined;
 var g_plugin_path_bufs: [plugin_cache.MAX_PLUGIN_JOBS][256]u8 = undefined;
 var g_plugin_path_lens: [plugin_cache.MAX_PLUGIN_JOBS]u8 = [_]u8{0} ** plugin_cache.MAX_PLUGIN_JOBS;
+// Precomputed fence ends, stamped by pluginStampFenceEnds at open/seeding
+// (issue #385): threaded into the entry bundle on every attach so layout
+// skips the per-frame fence-body walk. BSS, zero ship-file cost.
+var g_plugin_fence_ends: [plugin_cache.MAX_PLUGIN_JOBS]usize = [_]usize{0} ** plugin_cache.MAX_PLUGIN_JOBS;
 var g_plugin_launched: [plugin_cache.MAX_PLUGIN_JOBS]bool = [_]bool{false} ** plugin_cache.MAX_PLUGIN_JOBS;
 var g_plugin_inflight: u8 = 0;
 // Previously tracked children orphaned by a document swap: still reaped by
@@ -192,6 +281,11 @@ var g_reduce_motion: bool = false;
 fn retargetScroll(target: f32) void {
     if (g_reduce_motion) {
         snapScroll(target);
+        // Synchronous landing (see snapScroll): the tick edge never fires.
+        // Reduce Motion takes the synchronous path (issue #388): release
+        // here instead so keyboard/anchor jumps still shrink RSS. Zero
+        // extra cost on the animated path (this branch never runs there).
+        releaseSettledPages();
         return;
     }
     g_smooth.setTarget(target, g_app.max_scroll_y);
@@ -205,19 +299,38 @@ fn snapScroll(v: f32) void {
     g_app.scroll_y = g_smooth.current;
 }
 
-/// Async image natural sizes landed (platform completion): recompute metrics
-/// with live sizes (stale checkpoints would misplace content), then absorb
-/// the above-viewport height delta so content below stays put instead of
-/// jumping. The platform computes the delta from its last drawn rect
-/// (same laidOutImageHeight/above-viewport math, pinned by contract tests
-/// in controls_test.zig — see the scrollbar mirror precedent). Cold path:
-/// one metrics walk; zero allocations. No animation — snapScroll lands it
-/// synchronously and clamps to the fresh max.
-fn onImagesChanged(delta_above: f32) callconv(.c) void {
+/// Coalesced re-measure batch (issue #386): every async arrival (image
+/// decode, plugin completion) notes here instead of walking metrics
+/// inline. The drain below runs exactly one `updateDocumentMetrics` walk
+/// per frame no matter how many arrivals landed, then absorbs the summed
+/// above-viewport delta in a single snap. Static BSS; zero allocations.
+var g_metrics_batch: layout.MetricsCoalescer = .{};
+
+/// Drain one frame's arrival batch: a single metrics walk plus the summed
+/// above-viewport shift (same anchor math as the old per-arrival path, so
+/// final scroll offset and laid-out images are identical). Returns true
+/// when a walk ran (caller repaints once: AppKit coalesces repeats).
+fn drainMetricsBatch() bool {
+    if (!g_metrics_batch.drain()) return false;
     updateDocumentMetrics();
-    if (delta_above != 0.0) {
-        snapScroll(g_app.scroll_y + delta_above);
-    }
+    const d = g_metrics_batch.takeDelta();
+    if (d != 0.0) snapScroll(g_app.scroll_y + d);
+    return true;
+}
+
+/// Async image natural sizes landed (platform completion): batch into the
+/// frame's re-measure instead of walking metrics inline (issue #386: 16
+/// staggered arrivals cost 16 walks; now one). The metrics resync still
+/// happens before the repaint — the drain runs synchronously here when
+/// called outside a tick — so the draw uses fresh geometry and content
+/// below doesn't jump. The platform computes the delta from its last drawn
+/// rect (same laidOutImageHeight/above-viewport math, pinned by contract
+/// tests in controls_test.zig — see the scrollbar mirror precedent).
+/// Cold path: at most one metrics walk; zero allocations. No animation —
+/// snapScroll lands it synchronously and clamps to the fresh max.
+fn onImagesChanged(delta_above: f32) callconv(.c) void {
+    g_metrics_batch.noteArrival(delta_above);
+    if (drainMetricsBatch()) bridge.platform_request_redraw();
 }
 
 // ---------------------------------------------------------------------------
@@ -310,22 +423,42 @@ fn pluginResolvePaths(
     bufs: [][256]u8,
     lens: []u8,
 ) usize {
-    const cap = @min(jobs.len, plugin_cache.MAX_PLUGIN_JOBS);
-    const n = plugin_cache.collectPluginJobs(bytes, lines, cache_root, jobs[0..cap]);
-    const take = @min(n, cap);
+    // collectPluginJobs caps at min(jobs.len, MAX_PLUGIN_JOBS) internally,
+    // so n needs no second min here (the old cap/take pair was identity).
+    // bufs tracks jobs 1:1 at every in-tree caller (16 slots each), so the
+    // old `i < bufs.len` guard was provably dead; index directly.
+    const n = plugin_cache.collectPluginJobs(bytes, lines, cache_root, jobs);
     var i: usize = 0;
-    while (i < take) : (i += 1) {
+    while (i < n) : (i += 1) {
         lens[i] = 0;
-        if (i < bufs.len) {
-            if (plugin_cache.cachePath(cache_root, jobs[i].renderer, jobs[i].hash, &bufs[i])) |p| {
-                if (p.len < bufs[i].len) {
-                    lens[i] = @intCast(p.len);
-                    bufs[i][p.len] = 0;
-                }
+        if (plugin_cache.cachePath(cache_root, jobs[i].renderer, jobs[i].hash, &bufs[i])) |p| {
+            if (p.len < bufs[i].len) {
+                lens[i] = @intCast(p.len);
+                bufs[i][p.len] = 0;
             }
         }
     }
-    return take;
+    return n;
+}
+
+/// Stamp the precomputed fence ends onto the layout-facing entry bundle
+/// (issue #385): one inline walk per row from its `fence_line` to the
+/// matching `code_fence_end` (first wins, mirroring the old per-frame
+/// scan), so render/height/refine skip the per-frame body walk. Cold
+/// path (open/seeding); rows keep document order.
+fn pluginStampFenceEnds(
+    lines: []const simd.Line,
+    jobs: []const plugin_cache.PluginJob,
+    entries: []layout.PluginEntry,
+    count: usize,
+) void {
+    const take = @min(count, @min(jobs.len, entries.len));
+    var i: usize = 0;
+    while (i < take) : (i += 1) {
+        var j: usize = jobs[i].fence_line + 1;
+        while (j < lines.len and lines[j].block_type != .code_fence_end) : (j += 1) {}
+        entries[i].fence_end = j;
+    }
 }
 
 /// Cache root for rendered PNGs (`<root>/read/plugins/<name>/<hex>.png`):
@@ -559,6 +692,8 @@ fn pluginMarkNaive(r: usize) void {
 
 /// Write one shim script (render or probe entry point) under dir and mark
 /// it executable. The stable path persists for later launches.
+/// Hash-skip (#390): when a shim with identical bytes already exists, keep
+/// it — no rewrite, no chmod, no mtime churn for watchers or Time Machine.
 fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe: bool, stable: []u8, stable_len: *u8) bool {
     const infix = if (probe) "/probe-" else "/run-";
     const ext = ".sh";
@@ -578,11 +713,33 @@ fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe:
     var body: [2048]u8 = undefined;
     const text = if (probe) pluginProbeShim(helper, name, &body) else pluginRenderShim(helper, name, &body);
     const t = text orelse return false;
+    if (pluginFileContentMatches(stable[0..s], t)) return true;
     if (!pluginWriteFile(path_z, t)) return false;
     // Windows: no chmod (CreateFile ACLs already permit execution; the
     // shims never execute there — probes demote before launching).
     if (comptime builtin.os.tag == .windows) return true;
     if (std.c.chmod(path_z, 0o755) != 0) return false;
+    return true;
+}
+
+/// True when the file at `path` holds exactly `want` bytes. Pure read
+/// probe for the shim hash-skip: a missing/unreadable file reads as
+/// different (rewrite path), never as equal.
+fn pluginFileContentMatches(path: []const u8, want: []const u8) bool {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return false;
+    if (st.size != want.len) return false;
+    var off: usize = 0;
+    var buf: [512]u8 = undefined;
+    while (off < want.len) {
+        const n = std.c.read(fd, &buf, @min(buf.len, want.len - off));
+        if (n <= 0) return false;
+        const got: usize = @intCast(n);
+        if (!std.mem.eql(u8, buf[0..got], want[off..][0..got])) return false;
+        off += got;
+    }
     return true;
 }
 
@@ -763,19 +920,173 @@ fn pluginPollAndAdvance() bool {
     g_plugin_orphans = @intCast(@max(orphans_open, 0));
     pluginProbeAndLaunch();
     if (resolved > 0) {
-        // Same arrival path as async images (no above-viewport shift is
-        // known here: content below settles on the next frame's layout).
-        onImagesChanged(0.0);
-        bridge.platform_request_redraw();
+        // Batch the whole drain's flips into one re-measure (issue #386:
+        // N completions in one poll cost one walk, not N). Same arrival
+        // path as async images (no above-viewport shift is known here:
+        // content below settles on the next frame's layout).
+        g_metrics_batch.noteArrival(0.0);
+        if (drainMetricsBatch()) bridge.platform_request_redraw();
         return true;
     }
     return false;
 }
 
-/// Per-open plugin kick (cold): reset per-doc state, resolve the table,
-/// stat cache hits to ready, then probe and launch. Read-test/headless
-/// binaries skip the entire kick (same determinism rule as the parked image
-/// decodes: fences stay code cards there).
+/// Cold-path cache tidy (#390): sweeps every renderer's cache dir under
+/// `root` — removes stale `probe-*` sentinels (leaked when a previous run
+/// crashed between probe launch and reap) and prunes the per-renderer PNG
+/// cache past PLUGIN_CACHE_MAX_FILES, oldest mtime first (LRU-ish; mtime
+/// on a cache hit is NOT bumped — hits are stat-only on the hot path).
+/// Bounded: scans at most PLUGIN_TIDY_SCAN entries per renderer dir,
+/// deletes at most PLUGIN_TIDY_DEL_MAX files. One pass per open, before
+/// the fence fast path so plain documents clean too; best-effort (any
+/// failure silently keeps old bytes, including a missing dir). Zero heap:
+/// libc dir iteration into stack buffers; no std.Io.Dir (needs an Io
+/// context the cold path does not thread) and no std.fs (links plumbing
+/// into ship __TEXT).
+///
+/// Portability: Zig 0.16's `std.c` exposes `readdir`/`stat` only for
+/// Darwin targets, so the two entry points are declared locally with an
+/// explicit symbol name — plain `readdir`/`stat` exist in both libSystem
+/// (arm64) and glibc. The dirent name field differs per OS ([1024]u8
+/// Darwin, [256]u8 Linux), handled by the per-OS struct below; only the
+/// name is read.
+const pluginDirent = switch (builtin.os.tag) {
+    .linux => extern struct {
+        ino: std.c.ino_t,
+        off: std.c.off_t,
+        reclen: c_ushort,
+        kind: u8,
+        name: [256]u8,
+    },
+    else => extern struct {
+        ino: u64,
+        seekoff: u64,
+        reclen: u16,
+        namlen: u16,
+        kind: u8,
+        name: [1024]u8,
+    },
+};
+const pluginReaddir = @extern(*const fn (*std.c.DIR) callconv(.c) ?*pluginDirent, .{ .name = "readdir" });
+const pluginStat = @extern(*const fn ([*:0]const u8, *std.c.Stat) callconv(.c) c_int, .{ .name = "stat" });
+const PLUGIN_CACHE_MAX_FILES: usize = 64;
+const PLUGIN_TIDY_SCAN: usize = 256;
+const PLUGIN_TIDY_DEL_MAX: usize = 32;
+/// Sweep one renderer's cache dir: drop stale probe sentinels, prune PNG
+/// overflow. `root` is the cache root (resolved once by the caller).
+fn pluginTidyCache(root: []const u8) void {
+    var r: usize = 0;
+    while (r < PLUGIN_RENDERER_COUNT) : (r += 1) {
+        const renderer: plugin_cache.Renderer = @enumFromInt(r);
+        var dbuf: [512]u8 = undefined;
+        const dir = pluginRendererDir(root, @tagName(renderer), &dbuf) orelse continue;
+        pluginTidyRendererDir(dir);
+    }
+}
+
+fn pluginTidyRendererDir(dir: []const u8) void {
+    var zdir: [1024:0]u8 = [_:0]u8{0} ** 1024;
+    if (dir.len + 1 > zdir.len) return;
+    @memcpy(zdir[0..dir.len], dir);
+    zdir[dir.len] = 0;
+    const dz: [*:0]const u8 = @ptrCast(&zdir[0]);
+    const dp = std.c.opendir(dz) orelse return;
+    defer _ = std.c.closedir(dp);
+    var oldest: [PLUGIN_TIDY_DEL_MAX]i64 = [_]i64{0} ** PLUGIN_TIDY_DEL_MAX;
+    var onames: [PLUGIN_TIDY_DEL_MAX][64]u8 = [_][64]u8{[_]u8{0} ** 64} ** PLUGIN_TIDY_DEL_MAX;
+    var n_old: usize = 0;
+    var png_count: usize = 0;
+    var scanned: usize = 0;
+    while (scanned < PLUGIN_TIDY_SCAN) {
+        const ent = pluginReaddir(dp) orelse break;
+        scanned += 1;
+        // d_name is a fixed array ([256]u8 Linux, [1024]u8 Darwin):
+        // slice to the first NUL (never a raw sentinel pointer).
+        const n = std.mem.sliceTo(ent.*.name[0..], 0);
+        if (n.len == 0) continue;
+        if (n[0] == '.') continue;
+        // Stale probe sentinels first: only the `probe-<hh>.src/.out`
+        // shape (live shims `probe-<name>.sh` never match — longer tail,
+        // `.sh` extension; see pluginIsStaleProbeName). Note the seq
+        // counter is u8, so leaves are always two hex digits, never wider
+        // (see pluginLaunchProbe).
+        if (pluginIsStaleProbeName(n)) {
+            var full: [1024:0]u8 = [_:0]u8{0} ** 1024;
+            if (pluginJoinPath(dir, n, full[0..1023]) != null) {
+                const fz: [*:0]const u8 = @ptrCast(&full[0]);
+                _ = std.c.unlink(fz);
+            }
+            continue;
+        }
+        if (!std.mem.endsWith(u8, n, ".png")) continue;
+        png_count += 1;
+        var full: [1024:0]u8 = [_:0]u8{0} ** 1024;
+        if (pluginJoinPath(dir, n, full[0..1023]) == null) continue;
+        const fz: [*:0]const u8 = @ptrCast(&full[0]);
+        var st: std.c.Stat = undefined;
+        if (pluginStat(fz, &st) != 0) continue;
+        // mtime() (method, not field) is portable across Darwin/Linux
+        // Stat shapes; compare seconds only — prune order needs no nsec.
+        const mt = st.mtime().sec;
+        // Track the oldest few for pruning; insertion into a tiny sorted
+        // window keeps this O(scan * 32) with no allocation.
+        if (n_old < PLUGIN_TIDY_DEL_MAX or mt < oldest[n_old - 1]) {
+            var pos: usize = 0;
+            while (pos < n_old and oldest[pos] <= mt) : (pos += 1) {}
+            if (n_old < PLUGIN_TIDY_DEL_MAX) n_old += 1;
+            var q: usize = n_old - 1;
+            while (q > pos) : (q -= 1) {
+                oldest[q] = oldest[q - 1];
+                onames[q] = onames[q - 1];
+            }
+            oldest[pos] = mt;
+            const take = @min(n.len, 63);
+            @memcpy(onames[pos][0..take], n[0..take]);
+            onames[pos][take] = 0;
+        }
+    }
+    if (png_count <= PLUGIN_CACHE_MAX_FILES) return;
+    var drop = png_count - PLUGIN_CACHE_MAX_FILES;
+    if (drop > n_old) drop = n_old;
+    var i: usize = 0;
+    while (i < drop) : (i += 1) {
+        const tail = std.mem.span(@as([*:0]const u8, @ptrCast(&onames[i][0])));
+        var full: [1024:0]u8 = [_:0]u8{0} ** 1024;
+        if (pluginJoinPath(dir, tail, full[0..1023]) != null) {
+            const fz: [*:0]const u8 = @ptrCast(&full[0]);
+            _ = std.c.unlink(fz);
+        }
+    }
+}
+
+/// Stale probe sentinel shape: `probe-<hh>.src` / `probe-<hh>.out` where
+/// <hh> are exactly two lowercase hex digits. Live shims (`probe-<name>.sh`)
+/// never match: their post-prefix tail is longer and ends in `.sh`.
+fn pluginIsStaleProbeName(n: []const u8) bool {
+    const pre = "probe-";
+    if (!std.mem.startsWith(u8, n, pre)) return false;
+    const tail = n[pre.len..];
+    if (tail.len != 6) return false; // "<hh>.src" / "<hh>.out"
+    for (tail[0..2]) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    }
+    return std.mem.eql(u8, tail[2..], ".src") or std.mem.eql(u8, tail[2..], ".out");
+}
+
+/// `<dir>/<leaf>` into `out` with NUL termination. Returns the path slice,
+/// or null when it does not fit (caller keeps old bytes). Thin wrapper
+/// over pluginChildPath (one join codegen site, not two).
+fn pluginJoinPath(dir: []const u8, leaf: []const u8, out: []u8) ?[]u8 {
+    if (out.len == 0) return null;
+    const p = pluginChildPath(dir, leaf, out[0 .. out.len - 1]) orelse return null;
+    out[p.len] = 0;
+    return out[0..p.len];
+}
+
+/// Per-open plugin kick (cold): reset per-doc state, tidy the cache,
+/// resolve the table, stat cache hits to ready, then probe and launch.
+/// Read-test/headless binaries skip the entire kick (same determinism rule
+/// as the parked image decodes: fences stay code cards there).
 fn pluginKickForDocument() void {
     g_plugin_orphans +|= g_plugin_inflight;
     g_plugin_count = 0;
@@ -783,11 +1094,18 @@ fn pluginKickForDocument() void {
     for (&g_plugin_launched) |*l| l.* = false;
     for (&g_plugin_probe_pending) |*p| p.* = false;
     if (build_options.test_hooks) return;
-    // No hasPluginFences pre-check: collectPluginJobs already scans the
-    // lines once and returns 0 when none match, so a separate pre-scan
-    // would walk every plain document twice (one inline copy + one pass).
     const root = pluginCacheRoot(g_plugin_root_buf[0..]) orelse return;
     g_plugin_root_len = root.len;
+    // Cold-path tidy (#390): one bounded sweep per open — stale probe
+    // sentinels from a crashed earlier run and cache overflow never linger
+    // or grow without bound, even across sessions (renderer dirs derive
+    // from the root, not session state). Runs before the fence fast path
+    // so plain documents clean too; best-effort, failures keep old bytes.
+    pluginTidyCache(root);
+    // Fast path (#390): documents without plugin fences skip the job scan
+    // and every per-job stat. hasPluginFences is one scan over
+    // already-resident line structs (no bytes walk).
+    if (!plugin_cache.hasPluginFences(g_app.bytes, g_app.lines[0..g_app.line_count])) return;
     const n = pluginResolvePaths(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
@@ -796,9 +1114,15 @@ fn pluginKickForDocument() void {
         g_plugin_path_bufs[0..],
         g_plugin_path_lens[0..],
     );
-    // Explicit truncation at 16 rows (Task 4 review F2): collection caps
-    // there too, so this minimum documents the bound at the build.
-    g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    // resolvePaths returns take <= MAX_PLUGIN_JOBS already (collect caps
+    // internally), so a second min here would be identity, not truncation.
+    g_plugin_count = n;
+    pluginStampFenceEnds(
+        g_app.lines[0..g_app.line_count],
+        g_plugin_jobs[0..],
+        g_plugin_entries[0..],
+        g_plugin_count,
+    );
     if (g_plugin_count == 0) return;
     var saw_ready = false;
     var i: usize = 0;
@@ -846,6 +1170,12 @@ fn pluginSeedReadyForScreenshot() void {
         g_plugin_path_lens[0..],
     );
     g_plugin_count = @min(n, plugin_cache.MAX_PLUGIN_JOBS);
+    pluginStampFenceEnds(
+        g_app.lines[0..g_app.line_count],
+        g_plugin_jobs[0..],
+        g_plugin_entries[0..],
+        g_plugin_count,
+    );
     if (g_plugin_count == 0) return;
     var saw_ready = false;
     var i: usize = 0;
@@ -879,6 +1209,7 @@ noinline fn pluginAttachConfig(cfg: *layout.ViewportConfig) void {
         g_plugin_entries[i] = .{
             .job = g_plugin_jobs[i],
             .path = g_plugin_path_bufs[i][0..g_plugin_path_lens[i]],
+            .fence_end = g_plugin_fence_ends[i],
         };
     }
     cfg.plugins = g_plugin_entries[0..g_plugin_count];
@@ -935,6 +1266,16 @@ var g_sweep_step: f32 = 0.0;
 // Two-phase drag-back residue test state (read-test binary only): selection A
 // then shrink to B, painted incrementally on one bitmap. See --select-drag.
 var g_drag_active: bool = false;
+// Repaint-idempotence probe state (read-test binary only): same frame drawn
+// twice on one bitmap, caches warm on the second pass. See --repaint-idempotence.
+var g_repaint_active: bool = false;
+// Tier-isolation bypasses (test binary only): force legacy direct paint
+// to name a divergent raster cache tier.
+var g_pill_direct: bool = false;
+var g_shape_direct: bool = false;
+// Force fresh layout on every draw (test binary only): isolates the reuse
+// path when the idempotence probe diverges. See --no-reuse.
+var g_no_reuse: bool = false;
 // First-paint gate for deferred image decodes (see platform_arm_images):
 // image records park until the first frame is committed, then decode.
 // Headless one-shot screenshots never arm (deterministic placeholders).
@@ -949,8 +1290,77 @@ fn onScrollTo(scroll_y: f32) callconv(.c) void {
     snapScroll(scroll_y);
 }
 
-fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int) callconv(.c) void {
-    const now_ms = getTimestampMs();
+/// Fold one vertical delta into the easing state (#384: shared by the
+/// input handler and the per-vsync coalesced fold). Routing (precise 1:1
+/// vs eased wheel) lives in MotionPolicy.applyVertical, pinned by strict
+/// tests. Bound residual becomes rubber-band overshoot (capped, decaying);
+/// the spring decay arms the tick even when scroll already settled.
+fn applyVerticalScroll(dy: f32, precise: bool) void {
+    const target_before = g_smooth.target;
+    const current_before = g_smooth.current;
+    g_smooth = layout.MotionPolicy.applyVertical(
+        g_smooth.target,
+        g_smooth.current,
+        dy,
+        precise,
+        g_app.max_scroll_y,
+        g_reduce_motion,
+    );
+    const desired = if (precise) current_before - dy else target_before - dy;
+    const actual = if (precise) g_smooth.current else g_smooth.target;
+    const over = desired - actual;
+    if (over != 0.0) {
+        g_edge.absorb(over);
+        bridge.platform_smooth_kick();
+    }
+    g_app.scroll_y = g_smooth.current;
+}
+
+/// Fold coalesced deltas once per vsync (#384): superseded precise samples
+/// collapse into a single quantized target before the frame runs, so the
+/// displayed offset lands on whole device pixels without touching 1:1 feel
+/// (precise still snaps from the displayed offset, wheel still retargets).
+fn foldPendingScroll(backing_scale: f32) void {
+    if (!g_pending_scroll) return;
+    g_pending_scroll = false;
+    const dy = g_pending_dy;
+    const precise = g_pending_precise;
+    g_pending_dy = 0.0;
+    g_pending_precise = false;
+    if (dy == 0.0) return;
+    if (precise) {
+        g_smooth = layout.MotionPolicy.applyVertical(
+            g_smooth.target,
+            layout.SmoothScroll.quantize(g_smooth.current, backing_scale),
+            dy,
+            true,
+            g_app.max_scroll_y,
+            g_reduce_motion,
+        );
+        g_smooth.current = layout.SmoothScroll.quantize(g_smooth.current, backing_scale);
+        g_smooth.target = g_smooth.current;
+        g_app.scroll_y = g_smooth.current;
+    } else {
+        applyVerticalScroll(dy, false);
+    }
+}
+
+/// Present a synchronously-settled scroll step (Reduce Motion snap, or
+/// any path that lands settled with no timer armed): sync the platform
+/// mirror and blit pixels + strip in one call. No-op when nothing moved.
+fn presentSettledScroll(before: f32) void {
+    bridge.platform_sync_scroll(g_app.scroll_y);
+    bridge.platform_request_scroll(before, g_app.scroll_y);
+}
+
+fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int, event_ms: f64) callconv(.c) void {
+    // NSEvent timestamp (issue #385): the platform stamps each scroll
+    // event with its own monotonic time, so the gesture/scroll-lock
+    // engine reads event time with no clock_gettime per callback. The
+    // timestamp rides the existing FFI as a trailing double — appended
+    // last so all prior field offsets never shift. A non-positive stamp
+    // (synthetic/test callers) falls back to one clock read.
+    const now_ms: i64 = if (event_ms > 0.0) @intFromFloat(event_ms) else getTimestampMs();
     // Gesture conditioning first: precise deltas pass bit-exact (1:1
     // sync preserved); absorbed wheel jitter feeds the lock a zero so a
     // lifted gesture still resets cleanly, then returns (nothing moved).
@@ -962,33 +1372,28 @@ fn onScroll(delta_x: f32, delta_y: f32, hovered_block_id: c_int, precise: c_int)
     const locked = g_scroll_lock.processScroll(cond.dx, cond.dy, hovered_block_id, now_ms);
 
     if (locked.dy != 0.0) {
+    const scroll_before = g_app.scroll_y;
         // Routing (precise 1:1 vs eased wheel) lives in
         // MotionPolicy.applyVertical, pinned by strict tests; the full
-        // rationale is documented there. Reduce Motion snaps here, so no
-        // timer is armed. Sync the displayed offset, then arm the tick
-        // while unsettled (snaps settle synchronously, no timer).
-        const target_before = g_smooth.target;
-        const current_before = g_smooth.current;
-        g_smooth = layout.MotionPolicy.applyVertical(
-            g_smooth.target,
-            g_smooth.current,
-            locked.dy,
-            precise != 0,
-            g_app.max_scroll_y,
-            g_reduce_motion,
-        );
-        // Bound residual becomes rubber-band overshoot (capped, decaying):
-        // desired minus actual, in scroll coords. Also arm the tick so the
-        // spring decay runs even when the scroll itself already settled.
-        const desired = if (precise != 0) current_before - locked.dy else target_before - locked.dy;
-        const actual = if (precise != 0) g_smooth.current else g_smooth.target;
-        const over = desired - actual;
-        if (over != 0.0) {
-            g_edge.absorb(over);
+        // rationale is documented there. Precise deltas coalesce per vsync
+        // (#384): accumulate here, fold once per tick/draw so superseded
+        // finger samples collapse into one quantized target. Reduce Motion
+        // snaps here, so no timer is armed. Sync the displayed offset,
+        // then arm the tick while unsettled (snaps settle synchronously,
+        // no timer).
+        if (precise != 0 and !g_reduce_motion) {
+            g_pending_dy += locked.dy;
+            g_pending_precise = true;
+            g_pending_scroll = true;
             bridge.platform_smooth_kick();
+        } else {
+            applyVerticalScroll(locked.dy, precise != 0);
         }
-        g_app.scroll_y = g_smooth.current;
-        if (!g_smooth.settled()) bridge.platform_smooth_kick();
+        if (!g_smooth.settled()) {
+            bridge.platform_smooth_kick();
+        } else {
+            presentSettledScroll(scroll_before);
+        }
     }
     if (locked.dx != 0.0 and hovered_block_id >= 0 and hovered_block_id < MAX_SCROLLABLE_BLOCKS) {
         const id: usize = @intCast(hovered_block_id);
@@ -1019,16 +1424,44 @@ fn onTick(dt_ms: f32) callconv(.c) c_int {
         snapScroll(g_smooth.target);
         return if (plugin_flying or plugin_changed) 1 else 0;
     }
+    foldPendingScroll(1.0);
     g_smooth.setTarget(g_smooth.target, g_app.max_scroll_y);
     const settled = g_smooth.tick(dt_ms / 1000.0);
+    const was_settled = g_smooth.settled();
+    g_smooth.current = layout.SmoothScroll.quantize(g_smooth.current, 1.0);
     g_app.scroll_y = g_smooth.current;
+    // The timer fire keys its single invalidation on the platform
+    // mirror moving during this tick (scroll-blit when moved, skip when
+    // still). Sync every tick: a synchronously-settling step (precise
+    // 1:1 snap, small eased step) would otherwise park the timer with
+    // zero invalidation and the frame would never present.
+    bridge.platform_sync_scroll(g_app.scroll_y);
+    // Goldilocks steady state (issue #388): the tick just settled a scroll
+    // that moved — drop clean pages outside viewport +/-1 screen. Gated on
+    // the settled EDGE (not every settled frame) so a static screen costs
+    // zero syscalls; the map/byte math is a few integer ops, never on the
+    // layout hot path.
+    if (settled and !was_settled) releaseSettledPages();
     // Rubber-band decay keeps the timer alive past scroll settle (full
     // redraws: the translate moves every pixel) and parks exactly at zero.
+    // Coalesced with the scroll frame: one invalidation below covers both
+    // (the platform skips setNeedsDisplay when nothing moved).
     if (!g_edge.tick(dt_ms / 1000.0)) {
-        bridge.platform_request_redraw();
         return 1;
     }
     return if (settled and !plugin_flying and !plugin_changed) 0 else 1;
+}
+
+/// Goldilocks steady state (issue #388): scroll just settled — drop clean
+/// pages outside viewport +/-1 screen. Same window model as the cold-open
+/// release above; dropped pages fault back on the next scroll. Best-effort,
+/// zero allocations. Never fires while gliding: only the settled edge.
+fn releaseSettledPages() void {
+    const bytes = g_app.bytes;
+    if (bytes.len < mmap.min_advise_bytes) return;
+    const hint = bytesPerScreenHint(bytes);
+    const w = mmap.goldilocksScrollWindow(g_app.scroll_y, g_app.window_height, bytes.len, hint);
+    if (w.end > w.start) bytesReleaseOutside(bytes, w.start, w.end);
 }
 
 /// Display preferences pushed by the platform (launch, Reduce Motion
@@ -1045,6 +1478,42 @@ fn onDisplay(category_class: c_int, reduce_motion: c_int) callconv(.c) void {
     } else {
         snapScroll(g_app.scroll_y);
     }
+}
+
+/// Goldilocks RSS release (issue #388): after the full scan + metrics
+/// touched every page of a large file, drop clean pages outside the first
+/// viewport +/-1 screen. Dropped pages fault back from the file on scroll;
+/// the mapping stays open and zero-copy. Best-effort (madvise may no-op),
+/// zero allocations, cold path only — never on the scroll hot path (the
+/// steady-state twin lives in onTick, gated on settle).
+fn releaseColdPages(bytes: []const u8) void {
+    if (bytes.len < mmap.min_advise_bytes) return;
+    const hint = bytesPerScreenHint(bytes);
+    const w = mmap.goldilocksScrollWindow(0.0, g_app.window_height, bytes.len, hint);
+    // Empty mapping or a zero hint: no window, no syscall noise.
+    if (w.end > w.start) bytesReleaseOutside(bytes, w.start, w.end);
+}
+
+/// Test seam: the madvise itself lives one call away so unit tests can pin
+/// the window math without touching the real mapping.
+fn bytesReleaseOutside(bytes: []const u8, keep_start: usize, keep_end: usize) void {
+    mmap.releaseOutsideWindow(bytes, keep_start, keep_end);
+}
+
+/// Bytes-per-screen density for the Goldilocks window: the scan already
+/// knows the average line length, so one screen of pixels maps to a real
+/// byte count instead of a guess. Zero when unknown (empty doc, zero
+/// window) — callers treat that as "no window".
+fn bytesPerScreenHint(bytes: []const u8) usize {
+    if (bytes.len == 0 or g_app.line_count == 0) return 0;
+    if (g_app.window_height <= 0.0) return 0;
+    const avg_line: usize = bytes.len / @max(g_app.line_count, 1);
+    // Lines per screen at the live geometry: window height over the
+    // effective line advance (base * 1.75 layout constant, AGENTS.md §3).
+    const advance: f32 = g_text_scale.effectiveBase() * 1.75;
+    if (advance <= 0.0) return 0;
+    const lines_per_screen: usize = @intFromFloat(@max(g_app.window_height / advance, 1.0));
+    return @min(bytes.len, avg_line *| lines_per_screen);
 }
 
 fn updateDocumentMetrics() void {
@@ -1065,11 +1534,12 @@ fn updateDocumentMetrics() void {
     const total_height = layout.computeDocumentHeightEx(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
-        vp_config,
+        &vp_config,
         &g_checkpoints,
         &g_checkpoint_count,
     );
     g_app.max_scroll_y = @max(0.0, total_height - g_app.window_height + 400.0);
+    invalidateScrollCache();
 }
 
 /// Overscroll strip (#104): the rubber-band translate uncovers window
@@ -1210,7 +1680,7 @@ fn anchorTargetY(frag: []const u8) ?f32 {
     return layout.anchorScrollY(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
-        vp_config,
+        &vp_config,
         frag,
     );
 }
@@ -1242,6 +1712,10 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     if (g_app.mapped_file) |*m| m.close();
     g_app.mapped_file = mapped;
     g_app.bytes = mapped.bytes;
+    // Cold-open prefetch (#390): same SEQUENTIAL + WILLNEED hint as the
+    // startup path — in-place opens and external reloads walk the mapping
+    // front to back exactly once too. One syscall, cold only.
+    mapped.adviseSequential();
     var in_fence: simd.FenceState = .{};
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
     g_app.lines = g_lines_buffer[0..g_app.line_count];
@@ -1256,7 +1730,16 @@ fn activateMappedFile(mapped: mmap.MappedFile, reset_scroll: bool) void {
     // A new document ends any find session (issue #42): matches belong
     // to the old bytes. (External reloads keep the query; see #44.)
     clearFind();
+    // Per-document memo tables (issue #385): image sizes, fence ends, and
+    // (in onDraw) math/token caches are keyed by document slices — reset
+    // here so a swapped-in document never reads the old one's entries.
+    imageSizeCacheReset();
+    layout.mathBoxCacheReset(&g_math_box_cache);
+    layout.tokenCacheReset(&g_token_cache);
     updateDocumentMetrics();
+    // Cold path like the open path above: scan + metrics touched every
+    // page, so keep only the first viewport +/-1 screen resident.
+    releaseColdPages(g_app.bytes);
     // Plugin renders (issue #323): per-doc table, cache-hit stat-marking,
     // probe and FIFO launch. No-op in read-test/headless binaries.
     pluginKickForDocument();
@@ -1288,6 +1771,9 @@ fn openDocumentInPlace(link_path: []const u8, frag: []const u8) bool {
 // Empty for the built-in doc and stdin spools (unlinked): unwatched.
 var g_doc_path_buf: [2048]u8 = undefined;
 var g_doc_path: []const u8 = "";
+// Last accepted reload timestamp (monotonic ms) for the #386 save-pair
+// debounce above. Null until the first reload; static BSS.
+var g_last_reload_ms: ?i64 = null;
 
 fn setDocPath(path: []const u8) void {
     const take = @min(path.len, g_doc_path_buf.len);
@@ -1310,10 +1796,17 @@ fn watchCurrentDocument() void {
 /// (editors replace files, killing the watched fd), then reload with
 /// scroll preserved and clamped. A vanished or momentarily unreadable
 /// file keeps the old document; the next event converges.
+/// Debounced (issue #386): editors save in rapid pairs (temp write +
+/// rename), so repeats inside the 250 ms quiet window are swallowed — one
+/// save pair costs exactly one mmap + metrics walk. The re-arm still runs
+/// first so the watcher never goes deaf on a swallowed repeat.
 fn onFileChanged() callconv(.c) void {
     watchCurrentDocument();
     if (g_doc_path.len == 0) return;
+    const now = getTimestampMs();
+    if (!idle.reloadDebounced(now, g_last_reload_ms)) return;
     const mapped = mmap.MappedFile.open(g_doc_path) catch return;
+    g_last_reload_ms = now;
     activateMappedFile(mapped, false);
 }
 
@@ -1352,13 +1845,21 @@ var g_find_folded: [FIND_QUERY_MAX]u8 = undefined;
 var g_find_count: usize = 0;
 var g_find_current: usize = 0;
 var g_find_query_len: usize = 0;
-// Chase state (issue #42): findOffsetY lands block-exact; when wrapping
-// pushes the match below the viewport, up to 4 viewport-steps follow the
-// painted wash. painted is set by the highlight pass when the current
-// match draws any rect this frame.
+// Landing state (issues #42/#386): scrollFindTo snaps row-exact in one
+// step, so no chase steps follow. `armed` is disarmed by the draw pass if
+// ever set (legacy headless paths); `painted` is draw-pass telemetry set
+// by the highlight pass when the current match draws any rect this frame.
 var g_find_chase_armed: bool = false;
-var g_find_chase_left: u8 = 0;
 var g_find_painted: bool = false;
+// Per-run first-overlap memo (issue #385): paintFindHighlights binary
+// searches the match list per text run per frame; runs arrive in offset
+// order within a frame, so the previous run's lower bound is a warm
+// start for the next search (monotone: never moves backward). Keyed by
+// frame: reset in onDraw before the command loop, so a new frame (new
+// scroll, new commands) restarts from zero exactly like the old cold
+// search. Bit-identical washes: the memo only narrows the search floor,
+// the binary search above the floor is unchanged.
+var g_find_search_floor: usize = 0;
 
 fn pushFindCount() void {
     const shown: c_int = if (g_find_count == 0) 0 else @intCast(g_find_current + 1);
@@ -1400,16 +1901,25 @@ fn findMatchY(offset: usize) ?f32 {
         .join_buf = &g_joinbuf,
     };
     pluginAttachConfig(&vp_config);
-    return layout.findOffsetY(g_app.bytes, g_app.lines, vp_config, offset);
+    const top = layout.findOffsetY(g_app.bytes, g_app.lines, &vp_config, offset) orelse return null;
+    // Row-exact landing (issue #386): resolve the containing unit and step
+    // to the match's wrapped visual row in the same snap — the old chase
+    // loop's follow-up steps converge here by construction, so the final
+    // offset is identical with zero extra fullscreen redraws.
+    var unit: usize = 0;
+    while (unit < g_app.line_count and
+        g_app.lines[unit].offset + g_app.lines[unit].len <= offset) : (unit += 1)
+    {}
+    if (unit >= g_app.line_count) return top;
+    unit = layout.snapWindowStart(g_app.bytes, g_app.lines[0..g_app.line_count], unit);
+    return layout.findRowOffsetY(g_app.bytes, g_app.lines[0..g_app.line_count], vp_config, unit, top, offset);
 }
 
 fn scrollFindTo(idx: usize) void {
     if (idx >= g_find_count) return;
     if (findMatchY(g_find_matches[idx].start)) |y| {
-        // Coarse landing on the match's block top; the draw pass refines
-        // (see the chase below) when wrapping puts the match lower.
-        g_find_chase_armed = true;
-        g_find_chase_left = 4;
+        // Single exact snap on the match row: no chase steps, no extra
+        // redraws. The painted flag stays as draw-pass telemetry only.
         g_find_painted = false;
         snapScroll(@max(0.0, y - g_app.window_height / 3.0));
     }
@@ -1441,10 +1951,31 @@ fn clearFind() void {
     g_find_current = 0;
     g_find_query_len = 0;
     g_find_chase_armed = false;
-    g_find_chase_left = 0;
     g_find_painted = false;
+    g_find_search_floor = 0;
     bridge.platform_find_hide();
     bridge.platform_request_redraw();
+}
+
+// Per-frame visited-URL memo (issue #385): the FFI probe is pure per
+// URL per frame (the set only changes on click, which redraws anyway).
+// One latched slot: wrapped links repeat one URL across consecutive
+// runs (the common repeat); a different URL simply re-probes and
+// re-latches (still at most one FFI per run, never more). Reset in
+// onDraw before the command loop and on document open.
+var g_visited_memo_ptr: usize = 0;
+var g_visited_memo_len: usize = 0;
+var g_visited_memo_hit: bool = false;
+
+fn visitedCached(t: []const u8) bool {
+    if (g_visited_memo_len == t.len and g_visited_memo_ptr == @intFromPtr(t.ptr)) {
+        return g_visited_memo_hit;
+    }
+    const hit = bridge.platform_link_visited(t.ptr, @intCast(t.len)) != 0;
+    g_visited_memo_ptr = @intFromPtr(t.ptr);
+    g_visited_memo_len = t.len;
+    g_visited_memo_hit = hit;
+    return hit;
 }
 
 /// Find highlight wash (issue #42): intersects one text run's source
@@ -1462,13 +1993,16 @@ fn paintFindHighlights(cmd: *const layout.DrawCommand, find_bg: *const layout.Co
     const rs = rp - base;
     const re = rs + cmd.text.len;
     // Matches are offset-ordered and disjoint: binary search the first
-    // one ending past the run start, then walk while overlapping.
-    var lo: usize = 0;
+    // one ending past the run start, then walk while overlapping. The
+    // floor is the previous run's lower bound (runs arrive offset-ordered
+    // per frame; clamped to the count so a shorter list stays safe).
+    var lo: usize = @min(g_find_search_floor, g_find_count);
     var hi: usize = g_find_count;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         if (g_find_matches[mid].start + g_find_matches[mid].len > rs) hi = mid else lo = mid + 1;
     }
+    g_find_search_floor = lo;
     var mi = lo;
     while (mi < g_find_count and g_find_matches[mi].start < re) : (mi += 1) {
         const m = g_find_matches[mi];
@@ -1545,10 +2079,11 @@ var g_outline_arena: [512 * layout.OUTLINE_TEXT_MAX]u8 = undefined;
 /// the native picker. Jumps reuse on_scroll_to (exact y, no slug roundtrip,
 /// so duplicate headings land precisely). Cold path: zero heap.
 fn onOutlineOpen() callconv(.c) void {
+    var measure_cfg = measureConfig();
     const n = layout.collectHeadings(
         g_app.bytes,
         g_app.lines[0..g_app.line_count],
-        measureConfig(),
+        &measure_cfg,
         &g_outline_arena,
         &g_outline_marks,
     );
@@ -1575,6 +2110,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
                     0.0,
                     g_app.block_max_scroll_x[id],
                 );
+                invalidateScrollCache();
             }
         },
         .block_right => {
@@ -1585,6 +2121,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
                     0.0,
                     g_app.block_max_scroll_x[id],
                 );
+                invalidateScrollCache();
             }
         },
         .page_down => {
@@ -1594,6 +2131,7 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
             // Manual override (#47): wins until the next system change.
             g_app.is_dark_theme = !g_app.is_dark_theme;
             g_app.theme_override = g_app.is_dark_theme;
+            invalidateScrollCache();
         },
         .toggle_help => {
             g_show_help = !g_show_help;
@@ -1618,22 +2156,27 @@ fn onKey(key_code: c_int, hovered_block_id: c_int) callconv(.c) void {
 }
 
 // Centered cheat-sheet overlay (issue #54): geometry comes from the same
-// table as the key handler (see help_overlay.emitOverlay). Painted after
-// the damage clip closes so the modal card is never partially culled;
-// pixels reuse platform_draw_text, which also records the runs in the
-// text model (selection and clipboard).
-fn drawHelpOverlay() void {
+// table as the key handler (see help_overlay.emitOverlay). Per-command
+// damage gating (the dmg parameter) culls off-region overlay pixels on
+// partial passes (#389 GPU: the card no longer re-rasterizes all 31 runs
+// when the damage is an unrelated line elsewhere); the dim fullscreen
+// rect still paints whenever any part of it is kept, so the modal card is
+// never left half-drawn. Pixels reuse platform_draw_text, which also
+// records the runs in the text model (selection and clipboard).
+fn drawHelpOverlay(dmg: damage.Damage) void {
     const theme = if (g_app.is_dark_theme) layout.Theme.dark else layout.Theme.light;
     var cmds: [32]layout.DrawCommand = undefined;
     const n = help_overlay.emitOverlay(&cmds, g_app.window_width, g_app.window_height, theme);
     for (cmds[0..n]) |cmd| {
         switch (cmd.kind) {
             .fill_rect => {
+                const r = dmg.clip(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h);
+                if (r.isEmpty()) continue;
                 bridge.platform_draw_rect(
-                    cmd.rect.x,
-                    cmd.rect.y,
-                    cmd.rect.w,
-                    cmd.rect.h,
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
                     cmd.color.r,
                     cmd.color.g,
                     cmd.color.b,
@@ -1641,6 +2184,27 @@ fn drawHelpOverlay() void {
                 );
             },
             .text_run => {
+                if (!dmg.keeps(cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h)) {
+                    // Record-only path (same contract as the main text_run
+                    // arm below): the selection/hover/link model must see
+                    // overlay runs even when their pixels are culled.
+                    bridge.platform_register_text_run(
+                        cmd.text.ptr,
+                        @intCast(cmd.text.len),
+                        cmd.rect.x,
+                        cmd.rect.y,
+                        cmd.rect.w,
+                        cmd.rect.h,
+                        cmd.font_size,
+                        1,
+                        0,
+                        0,
+                        0,
+                        null,
+                        0,
+                    );
+                    continue;
+                }
                 const is_bold: c_int = if (cmd.style.bold) 1 else 0;
                 bridge.platform_draw_text(
                     cmd.text.ptr,
@@ -1685,6 +2249,7 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
         g_app.window_height = fh;
         updateDocumentMetrics();
     }
+    foldPendingScroll(1.0);
 
     syncThemeToPlatform();
     bridge.platform_sync_scroll(g_app.scroll_y);
@@ -1693,8 +2258,9 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     // Damage tracking: AppKit reports the dirty rect for this draw.
     // Full-screen redraw happens only when the pending rect covers the view
-    // (resize, scroll, theme toggle) or is absent (headless, first draw).
-    // Partial damage culls off-region pixel commands below.
+    // (resize, theme toggle) or is absent (headless, first draw). Scroll
+    // blits on the platform (#384), so scroll damage is the exposed strip
+    // only. Partial damage culls off-region pixel commands below.
     var pdx: f32 = 0.0;
     var pdy: f32 = 0.0;
     var pdw: f32 = 0.0;
@@ -1704,17 +2270,25 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     g_markers.reset();
     g_entities.reset();
+    // Per-frame memo resets (issue #385): the find floor and the visited
+    // latch are keyed by this frame's command stream — a new draw starts
+    // both cold, exactly like the old per-run searches/probes.
+    g_find_search_floor = 0;
+    g_visited_memo_ptr = 0;
+    g_visited_memo_len = 0;
     var vp_config = layout.ViewportConfig{
         .window_width = g_app.window_width,
         .window_height = g_app.window_height,
         .scroll_y = g_app.scroll_y,
         .base_font_size = g_text_scale.effectiveBase(),
-        .block_scroll_x = g_app.block_scroll_x,
+        .block_scroll_x = &g_app.block_scroll_x,
         .is_dark_theme = g_app.is_dark_theme,
         .checkpoints = g_checkpoints[0..g_checkpoint_count],
         .image_size_fn = gatedImageSize,
         .math_size_fn = liveMathSizeFn(),
         .math_error_fn = liveMathErrorFn(),
+        .math_box_cache = &g_math_box_cache,
+        .token_cache = &g_token_cache,
         .ordered_markers = &g_markers,
         .ref_defs = g_refdefs[0..g_refdef_count],
         .entities = &g_entities,
@@ -1724,12 +2298,34 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
 
     var t_layout_ns: u64 = 0;
     if (build_options.test_hooks and g_sweep_active) t_layout_ns = nowNs();
-    const cmd_count = layout.layoutViewport(
-        g_app.bytes,
-        g_app.lines[0..g_app.line_count],
-        vp_config,
-        &g_commands_buffer,
-    );
+    // Scroll fast path (#384): same-scroll damage repaints (selection,
+    // GIF ticks, hover) reuse the cached frame instead of re-running
+    // layout. Registration/state records replay verbatim, so the text
+    // model rebuilds bit-identically and the damage-parity contract holds.
+    // Scroll changes always miss and re-lay out: the cache holds
+    // viewport-window rows only, and a shifted replay would serve stale
+    // rows past the fold (live blank expose strips).
+    var cmd_count: usize = 0;
+    const content_id = scrollContentId();
+    // Test-only layout forcing (idempotence isolation): comptime-folded away
+    // in ship builds so the hot path keeps its exact shape and __TEXT.
+    const force_layout = build_options.test_hooks and g_no_reuse;
+    const reused: ?usize = if (force_layout) null else g_scroll_cache.reuse(g_scroll_cached_cmds[0..g_scroll_cache.count], &g_commands_buffer, vp_config, content_id, 0);
+    if (reused) |n| {
+        cmd_count = n;
+    } else {
+        cmd_count = layout.layoutViewport(
+            g_app.bytes,
+            g_app.lines[0..g_app.line_count],
+            &vp_config,
+            &g_commands_buffer,
+        );
+        const take = @min(cmd_count, g_scroll_cached_cmds.len);
+        @memcpy(g_scroll_cached_cmds[0..take], g_commands_buffer[0..take]);
+        g_scroll_cache.snapshot(g_scroll_cached_cmds[0..take], take, vp_config, content_id, 0, 1.0);
+    }
+    g_last_drawn_scroll = g_app.scroll_y;
+    g_last_drawn_overshoot = g_edge.overshoot;
     var t_paint_ns: u64 = 0;
     if (build_options.test_hooks and g_sweep_active) t_paint_ns = nowNs();
 
@@ -1889,12 +2485,13 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
                 // Visited-link state (issue #25): the platform owns the
                 // clicked-URL set; linked runs query it and take the theme
                 // visited color. Link runs are rare, so the FFI round-trip
-                // never touches the hot path.
+                // never touches the hot path. Per-frame memo (issue #385):
+                // one URL repeats across the runs of a wrapped link — the
+                // first run's verdict is latched by slice identity, so the
+                // rest skip the FFI with the identical color.
                 var run_color = cmd.color;
                 if (cmd.link_target) |t| {
-                    if (t.len > 0 and
-                        bridge.platform_link_visited(t.ptr, @intCast(t.len)) != 0)
-                    {
+                    if (t.len > 0 and visitedCached(t)) {
                         run_color = if (g_app.is_dark_theme)
                             layout.Theme.dark.link_visited
                         else
@@ -2024,53 +2621,61 @@ fn onDraw(w: c_int, h: c_int) callconv(.c) void {
     if (clipped_pass) {
         bridge.platform_end_clip();
     }
+    // #389 (GPU): close the fill-color batch the text-run loop opened.
+    // Idempotent: partial passes that never drew text close a never-opened
+    // batch (no-op), and the drawRect-side close below double-closes
+    // safely (live path calls onDraw through the same context).
+    bridge.platform_batch_end();
 
-    // Find chase (issue #42): the cycle scrolled to the match's block
-    // top; if wrapping kept the current wash off-viewport (nothing
-    // painted this frame), step down and redraw — bounded, then rest.
+    // Find landing (issues #42/#386): scrollFindTo already snaps exactly
+    // on the match's wrapped row, so no chase steps follow. The armed flag
+    // is disarmed here if ever set (legacy headless paths); the draw never
+    // issues follow-up scrolls or extra fullscreen redraws.
     if (g_find_chase_armed) {
-        if (g_find_painted or g_find_chase_left == 0) {
-            g_find_chase_armed = false;
-        } else {
-            g_find_chase_left -= 1;
-            snapScroll(g_app.scroll_y + g_app.window_height * 0.8);
-            bridge.platform_request_redraw();
-        }
+        g_find_chase_armed = false;
     }
 
-    // Modal cheat sheet paints above everything, unclipped (see
-    // drawHelpOverlay: never culled by partial damage).
-    if (g_show_help) drawHelpOverlay();
+    // Modal cheat sheet paints above everything; per-command damage
+    // gating inside drawHelpOverlay culls off-region overlay pixels on
+    // partial passes (#389 GPU). The overlay is a modal card: any damage
+    // while it is visible repaints at least the card (full passes keep
+    // everything; partial passes keep exactly the intersected runs).
+    if (g_show_help) drawHelpOverlay(dmg);
     // Remote-image privacy indicator (issue #52): visible whenever the
-    // document contains remote content. Painted last and unclipped so a
-    // partial damage pass can never leave it half-drawn.
+    // document contains remote content. Painted last; damage-gated so a
+    // partial pass far from the top-right corner skips it, clipped to the
+    // damage when kept so it can never be left half-drawn.
     if (g_remote_seen) {
         const ind_on = g_app.remote_images;
         const ind_text = if (ind_on) "remote images on (i to block)" else "remote images off (i to allow)";
         const ind_fs: f32 = 12.0;
         const ind_w = layout.measureTextEx(ind_text, ind_fs, false, false, false, false);
         const ind_x = g_app.window_width - ind_w - 14.0;
-        const ind_color = if (g_app.is_dark_theme)
-            layout.Color{ .r = 140, .g = 140, .b = 145, .a = 255 }
-        else
-            layout.Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
-        bridge.platform_draw_text(
-            ind_text.ptr,
-            @intCast(ind_text.len),
-            ind_x,
-            8.0,
-            ind_fs,
-            0,
-            0,
-            0,
-            0,
-            ind_color.r,
-            ind_color.g,
-            ind_color.b,
-            ind_color.a,
-            null,
-            0,
-        );
+        if (!dmg.keeps(ind_x - 2.0, 6.0, ind_w + 4.0, ind_fs * 1.75 + 4.0)) {
+            // Off-damage: skip pixels entirely.
+        } else {
+            const ind_color = if (g_app.is_dark_theme)
+                layout.Color{ .r = 140, .g = 140, .b = 145, .a = 255 }
+            else
+                layout.Color{ .r = 105, .g = 110, .b = 118, .a = 255 };
+            bridge.platform_draw_text(
+                ind_text.ptr,
+                @intCast(ind_text.len),
+                ind_x,
+                8.0,
+                ind_fs,
+                0,
+                0,
+                0,
+                0,
+                ind_color.r,
+                ind_color.g,
+                ind_color.b,
+                ind_color.a,
+                null,
+                0,
+            );
+        }
     }
 
     // First frame committed: image decodes may start now, off the startup
@@ -2117,8 +2722,6 @@ const CLI_USAGE =
     \\  -          Read Markdown from stdin (max 32 MiB)
     \\  --help     Print this help and exit
     \\  --version  Print version and exit
-    \\
-    \\With no file and piped stdin (`curl … | read`), stdin is read instead.
     \\
 ;
 const CLI_VERSION_LINE = "read " ++ READ_VERSION ++ "\n";
@@ -2536,6 +3139,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     if (args_it.next()) |sc_str| {
                         bridge.platform_set_test_scale(std.fmt.parseFloat(f32, sc_str) catch 0.0);
                     }
+                } else if (std.mem.eql(u8, arg, "--repaint-idempotence")) {
+                    // Repaint-idempotence probe (pill MISS/HIT parity): the
+                    // dispatch below draws the same scrolled frame twice on
+                    // one bitmap (caches warm on pass two, like live
+                    // scrolling) to fixed /tmp paths the caller diffs.
+                    // Needs --screenshot as well (all headless dispatch does).
+                    g_repaint_active = true;
+                } else if (std.mem.eql(u8, arg, "--no-reuse")) {
+                    // Idempotence-probe isolation: every draw re-runs layout
+                    // instead of replaying the scroll-frame snapshot.
+                    g_no_reuse = true;
+                } else if (std.mem.eql(u8, arg, "--pill-direct")) {
+                    // Tier-isolation bypass (test binary only).
+                    g_pill_direct = true;
+                } else if (std.mem.eql(u8, arg, "--shape-direct")) {
+                    // Tier-isolation bypass (test binary only).
+                    g_shape_direct = true;
+                } else if (std.mem.startsWith(u8, arg, "--probe-scroll-plan=")) {
+                    // Scroll-copy plan query (copy/seam-band residue rules):
+                    // dy,scale,view_h,overshoot in points; prints USE_COPY,
+                    // quantized copy delta, and the seam band to repaint.
+                    var it = std.mem.splitScalar(u8, arg["--probe-scroll-plan=".len..], ',');
+                    const qdy = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const qscale = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const qvh = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    const qover = std.fmt.parseFloat(f32, it.next() orelse "0") catch 0.0;
+                    var quse: c_int = 0;
+                    var qcopy: f32 = 0;
+                    var qby: f32 = 0;
+                    var qbh: f32 = 0;
+                    bridge.platform_probe_scroll_plan(qdy, qscale, qvh, qover, &quse, &qcopy, &qby, &qbh);
+                    std.debug.print("SCROLLPLAN={d},{d:.2},{d:.2},{d:.2}\n", .{ quse, qcopy, qby, qbh });
                 } else if (std.mem.eql(u8, arg, "--select-drag")) {
                     // Drag-back residue test: caret baseline, extend to A,
                     // shrink to B — every phase after the first incremental
@@ -2616,6 +3251,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Fresh document: privacy indicator latch re-arms (relatched by the
     // metrics pass below when the doc actually contains remote images).
     g_remote_seen = false;
+    // Per-document memo tables (issue #385): same reset as the
+    // activateMappedFile path above (stale slices must never pin).
+    imageSizeCacheReset();
+    layout.mathBoxCacheReset(&g_math_box_cache);
+    layout.tokenCacheReset(&g_token_cache);
 
     // Index lines with SIMD scanner
     g_app.line_count = simd.scanLines(g_app.bytes, &g_lines_buffer, &in_fence);
@@ -2627,6 +3267,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Compute accurate total document height and max scroll limit
     updateDocumentMetrics();
+    // Goldilocks cold release (issue #388): scan + metrics just touched
+    // every page; keep only the first viewport +/-1 screen resident.
+    releaseColdPages(g_app.bytes);
     // Plugin renders (issue #323): per-doc table, cache-hit stat-marking,
     // probe and FIFO launch. No-op in read-test/headless binaries.
     pluginKickForDocument();
@@ -2672,6 +3315,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // residue test compares incremental vs fresh renders pixel-wise,
             // so decodes must not land mid-test. Placeholders throughout.
             g_headless_oneshot = true;
+            // Fix-round 4: sweep gestures are doc-space at --scroll N, but
+            // the drag TU computed damage from selection boxes with a stale
+            // zero scroll — sync the platform scroll first so damage,
+            // records, and wash share the swept coordinate space.
+            bridge.platform_set_test_scroll(g_app.scroll_y);
             const v = g_drag_vals;
             const r = bridge.platform_render_select_drag_png(sc_path, 1200, 900, onDraw,
                 v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
@@ -2704,10 +3352,31 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             std.c.exit(0);
         }
+        // Repaint-idempotence probe (read-test binary only): the same
+        // scrolled frame twice on one bitmap, no clear between passes.
+        // Pass two hits warm caches (pill rasters, shape slices, atlas) —
+        // exactly the live-scroll state — so any byte difference between
+        // the two phases is a cache-state-dependent paint defect.
+        if (build_options.test_hooks and g_repaint_active) {
+            g_headless_oneshot = true;
+            bridge.platform_set_test_scroll(g_app.scroll_y);
+            bridge.platform_set_test_bypass(if (g_pill_direct) 1 else 0, if (g_shape_direct) 1 else 0);
+            const r = bridge.platform_render_repaint_png("/tmp/repaint_phase_0.png", "/tmp/repaint_phase_1.png", "/tmp/repaint_phase_2.png", 1200, 900, onDraw);
+            if (r == 0) {
+                std.debug.print("Repaint capture generated\n", .{});
+                std.c.exit(0);
+            } else {
+                std.debug.print("Repaint capture failed (code {d})\n", .{r});
+                std.c.exit(1);
+            }
+        }
         // Plain one-shot: placeholders are the expected output (decodes
         // never win the race today either); suppress the first-paint arm
         // so no decode CPU lands in the startup window at all.
         g_headless_oneshot = true;
+        // Fix-round 4: fresh --select references must render at the swept
+        // --scroll like the drag phases do (same hook as above).
+        bridge.platform_set_test_scroll(g_app.scroll_y);
         const rc = bridge.platform_render_to_png(sc_path, 1200, 900, onDraw);
         if (rc == 0) {
             std.debug.print("Screenshot successfully generated: {s}\n", .{sc_path});
@@ -2761,11 +3430,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
 const CRISP_PNG_W: c_int = 600;
 const CRISP_PNG_H: c_int = 260;
 const CRISP_PNG_PATH = "/tmp/crisp_regression.png";
-// Calibrated (2026-09, arm64, bundled IBM Plex Serif / Space Grotesk /
-// JetBrains Mono): blurry atlas blits score acutance 155.2 with edge_frac
-// 0.1340 (stable across runs); snapped 1:1 blits score 182.5 with 0.0765.
-// Thresholds sit at the midpoints with margin on both sides.
-const CRISP_ACUTANCE_MIN: f64 = 169.0;
+// Calibrated (2026-10, arm64, bundled IBM Plex Serif / Space Grotesk /
+// JetBrains Mono): the forced-2x harness allocates a true 2x backing, and
+// the batch-clip fix paints all four runs below. Snapped 1:1 blits score
+// acutance 157.5 with edge_frac 0.0757. The edge_frac signature matches
+// the old basis (0.0765), confirming the 1:1 snap; acutance reads lower
+// than the old 182.5 because genuine 2x antialiasing replaced downsample
+// aliasing (the old basis rasterized 2x art into a 1x bitmap and,
+// pre-fix, effectively painted the first run only). Floor sits ~8% under
+// the measured value, same margin convention as before: acutance guards
+// gross blur/void, edge_frac is the primary 1:1 pin.
+const CRISP_ACUTANCE_MIN: f64 = 145.0;
 const CRISP_EDGE_FRAC_MAX: f64 = 0.105;
 
 fn crispRenderFn(w: c_int, h: c_int) callconv(.c) void {
@@ -2980,9 +3655,11 @@ const MATH355_PNG_PATH = "/tmp/math_atlas_355.png";
 const MATH355_PNG_W: c_int = 600;
 const MATH355_PNG_H: c_int = 260;
 // Math-only acutance floor (issue #355 follow-up): thin STIX strokes
-// through the 1x-harness 2x→1x downsample read softer than body ink, so
-// math carries its own bar instead of the shared body one. Calibrated on
-// the corrected (unmirrored) raster at 149.9 — the 189.5 previously
+// read softer than body ink, so math carries its own bar instead of the
+// shared body one. Calibrated on the corrected (unmirrored) raster at
+// 149.9 under the old downsampling harness (2026-10: forced-2x now backs
+// a true 2x bitmap, which resamples nothing 1:1 and should score at or
+// above this floor; re-measure where libzatex exists) — the 189.5 previously
 // recorded here came from a vertically MIRRORED raster, so acutance alone
 // cannot pin orientation; the hit/miss asserts below pin the hot path and
 // this bar guards blur regressions (unsnapped origins, wrong filter).
@@ -3082,9 +3759,10 @@ test "math atlas reuses formula rasters at 2x, pixels stay crisp (issue #355)" {
         // Pixels first (measured in every phase, red or green): math ink
         // must be present and must not fringe past the math crisp budget
         // (MATH355_ACUTANCE_MIN above; the edge cap stays shared). The
-        // blit uses bilinear sampling (see zatex_blit_cached): nearest
-        // scores ~143 here because the 1x harness bitmap downsamples
-        // forced-2x masks, so these thresholds pin that choice too.
+        // blit uses bilinear sampling (see zatex_blit_cached); the old
+        // nearest-vs-bilinear numbers were measured through the
+        // downsampling harness, so re-measure that choice where libzatex
+        // exists instead of trusting them against the true 2x backing.
         const m = try crispPngMetrics(alloc, MATH355_PNG_PATH);
         std.debug.print("\n[MATH355] acutance={d:.1} edge_frac={d:.4} hits={d}+{d} misses={d}+{d}\n", .{ m.acutance, m.edge_frac, h0, h2 - h0, m0, m2 - m0 });
         try t.expect(m.acutance >= MATH355_ACUTANCE_MIN);
@@ -3917,13 +4595,22 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
         watchCurrentDocument();
         try t.expectEqual(@as(c_int, 1), bridge.platform_test_watch_active());
         // External modify: content swaps, scroll offset is preserved.
+        // Reset the debounce latch first: the test fires events back to
+        // back, and the second (vanish) event must not be swallowed.
+        g_last_reload_ms = null;
         try port_fs.writeFile(rio, rcwd, tmp_name, v2);
         g_app.scroll_y = 40.0;
         onFileChanged();
         try t.expectEqualStrings(v2, g_app.bytes);
         try t.expectEqual(@as(usize, 200), g_app.line_count);
         try t.expectEqual(@as(f32, 40.0), g_app.scroll_y);
-        // Vanished file: the last good document stays, no crash.
+        // Rapid save-pair repeat: same content, one walk — the debounce
+        // swallows it, so bytes stay converged without a second swap.
+        onFileChanged();
+        try t.expectEqualStrings(v2, g_app.bytes);
+        // Vanished file: the last good document stays, no crash. Reset
+        // the latch so the age check cannot swallow this distinct event.
+        g_last_reload_ms = null;
         port_fs.deleteFile(rio, rcwd, tmp_name);
         onFileChanged();
         try t.expectEqualStrings(v2, g_app.bytes);
@@ -3936,8 +4623,9 @@ test "external change reloads in place, scroll kept, vanish keeps doc (#44)" {
 
 test "find: query, cycle, close state machine (#42)" {
     // Drives the real callbacks against a static doc (save/restore keeps
-    // other tests hermetic). Scroll assertions stay coarse: exact landing
-    // is pinned headless by the --find probes and by findOffsetY below.
+    // other tests hermetic). Exact landing is pinned by findRowOffsetY and
+    // the row tests in viewport.zig; settle behavior (#386: one snap, no
+    // chase redraws) is pinned here.
     if (build_options.test_hooks) {
         const t = std.testing;
         const doc = "foo bar foo\nbaz foo\n";
@@ -3965,16 +4653,28 @@ test "find: query, cycle, close state machine (#42)" {
         try t.expectEqual(@as(usize, 3), g_find_count);
         try t.expectEqual(@as(usize, 0), g_find_current);
         try t.expectEqualStrings("foo", g_find_query[0..g_find_query_len]);
+        // #386: a cycle lands in one snap — no chase armed, no follow-up
+        // steps queued — and wrap-around returns to the first offset.
+        // ("foo bar foo\nbaz foo\n": matches 0/1 share line 0's block, so
+        // all three land on the same block top; the wrap assertion below
+        // checks the return, not distinct rows — row-exactness for
+        // wrapped rows is pinned by the viewport row tests.)
+        const y0 = g_app.scroll_y;
+        try t.expect(!g_find_chase_armed);
         onFindNext(0);
         try t.expectEqual(@as(usize, 1), g_find_current);
+        try t.expect(!g_find_chase_armed);
         onFindNext(0);
         try t.expectEqual(@as(usize, 2), g_find_current);
+        try t.expect(!g_find_chase_armed);
         onFindNext(0); // wraps to first
         try t.expectEqual(@as(usize, 0), g_find_current);
+        try t.expectEqual(y0, g_app.scroll_y);
         onFindNext(1); // previous wraps to last
         try t.expectEqual(@as(usize, 2), g_find_current);
         onFindNext(0);
         try t.expectEqual(@as(usize, 0), g_find_current);
+        try t.expectEqual(y0, g_app.scroll_y);
         // Empty query and misses clear the match list, never crash.
         onFindQuery("", 0);
         try t.expectEqual(@as(usize, 0), g_find_count);
@@ -4025,9 +4725,11 @@ test "cheatsheet overlay: ? toggles, Esc dismisses, unknown keys no-op" {
     try std.testing.expect(!g_show_help);
     // Overlay paint path runs headless without crashing (platform draws
     // early-return with no live context; geometry is pinned in
-    // help_overlay.zig tests).
+    // help_overlay.zig tests). Partial damage culls off-region runs but
+    // records them, so the text model stays complete.
     g_show_help = true;
-    drawHelpOverlay();
+    drawHelpOverlay(damage.Damage.fullView(1200.0, 800.0, .unknown));
+    drawHelpOverlay(damage.Damage.partial(.{ .x = 0.0, .y = 0.0, .w = 80.0, .h = 60.0 }, .unknown));
 }
 
 test "remote images: i toggles through the shared key table" {
@@ -4312,8 +5014,54 @@ test "plugin task5: sidecar path + shim bodies are exact, hostile helpers refuse
     try t.expect(pluginProbeShim("/h/a\"b.sh", "mermaid", &jb) == null);
 }
 
+test "plugin tidy: stale probe names match, live shims never do (#390)" {
+    const t = std.testing;
+    // Stale sentinel shapes (two lowercase hex + .src/.out).
+    try t.expect(pluginIsStaleProbeName("probe-00.src"));
+    try t.expect(pluginIsStaleProbeName("probe-af.out"));
+    try t.expect(pluginIsStaleProbeName("probe-9c.src"));
+    // Live shims in the same dir are never tidy targets.
+    try t.expect(!pluginIsStaleProbeName("probe-mermaid.sh"));
+    try t.expect(!pluginIsStaleProbeName("run-mermaid.sh"));
+    // Near-misses: wrong length, uppercase hex, wrong extension.
+    try t.expect(!pluginIsStaleProbeName("probe-0.src"));
+    try t.expect(!pluginIsStaleProbeName("probe-000.src"));
+    try t.expect(!pluginIsStaleProbeName("probe-AF.out"));
+    try t.expect(!pluginIsStaleProbeName("probe-af.png"));
+    try t.expect(!pluginIsStaleProbeName("src-0123456789abcdef.txt"));
+    try t.expect(!pluginIsStaleProbeName("probe-"));
+    try t.expect(!pluginIsStaleProbeName(""));
+    // Join helper: exact bytes + NUL, null when it does not fit.
+    var out: [32]u8 = undefined;
+    const j = pluginJoinPath("/d", "f.png", &out).?;
+    try t.expectEqualStrings("/d/f.png", j);
+    try t.expectEqual(@as(u8, 0), out[j.len]);
+    var tiny: [4]u8 = undefined;
+    try t.expect(pluginJoinPath("/dir", "leaf.png", &tiny) == null);
+}
+
+test "energy #385: fence-end stamping mirrors the inline scan" {
+    if (comptime build_options.plugin_stub) return;
+    const doc = "```mermaid\nA-->B\n```\ntext\n```mermaid\nC-->D\n```\n";
+    var lines: [16]simd.Line = undefined;
+    var fence: simd.FenceState = .{};
+    const n = simd.scanLines(doc, &lines, &fence);
+    var jobs: [plugin_cache.MAX_PLUGIN_JOBS]plugin_cache.PluginJob = undefined;
+    var bufs: [plugin_cache.MAX_PLUGIN_JOBS][256]u8 = undefined;
+    var lens: [plugin_cache.MAX_PLUGIN_JOBS]u8 = [_]u8{0} ** plugin_cache.MAX_PLUGIN_JOBS;
+    const take = pluginResolvePaths(doc, lines[0..n], "/tmp/C", jobs[0..], bufs[0..], lens[0..]);
+    try std.testing.expectEqual(@as(usize, 2), take);
+    var entries: [plugin_cache.MAX_PLUGIN_JOBS]layout.PluginEntry = undefined;
+    pluginStampFenceEnds(lines[0..n], jobs[0..], entries[0..], take);
+    // Fence ends match the first-close-wins inline rule: fence 0 closes
+    // at scan index 2, fence 4 at index 6.
+    try std.testing.expectEqual(jobs[0].fence_line + 2, entries[0].fence_end);
+    try std.testing.expectEqual(jobs[1].fence_line + 2, entries[1].fence_end);
+    // The layout helper honors the stamped ends.
+    try std.testing.expectEqual(entries[0].fence_end, layout.codeFenceEnd(entries[0..take], lines[0..n], jobs[0].fence_line));
+}
+
 test "plugin task5: table build truncates at 16, read-test never kicks (#323)" {
-    // Build truncation is explicit at table build (Task 4 review F2): a
     // 17-fence doc keeps 16 rows with NUL-terminated paths for the query.
     // Twin builds collect zero jobs, so skip there.
     if (comptime build_options.plugin_stub) return;
@@ -4392,4 +5140,54 @@ test "outline picker contracts: filter + panel build (#48)" {
     }
 }
 
-
+test "settled scroll steps sync the platform mirror (scroll presents)" {
+    // A synchronously-settling scroll (precise 1:1 snap, Reduce Motion)
+    // produces no timer frames, so the tick/present path must sync the
+    // platform mirror itself. The timer fire keys its single
+    // invalidation on the mirror moving: without the sync it sees no
+    // movement, invalidates nothing, and the scroll never presents
+    // until some unrelated redraw (e.g. selection) shows the new offset.
+    if (build_options.test_hooks) {
+        const t = std.testing;
+        const s_scroll = g_app.scroll_y;
+        const s_max = g_app.max_scroll_y;
+        const s_smooth = g_smooth;
+        const s_pd = g_pending_dy;
+        const s_pp = g_pending_precise;
+        const s_ps = g_pending_scroll;
+        const s_rm = g_reduce_motion;
+        const s_mirror = bridge.platform_test_scroll_synced();
+        defer {
+            g_app.scroll_y = s_scroll;
+            g_app.max_scroll_y = s_max;
+            g_smooth = s_smooth;
+            g_pending_dy = s_pd;
+            g_pending_precise = s_pp;
+            g_pending_scroll = s_ps;
+            g_reduce_motion = s_rm;
+            bridge.platform_sync_scroll(s_mirror);
+        }
+        g_app.max_scroll_y = 10000.0;
+        g_app.scroll_y = 0.0;
+        g_smooth = .{ .current = 0.0, .target = 0.0 };
+        g_reduce_motion = false;
+        bridge.platform_sync_scroll(0.0);
+        // Precise 1:1 step, coalesced exactly like a trackpad event, then
+        // one vsync tick: the step settles synchronously and the timer
+        // parks (more == 0) -- the mirror must still advance.
+        g_pending_dy = -40.0;
+        g_pending_precise = true;
+        g_pending_scroll = true;
+        const more = onTick(8.0);
+        try t.expectEqual(@as(c_int, 0), more);
+        try t.expectEqual(@as(f32, 40.0), g_app.scroll_y);
+        try t.expectEqual(@as(f32, 40.0), bridge.platform_test_scroll_synced());
+        // Reduce Motion snap path (no tick involved): same guarantee.
+        g_app.scroll_y = 0.0;
+        g_smooth = .{ .current = 0.0, .target = 0.0 };
+        bridge.platform_sync_scroll(0.0);
+        g_app.scroll_y = 80.0;
+        presentSettledScroll(0.0);
+        try t.expectEqual(@as(f32, 80.0), bridge.platform_test_scroll_synced());
+    }
+}

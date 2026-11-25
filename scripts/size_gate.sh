@@ -56,7 +56,14 @@ if [ "$OS_ID" = "pe" ]; then CORE_BUDGET=$((280 * 1024)); fi
 # round up) for #348 native math/ARM after exhausted honest diet (residual 694 B
 # plugin over: 4 area agents + whole-view ±0 + round-2/round-3/finisher/micro-diet
 # with measured probes, lean audit clean, small-loss evaluated, nothing qualifying).
-PLUGIN_BUDGET_KIB=16
+# bumped to 17 KiB by owner decision 2026-10-03 (§7 5%: 16*1.05=16.8,
+# round up) for the [energy] series (#385 memoize +950 B, #390 launch-I/O
+# +602 B, #391 micro-diet +202 B over 16 KiB).
+# bumped to 18 KiB by owner decision 2026-10-04 (§7 5%: 17*1.05=17.85,
+# round up) for the [energy] rebase union (#385 at 17546 B, +138 B over 17 KiB
+# with 0 B in-scope diet available; #390 at 17438 B after an honest 80 B diet,
+# +30 B over 17 KiB; both remainders core-account per twin mechanics).
+PLUGIN_BUDGET_KIB=18
 PLUGIN_BUDGET=$((PLUGIN_BUDGET_KIB * 1024))
 
 # Build both accounts; zig-cache incrementality makes this a fast no-op

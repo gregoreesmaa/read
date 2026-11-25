@@ -1,9 +1,9 @@
-# FINDABILITY — web-side GitHub settings (owner action, copy-paste)
+# Findability — applied GitHub settings
 
-These settings live in GitHub's web UI / API, not in git — a maintainer must apply them
-at <https://github.com/gregoreesmaa/read/settings>. Everything below is copy-paste ready.
+> Status: **applied**. Description, website, and all 14 topics below are live
+> on the repo header. Kept for the record and for the social-preview step.
 
-## 1. About → Description (1 line)
+## 1. About → Description
 
 ```text
 Ultra-minimalist zero-dependency Markdown reader in Zig — mmap + SIMD, microsecond rendering, native macOS CoreText
@@ -12,10 +12,11 @@ Ultra-minimalist zero-dependency Markdown reader in Zig — mmap + SIMD, microse
 ## 2. About → Website
 
 ```text
-https://github.com/gregoreesmaa/read/blob/main/showcase.md
+https://gregoreesmaa.github.io/read/
 ```
 
-(Use the repo URL until there is a real homepage; points visitors at the live demo doc.)
+The docs site (`docs/site/`, published via GitHub Pages). Falls back to
+`https://github.com/gregoreesmaa/read/blob/main/showcase.md` if Pages is off.
 
 ## 3. About → Topics (click "Add topics", one per line)
 
@@ -53,7 +54,19 @@ Read — microsecond-grade Markdown in pure Zig.
 
 ## 5. After applying (verify)
 
-- [ ] Repo header shows description + website + topics.
-- [ ] `https://github.com/gregoreesmaa/read` search-matches "zig markdown reader mmap simd".
+- [x] Repo header shows description + website + topics.
+- [x] `https://github.com/gregoreesmaa/read` search-matches "zig markdown reader mmap simd".
 - [ ] Social card renders on the repo page and in link unfurls.
 - [ ] CI badge in README is green (`.github/workflows/ci.yml` on default branch).
+
+## 6. Follow-ups (need the polish PR merged first)
+
+- [ ] Pages deploy runs green (Docs-site workflow deploys `docs/site/` on merge to `main`).
+- [ ] Wiki: create the first page via the web UI (initializes the wiki repo —
+      the API/git push returns "Repository not found" until then), then push
+      the staged seed from `.tmp/wiki-seed/` (Home + 8 pages: Getting Started,
+      Keybindings, Supported Markdown, Examples, Math Engine, Privacy,
+      Architecture, FAQ).
+- [ ] Social preview: upload `screenshots/text_wrapping.png` at
+      Settings → Social preview with headline
+      `Read — microsecond-grade Markdown in pure Zig.`

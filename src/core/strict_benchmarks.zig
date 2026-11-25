@@ -179,7 +179,7 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         const bytes = mapped.bytes;
         var in_fence: simd.FenceState = .{};
         const line_count = simd.scanLines(bytes, &lines_buf, &in_fence);
-        const vp_config = layout.ViewportConfig{
+        var vp_config = layout.ViewportConfig{
             .window_width = 1000.0,
             .window_height = 750.0,
             .scroll_y = 0.0,
@@ -188,11 +188,11 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         _ = layout.computeDocumentHeightEx(
             bytes,
             lines_buf[0..line_count],
-            vp_config,
+            &vp_config,
             &checkpoints,
             &cp_count,
         );
-        const deep_config = layout.ViewportConfig{
+        var deep_config = layout.ViewportConfig{
             .window_width = 1000.0,
             .window_height = 750.0,
             .scroll_y = 0.0,
@@ -201,7 +201,7 @@ test "STRICT: Showcase Startup Budget (open + scan + metrics + first frame)" {
         const cmd_count = layout.layoutViewport(
             bytes,
             lines_buf[0..line_count],
-            deep_config,
+            &deep_config,
             &commands,
         );
         mapped.close();
@@ -256,7 +256,7 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
     const line_count = simd.scanLines(mem, line_entries, &in_fence);
 
     var commands: [1024]layout.DrawCommand = undefined;
-    const vp_config = layout.ViewportConfig{
+    var vp_config = layout.ViewportConfig{
         .window_width = 1200.0,
         .window_height = 800.0,
         .scroll_y = 1200.0,
@@ -268,7 +268,7 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
     _ = layout.layoutViewport(
         mem,
         line_entries[0..line_count],
-        vp_config,
+        &vp_config,
         &commands,
     );
     var min_elapsed_us: i128 = 999999;
@@ -281,7 +281,7 @@ test "STRICT: Viewport Layout Under 500 µs on 50,000 Lines" {
         const cmd_count = layout.layoutViewport(
             mem,
             line_entries[0..line_count],
-            vp_config,
+            &vp_config,
             &commands,
         );
         last_cmd_count = cmd_count;
@@ -390,7 +390,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
     var checkpoints: [2048]layout.Checkpoint = undefined;
     var cp_count: usize = 0;
 
-    const base_cfg = layout.ViewportConfig{
+    var base_cfg = layout.ViewportConfig{
         .window_width = 1000.0,
         .window_height = 800.0,
         .scroll_y = 0.0,
@@ -399,7 +399,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
     const doc_h = layout.computeDocumentHeightEx(
         mem,
         line_entries[0..line_count],
-        base_cfg,
+        &base_cfg,
         &checkpoints,
         &cp_count,
     );
@@ -407,7 +407,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
 
     // Deep scroll position: 90% down the document (around line 45,000)
     const deep_scroll_y = doc_h * 0.90;
-    const vp_config_deep = layout.ViewportConfig{
+    var vp_config_deep = layout.ViewportConfig{
         .window_width = 1000.0,
         .window_height = 800.0,
         .scroll_y = deep_scroll_y,
@@ -422,7 +422,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
     _ = layout.layoutViewport(
         mem,
         line_entries[0..line_count],
-        vp_config_deep,
+        &vp_config_deep,
         &commands,
     );
     var min_elapsed_us: i128 = 999999;
@@ -434,7 +434,7 @@ test "STRICT: Deep Viewport Layout Under 20 µs at Line 45,000+" {
         const cmd_count = layout.layoutViewport(
             mem,
             line_entries[0..line_count],
-            vp_config_deep,
+            &vp_config_deep,
             &commands,
         );
 

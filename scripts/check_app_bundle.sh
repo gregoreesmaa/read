@@ -27,6 +27,13 @@ grep -q "public.markdown" "$APP/Contents/Info.plist" || fail "missing public.mar
 grep -q "net.daringfireball.markdown" "$APP/Contents/Info.plist" || fail "missing net.daringfireball.markdown document type"
 grep -q "UTImportedTypeDeclarations" "$APP/Contents/Info.plist" || fail "missing UTImportedTypeDeclarations (mdown/mkd/mkdn)"
 sips -g pixelWidth "$APP/Contents/Resources/Read.icns" >/dev/null || fail "Read.icns unreadable"
+# Font vendoring (issue #390): Typography ships under Resources/Fonts so
+# launch pays bundle-relative lookups, never source-tree stats. Hard gate:
+# a bundle without fonts renders in fallback faces (silent degradation).
+for f in IBMPlexSerif-Regular.ttf IBMPlexSerif-Bold.ttf IBMPlexSerif-Italic.ttf SpaceGrotesk.ttf JetBrainsMono.ttf; do
+    [ -f "$APP/Contents/Resources/Fonts/$f" ] || fail "missing Resources/Fonts/$f (see scripts/make_app_bundle.sh)"
+done
+echo "NOTE: vendored fonts present (Resources/Fonts, 5 TTFs)"
 # Engine assertion (issue #367): a vendored libzatex is the version that
 # release ships. Soft gate: present must be a Mach-O dylib; absent is a
 # NOTE, not a failure — engine-less bundles still assemble and run, with
