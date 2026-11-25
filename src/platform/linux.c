@@ -1651,8 +1651,29 @@ void platform_sync_scroll(float scroll_y) {
 void platform_request_scroll(float old_scroll_y, float new_scroll_y) {
     if (new_scroll_y != old_scroll_y) request_redraw();
 }
+// Fill-color batch close (#389): X11 draws each run directly, no batch.
+void platform_batch_end(void) {}
 #ifdef TEST_HOOKS
 float platform_test_scroll_synced(void) { return g_scroll_y; }
+void platform_set_test_scroll(float scroll_y) {
+    g_scroll_y = scroll_y;
+    g_hover_link_hash = 0;
+}
+// macOS-only probes (tier bypasses, scroll-copy plan, repaint rows): the
+// CLI flags link on X11 but have nothing to measure.
+void platform_set_test_bypass(int pill_direct, int shape_direct) {
+    (void)pill_direct; (void)shape_direct;
+}
+void platform_probe_scroll_plan(float dy, float scale, float view_h, float overshoot,
+                                int* use_copy, float* copy_dy, float* band_y, float* band_h) {
+    (void)dy; (void)scale; (void)view_h; (void)overshoot;
+    *use_copy = 0; *copy_dy = 0.0f; *band_y = 0.0f; *band_h = 0.0f;
+}
+int platform_render_repaint_png(const char* out_a, const char* out_b, const char* out_c,
+                                int width, int height, void (*render_fn)(int, int)) {
+    (void)out_a; (void)out_b; (void)out_c; (void)width; (void)height; (void)render_fn;
+    return -1;
+}
 #endif
 
 void platform_sync_overshoot(float overshoot) {

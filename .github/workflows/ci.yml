@@ -121,6 +121,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Create \tmp (tests write "/tmp/..." paths, drive-rooted on Windows)
+        run: cmd //c "if not exist \\tmp mkdir \\tmp"
       - name: Strict gate (tests + microsecond benchmarks)
         run: zig build test -Doptimize=ReleaseFast --summary all
       - name: Parser short fuzz (malformed + huge inputs, issue #34)
