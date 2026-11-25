@@ -722,15 +722,44 @@ fn pluginWriteShim(dir: []const u8, name: []const u8, helper: []const u8, probe:
     return true;
 }
 
+/// File size via statx on Linux (std.c.Stat is void there in Zig 0.16),
+/// libc fstat elsewhere.
+fn pluginFdSize(fd: std.posix.fd_t) ?u64 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx = std.mem.zeroes(linux.Statx);
+        const err = linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &sx));
+        if (err != .SUCCESS or !sx.mask.SIZE) return null;
+        return sx.size;
+    } else {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0) return null;
+        return @intCast(st.size);
+    }
+}
+
+/// mtime seconds by path; statx on Linux, libc stat elsewhere.
+fn pluginMtimeSec(path_z: [*:0]const u8) ?i64 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx = std.mem.zeroes(linux.Statx);
+        const err = linux.errno(linux.statx(linux.AT.FDCWD, path_z, 0, .{ .MTIME = true }, &sx));
+        if (err != .SUCCESS or !sx.mask.MTIME) return null;
+        return sx.mtime.sec;
+    } else {
+        var st: std.c.Stat = undefined;
+        if (pluginStat(path_z, &st) != 0) return null;
+        return st.mtime().sec;
+    }
+}
+
 /// True when the file at `path` holds exactly `want` bytes. Pure read
 /// probe for the shim hash-skip: a missing/unreadable file reads as
 /// different (rewrite path), never as equal.
 fn pluginFileContentMatches(path: []const u8, want: []const u8) bool {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
     defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return false;
-    if (st.size != want.len) return false;
+    if ((pluginFdSize(fd) orelse return false) != want.len) return false;
     var off: usize = 0;
     var buf: [512]u8 = undefined;
     while (off < want.len) {
@@ -968,7 +997,7 @@ const pluginDirent = switch (builtin.os.tag) {
     },
 };
 const pluginReaddir = @extern(*const fn (*std.c.DIR) callconv(.c) ?*pluginDirent, .{ .name = "readdir" });
-const pluginStat = @extern(*const fn ([*:0]const u8, *std.c.Stat) callconv(.c) c_int, .{ .name = "stat" });
+const pluginStat = if (builtin.os.tag == .linux) void else @extern(*const fn ([*:0]const u8, *std.c.Stat) callconv(.c) c_int, .{ .name = "stat" });
 const PLUGIN_CACHE_MAX_FILES: usize = 64;
 const PLUGIN_TIDY_SCAN: usize = 256;
 const PLUGIN_TIDY_DEL_MAX: usize = 32;
@@ -1023,11 +1052,7 @@ fn pluginTidyRendererDir(dir: []const u8) void {
         var full: [1024:0]u8 = [_:0]u8{0} ** 1024;
         if (pluginJoinPath(dir, n, full[0..1023]) == null) continue;
         const fz: [*:0]const u8 = @ptrCast(&full[0]);
-        var st: std.c.Stat = undefined;
-        if (pluginStat(fz, &st) != 0) continue;
-        // mtime() (method, not field) is portable across Darwin/Linux
-        // Stat shapes; compare seconds only — prune order needs no nsec.
-        const mt = st.mtime().sec;
+        const mt = pluginMtimeSec(fz) orelse continue;
         // Track the oldest few for pruning; insertion into a tiny sorted
         // window keeps this O(scan * 32) with no allocation.
         if (n_old < PLUGIN_TIDY_DEL_MAX or mt < oldest[n_old - 1]) {
